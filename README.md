@@ -6,7 +6,7 @@ Briefly, this application combines the kaa editor and the visidata data visualiz
 
 ![Editor](/data/editor.png)
 
-![Data representation](/data/visidata.png)
+![Data representation](/data/data.png)
 
 
 ## Installation
