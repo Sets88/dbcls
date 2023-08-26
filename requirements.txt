@@ -1,0 +1,7 @@
+kaaedit==0.54.0
+visidata==2.11.1
+aiochclient[aiohttp]==2.4.0
+ciso8601==2.3.0
+aiomysql==0.2.0
+aiopg==1.4.0
+ssh_crypt==1.1.8
