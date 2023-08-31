@@ -27,6 +27,10 @@ class CaseInsensitiveKeywords(Keywords):
         return rf'\b({"|".join(tokens)})\b'
 
 
+class NonSqlComment(Span):
+    pass
+
+
 KEYWORDS = [
     'SELECT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'COLUMN', 'USE',
     'FROM', 'JOIN', 'OUTER', 'INNER', 'LIMIT', 'ORDER BY', 'AS',
@@ -40,7 +44,7 @@ KEYWORDS = [
 def sqleditor_tokens() -> list[tuple[str, Token]]:
     return [
         ('comment1', Span('comment', r'--', '$')),
-        ('comment2', Span('comment', r'\#', '$')),
+        ('comment2', NonSqlComment('comment', r'\#', '$')),
         ("string1", Span('string', '"', '"', escape='\\')),
         ("string2", Span('string', "'", "'", escape='\\')),
         ("number", SingleToken('number', [r'\b[0-9]+(\.[0-9]*)*\b', r'\b\.[0-9]+\b'])),
