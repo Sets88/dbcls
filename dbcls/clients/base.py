@@ -15,13 +15,13 @@ class Result:
         if self.message:
             return self.message
 
-        if not self.data and self.rowcount:
+        if self.data:
+            return f'{self.rowcount} rows returned'
+
+        if self.rowcount:
             return f'{self.rowcount} rows affected'
 
-        if not self.data and not self.rowcount:
-            return 'Empty set'
-
-        return f'{self.rowcount} rows returned'
+        return 'Empty set'
 
 
 class ClientClass(abc.ABC):
