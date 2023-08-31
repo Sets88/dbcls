@@ -33,26 +33,25 @@ client = None
 
 
 def get_sel(wnd: TextEditorWindow) -> str:
-    if wnd.screen.selection.is_selected():
-        if not wnd.screen.selection.is_rectangular():
-            f, t = wnd.screen.selection.get_selrange()
-            return wnd.document.gettext(f, t)
+    selection = wnd.screen.selection
+    if not selection.is_selected():
+        return
+    if not selection.is_rectangular():
+        selected_from, selected_to = selection.get_selrange()
+        return wnd.document.gettext(selected_from, selected_to)
+    data = []
+    position_from, position_to, column_from, column_to = selection.get_rect_range()
+
+    while position_from < position_to:
+        position_and_col_string = selection.get_col_string(position_from, column_from, column_to)
+        if position_and_col_string:
+            *_, col_string = position_and_col_string
+            data.append(col_string.rstrip('\n'))
         else:
-            s = []
-            (posfrom, posto, colfrom, colto
-             ) = wnd.screen.selection.get_rect_range()
+            data.append('')
+        position_from = wnd.document.geteol(position_from)
 
-            while posfrom < posto:
-                sel = wnd.screen.selection.get_col_string(
-                    posfrom, colfrom, colto)
-                if sel:
-                    f, t, org = sel
-                    s.append(org.rstrip('\n'))
-                else:
-                    s.append('')
-                posfrom = wnd.document.geteol(posfrom)
-
-            return '\n'.join(s)
+    return '\n'.join(data)
 
 
 def get_current_sql_rows_pos(wnd: TextEditorWindow) -> list[int]:
