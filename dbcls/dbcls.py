@@ -2,6 +2,7 @@ from time import time
 import asyncio
 from functools import partial
 from typing import Callable
+from typing import Optional
 
 import kaa
 import kaa.cui.main
@@ -234,7 +235,7 @@ def on_keypressed(
         original_fn: Callable,
         wnd: TextEditorWindow,
         event: KeyEvent,
-        key: str | None,
+        key: Optional[str],
         commands: list[str],
         candidate: list[tuple]
 ):

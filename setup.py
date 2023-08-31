@@ -15,7 +15,7 @@ def get_requirements():
 
 setup(
     name='dbcls',
-    version='1.0.3',
+    version='1.0.4',
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',
@@ -27,7 +27,7 @@ setup(
     zip_safe=False,
     platforms='any',
     install_requires=get_requirements(),
-    python_requires='>=3.7',
+    python_requires='>=3.9',
     entry_points={
         'console_scripts': [
             'dbcls = dbcls:main',
