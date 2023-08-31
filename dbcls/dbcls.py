@@ -19,7 +19,7 @@ import visidata
 import curses
 from ssh_crypt import E
 
-from .sql_tokenizer import make_tokenizer, sql_editor_themes, CaseInsensitiveKeywords, NonSqlComment, Span
+from .sql_tokenizer import make_tokenizer, sql_editor_themes, CaseInsensitiveKeywords, NonSqlComment
 from .clients.base import Result
 
 
@@ -140,7 +140,10 @@ def get_expression_under_cursor(wnd: TextEditorWindow) -> str:
     return line
 
 
-async def await_and_print_time(wnd: TextEditorWindow, coro: asyncio.coroutines) -> Result:
+async def await_and_print_time(
+        wnd: TextEditorWindow,
+        coro: asyncio.coroutines
+) -> Result:
     start = time()
     task = asyncio.create_task(coro)
 
@@ -246,7 +249,12 @@ def on_keypressed(
     return original_fn(wnd, event, key, commands, candidate)
 
 
-def on_cursor_located(self: DefaultMode, original_fn: Callable, wnd: TextEditorWindow, *args, **kwargs):
+def on_cursor_located(
+        self: DefaultMode,
+        original_fn: Callable,
+        wnd: TextEditorWindow,
+        *args, **kwargs
+):
     wnd.document.highlights = []
     for id, row_pos in enumerate(get_current_sql_rows_pos(wnd)):
         wnd.document.highlights.append(

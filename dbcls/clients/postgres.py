@@ -1,5 +1,6 @@
 import aiopg
-import psycopg2
+from psycopg2 import ProgrammingError
+from psycopg2.extras import RealDictCursor
 
 from .base import ClientClass
 from .base import Result
@@ -14,7 +15,10 @@ class PostgresClient(ClientClass):
             self.port = '5432'
 
     async def get_tables(self) -> Result:
-        sql = "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';"
+        sql = (
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_type='BASE TABLE';"
+        )
         return await self.execute(sql)
 
     async def get_databases(self) -> Result:
@@ -22,15 +26,21 @@ class PostgresClient(ClientClass):
         return await self.execute(sql)
 
     async def execute(self, sql) -> Result:
-        if sql.strip().startswith('\\c '):
-            db = sql.strip().split(' ')[1].rstrip(';')
-            return await self.change_database(db)
+        sql_stripped = sql.strip()
+        first_word = sql_stripped.split(' ')[1]
 
-        if sql.strip().startswith('\\d '):
-            sql = f"SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '{sql.strip().split(' ')[1]}'"
-        if sql.strip() == ('\\d'):
+        if sql_stripped.startswith('\\c '):
+            db = first_word.rstrip(';')
+            return await self.change_database(db)
+        if sql_stripped.startswith('\\d '):
+            sql = (
+                "SELECT column_name, data_type"
+                "FROM information_schema.columns"
+                f"WHERE table_name = '{first_word}'"
+            )
+        if sql_stripped == ('\\d'):
             return await self.get_tables()
-        if sql.strip().startswith('\\l'):
+        if sql_stripped.startswith('\\l'):
             return await self.get_databases()
 
         async with aiopg.connect(
@@ -40,14 +50,13 @@ class PostgresClient(ClientClass):
             password=self.password,
             dbname=self.dbname,
         ) as conn:
-            async with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            async with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 await cur.execute(sql)
                 rowcount = cur.rowcount
                 result = Result(rowcount=rowcount)
                 try:
-
                     result.data = await cur.fetchall()
-                except psycopg2.ProgrammingError:
+                except ProgrammingError:
                     pass
 
                 return result

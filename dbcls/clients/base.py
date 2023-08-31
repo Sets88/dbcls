@@ -43,7 +43,7 @@ class ClientClass(abc.ABC):
         old_db = self.dbname
         self.dbname = database
         try:
-            await self.execute(f'SELECT 1')
+            await self.execute('SELECT 1')
             return Result(message=f'You are now connected to database "{database}"')
         except Exception:
             self.dbname = old_db
