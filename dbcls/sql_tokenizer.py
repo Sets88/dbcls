@@ -1,7 +1,12 @@
-from kaa.theme import Style
 from kaa import doc_re
-from kaa.syntax_highlight import Span, SingleToken, Tokenizer, Keywords, Token
-
+from kaa.syntax_highlight import (
+    Keywords,
+    SingleToken,
+    Span,
+    Token,
+    Tokenizer,
+)
+from kaa.theme import Style
 
 sql_editor_themes = {
     'basic': [

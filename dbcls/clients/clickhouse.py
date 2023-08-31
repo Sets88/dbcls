@@ -1,8 +1,10 @@
-from aiohttp import ClientSession
 import aiochclient
+from aiohttp import ClientSession
 
-from .base import ClientClass
-from .base import Result
+from .base import (
+    ClientClass,
+    Result,
+)
 
 
 class ClickhouseClient(ClientClass):

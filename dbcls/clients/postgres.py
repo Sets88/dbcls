@@ -2,8 +2,10 @@ import aiopg
 from psycopg2 import ProgrammingError
 from psycopg2.extras import RealDictCursor
 
-from .base import ClientClass
-from .base import Result
+from .base import (
+    ClientClass,
+    Result,
+)
 
 
 class PostgresClient(ClientClass):

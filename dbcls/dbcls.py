@@ -1,27 +1,33 @@
-from time import time
 import asyncio
+import curses
 from functools import partial
+from time import time
 from typing import Callable
 
 import kaa
 import kaa.cui.main
+import visidata
+from kaa.addon import (
+    alt,
+    backspace,
+    command,
+    ctrl,
+    setup,
+)
+from kaa.cui.editor import TextEditorWindow
 from kaa.cui.keydef import KeyEvent
 from kaa.filetype.default.defaultmode import DefaultMode
 from kaa.options import build_parser
 from kaa.syntax_highlight import DefaultToken
-from kaa.cui.editor import TextEditorWindow
-from kaa.addon import command
-from kaa.addon import setup
-from kaa.addon import alt
-from kaa.addon import ctrl
-from kaa.addon import backspace
-import visidata
-import curses
 from ssh_crypt import E
 
-from .sql_tokenizer import make_tokenizer, sql_editor_themes, CaseInsensitiveKeywords, NonSqlComment
 from .clients.base import Result
-
+from .sql_tokenizer import (
+    CaseInsensitiveKeywords,
+    NonSqlComment,
+    make_tokenizer,
+    sql_editor_themes,
+)
 
 client = None
 
