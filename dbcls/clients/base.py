@@ -1,5 +1,8 @@
 import abc
-from dataclasses import dataclass, field
+from dataclasses import (
+    dataclass,
+    field,
+)
 
 
 @dataclass
@@ -12,13 +15,13 @@ class Result:
         if self.message:
             return self.message
 
-        if not self.data and self.rowcount:
+        if self.data:
+            return f'{self.rowcount} rows returned'
+
+        if self.rowcount:
             return f'{self.rowcount} rows affected'
 
-        if not self.data and not self.rowcount:
-            return 'Empty set'
-
-        return f'{self.rowcount} rows returned'
+        return 'Empty set'
 
 
 class ClientClass(abc.ABC):
@@ -43,7 +46,7 @@ class ClientClass(abc.ABC):
         old_db = self.dbname
         self.dbname = database
         try:
-            await self.execute(f'SELECT 1')
+            await self.execute('SELECT 1')
             return Result(message=f'You are now connected to database "{database}"')
         except Exception:
             self.dbname = old_db

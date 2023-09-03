@@ -1,7 +1,9 @@
 import aiomysql
 
-from .base import ClientClass
-from .base import Result
+from .base import (
+    ClientClass,
+    Result,
+)
 
 
 class MysqlClient(ClientClass):

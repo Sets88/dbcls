@@ -1,53 +1,58 @@
-from time import time
 import asyncio
+import curses
 from functools import partial
+from time import time
 from typing import Callable
 from typing import Optional
 
 import kaa
 import kaa.cui.main
+import visidata
+from kaa.addon import (
+    alt,
+    backspace,
+    command,
+    ctrl,
+    setup,
+)
+from kaa.cui.editor import TextEditorWindow
 from kaa.cui.keydef import KeyEvent
 from kaa.filetype.default.defaultmode import DefaultMode
 from kaa.options import build_parser
 from kaa.syntax_highlight import DefaultToken
-from kaa.cui.editor import TextEditorWindow
-from kaa.addon import command
-from kaa.addon import setup
-from kaa.addon import alt
-from kaa.addon import ctrl
-from kaa.addon import backspace
-import visidata
-import curses
 from ssh_crypt import E
 
-from .sql_tokenizer import make_tokenizer, sql_editor_themes, CaseInsensitiveKeywords, NonSqlComment, Span
 from .clients.base import Result
-
+from .sql_tokenizer import (
+    CaseInsensitiveKeywords,
+    NonSqlComment,
+    make_tokenizer,
+    sql_editor_themes,
+)
 
 client = None
 
 
 def get_sel(wnd: TextEditorWindow) -> str:
-    if wnd.screen.selection.is_selected():
-        if not wnd.screen.selection.is_rectangular():
-            f, t = wnd.screen.selection.get_selrange()
-            return wnd.document.gettext(f, t)
+    selection = wnd.screen.selection
+    if not selection.is_selected():
+        return
+    if not selection.is_rectangular():
+        selected_from, selected_to = selection.get_selrange()
+        return wnd.document.gettext(selected_from, selected_to)
+    data = []
+    position_from, position_to, column_from, column_to = selection.get_rect_range()
+
+    while position_from < position_to:
+        position_and_col_string = selection.get_col_string(position_from, column_from, column_to)
+        if position_and_col_string:
+            *_, col_string = position_and_col_string
+            data.append(col_string.rstrip('\n'))
         else:
-            s = []
-            (posfrom, posto, colfrom, colto
-             ) = wnd.screen.selection.get_rect_range()
+            data.append('')
+        position_from = wnd.document.geteol(position_from)
 
-            while posfrom < posto:
-                sel = wnd.screen.selection.get_col_string(
-                    posfrom, colfrom, colto)
-                if sel:
-                    f, t, org = sel
-                    s.append(org.rstrip('\n'))
-                else:
-                    s.append('')
-                posfrom = wnd.document.geteol(posfrom)
-
-            return '\n'.join(s)
+    return '\n'.join(data)
 
 
 def get_current_sql_rows_pos(wnd: TextEditorWindow) -> list[int]:
@@ -141,7 +146,10 @@ def get_expression_under_cursor(wnd: TextEditorWindow) -> str:
     return line
 
 
-async def await_and_print_time(wnd: TextEditorWindow, coro: asyncio.coroutines) -> Result:
+async def await_and_print_time(
+        wnd: TextEditorWindow,
+        coro: asyncio.coroutines
+) -> Result:
     start = time()
     task = asyncio.create_task(coro)
 
@@ -247,7 +255,12 @@ def on_keypressed(
     return original_fn(wnd, event, key, commands, candidate)
 
 
-def on_cursor_located(self: DefaultMode, original_fn: Callable, wnd: TextEditorWindow, *args, **kwargs):
+def on_cursor_located(
+        self: DefaultMode,
+        original_fn: Callable,
+        wnd: TextEditorWindow,
+        *args, **kwargs
+):
     wnd.document.highlights = []
     for id, row_pos in enumerate(get_current_sql_rows_pos(wnd)):
         wnd.document.highlights.append(
