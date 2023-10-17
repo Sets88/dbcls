@@ -201,7 +201,7 @@ def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines
         message = str(result)
 
         fix_visidata_curses()
-        visidata.vd.options.set('disp_float_fmt', '')
+        visidata.vd.options.set('disp_float_fmt', '{}')
         visidata.vd.run()
         visidata.vd.view(result.data)
     except Exception as exc:
