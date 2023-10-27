@@ -298,6 +298,8 @@ def editor(mode: DefaultMode):
         (alt, 't'): 'db.show_tables',
         (alt, 'e'): 'db.show_databases',
         (ctrl, 's'): 'file.save',
+        (alt, 'f'): 'search.showsearch',
+        (ctrl, 'f'): 'search.showreplace',
         (ctrl, 'q'): 'file.quit',
         (alt, backspace): 'edit.backspace.word'
     })
