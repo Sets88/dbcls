@@ -29,6 +29,7 @@ from .sql_tokenizer import (
     make_tokenizer,
     sql_editor_themes,
 )
+from .clients.sqlite3 import Sqlite3Client
 
 client = None
 
@@ -146,6 +147,14 @@ def get_expression_under_cursor(wnd: TextEditorWindow) -> str:
     return line
 
 
+def print_center(window: curses.window, text: str):
+    num_rows, num_cols = window.getmaxyx()
+    x = num_cols // 2 - len(text) // 2
+    y = num_rows // 2
+    window.addstr(y, x, text)
+    window.refresh()
+
+
 async def await_and_print_time(
         wnd: TextEditorWindow,
         coro: asyncio.coroutines
@@ -153,19 +162,26 @@ async def await_and_print_time(
     start = time()
     task = asyncio.create_task(coro)
 
-    while not task.done():
-        wnd.mainframe._cwnd.timeout(0)
-        key = wnd.mainframe._cwnd.getch()
+    posy, _ = wnd.get_cursor_loc()
 
-        if key == 27:
-            task.cancel()
-            return
+    win = curses.newwin(3, 50, max(posy - 3, 0), 5)
 
-        await asyncio.sleep(0.1)
+    try:
+        win.box()
 
-        print(f'Running (press ESC to cancel): {round(time() - start, 2)}s ')
-        print('\033[F', end='')
+        while not task.done():
+            wnd.mainframe._cwnd.timeout(0)
+            key = wnd.mainframe._cwnd.getch()
 
+            if key == 27:
+                task.cancel()
+                raise asyncio.CancelledError()
+
+            await asyncio.sleep(0.1)
+
+            print_center(win, f'Running (press ESC to cancel): {round(time() - start, 2)}s ')
+    finally:
+        del win
     return await task
 
 
@@ -191,17 +207,23 @@ def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines
     message = ''
 
     try:
-        result = asyncio.run(await_and_print_time(
-            wnd,
-            coro
-        ))
+        try:
+            result = asyncio.run(await_and_print_time(
+                wnd,
+                coro
+            ))
+        except asyncio.CancelledError:
+            end = time()
+            message = 'Cancelled'
+            return
 
         end = time()
-
         message = str(result)
 
+        if not result:
+            return
+
         fix_visidata_curses()
-        visidata.vd.options.set('disp_float_fmt', '{}')
         visidata.vd.run()
         visidata.vd.view(result.data)
     except Exception as exc:
@@ -298,8 +320,8 @@ def editor(mode: DefaultMode):
         (alt, 't'): 'db.show_tables',
         (alt, 'e'): 'db.show_databases',
         (ctrl, 's'): 'file.save',
-        (alt, 'f'): 'search.showsearch',
-        (ctrl, 'f'): 'search.showreplace',
+        (ctrl, 'f'): 'search.showsearch',
+        (ctrl, 'r'): 'search.showreplace',
         (ctrl, 'q'): 'file.quit',
         (alt, backspace): 'edit.backspace.word'
     })
@@ -317,12 +339,14 @@ def main():
 
     args_parser.description = 'DB connection tool'
     args_parser.add_argument('--host', '-H', dest='host', help='specify host name', default='127.0.0.1')
-    args_parser.add_argument('--user', '-u', dest='user', help='specify user name', required=True)
+    args_parser.add_argument('--user', '-u', dest='user', help='specify user name', required=False)
     args_parser.add_argument('--encpass', '-e', dest='encpass', default='', help='specify encrypted with ssh-crypt password')
     args_parser.add_argument('--password', '-p', dest='password', default='', help='specify raw password')
     args_parser.add_argument('--port', '-P', dest='port', default='', help='specify port')
-    args_parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=True)
-    args_parser.add_argument('--dbname', '-d', dest='dbname', help='specify db name', required=True)
+    args_parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=True,
+        choices=['clickhouse', 'mysql', 'postgres', 'sqlite3'])
+    args_parser.add_argument('--dbname', '-d', dest='dbname', help='specify db name', required=False)
+    args_parser.add_argument('--filepath', '-f', dest='filepath', help='specify db filepath', required=False)
 
     args = args_parser.parse_args()
 
@@ -336,6 +360,7 @@ def main():
     port = args.port
     engine = args.engine
     dbname = args.dbname
+    filepath = args.filepath
 
     # imported here to make db libs dependencies optional
     if engine == 'clickhouse':
@@ -347,6 +372,8 @@ def main():
     if engine == 'postgres':
         from .clients.postgres import PostgresClient
         client = PostgresClient(host, username, password, dbname, port=port)
+    if engine == 'sqlite3':
+        client = Sqlite3Client(filepath)
 
     kaa.cui.main.opt = args
     kaa.cui.main._init_term()

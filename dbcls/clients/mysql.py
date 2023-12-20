@@ -37,7 +37,4 @@ class MysqlClient(ClientClass):
                 await cur.execute(sql)
                 data = await cur.fetchall()
 
-                if not data and cur.rowcount:
-                    return Result(data, cur.rowcount)
-
                 return Result(data, cur.rowcount)
