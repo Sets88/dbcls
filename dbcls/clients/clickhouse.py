@@ -1,5 +1,6 @@
 import aiochclient
 from aiohttp import ClientSession
+from aiohttp import ClientTimeout
 
 from .base import (
     ClientClass,
@@ -30,7 +31,9 @@ class ClickhouseClient(ClientClass):
             db = sql.strip().split(' ')[1].rstrip(';')
             return await self.change_database(db)
 
-        async with ClientSession() as sess:
+        timeout = ClientTimeout(connect=60)
+
+        async with ClientSession(timeout=timeout) as sess:
             client = aiochclient.ChClient(
                 sess,
                 url=f"http://{self.host}:{self.port}",
