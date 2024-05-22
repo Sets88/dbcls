@@ -34,11 +34,16 @@ class PostgresClient(ClientClass):
         if sql_stripped.startswith('\\c '):
             db = first_word.rstrip(';')
             return await self.change_database(db)
+
         if sql_stripped.startswith('\\d '):
             sql = (
-                "SELECT column_name, data_type"
-                "FROM information_schema.columns"
+                "SELECT column_name, data_type "
+                "FROM information_schema.columns "
                 f"WHERE table_name = '{first_word}'"
+                "UNION ALL SELECT 'INDEXES', NULL "
+                "UNION ALL "
+                "SELECT indexname, indexdef "
+                f"FROM pg_indexes WHERE tablename = '{first_word}';"
             )
         if sql_stripped == ('\\d'):
             return await self.get_tables()

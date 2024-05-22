@@ -220,10 +220,11 @@ def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines
         end = time()
         message = str(result)
 
-        if not result:
+        if not result or not result.data:
             return
 
         fix_visidata_curses()
+
         visidata.vd.run()
         visidata.vd.view(result.data)
     except Exception as exc:
