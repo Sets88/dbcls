@@ -57,10 +57,6 @@ Database to use
 
 Port number to use for connection (optional)
 
--e --encpass
-
-Encrypted with ssh-crypt password
-
 # Bugs
 
 See github issues: https://github.com/Sets88/dbcls/issues

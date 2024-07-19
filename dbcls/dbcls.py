@@ -4,6 +4,7 @@ from functools import partial
 from time import time
 from typing import Callable
 from typing import Optional
+import logging
 
 import kaa
 import kaa.cui.main
@@ -20,7 +21,6 @@ from kaa.cui.keydef import KeyEvent
 from kaa.filetype.default.defaultmode import DefaultMode
 from kaa.options import build_parser
 from kaa.syntax_highlight import DefaultToken
-from ssh_crypt import E
 
 from .clients.base import Result
 from .sql_tokenizer import (
@@ -31,7 +31,10 @@ from .sql_tokenizer import (
 )
 from .clients.sqlite3 import Sqlite3Client
 
+
 client = None
+
+logging.basicConfig(level=logging.WARNING)
 
 
 def get_sel(wnd: TextEditorWindow) -> str:
@@ -341,7 +344,6 @@ def main():
     args_parser.description = 'DB connection tool'
     args_parser.add_argument('--host', '-H', dest='host', help='specify host name', default='127.0.0.1')
     args_parser.add_argument('--user', '-u', dest='user', help='specify user name', required=False)
-    args_parser.add_argument('--encpass', '-e', dest='encpass', default='', help='specify encrypted with ssh-crypt password')
     args_parser.add_argument('--password', '-p', dest='password', default='', help='specify raw password')
     args_parser.add_argument('--port', '-P', dest='port', default='', help='specify port')
     args_parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=True,
@@ -354,10 +356,10 @@ def main():
     host = args.host
     username = args.user
     password = ''
-    if args.encpass:
-        password = str(E(args.encpass))
+
     if args.password:
         password = args.password
+
     port = args.port
     engine = args.engine
     dbname = args.dbname
