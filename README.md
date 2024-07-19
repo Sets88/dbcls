@@ -23,6 +23,40 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 ```
 
 
+## Using config file rather then process arguments to configure
+
+``` bash
+dbcls -c config.json mydb.sql
+```
+
+Where config file is:
+```json
+{
+    "host": "127.0.0.1",
+    "port": "3306",
+    "username": "user",
+    "password": "mypasswd",
+    "dbname": "mydb",
+    "engine": "mysql"
+}
+```
+
+or from bash file
+```bash
+#! /bin/bash
+
+CONFIG='{
+    "host": "127.0.0.1",
+    "port": "3306",
+    "username": "user",
+    "password": "mypasswd",
+    "dbname": "mydb",
+    "engine": "mysql"
+}'
+
+dbcls -c <(echo "$CONFIG") mydb.sql
+```
+
 ## Hotkeys
 
 - Alt + r - Execute query under cursor or selected text
@@ -56,6 +90,10 @@ Database to use
 -P --port
 
 Port number to use for connection (optional)
+
+-c --config
+
+Path to a config file to use
 
 # Bugs
 

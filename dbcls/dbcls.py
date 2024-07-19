@@ -1,4 +1,6 @@
 import asyncio
+import sys
+import json
 import curses
 from functools import partial
 from time import time
@@ -342,11 +344,12 @@ def main():
     args_parser = build_parser()
 
     args_parser.description = 'DB connection tool'
-    args_parser.add_argument('--host', '-H', dest='host', help='specify host name', default='127.0.0.1')
+    args_parser.add_argument('--config', '-c', dest='config', help='specify config path', default='')
+    args_parser.add_argument('--host', '-H', dest='host', help='specify host name', default='')
     args_parser.add_argument('--user', '-u', dest='user', help='specify user name', required=False)
     args_parser.add_argument('--password', '-p', dest='password', default='', help='specify raw password')
     args_parser.add_argument('--port', '-P', dest='port', default='', help='specify port')
-    args_parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=True,
+    args_parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=False,
         choices=['clickhouse', 'mysql', 'postgres', 'sqlite3'])
     args_parser.add_argument('--dbname', '-d', dest='dbname', help='specify db name', required=False)
     args_parser.add_argument('--filepath', '-f', dest='filepath', help='specify db filepath', required=False)
@@ -364,6 +367,25 @@ def main():
     engine = args.engine
     dbname = args.dbname
     filepath = args.filepath
+
+    if args.config:
+        with open(args.config) as f:
+            config = json.load(f)
+
+        if not host or host == '127.0.0.1':
+            host = config.get('host', '')
+        if not port:
+            port = config.get('port', '')
+        if not username:
+            username = config.get('username', '')
+        if not password:
+            password = config.get('password', '')
+        if not dbname:
+            dbname = config.get('dbname', '')
+        if not engine:
+            engine = config.get('engine', '')
+        if not filepath:
+            filepath = config.get('filepath', '')
 
     # imported here to make db libs dependencies optional
     if engine == 'clickhouse':
