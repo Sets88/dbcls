@@ -1,12 +1,14 @@
 import asyncio
+import threading
 import sys
 import json
 import curses
 from functools import partial
-from time import time
+import time
 from typing import Callable
 from typing import Optional
 import logging
+from queue import LifoQueue
 
 import kaa
 import kaa.cui.main
@@ -35,8 +37,65 @@ from .clients.sqlite3 import Sqlite3Client
 
 
 client = None
+asyncloop_thread = None
 
 logging.basicConfig(level=logging.WARNING)
+
+
+class AsyncLoopThread(threading.Thread):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.request_queue = asyncio.Queue()
+        self.result_queue = LifoQueue()
+        self.current_running_task = None
+        self.loop = None
+
+    async def _run(self):
+        if not self.loop:
+            self.loop = asyncio.get_event_loop()
+
+        while True:
+            try:
+                coro = await self.request_queue.get()
+                self.current_running_task = asyncio.create_task(coro)
+                result = await self.current_running_task
+                self.result_queue.put(result)
+            except BaseException as exc:
+                self.result_queue.put(exc)
+            finally:
+                await asyncio.sleep(0.1)
+
+    def run(self):
+        asyncio.run(self._run())
+
+    def cancel_current(self):
+        if self.current_running_task:
+            self.loop.call_soon_threadsafe(self.current_running_task.cancel)
+
+    def is_done(self):
+        if not self.current_running_task:
+            return True
+        if self.current_running_task.done():
+            self.current_running_task = None
+            return True
+        return False
+
+    def submit(self, coro: asyncio.coroutines):
+        asyncio.run_coroutine_threadsafe(self.request_queue.put(coro), loop=self.loop)
+
+        while not self.current_running_task:
+            time.sleep(0.05)
+
+    def get_response(self):
+        result = self.result_queue.get_nowait()
+
+        while not self.result_queue.empty():
+            self.result_queue.get_nowait()
+
+        if isinstance(result, BaseException):
+            raise result
+
+        return result
 
 
 def get_sel(wnd: TextEditorWindow) -> str:
@@ -160,12 +219,11 @@ def print_center(window: curses.window, text: str):
     window.refresh()
 
 
-async def await_and_print_time(
+def await_and_print_time(
         wnd: TextEditorWindow,
         coro: asyncio.coroutines
 ) -> Result:
-    start = time()
-    task = asyncio.create_task(coro)
+    start = time.time()
 
     posy, _ = wnd.get_cursor_loc()
 
@@ -173,21 +231,20 @@ async def await_and_print_time(
 
     try:
         win.box()
+        asyncloop_thread.submit(coro)
 
-        while not task.done():
+        while not asyncloop_thread.is_done():
             wnd.mainframe._cwnd.timeout(0)
             key = wnd.mainframe._cwnd.getch()
 
             if key == 27:
-                task.cancel()
-                raise asyncio.CancelledError()
+                asyncloop_thread.cancel_current()
 
-            await asyncio.sleep(0.1)
-
-            print_center(win, f'Running (press ESC to cancel): {round(time() - start, 2)}s ')
+            print_center(win, f'Running (press ESC to cancel): {round(time.time() - start, 2)}s'.ljust(45, ' '))
+            time.sleep(0.1)
     finally:
         del win
-    return await task
+    return asyncloop_thread.get_response()
 
 
 def fix_visidata_curses():
@@ -207,22 +264,19 @@ def fix_kaa_curses(wnd: TextEditorWindow):
 
 
 def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines):
-    start = time()
+    start = time.time()
     end = None
     message = ''
 
     try:
         try:
-            result = asyncio.run(await_and_print_time(
-                wnd,
-                coro
-            ))
+            result = await_and_print_time(wnd, coro)
         except asyncio.CancelledError:
-            end = time()
+            end = time.time()
             message = 'Cancelled'
             return
 
-        end = time()
+        end = time.time()
         message = str(result)
 
         if not result or not result.data:
@@ -233,7 +287,7 @@ def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines
         visidata.vd.run()
         visidata.vd.view(result.data)
     except Exception as exc:
-        end = time()
+        end = time.time()
         message = str(exc)
     finally:
         wnd.document.set_title(client.get_title())
@@ -340,6 +394,7 @@ def editor(mode: DefaultMode):
 
 def main():
     global client
+    global asyncloop_thread
 
     args_parser = build_parser()
 
@@ -399,6 +454,9 @@ def main():
         client = PostgresClient(host, username, password, dbname, port=port)
     if engine == 'sqlite3':
         client = Sqlite3Client(filepath)
+
+    asyncloop_thread = AsyncLoopThread(daemon=True)
+    asyncloop_thread.start()
 
     kaa.cui.main.opt = args
     kaa.cui.main._init_term()

@@ -1,5 +1,5 @@
 import aiopg
-from psycopg2 import ProgrammingError
+from psycopg2 import ProgrammingError, InterfaceError
 from psycopg2.extras import RealDictCursor
 
 from .base import (
@@ -16,6 +16,21 @@ class PostgresClient(ClientClass):
         if not port:
             self.port = '5432'
 
+    async def connect(self):
+        self.connection = await aiopg.connect(
+            host=self.host,
+            port=int(self.port),
+            user=self.username,
+            password=self.password,
+            dbname=self.dbname,
+        )
+
+    async def change_database(self, database: str):
+        if self.connection:
+            await self.connection.close()
+        self.connection = None
+        return await super().change_database(database)
+
     async def get_tables(self) -> Result:
         sql = (
             "SELECT table_name FROM information_schema.tables "
@@ -29,10 +44,10 @@ class PostgresClient(ClientClass):
 
     async def execute(self, sql) -> Result:
         sql_stripped = sql.strip()
-        first_word = sql_stripped.split(' ')[1]
+        first_word = sql_stripped.split(' ', 1)[1].rstrip(';').strip()
 
         if sql_stripped.startswith('\\c '):
-            db = first_word.rstrip(';')
+            db = first_word
             return await self.change_database(db)
 
         if sql_stripped.startswith('\\d '):
@@ -50,14 +65,11 @@ class PostgresClient(ClientClass):
         if sql_stripped.startswith('\\l'):
             return await self.get_databases()
 
-        async with aiopg.connect(
-            host=self.host,
-            port=int(self.port),
-            user=self.username,
-            password=self.password,
-            dbname=self.dbname,
-        ) as conn:
-            async with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if self.connection is None:
+            await self.connect()
+
+        try:
+            async with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
                 await cur.execute(sql)
                 rowcount = cur.rowcount
                 result = Result(rowcount=rowcount)
@@ -67,3 +79,6 @@ class PostgresClient(ClientClass):
                     pass
 
                 return result
+        except InterfaceError as exc:
+            self.connection = None
+            raise exc

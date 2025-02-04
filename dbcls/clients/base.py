@@ -33,6 +33,7 @@ class ClientClass(abc.ABC):
         self.password = password
         self.dbname = dbname
         self.port = port
+        self.connection = None
 
     @abc.abstractmethod
     def get_databases(self) -> Result:
