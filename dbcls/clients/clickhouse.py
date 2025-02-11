@@ -13,10 +13,24 @@ class ClickhouseClient(ClientClass):
 
     def __init__(self, host, username, password, dbname, port='8123'):
         super().__init__(host, username, password, dbname, port)
+        self.cache = {}
         if not dbname:
             self.dbname = 'default'
         if not port:
             self.port = '8123'
+
+    async def get_suggestions(self):
+        if 'tables' not in self.cache:
+            self.cache['tables'] = [list(x.values())[0] for x in (await self.get_tables()).data]
+
+        if 'databases' not in self.cache:
+            self.cache['databases'] = [list(x.values())[0] for x in (await self.get_databases()).data]
+
+        suggestions = [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
+        tables = [f"{x} (TABLE)" for x in self.cache['tables']]
+        databases = [f"{x} (DATABASE)" for x in self.cache['databases']]
+
+        return suggestions + tables + databases
 
     async def get_tables(self) -> Result:
         return await self.execute('SHOW TABLES')
@@ -29,6 +43,7 @@ class ClickhouseClient(ClientClass):
 
         if sql.strip().upper().startswith('USE '):
             db = sql.strip().split(' ')[1].rstrip(';')
+            self.cache.pop('tables', None)
             return await self.change_database(db)
 
         timeout = ClientTimeout(connect=60)

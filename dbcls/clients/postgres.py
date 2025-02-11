@@ -21,10 +21,6 @@ class PostgresClient(ClientClass):
         if 'tables' not in self.cache:
             self.cache['tables'] = [list(x.values())[0] for x in (await self.get_tables()).data]
 
-        import curses
-        curses.endwin()
-        import pdb; pdb.set_trace()
-
         if 'databases' not in self.cache:
             self.cache['databases'] = [list(x.values())[0] for x in (await self.get_databases()).data]
 
@@ -44,6 +40,7 @@ class PostgresClient(ClientClass):
         )
 
     async def change_database(self, database: str):
+        self.cache.pop('tables', None)
         if self.connection:
             await self.connection.close()
         self.connection = None

@@ -41,6 +41,7 @@ class MysqlClient(ClientClass):
 
     async def change_database(self, database: str):
         self.connection = None
+        self.cache.pop('tables', None)
         return await super().change_database(database)
 
     async def get_tables(self) -> Result:

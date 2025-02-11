@@ -43,7 +43,7 @@ class ClientClass(abc.ABC):
         self.connection = None
 
     async def get_suggestions(self):
-        return self.SQL_COMMANDS
+        return [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
 
     @abc.abstractmethod
     def get_databases(self) -> Result:
