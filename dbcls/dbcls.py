@@ -2,6 +2,7 @@ import asyncio
 import threading
 import operator
 import json
+import sys
 import curses
 from functools import partial
 import time
@@ -525,6 +526,11 @@ def main():
         client = PostgresClient(host, username, password, dbname, port=port)
     if engine == 'sqlite3':
         client = Sqlite3Client(filepath)
+
+    if not client:
+        args_parser.print_help(sys.stderr)
+        print('Invalid engine specified')
+        sys.exit(1)
 
     asyncloop_thread = AsyncLoopThread(daemon=True)
     asyncloop_thread.start()
