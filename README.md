@@ -58,7 +58,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 ```
 
 ## Hotkeys
-
+- Alt + 1 - Autocompletion suggestion list
 - Alt + r - Execute query under cursor or selected text
 - Alt + e - Show databases list
 - Alt + t - Show tables list

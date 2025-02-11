@@ -1,6 +1,6 @@
 import asyncio
 import threading
-import sys
+import operator
 import json
 import curses
 from functools import partial
@@ -12,12 +12,16 @@ from queue import LifoQueue
 
 import kaa
 import kaa.cui.main
+from kaa.ui.itemlist import itemlistmode
+from kaa.ui.selectlist import filterlist
 import visidata
 from kaa.addon import (
     alt,
     backspace,
     command,
     ctrl,
+    right,
+    shift,
     setup,
 )
 from kaa.cui.editor import TextEditorWindow
@@ -42,6 +46,32 @@ asyncloop_thread = None
 logging.basicConfig(level=logging.WARNING)
 
 
+class Task:
+    def __init__(self, coro, loop):
+        self.coro = coro
+        self.loop = loop
+        self.task = None
+
+    async def worker(self):
+        return await self.coro
+
+    def cancel(self):
+        self.loop.call_soon_threadsafe(self.task.cancel)
+
+    def is_done(self):
+        if self.task is None:
+            return False
+
+        return self.task.done()
+
+    def result(self):
+        return self.task.result()
+
+    async def run(self):
+        self.task = asyncio.create_task(self.worker())
+        return self.task
+
+
 class AsyncLoopThread(threading.Thread):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -51,26 +81,13 @@ class AsyncLoopThread(threading.Thread):
         self.loop = None
 
     async def _run(self):
-        if not self.loop:
-            self.loop = asyncio.get_event_loop()
+        self.loop = asyncio.get_event_loop()
 
         while True:
-            try:
-                coro = await self.request_queue.get()
-                self.current_running_task = asyncio.create_task(coro)
-                result = await self.current_running_task
-                self.result_queue.put(result)
-            except BaseException as exc:
-                self.result_queue.put(exc)
-            finally:
-                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.1)
 
     def run(self):
         asyncio.run(self._run())
-
-    def cancel_current(self):
-        if self.current_running_task:
-            self.loop.call_soon_threadsafe(self.current_running_task.cancel)
 
     def is_done(self):
         if not self.current_running_task:
@@ -81,21 +98,24 @@ class AsyncLoopThread(threading.Thread):
         return False
 
     def submit(self, coro: asyncio.coroutines):
-        asyncio.run_coroutine_threadsafe(self.request_queue.put(coro), loop=self.loop)
+        task = Task(coro, self.loop)
+        asyncio.run_coroutine_threadsafe(task.run(), loop=self.loop)
+        return task
 
-        while not self.current_running_task:
-            time.sleep(0.05)
 
-    def get_response(self):
-        result = self.result_queue.get_nowait()
+def show_listdlg(title, candidates, callback, query=''):
+    doc = filterlist.FilterListInputDlgMode.build(
+        title, callback)
+    dlg = kaa.app.show_dialog(doc)
 
-        while not self.result_queue.empty():
-            self.result_queue.get_nowait()
+    filterlistdoc = filterlist.FilterListMode.build()
+    list = dlg.add_doc('dlg_filterlist', 0, filterlistdoc)
 
-        if isinstance(result, BaseException):
-            raise result
+    filterlistdoc.mode.set_candidates(candidates)
+    filterlistdoc.mode.set_query(list, query.strip())
+    dlg.on_console_resized()
 
-        return result
+    return dlg
 
 
 def get_sel(wnd: TextEditorWindow) -> str:
@@ -229,22 +249,28 @@ def await_and_print_time(
 
     win = curses.newwin(3, 50, max(posy - 3, 0), 5)
 
+    task = asyncloop_thread.submit(coro)
+
+    while time.time() - start < 0.3:
+        time.sleep(0.1)
+        if task.is_done():
+            return task.result()
+
     try:
         win.box()
-        asyncloop_thread.submit(coro)
 
-        while not asyncloop_thread.is_done():
+        while not task.is_done():
             wnd.mainframe._cwnd.timeout(0)
             key = wnd.mainframe._cwnd.getch()
 
             if key == 27:
-                asyncloop_thread.cancel_current()
+                task.cancel()
 
             print_center(win, f'Running (press ESC to cancel): {round(time.time() - start, 2)}s'.ljust(45, ' '))
             time.sleep(0.1)
     finally:
         del win
-    return asyncloop_thread.get_response()
+    return task.result()
 
 
 def fix_visidata_curses():
@@ -261,6 +287,14 @@ def fix_kaa_curses(wnd: TextEditorWindow):
         curses.init_pair(pairnum, fg, bg)
 
     wnd.draw_screen(force=True)
+
+
+def predictions_weights(query, candidate):
+    if query == candidate:
+        return (0, candidate)
+    if candidate.startswith(query):
+        return (1, candidate)
+    return (2, candidate)
 
 
 def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines):
@@ -308,6 +342,42 @@ def db_query(wnd: TextEditorWindow):
 
     selection = sel.strip()
     run_corutine_and_show_result(wnd, client.execute(selection))
+
+
+@command('db.show_prediction')
+def show_prediction(wnd: TextEditorWindow):
+    from_pos = None
+    to_pos = None
+    word = ''
+
+    res = wnd.document.mode.get_word_at(wnd.cursor.pos)
+
+    if res:
+        from_pos, to_pos, _ = res
+        if from_pos != to_pos:
+            word = wnd.document.gettext(from_pos, to_pos)
+
+    candidates = await_and_print_time(wnd, client.get_suggestions())
+    sorted_candidates = sorted(candidates, key=partial(predictions_weights, word))
+
+    def callback(result):
+        if not result:
+            return
+
+        type_idx = operator.indexOf(reversed(result), '(') + 2
+        result = result[:-type_idx]
+
+        pos = wnd.cursor.pos
+
+        if from_pos is not None and from_pos < pos:
+            wnd.cursor.left(word=True)
+
+            wnd.document.mode.delete_string(wnd, from_pos, to_pos)
+
+        wnd.document.mode.put_string(wnd, result)
+        return
+
+    show_listdlg('Select', sorted_candidates, callback, query=word)
 
 
 @command('db.show_tables')
@@ -376,6 +446,7 @@ def editor(mode: DefaultMode):
 
     # add key bind th execute 'run.query'
     mode.add_keybinds(keys={
+        (alt, '1'): 'db.show_prediction',
         (alt, 'r'): 'db.query',
         (alt, 't'): 'db.show_tables',
         (alt, 'e'): 'db.show_databases',

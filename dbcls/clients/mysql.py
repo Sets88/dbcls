@@ -12,8 +12,22 @@ class MysqlClient(ClientClass):
 
     def __init__(self, host, username, password, dbname, port='3306'):
         super().__init__(host, username, password, dbname, port)
+        self.cache = {}
         if not port:
             self.port = '3306'
+
+    async def get_suggestions(self):
+        if 'tables' not in self.cache:
+            self.cache['tables'] = [list(x.values())[0] for x in (await self.get_tables()).data]
+
+        if 'databases' not in self.cache:
+            self.cache['databases'] = [list(x.values())[0] for x in (await self.get_databases()).data]
+
+        suggestions = [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
+        tables = [f"{x} (TABLE)" for x in self.cache['tables']]
+        databases = [f"{x} (DATABASE)" for x in self.cache['databases']]
+
+        return suggestions + tables + databases
 
     async def connect(self):
         self.connection = await aiomysql.connect(
