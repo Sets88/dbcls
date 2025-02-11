@@ -80,20 +80,21 @@ class PostgresClient(ClientClass):
         if sql_stripped.startswith('\\l'):
             return await self.get_databases()
 
-        if self.connection is None:
-            await self.connect()
+        for tries in range(2):
+            try:
+                if self.connection is None:
+                    await self.connect()
 
-        try:
-            async with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
-                await cur.execute(sql)
-                rowcount = cur.rowcount
-                result = Result(rowcount=rowcount)
-                try:
+                async with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
+                    await cur.execute(sql)
+                    rowcount = cur.rowcount
+                    result = Result(rowcount=rowcount)
+
                     result.data = await cur.fetchall()
-                except ProgrammingError:
-                    pass
 
-                return result
-        except InterfaceError as exc:
-            self.connection = None
-            raise exc
+                    return result
+            except InterfaceError as exc:
+                self.connection = None
+
+                if tries == 1:
+                    raise exc

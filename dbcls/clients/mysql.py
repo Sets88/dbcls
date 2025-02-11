@@ -55,16 +55,19 @@ class MysqlClient(ClientClass):
             db = sql.strip().split(' ')[1].rstrip(';')
             return await self.change_database(db)
 
-        try:
+        for tries in range(2):
+            try:
 
-            if self.connection is None:
-                await self.connect()
+                if self.connection is None:
+                    await self.connect()
 
-            async with self.connection.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute(sql)
-                data = await cur.fetchall()
+                async with self.connection.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(sql)
+                    data = await cur.fetchall()
 
-                return Result(data, cur.rowcount)
-        except InterfaceError as exc:
-            self.connection = None
-            raise exc
+                    return Result(data, cur.rowcount)
+            except InterfaceError as exc:
+                self.connection = None
+
+                if tries == 1:
+                    raise exc
