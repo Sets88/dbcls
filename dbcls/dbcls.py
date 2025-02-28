@@ -35,6 +35,7 @@ from .clients.base import Result
 from .sql_tokenizer import (
     CaseInsensitiveKeywords,
     NonSqlComment,
+    CommandSpan,
     make_tokenizer,
     sql_editor_themes,
 )
@@ -151,6 +152,19 @@ def get_current_sql_rows_pos(wnd: TextEditorWindow) -> list[int]:
     if (
         pos < len(wnd.document.buf) and
         (
+            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), CommandSpan) or
+            (
+                pos > 0 and
+                wnd.document.buf[pos] == '\n' and
+                isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos - 1), CommandSpan)
+            )
+        )
+    ):
+        return [wnd.document.gettol(pos)]
+
+    if (
+        pos < len(wnd.document.buf) and
+        (
             isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), NonSqlComment) or
             (
                 pos > 0 and
@@ -188,10 +202,10 @@ def get_current_sql_rows_pos(wnd: TextEditorWindow) -> list[int]:
                     (DefaultToken, CaseInsensitiveKeywords)
                 )
             ) or
-            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), NonSqlComment) or
+            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), (NonSqlComment, CommandSpan)) or
             (
                 wnd.document.buf[pos] == '\n' and
-                isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos - 1), NonSqlComment)
+                isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos - 1), (NonSqlComment, CommandSpan))
             )
         ):
             break
@@ -205,7 +219,7 @@ def get_current_sql_rows_pos(wnd: TextEditorWindow) -> list[int]:
 
     for pos in range(pos, len(wnd.document.buf)):
         if (
-            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), NonSqlComment) or
+            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), (NonSqlComment, CommandSpan)) or
             (
                 (
                     wnd.document.buf[pos] == ';' or
@@ -267,7 +281,6 @@ def await_and_print_time(
             if key == 27:
                 task.cancel()
 
-            print_center(win, f'Running (press ESC to cancel): {round(time.time() - start, 2)}s'.ljust(45, ' '))
             time.sleep(0.1)
     finally:
         del win

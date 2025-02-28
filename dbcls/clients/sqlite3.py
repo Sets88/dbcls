@@ -2,22 +2,26 @@ import sqlite3
 import asyncio
 
 from .base import (
+    ClientClass,
     Result,
 )
 
 
-def dict_factory(cursor, row):
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
-
-
-class Sqlite3Client:
+class Sqlite3Client(ClientClass):
     ENGINE = 'Sqlite3'
 
     def __init__(self, filename):
+        self.cache = {}
         self.filename = filename
+
+    async def get_suggestions(self):
+        if 'tables' not in self.cache:
+            self.cache['tables'] = [list(x.values())[0] for x in (await self.get_tables()).data]
+
+        suggestions = [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
+        tables = [f"{x} (TABLE)" for x in self.cache['tables']]
+
+        return suggestions + tables
 
     async def get_tables(self) -> Result:
         return await self.execute("SELECT name FROM sqlite_master WHERE type='table';")

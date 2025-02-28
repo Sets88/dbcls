@@ -1,8 +1,18 @@
 import abc
+import re
 from dataclasses import (
     dataclass,
     field,
 )
+
+
+COMMAND_RE = re.compile(r'\.([a-zA-Z_0-9]+)\s*(.*)', re.IGNORECASE)
+
+
+@dataclass
+class CommandParams:
+    command: str
+    params: str
 
 
 @dataclass
@@ -26,6 +36,10 @@ class Result:
 
 class ClientClass(abc.ABC):
     ENGINE = ''
+
+    COMMANDS = [
+        'tables', 'databases', 'schema', 'use'
+    ]
 
     SQL_COMMANDS = [
         'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WHERE', 'TRUNCATE', 'USE', 'SHOW', 'DESCRIBE',
@@ -52,6 +66,27 @@ class ClientClass(abc.ABC):
     @abc.abstractmethod
     def get_tables(self) -> Result:
         pass
+
+    def get_internal_command_params(self, sql: str) -> list[str]:
+        command = sql.strip().rstrip(';')
+        if not command or not command.startswith('.'):
+            return
+
+        command, params = COMMAND_RE.match(command).groups()
+        command = command.lower()
+        if command not in self.COMMANDS:
+            return
+
+        return CommandParams(command, params)
+
+    async def if_command_process(self, sql: str) -> Result:
+        command = self.get_internal_command_params(sql)
+
+        if not command:
+            return
+
+        if hasattr(self, f'command_{command.command}'):
+            return await getattr(self, f'command_{command.command}')(command)
 
     async def change_database(self, database: str):
         old_db = self.dbname

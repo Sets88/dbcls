@@ -47,9 +47,13 @@ class NonSqlComment(Span):
     pass
 
 
+class CommandSpan(Span):
+    pass
+
 def sqleditor_tokens() -> list[tuple[str, Token]]:
     return [
-        ('comment1', Span('comment', r'--', '$')),
+        ("directive", CommandSpan('directive', r'^(\s+)?\.', '(\s|;|$)')),
+        ('comment1', Span('comment', r'-- ', '$')),
         ('comment2', NonSqlComment('comment', r'\#', '$')),
         ("string1", Span('string', '"', '"', escape='\\')),
         ("string2", Span('string', "'", "'", escape='\\')),

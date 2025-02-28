@@ -2,6 +2,7 @@ import aiomysql
 from aiomysql import InterfaceError
 
 from .base import (
+    CommandParams,
     ClientClass,
     Result,
 )
@@ -50,10 +51,25 @@ class MysqlClient(ClientClass):
     async def get_databases(self) -> Result:
         return await self.execute('SHOW DATABASES')
 
+    async def command_use(self, command: CommandParams):
+        self.cache.pop('tables', None)
+        return await self.change_database(command.params)
+
+    async def command_tables(self, command: CommandParams):
+        return await self.get_tables()
+
+    async def command_databases(self, command: CommandParams):
+        return await self.get_databases()
+
+    async def command_schema(self, command: CommandParams):
+        table = command.params
+        return await self.execute('SHOW CREATE TABLE %s' % table)
+
     async def execute(self, sql) -> Result:
-        if sql.strip().upper().startswith('USE '):
-            db = sql.strip().split(' ')[1].rstrip(';')
-            return await self.change_database(db)
+        result = await self.if_command_process(sql)
+
+        if result:
+            return result
 
         for tries in range(2):
             try:

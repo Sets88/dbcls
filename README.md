@@ -65,6 +65,13 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 - Ctrl + q - Quit
 - Ctrl + s - Save file
 
+## Commands
+
+.tables - Show tables list
+.databases - Show databases list
+.use <database> - Change database
+.schema <table> - Show table schema
+
 ## Options
 
 -H --host
