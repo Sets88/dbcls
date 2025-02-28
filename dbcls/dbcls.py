@@ -281,6 +281,8 @@ def await_and_print_time(
             if key == 27:
                 task.cancel()
 
+            print_center(win, f'Running (press ESC to cancel): {round(time.time() - start, 2)}s'.ljust(45, ' '))
+
             time.sleep(0.1)
     finally:
         del win
