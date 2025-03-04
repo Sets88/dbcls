@@ -68,13 +68,13 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 ## Commands
 
 
-.tables - Show tables list
+**.tables** - Show tables list
 
-.databases - Show databases list
+**.databases** - Show databases list
 
-.use <database> - Change database
+**.use <database>** - Change database
 
-.schema <table> - Show table schema
+**.schema <table>** - Show table schema
 
 
 ## Options
