@@ -11,6 +11,10 @@ from .base import (
 class MysqlClient(ClientClass):
     ENGINE = 'MySQL'
 
+    SQL_FUNCTIONS = [
+        'CONCAT', 'GROUP_CONCAT', 'UNIX_TIMESTAMP', 'FROM_UNIXTIME', 'DATE_FORMAT'
+    ]
+
     def __init__(self, host, username, password, dbname, port='3306'):
         super().__init__(host, username, password, dbname, port)
         self.cache = {}
@@ -24,7 +28,7 @@ class MysqlClient(ClientClass):
         if 'databases' not in self.cache:
             self.cache['databases'] = [list(x.values())[0] for x in (await self.get_databases()).data]
 
-        suggestions = [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
+        suggestions = [f"{x} (COMMAND)" for x in self.all_commands]
         tables = [f"{x} (TABLE)" for x in self.cache['tables']]
         databases = [f"{x} (DATABASE)" for x in self.cache['databases']]
 

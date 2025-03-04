@@ -12,6 +12,13 @@ from .base import (
 class ClickhouseClient(ClientClass):
     ENGINE = 'Clickhouse'
 
+    SQL_FUNCTIONS = [
+        'today', 'yesterday', 'toStartOfDay', 'toStartOfMonth', 'toStartOfQuarter', 'toStartOfYear',
+        'toStartOfMinute', 'toStartOfHour', 'toStartOfWeek', 'toDate', 'toFloat64', 'floor', 'round', 'ceil',
+        'JSONExtractInt', 'JSONExtractString', 'JSONExtract', 'JSONExtractKeys', 'arraySlice', 'splitByChar',
+        'any', 'toDateTime'
+    ]
+
     def __init__(self, host, username, password, dbname, port='8123'):
         super().__init__(host, username, password, dbname, port)
         self.cache = {}
@@ -27,7 +34,7 @@ class ClickhouseClient(ClientClass):
         if 'databases' not in self.cache:
             self.cache['databases'] = [list(x.values())[0] for x in (await self.get_databases()).data]
 
-        suggestions = [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
+        suggestions = [f"{x} (COMMAND)" for x in self.all_commands]
         tables = [f"{x} (TABLE)" for x in self.cache['tables']]
         databases = [f"{x} (DATABASE)" for x in self.cache['databases']]
 

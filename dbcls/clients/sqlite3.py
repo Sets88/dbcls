@@ -18,7 +18,7 @@ class Sqlite3Client(ClientClass):
         if 'tables' not in self.cache:
             self.cache['tables'] = [list(x.values())[0] for x in (await self.get_tables()).data]
 
-        suggestions = [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
+        suggestions = [f"{x} (COMMAND)" for x in self.all_commands]
         tables = [f"{x} (TABLE)" for x in self.cache['tables']]
 
         return suggestions + tables

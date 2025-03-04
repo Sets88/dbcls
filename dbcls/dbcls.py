@@ -447,36 +447,37 @@ def get_line_overlays(self: DefaultMode, original_fn: Callable) -> dict[int, str
     return highlights
 
 
-@setup('kaa.filetype.default.defaultmode.DefaultMode')
-def editor(mode: DefaultMode):
-    # register command to the mode
-    mode.add_command(db_query)
-    mode.add_command(db_show_tables)
-    mode.add_command(db_show_databases)
-    mode.on_keypressed = partial(on_keypressed, mode, mode.on_keypressed)
-    # To determine sql expression under current cursor after each key press
-    mode.on_cursor_located = partial(on_cursor_located, mode, mode.on_cursor_located)
-    # To highligt lines determined in on_cursor_located
-    mode.get_line_overlays = partial(get_line_overlays, mode, mode.get_line_overlays)
+def setup_editor():
+    @setup('kaa.filetype.default.defaultmode.DefaultMode')
+    def editor(mode: DefaultMode):
+        # register command to the mode
+        mode.add_command(db_query)
+        mode.add_command(db_show_tables)
+        mode.add_command(db_show_databases)
+        mode.on_keypressed = partial(on_keypressed, mode, mode.on_keypressed)
+        # To determine sql expression under current cursor after each key press
+        mode.on_cursor_located = partial(on_cursor_located, mode, mode.on_cursor_located)
+        # To highligt lines determined in on_cursor_located
+        mode.get_line_overlays = partial(get_line_overlays, mode, mode.get_line_overlays)
 
 
-    # add key bind th execute 'run.query'
-    mode.add_keybinds(keys={
-        (alt, '1'): 'db.show_prediction',
-        (alt, 'r'): 'db.query',
-        (alt, 't'): 'db.show_tables',
-        (alt, 'e'): 'db.show_databases',
-        (ctrl, 's'): 'file.save',
-        (ctrl, 'f'): 'search.showsearch',
-        (ctrl, 'r'): 'search.showreplace',
-        (ctrl, 'q'): 'file.quit',
-        (alt, backspace): 'edit.backspace.word'
-    })
+        # add key bind th execute 'run.query'
+        mode.add_keybinds(keys={
+            (alt, '1'): 'db.show_prediction',
+            (alt, 'r'): 'db.query',
+            (alt, 't'): 'db.show_tables',
+            (alt, 'e'): 'db.show_databases',
+            (ctrl, 's'): 'file.save',
+            (ctrl, 'f'): 'search.showsearch',
+            (ctrl, 'r'): 'search.showreplace',
+            (ctrl, 'q'): 'file.quit',
+            (alt, backspace): 'edit.backspace.word'
+        })
 
-    mode.SHOW_LINENO = True
-    # Syntax highlight
-    mode.tokenizer = make_tokenizer()
-    mode.themes.append(sql_editor_themes)
+        mode.SHOW_LINENO = True
+        # Syntax highlight
+        mode.tokenizer = make_tokenizer(client)
+        mode.themes.append(sql_editor_themes)
 
 
 def main():
@@ -546,6 +547,8 @@ def main():
         args_parser.print_help(sys.stderr)
         print('Invalid engine specified')
         sys.exit(1)
+
+    setup_editor()
 
     asyncloop_thread = AsyncLoopThread(daemon=True)
     asyncloop_thread.start()

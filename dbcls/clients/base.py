@@ -41,12 +41,20 @@ class ClientClass(abc.ABC):
         'tables', 'databases', 'schema', 'use'
     ]
 
-    SQL_COMMANDS = [
+    SQL_COMMON_COMMANDS = [
         'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WHERE', 'TRUNCATE', 'USE', 'SHOW', 'DESCRIBE',
         'EXPLAIN', 'DESC', 'RENAME', 'GRANT', 'REVOKE', 'SET', 'BEGIN', 'COMMIT', 'ROLLBACK' 'ANALYZE', 'OPTIMIZE',
         'KILL', 'FROM', 'GROUP BY', 'ORDER BY', 'LIMIT', 'OFFSET', 'HAVING', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN',
-        'FULL JOIN', 'INNER JOIN', 'OUTER JOIN', 'CROSS JOIN', 'ON', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN'
+        'FULL JOIN', 'INNER JOIN', 'OUTER JOIN', 'CROSS JOIN', 'ON', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN',
+        'PARTITION BY', 'WITH', 'TABLE', 'OF', 'OPTIMIZE', 'INTERVAL', 'AS'
     ]
+
+    SQL_COMMON_FUNCTIONS = [
+        'AVG', 'COUNT', 'MAX', 'MIN', 'SUM', 'NOW', 'DATE', 'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND'
+    ]
+
+    SQL_COMMANDS = []
+    SQL_FUNCTIONS = []
 
     def __init__(self, host: str, username: str, password: str, dbname: str, port: str):
         self.host = host
@@ -56,8 +64,16 @@ class ClientClass(abc.ABC):
         self.port = port
         self.connection = None
 
+    @property
+    def all_commands(self):
+        return self.SQL_COMMON_COMMANDS + self.SQL_COMMANDS
+
+    @property
+    def all_functions(self):
+        return self.SQL_COMMON_FUNCTIONS + self.SQL_FUNCTIONS
+
     async def get_suggestions(self):
-        return [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
+        return [f"{x} (COMMAND)" for x in self.all_commands]
 
     @abc.abstractmethod
     def get_databases(self) -> Result:

@@ -50,7 +50,7 @@ class NonSqlComment(Span):
 class CommandSpan(Span):
     pass
 
-def sqleditor_tokens() -> list[tuple[str, Token]]:
+def sqleditor_tokens(sql_client) -> list[tuple[str, Token]]:
     return [
         ("directive", CommandSpan('directive', r'^(\s+)?\.', '(\s|;|$)')),
         ('comment1', Span('comment', r'-- ', '$')),
@@ -58,9 +58,10 @@ def sqleditor_tokens() -> list[tuple[str, Token]]:
         ("string1", Span('string', '"', '"', escape='\\')),
         ("string2", Span('string', "'", "'", escape='\\')),
         ("number", SingleToken('number', [r'\b[0-9]+(\.[0-9]*)*\b', r'\b\.[0-9]+\b'])),
-        ("keyword", CaseInsensitiveKeywords('keyword', KEYWORDS)),
+        ("keyword", CaseInsensitiveKeywords('keyword', sql_client.all_commands)),
+        ("function", CaseInsensitiveKeywords('directive', sql_client.all_functions)),
     ]
 
 
-def make_tokenizer() -> Tokenizer:
-    return Tokenizer(tokens=sqleditor_tokens())
+def make_tokenizer(sql_client) -> Tokenizer:
+    return Tokenizer(tokens=sqleditor_tokens(sql_client))

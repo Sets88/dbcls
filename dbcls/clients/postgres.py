@@ -29,7 +29,7 @@ class PostgresClient(ClientClass):
         if 'databases' not in self.cache:
             self.cache['databases'] = [list(x.values())[0] for x in (await self.get_databases()).data]
 
-        suggestions = [f"{x} (COMMAND)" for x in self.SQL_COMMANDS]
+        suggestions = [f"{x} (COMMAND)" for x in self.all_commands]
         tables = [f"{x} (TABLE)" for x in self.cache['tables']]
         databases = [f"{x} (DATABASE)" for x in self.cache['databases']]
 
