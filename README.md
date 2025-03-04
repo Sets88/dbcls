@@ -74,7 +74,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 
 **.use <database>** - Change database
 
-**.schema <table>** - Show table schema
+**.schema &lt;table&gt; ** - Show table schema
 
 
 ## Options
