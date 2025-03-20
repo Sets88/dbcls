@@ -32,6 +32,7 @@ from kaa.options import build_parser
 from kaa.syntax_highlight import DefaultToken
 
 from .clients.base import Result
+from .vd_db_browser import DataBaseSheet, TablesSheet
 from .sql_tokenizer import (
     CaseInsensitiveKeywords,
     NonSqlComment,
@@ -254,6 +255,34 @@ def print_center(window: curses.window, text: str):
     window.refresh()
 
 
+class SyncClient:
+    def __init__(self, asyncloop_th, async_client):
+        self.asyncloop_thread = asyncloop_th
+        self.client = async_client
+        self.timeout = 10
+
+    def __getattr__(self, name):
+        attr = getattr(self.client, name)
+
+        if asyncio.iscoroutinefunction(attr):
+            return partial(self._run_coro, attr)
+
+        return attr
+
+    def _run_coro(self, coro, *args, **kwargs):
+        task = self.asyncloop_thread.submit(coro(*args, **kwargs))
+        start = time.time()
+
+        while not task.is_done():
+            time.sleep(0.1)
+
+            if time.time() - start > self.timeout:
+                task.cancel()
+                return Result('Timeout', None)
+
+        return task.result()
+
+
 def await_and_print_time(
         wnd: TextEditorWindow,
         coro: asyncio.coroutines
@@ -398,12 +427,23 @@ def show_prediction(wnd: TextEditorWindow):
 
 @command('db.show_tables')
 def db_show_tables(wnd: TextEditorWindow):
-    run_corutine_and_show_result(wnd, client.get_tables())
+    try:
+        fix_visidata_curses()
+        visidata.vd.run(TablesSheet(
+                client=SyncClient(asyncloop_thread, client), db=getattr(client, 'dbname', None)
+            )
+        )
+    finally:
+        fix_kaa_curses(wnd)
 
 
 @command('db.show_databases')
 def db_show_databases(wnd: TextEditorWindow):
-    run_corutine_and_show_result(wnd, client.get_databases())
+    try:
+        fix_visidata_curses()
+        visidata.vd.run(DataBaseSheet(client=SyncClient(asyncloop_thread, client)))
+    finally:
+        fix_kaa_curses(wnd)
 
 
 def on_keypressed(

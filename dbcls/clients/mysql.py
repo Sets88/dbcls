@@ -1,3 +1,5 @@
+from typing import Optional
+
 import aiomysql
 from aiomysql import InterfaceError
 
@@ -49,11 +51,36 @@ class MysqlClient(ClientClass):
         self.cache.pop('tables', None)
         return await super().change_database(database)
 
-    async def get_tables(self) -> Result:
-        return await self.execute('SHOW TABLES')
+    async def get_tables(self, database: Optional[str] = None) -> Result:
+        if not database:
+            database = self.dbname
+
+        result = await self.execute('SHOW TABLES IN %s' % database)
+
+        if result.data:
+            result.data = [{'table': next(iter(x.values())), 'database': database} for x in result.data]
+        return result
 
     async def get_databases(self) -> Result:
-        return await self.execute('SHOW DATABASES')
+        result = await self.execute('SHOW DATABASES')
+        if result.data:
+            result.data = [{'database': next(iter(x.values()))} for x in result.data]
+        return result
+
+    async def get_schema(self, table: str, database: Optional[str] = None) -> Result:
+        if not database:
+            database = self.dbname
+
+        result = await self.execute('SHOW CREATE TABLE `%s`.`%s`' % (database or self.dbname, table))
+
+        if result and result.data:
+            result.data = [{'schema': list(x.values())[-1]} for x in result.data]
+        return result
+
+    async def get_sample_data(self, table, database=None) -> Result:
+        if not database:
+            database = self.dbname
+        return await self.execute(f"SELECT * FROM `{database}`.`{table}` LIMIT 200;")
 
     async def command_use(self, command: CommandParams):
         self.cache.pop('tables', None)

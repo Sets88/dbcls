@@ -2,6 +2,7 @@ import sqlite3
 import asyncio
 
 from .base import (
+    CommandParams,
     ClientClass,
     Result,
 )
@@ -23,11 +24,30 @@ class Sqlite3Client(ClientClass):
 
         return suggestions + tables
 
-    async def get_tables(self) -> Result:
-        return await self.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    async def get_tables(self, database=None) -> Result:
+        return await self.execute(
+            "SELECT name AS 'table', '%s' AS database FROM sqlite_master WHERE type='table';" % self.filename
+        )
+
+    async def get_sample_data(self, table, database=None) -> Result:
+        return await self.execute(f"SELECT * FROM `{table}` LIMIT 200;")
 
     async def get_databases(self) -> Result:
-        return Result([], 0)
+        return Result([{'database': self.filename}], 0)
+
+    async def get_schema(self, table, database=None) -> Result:
+        return await self.execute(
+            f"SELECT sql AS schema FROM sqlite_master WHERE type='table' AND name='{table}';"
+        )
+
+    async def command_tables(self, command: CommandParams):
+        return await self.get_tables()
+
+    async def command_databases(self, command: CommandParams):
+        return await self.get_databases()
+
+    async def command_schema(self, command: CommandParams):
+        return await self.get_schema(command.params)
 
     def _execute_sync(self, sql) -> Result:
         conn = sqlite3.connect(self.filename)
@@ -43,14 +63,10 @@ class Sqlite3Client(ClientClass):
         return Result(data, rowcount)
 
     async def execute(self, sql) -> Result:
-        sql_stripped = sql.strip()
+        result = await self.if_command_process(sql)
 
-        if sql_stripped.startswith('.tables'):
-            return await self.get_tables()
-
-        if sql_stripped.startswith('.schema '):
-            first_word = sql_stripped.split(' ')[1]
-            sql = f"SELECT sql FROM sqlite_master WHERE tbl_name = '{first_word}';"
+        if result:
+            return result
 
         return await asyncio.to_thread(self._execute_sync, sql)
 

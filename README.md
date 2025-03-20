@@ -60,8 +60,8 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 ## Hotkeys
 - Alt + 1 - Autocompletion suggestion list
 - Alt + r - Execute query under cursor or selected text
-- Alt + e - Show databases list
-- Alt + t - Show tables list
+- Alt + e - Show database list, which has a submenu of .tables content
+- Alt + t - Show tables list, which has submenus with functionality to show schema or load some sample data
 - Ctrl + q - Quit
 - Ctrl + s - Save file
 

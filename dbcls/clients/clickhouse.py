@@ -1,3 +1,5 @@
+from typing import Optional
+
 import aiochclient
 from aiohttp import ClientSession
 from aiohttp import ClientTimeout
@@ -40,11 +42,35 @@ class ClickhouseClient(ClientClass):
 
         return suggestions + tables + databases
 
-    async def get_tables(self) -> Result:
-        return await self._execute('SHOW TABLES')
+    async def get_tables(self, database: Optional[str] = None) -> Result:
+        if not database:
+            database = self.dbname
+        result = await self._execute('SHOW TABLES IN %s' % database)
+
+        if result.data:
+            result.data = [{'table': next(iter(x.values())), 'database': database} for x in result.data]
+        return result
 
     async def get_databases(self) -> Result:
-        return await self._execute('SHOW DATABASES')
+        result = await self._execute('SHOW DATABASES')
+        if result.data:
+            result.data = [{'database': x['name']} for x in result.data]
+        return result
+
+    async def get_schema(self, table: str, database: Optional[str] = None) -> Result:
+        if not database:
+            database = self.dbname
+
+        result = await self.execute('SHOW CREATE TABLE `%s`.`%s`' % (database or self.dbname, table))
+
+        if result and result.data:
+            result.data = [{'schema': list(x.values())[-1]} for x in result.data]
+        return result
+
+    async def get_sample_data(self, table, database=None) -> Result:
+        if not database:
+            database = self.dbname
+        return await self.execute(f"SELECT * FROM `{database}`.`{table}` LIMIT 200;")
 
     async def command_use(self, command: CommandParams):
         self.cache.pop('tables', None)
@@ -57,7 +83,7 @@ class ClickhouseClient(ClientClass):
         return await self.get_databases()
 
     async def command_schema(self, command: CommandParams):
-        return await self._execute(f'SHOW CREATE TABLE {command.params}')
+        return await self.get_schema(command.params)
 
     async def _execute(self, sql):
         db = self.dbname

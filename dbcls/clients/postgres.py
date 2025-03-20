@@ -1,4 +1,6 @@
 import re
+from typing import Optional
+
 import aiopg
 from psycopg2 import InterfaceError
 from psycopg2.extras import RealDictCursor
@@ -51,18 +53,28 @@ class PostgresClient(ClientClass):
         self.connection = None
         return await super().change_database(database)
 
-    async def get_tables(self) -> Result:
+    async def get_tables(self, database: Optional[str] = None) -> Result:
+        if database and database != self.dbname:
+            raise Exception("Cross-database queries are not supported")
+        # Postgres doesn't support cross-database queries
         sql = (
-            "SELECT table_name FROM information_schema.tables "
+            f"SELECT table_name AS table, '{database}' AS database FROM information_schema.tables "
             "WHERE table_schema='public' AND table_type='BASE TABLE';"
         )
         return await self.execute(sql)
 
     async def get_databases(self) -> Result:
-        sql = "SELECT datname FROM pg_database;"
+        sql = "SELECT datname AS database FROM pg_database;"
         return await self.execute(sql)
 
-    async def show_create_table(self, table_name: str) -> Result:
+    async def get_sample_data(self, table, database=None) -> Result:
+        if database and database != self.dbname:
+            raise Exception("Cross-database queries are not supported")
+        return await self.execute(f"SELECT * FROM \"{table}\" LIMIT 200;")
+
+    async def get_schema(self, table_name: str, database: Optional[str]) -> Result:
+        if database and database != self.dbname:
+            raise Exception("Cross-database queries are not supported")
         # Columns
         result = await self.execute(f"""
             SELECT
@@ -201,7 +213,7 @@ class PostgresClient(ClientClass):
 
                 create_table_query += f"\n\nCREATE TABLE {partition[0]} PARTITION OF {table_name}\n    {partition[1]};"
 
-        return Result(data=[{'res': create_table_query}], rowcount=1)
+        return Result(data=[{'schema': create_table_query}], rowcount=1)
 
     async def command_use(self, command: CommandParams):
         self.cache.pop('tables', None)
@@ -215,7 +227,7 @@ class PostgresClient(ClientClass):
 
     async def command_schema(self, command: CommandParams):
         table_name = command.params
-        return await self.show_create_table(table_name)
+        return await self.get_schema(table_name)
 
     async def execute(self, sql) -> Result:
         result = await self.if_command_process(sql)
