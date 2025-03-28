@@ -29,8 +29,14 @@ class Sqlite3Client(ClientClass):
             "SELECT name AS 'table', '%s' AS database FROM sqlite_master WHERE type='table';" % self.filename
         )
 
-    async def get_sample_data(self, table, database=None) -> Result:
-        return await self.execute(f"SELECT * FROM `{table}` LIMIT 200;")
+    async def get_sample_data(
+        self,
+        table: str,
+        database=None,
+        limit: int = 200,
+        offset: int = 0
+    ) -> Result:
+        return await self.execute(f"SELECT * FROM `{table}` LIMIT {offset},{limit};")
 
     async def get_databases(self) -> Result:
         return Result([{'database': self.filename}], 0)

@@ -77,10 +77,16 @@ class MysqlClient(ClientClass):
             result.data = [{'schema': list(x.values())[-1]} for x in result.data]
         return result
 
-    async def get_sample_data(self, table, database=None) -> Result:
+    async def get_sample_data(
+        self,
+        table: str,
+        database: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0
+    ) -> Result:
         if not database:
             database = self.dbname
-        return await self.execute(f"SELECT * FROM `{database}`.`{table}` LIMIT 200;")
+        return await self.execute(f"SELECT * FROM `{database}`.`{table}` LIMIT {offset},{limit};")
 
     async def command_use(self, command: CommandParams):
         self.cache.pop('tables', None)

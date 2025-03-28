@@ -259,7 +259,7 @@ class SyncClient:
     def __init__(self, asyncloop_th, async_client):
         self.asyncloop_thread = asyncloop_th
         self.client = async_client
-        self.timeout = 10
+        self.timeout = 60
 
     def __getattr__(self, name):
         attr = getattr(self.client, name)

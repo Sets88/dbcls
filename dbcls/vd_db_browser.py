@@ -1,4 +1,8 @@
-from visidata import VisiData, vd, Sheet, Column, asyncthread, ENTER, AttrDict, PyobjSheet
+import time
+
+from visidata import VisiData, Sheet, Column, ColumnItem, asyncthread, ENTER, AttrDict, deduceType, Progress
+
+
 
 @VisiData.api
 class DataBaseSheet(Sheet):
@@ -7,16 +11,11 @@ class DataBaseSheet(Sheet):
     ]
 
     def iterload(self):
-        result = self.client.get_databases()
-        if result.data:
-            for row in result.data:
-                yield row
-
-    @asyncthread
-    def reload(self):
-        self.rows = []
-        for row in self.iterload():
-            self.addRow(AttrDict(row))
+        with Progress(gerund='loading databases'):
+            result = self.client.get_databases()
+            if result.data:
+                for row in sorted(result.data, key=lambda x: x['database']):
+                    yield AttrDict(row)
 
 
 @VisiData.api
@@ -27,16 +26,11 @@ class TablesSheet(Sheet):
     ]
 
     def iterload(self):
-        result = self.client.get_tables(self.db)
-        if result.data:
-            for row in result.data:
-                yield row
-
-    @asyncthread
-    def reload(self):
-        self.rows = []
-        for row in self.iterload():
-            self.addRow(AttrDict(row))
+        with Progress(gerund='loading tables'):
+            result = self.client.get_tables(self.db)
+            if result.data:
+                for row in sorted(result.data, key=lambda x: x['table']):
+                    yield AttrDict(row)
 
 
 @VisiData.api
@@ -45,7 +39,6 @@ class TableOptionsSheet(Sheet):
         Column('option', getter=lambda col, row: row.option),
     ]
 
-    @asyncthread
     def reload(self):
         self.rows = []
         self.addRow(AttrDict({'option': 'Schema', 'table': self.table, 'database': self.db}))
@@ -55,11 +48,62 @@ class TableOptionsSheet(Sheet):
         if row.option == 'Schema':
             return TableSchemaSheet(client=self.client, db=self.db, table=self.table)
         if row.option == 'Sample data':
-            data = self.client.get_sample_data(self.table, self.db).data
-            if not data:
-                vd.error(f'No data found in table {self.table}')
-                return
-            return PyobjSheet(source=data)
+            return TableSampleDataSheet(client=self.client, db=self.db, table=self.table)
+
+
+def add_columns_from_row(row, sheet):
+    sheet.columns = []
+    for i, (name, value) in enumerate(row.items()):
+        sheet.addColumn(ColumnItem(name, i, type=deduceType(value)))
+
+
+class TableSampleDataSheet(Sheet):
+    rowtype = 'tables'
+    CHUNK_SIZE = 500
+
+    def iterload(self):
+        loaded = False
+        offset = 0
+        progress = None
+        while True:
+            if (len(self.rows) -  self.cursorRowIndex) > 200:
+                if not progress:
+                    progress = Progress(gerund='Waiting for user to scroll')
+                    self.progresses.insert(0, progress)
+
+                time.sleep(0.1)
+                continue
+
+            if progress:
+                self.progresses.remove(progress)
+                progress = None
+
+            with Progress(gerund='loading sample data chunk'):
+                chunk = self.client.get_sample_data(
+                    self.table,
+                    self.db,
+                    limit=self.CHUNK_SIZE,
+                    offset=offset
+                )
+
+                if not chunk.data and not offset:
+                    raise Exception('No data found')
+
+                if not chunk.data:
+                    break
+
+                if not loaded:
+                    add_columns_from_row(chunk.data[0], self)
+                    loaded = True
+
+                if isinstance(chunk.data, str):
+                    raise Exception(chunk.data)
+
+                for row in chunk.data:
+
+                    yield tuple(row.values())
+
+                offset += self.CHUNK_SIZE
 
 
 @VisiData.api
