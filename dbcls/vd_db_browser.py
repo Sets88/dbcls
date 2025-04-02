@@ -1,3 +1,4 @@
+import json
 import time
 
 from visidata import VisiData, Sheet, Column, ColumnItem, asyncthread, ENTER, AttrDict, deduceType, Progress
@@ -119,5 +120,19 @@ class TableSchemaSheet(Sheet):
             self.addRow(AttrDict(row))
 
 
+@VisiData.api
+def makeFormatedTable(sheet, col, row):
+    if not row:
+        raise Exception('No data found')
+
+    cell = col.getValue(row)
+    data = json.dumps(json.loads(cell), indent=4)
+    return Sheet(
+        columns=[Column('json')],
+        rows=data.split('\n'),
+    )
+
+
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
+Sheet.addCommand('zf', 'cell-formated-table', 'vd.push(makeFormatedTable(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')

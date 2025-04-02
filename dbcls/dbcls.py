@@ -270,17 +270,21 @@ class SyncClient:
         return attr
 
     def _run_coro(self, coro, *args, **kwargs):
-        task = self.asyncloop_thread.submit(coro(*args, **kwargs))
-        start = time.time()
+        try:
+            task = self.asyncloop_thread.submit(coro(*args, **kwargs))
+            start = time.time()
 
-        while not task.is_done():
-            time.sleep(0.1)
+            while not task.is_done():
+                time.sleep(0.1)
 
-            if time.time() - start > self.timeout:
-                task.cancel()
-                return Result('Timeout', None)
+                if time.time() - start > self.timeout:
+                    task.cancel()
+                    return Result('Timeout', None)
 
-        return task.result()
+            return task.result()
+        except BaseException:
+            task.cancel()
+            return Result('Canceled', None)
 
 
 def await_and_print_time(
