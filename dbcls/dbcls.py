@@ -485,6 +485,9 @@ def get_line_overlays(self: DefaultMode, original_fn: Callable) -> dict[int, str
     highlights = {}
     highlights.update(original_fn())
 
+    if not hasattr(self.document, 'highlights'):
+        self.document.highlights = []
+
     for pos in self.document.highlights:
         highlights[pos] = 'cursor-row'
 
