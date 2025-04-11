@@ -13,7 +13,7 @@ from queue import LifoQueue
 
 import kaa
 import kaa.cui.main
-from kaa.ui.itemlist import itemlistmode
+from kaa.ui.msgbox import msgboxmode
 from kaa.ui.selectlist import filterlist
 import visidata
 from kaa.addon import (
@@ -372,6 +372,11 @@ def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines
     except Exception as exc:
         end = time.time()
         message = str(exc)
+        msgboxmode.MsgBoxMode.show_msgbox(
+            message, ['&Ok'], lambda c: c,
+                ['\r', '\n', '\x1b'],
+                border=True
+        )
     finally:
         wnd.document.set_title(client.get_title())
         kaa.app.messagebar.set_message(f'{round(end - start, 2)}s {message}')

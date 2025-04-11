@@ -1,6 +1,6 @@
 from typing import Optional
 
-import aiochclient
+import clickhouse_connect
 from aiohttp import ClientSession
 from aiohttp import ClientTimeout
 
@@ -94,20 +94,19 @@ class ClickhouseClient(ClientClass):
     async def _execute(self, sql):
         db = self.dbname
 
-        timeout = ClientTimeout(connect=60)
+        client = await clickhouse_connect.get_async_client(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            database=db
+        )
 
-        async with ClientSession(timeout=timeout) as sess:
-            client = aiochclient.ChClient(
-                sess,
-                url=f"http://{self.host}:{self.port}",
-                database=db,
-                user=self.username,
-                password = self.password,
-            )
+        raw_data = await client.query(query=sql)
 
-            data = [dict(x) for x in await client.fetch(sql.rstrip(';'), decode=True)]
+        data = [dict(x) for x in list(raw_data.named_results())]
 
-            return Result(data=data, rowcount=len(data))
+        return Result(data=data, message=" ".join([f'{x[0]}: {x[1]}' for x in raw_data.summary.items()]))
 
     async def execute(self, sql) -> Result:
         result = await self.if_command_process(sql)

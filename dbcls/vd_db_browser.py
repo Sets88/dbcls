@@ -4,7 +4,6 @@ import time
 from visidata import VisiData, Sheet, Column, ColumnItem, asyncthread, ENTER, AttrDict, deduceType, Progress
 
 
-
 @VisiData.api
 class DataBaseSheet(Sheet):
     columns = [
