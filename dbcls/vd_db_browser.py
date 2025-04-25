@@ -1,7 +1,8 @@
-import json
 import time
+from .utils import prettify
 
-from visidata import VisiData, Sheet, Column, ColumnItem, asyncthread, ENTER, AttrDict, deduceType, Progress
+from visidata import VisiData, Sheet, PyobjSheet, Column, ColumnItem
+from visidata import asyncthread, ENTER, AttrDict, deduceType, Progress
 
 
 @VisiData.api
@@ -53,8 +54,8 @@ class TableOptionsSheet(Sheet):
 
 def add_columns_from_row(row, sheet):
     sheet.columns = []
-    for i, (name, value) in enumerate(row.items()):
-        sheet.addColumn(ColumnItem(name, i, type=deduceType(value)))
+    for name, value in row.items():
+        sheet.addColumn(ColumnItem(name, type=deduceType(value)))
 
 
 class TableSampleDataSheet(Sheet):
@@ -100,8 +101,7 @@ class TableSampleDataSheet(Sheet):
                     raise Exception(chunk.data)
 
                 for row in chunk.data:
-
-                    yield tuple(row.values())
+                    yield AttrDict(row)
 
                 offset += self.CHUNK_SIZE
 
@@ -120,18 +120,18 @@ class TableSchemaSheet(Sheet):
 
 
 @VisiData.api
-def makeFormatedTable(sheet, col, row):
+def make_formated_table(sheet, col, row):
     if not row:
         raise Exception('No data found')
 
     cell = col.getValue(row)
-    data = json.dumps(json.loads(cell), indent=4)
-    return Sheet(
-        columns=[Column('json')],
-        rows=data.split('\n'),
+    data = prettify(cell)
+    return PyobjSheet(
+        'formated',
+        source=data.split('\n'),
     )
 
 
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
-Sheet.addCommand('zf', 'cell-formated-table', 'vd.push(makeFormatedTable(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')
+Sheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')

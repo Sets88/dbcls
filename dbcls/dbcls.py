@@ -343,7 +343,9 @@ def predictions_weights(query, candidate):
         return (0, candidate)
     if candidate.startswith(query):
         return (1, candidate)
-    return (2, candidate)
+    if query in candidate:
+        return (2, candidate)
+    return (3, candidate)
 
 
 def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines):
