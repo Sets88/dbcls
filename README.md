@@ -1,13 +1,25 @@
 # DbCls
 
-DbCls is a versatile client for multiple databases, enabling the editing and preservation of SQL queries in a file, and executing queries directly from the editor, thereby providing a convenient interface for data representation.
+DbCls is a powerful database client that combines the functionality of a SQL editor and data visualization tool. It integrates the kaa editor for SQL query editing and the visidata tool for data representation, providing a seamless experience for database management and data analysis.
 
-Briefly, this application combines the kaa editor and the visidata data visualization tool.
+## Features
 
+- SQL query editing with syntax highlighting
+- Direct query execution from the editor
+- Data visualization with interactive tables
+- Support for multiple database engines (MySQL, PostgreSQL, ClickHouse)
+- Configuration via command line or config file
+- Table schema inspection
+- Database and table browsing
+- Query history and file-based query storage
+
+## Screenshots
+
+### SQL Editor
 ![Editor](/data/editor.png)
 
+### Data Visualization
 ![Data representation](/data/data.png)
-
 
 ## Installation
 
@@ -15,21 +27,36 @@ Briefly, this application combines the kaa editor and the visidata data visualiz
 pip install dbcls
 ```
 
+## Quick Start
 
-## Run
-
+Basic usage with command line arguments:
 ```bash
 dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 ```
 
+### Command Line Options
 
-## Using config file rather then process arguments to configure
+| Option | Description |
+|--------|-------------|
+| `-H, --host` | Database host address |
+| `-u, --user` | Database username |
+| `-p, --password` | Database password |
+| `-E, --engine` | Database engine (mysql, postgresql, clickhouse) |
+| `-d, --database` | Database name |
+| `-P, --port` | Port number (optional) |
+| `-c, --config` | Path to configuration file |
 
-``` bash
+## Configuration
+
+### Using a Config File
+
+You can use a JSON configuration file instead of command line arguments:
+
+```bash
 dbcls -c config.json mydb.sql
 ```
 
-Where config file is:
+Example `config.json`:
 ```json
 {
     "host": "127.0.0.1",
@@ -41,9 +68,12 @@ Where config file is:
 }
 ```
 
-or from bash file
+### Using Bash Configuration
+
+You can also provide configuration directly from a bash script:
+
 ```bash
-#! /bin/bash
+#!/bin/bash
 
 CONFIG='{
     "host": "127.0.0.1",
@@ -57,56 +87,52 @@ CONFIG='{
 dbcls -c <(echo "$CONFIG") mydb.sql
 ```
 
-## Hotkeys
-- Alt + 1 - Autocompletion suggestion list
-- Alt + r - Execute query under cursor or selected text
-- Alt + e - Show database list, which has a submenu of .tables content
-- Alt + t - Show tables list, which has submenus with functionality to show schema or load some sample data
-- Ctrl + q - Quit
-- Ctrl + s - Save file
+## Editor Commands (kaaedit)
 
-## Commands
+### Hotkeys
+
+| Hotkey | Action |
+|--------|--------|
+| `Alt + 1` | Show autocompletion suggestions |
+| `Alt + r` | Execute query under cursor or selected text |
+| `Alt + e` | Show database list with table submenu |
+| `Alt + t` | Show tables list with schema and sample data options |
+| `Ctrl + q` | Quit application |
+| `Ctrl + s` | Save file |
+
+For more kaaedit hotkeys, visit: https://github.com/kaaedit/kaa
+
+## Data Visualization (visidata)
+
+### Hotkeys
+
+| Hotkey | Action |
+|--------|--------|
+| `zf` | Format current cell (JSON indentation, number prettification) |
+
+For more visidata hotkeys, visit: https://www.visidata.org/man/
+
+## SQL Commands
+
+| Command | Description |
+|---------|-------------|
+| `.tables` | List all tables in current database |
+| `.databases` | List all available databases |
+| `.use <database>` | Switch to specified database |
+| `.schema <table>` | Display schema for specified table |
+
+## Supported Database Engines
+
+- MySQL
+- PostgreSQL
+- ClickHouse
+- SQLite
 
 
-**.tables** - Show tables list
+## Contributing
 
-**.databases** - Show databases list
+Contributions are welcome! Please feel free to submit a Pull Request or submit an issue on [GitHub Issues](https://github.com/Sets88/dbcls/issues)
 
-**.use <database>** - Change database
+## License
 
-**.schema &lt;table&gt;** - Show table schema
-
-
-## Options
-
--H --host
-
-Host to connect to
-
--u --user
-
-Username to connect as
-
--p --password
-
-Password to use when connecting to server
-
--E --engine
-
-Database engine, options are: mysql, postgresql, clickhouse
-
--d --database
-
-Database to use
-
--P --port
-
-Port number to use for connection (optional)
-
--c --config
-
-Path to a config file to use
-
-# Bugs
-
-See github issues: https://github.com/Sets88/dbcls/issues
+[here](https://github.com/Sets88/dbcls/blob/main/LICENSE)
