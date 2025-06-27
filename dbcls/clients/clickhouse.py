@@ -1,8 +1,6 @@
 from typing import Optional
 
 import clickhouse_connect
-from aiohttp import ClientSession
-from aiohttp import ClientTimeout
 
 from .base import (
     CommandParams,
