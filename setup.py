@@ -19,11 +19,11 @@ def get_requirements():
 
 setup(
     name='dbcls',
-    version='1.1.16',
+    version='1.1.17',
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',
-    packages=find_packages(),
+    packages=find_packages(exclude=("tests",)),
     description='dbcls is a versatile client that supports various databases',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
