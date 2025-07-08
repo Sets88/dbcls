@@ -135,7 +135,7 @@ class AutoComplete:
 
         if part2 is None:
             curr_tables_list = await self.get_cached_tables()
-            if len(parts) == 1 and curr_tables_list:
+            if len(parts) < 2 and curr_tables_list:
                 suggestions += [f"{x} (TABLE)" for x in curr_tables_list]
 
         if part1 is not None and part2 is None:
