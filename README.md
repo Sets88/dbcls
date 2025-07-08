@@ -129,6 +129,35 @@ For more visidata hotkeys, visit: https://www.visidata.org/man/
 - SQLite
 
 
+## Password safety
+To ensure password safety, I recommend using the project [ssh-crypt](https://github.com/Sets88/ssh-crypt) to encrypt your config file. This way, you can store your password securely and use it with dbcls.
+
+Caveats:
+- If you keep the raw password in a shell script, it will be visible to other users on the system.
+- Even if you encrypt your password inside a shell script, if you pass it to dbcls via the command line, it will be visible in the process list.
+
+To avoid this, you can use this technique:
+
+```bash
+#!/bin/bash
+
+ENC_PASS='{V|B;*R$Ep:HtO~*;QAd?yR#b?V9~a34?!!sxqQT%{!x)bNby^5'
+PASS_DEC=`ssh-crypt -d -s $PASS`
+
+CONFIG=`cat << EOF
+{
+    "host": "127.0.0.1",
+    "username": "user",
+    "password": "$PASS_DEC",
+    "dbname": "mydb",
+    "engine": "mysql"
+}
+`
+
+dbcls -c <(echo "$CONFIG") mydb.sql
+```
+
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request or submit an issue on [GitHub Issues](https://github.com/Sets88/dbcls/issues)
