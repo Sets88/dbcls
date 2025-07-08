@@ -19,22 +19,8 @@ class MysqlClient(ClientClass):
 
     def __init__(self, host, username, password, dbname, port='3306'):
         super().__init__(host, username, password, dbname, port)
-        self.cache = {}
         if not port:
             self.port = '3306'
-
-    async def get_suggestions(self):
-        if 'tables' not in self.cache:
-            self.cache['tables'] = [list(x.values())[0] for x in (await self.get_tables()).data]
-
-        if 'databases' not in self.cache:
-            self.cache['databases'] = [list(x.values())[0] for x in (await self.get_databases()).data]
-
-        suggestions = [f"{x} (COMMAND)" for x in self.all_commands]
-        tables = [f"{x} (TABLE)" for x in self.cache['tables']]
-        databases = [f"{x} (DATABASE)" for x in self.cache['databases']]
-
-        return suggestions + tables + databases
 
     async def connect(self):
         self.connection = await aiomysql.connect(
@@ -48,8 +34,19 @@ class MysqlClient(ClientClass):
 
     async def change_database(self, database: str):
         self.connection = None
-        self.cache.pop('tables', None)
         return await super().change_database(database)
+
+    async def get_table_columns(self, table_name: str, database: str = None):
+        db_name = database or self.dbname
+        result = await self.execute(f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = '{table_name}'
+            AND table_schema = '{db_name}'
+            ORDER BY ordinal_position
+        """)
+
+        return [f"{row['COLUMN_NAME']}" for row in result.data]
 
     async def get_tables(self, database: Optional[str] = None) -> Result:
         if not database:
@@ -89,7 +86,6 @@ class MysqlClient(ClientClass):
         return await self.execute(f"SELECT * FROM `{database}`.`{table}` LIMIT {offset},{limit};")
 
     async def command_use(self, command: CommandParams):
-        self.cache.pop('tables', None)
         return await self.change_database(command.params)
 
     async def command_tables(self, command: CommandParams):

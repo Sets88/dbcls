@@ -19,23 +19,9 @@ class PostgresClient(ClientClass):
     ENGINE = 'PostgreSQL'
 
     def __init__(self, host, username, password, dbname, port='5432'):
-        self.cache = {}
         super().__init__(host, username, password, dbname, port)
         if not port:
             self.port = '5432'
-
-    async def get_suggestions(self):
-        if 'tables' not in self.cache:
-            self.cache['tables'] = [list(x.values())[0] for x in (await self.get_tables()).data]
-
-        if 'databases' not in self.cache:
-            self.cache['databases'] = [list(x.values())[0] for x in (await self.get_databases()).data]
-
-        suggestions = [f"{x} (COMMAND)" for x in self.all_commands]
-        tables = [f"{x} (TABLE)" for x in self.cache['tables']]
-        databases = [f"{x} (DATABASE)" for x in self.cache['databases']]
-
-        return suggestions + tables + databases
 
     async def connect(self):
         self.connection = await aiopg.connect(
@@ -47,11 +33,20 @@ class PostgresClient(ClientClass):
         )
 
     async def change_database(self, database: str):
-        self.cache.pop('tables', None)
         if self.connection:
             await self.connection.close()
         self.connection = None
         return await super().change_database(database)
+
+    async def get_table_columns(self, table_name: str, database: str = None):
+        result = await self.execute(f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = '{table_name}'
+            AND table_schema = 'public'
+            ORDER BY ordinal_position
+        """)
+        return [f"{row['column_name']} (COLUMN)" for row in result.data]
 
     async def get_tables(self, database: Optional[str] = None) -> Result:
         if database and database != self.dbname:
@@ -222,7 +217,6 @@ class PostgresClient(ClientClass):
         return Result(data=[{'schema': create_table_query}], rowcount=1)
 
     async def command_use(self, command: CommandParams):
-        self.cache.pop('tables', None)
         return await self.change_database(command.params)
 
     async def command_tables(self, command: CommandParams):

@@ -1,5 +1,7 @@
 import abc
 import re
+from time import time
+from typing import Optional
 from dataclasses import (
     dataclass,
     field,
@@ -72,15 +74,16 @@ class ClientClass(abc.ABC):
     def all_functions(self):
         return self.SQL_COMMON_FUNCTIONS + self.SQL_FUNCTIONS
 
-    async def get_suggestions(self):
-        return [f"{x} (COMMAND)" for x in self.all_commands]
+    @abc.abstractmethod
+    async def get_table_columns(self, table_name: str, database: str = None):
+        pass
 
     @abc.abstractmethod
     def get_databases(self) -> Result:
         pass
 
     @abc.abstractmethod
-    def get_tables(self) -> Result:
+    def get_tables(self, database: Optional[str] = None) -> Result:
         pass
 
     def get_internal_command_params(self, sql: str) -> list[str]:

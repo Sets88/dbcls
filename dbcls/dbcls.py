@@ -4,6 +4,7 @@ import operator
 import json
 import sys
 import curses
+import traceback
 from functools import partial
 import time
 from typing import Callable
@@ -41,9 +42,11 @@ from .sql_tokenizer import (
     sql_editor_themes,
 )
 from .clients.sqlite3 import Sqlite3Client
+from .autocomplete import AutoComplete
 
 
 client = None
+autocomplete: Optional[AutoComplete] = None
 asyncloop_thread = None
 
 logging.basicConfig(level=logging.WARNING)
@@ -338,14 +341,25 @@ def fix_kaa_curses(wnd: TextEditorWindow):
     wnd.draw_screen(force=True)
 
 
-def predictions_weights(query, candidate):
-    if query == candidate:
-        return (0, candidate)
-    if candidate.startswith(query):
-        return (1, candidate)
-    if query in candidate:
-        return (2, candidate)
-    return (3, candidate)
+def get_word_parts(wnd: TextEditorWindow) -> list[str]:
+    """Get database name from the current editor context"""
+    pos = wnd.cursor.pos
+
+    while (
+        pos >= 0 and (
+            wnd.document.buf[pos - 1].isalnum() or
+            wnd.document.buf[pos - 1] == '_' or
+            wnd.document.buf[pos - 1] == '.'
+        )
+    ):
+        pos -= 1
+
+    string = wnd.document.gettext(pos, wnd.cursor.pos).strip()
+
+    if not string:
+        return []
+
+    return string.split('.')
 
 
 def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines):
@@ -402,38 +416,56 @@ def db_query(wnd: TextEditorWindow):
 
 @command('db.show_prediction')
 def show_prediction(wnd: TextEditorWindow):
-    from_pos = None
-    to_pos = None
-    word = ''
+    try:
+        from_pos = None
+        to_pos = None
+        word = ''
 
-    res = wnd.document.mode.get_word_at(wnd.cursor.pos)
+        res = wnd.document.mode.get_word_at(wnd.cursor.pos)
 
-    if res:
-        from_pos, to_pos, _ = res
-        if from_pos != to_pos:
-            word = wnd.document.gettext(from_pos, to_pos)
+        if wnd.document.gettol(wnd.cursor.pos) == '.':
+            res = wnd.document.mode.get_word_at(wnd.cursor.pos - 1)
 
-    candidates = await_and_print_time(wnd, client.get_suggestions())
-    sorted_candidates = sorted(candidates, key=partial(predictions_weights, word))
+        if res:
+            from_pos, to_pos, _ = res
+            if from_pos != to_pos:
+                word = wnd.document.gettext(from_pos, to_pos)
 
-    def callback(result):
-        if not result:
+        if word == '.':
+            word = ''
+            from_pos = None
+            to_pos = None
+
+        parts = get_word_parts(wnd)
+
+        candidates = await_and_print_time(wnd, autocomplete.get_suggestions(parts))
+
+        def callback(result):
+            if not result:
+                return
+
+            type_idx = operator.indexOf(reversed(result), '(') + 2
+            result = result[:-type_idx]
+
+            pos = wnd.cursor.pos
+
+            if from_pos is not None and from_pos < pos:
+                wnd.cursor.left(word=True)
+
+                wnd.document.mode.delete_string(wnd, from_pos, to_pos)
+
+            wnd.document.mode.put_string(wnd, result)
             return
 
-        type_idx = operator.indexOf(reversed(result), '(') + 2
-        result = result[:-type_idx]
+        show_listdlg('Select', candidates, callback)
+    except Exception as exc:
+        message = "".join(traceback.format_exception(exc))
+        msgboxmode.MsgBoxMode.show_msgbox(
+            message, ['&Ok'], lambda c: c,
+                ['\r', '\n', '\x1b'],
+                border=True
+        )
 
-        pos = wnd.cursor.pos
-
-        if from_pos is not None and from_pos < pos:
-            wnd.cursor.left(word=True)
-
-            wnd.document.mode.delete_string(wnd, from_pos, to_pos)
-
-        wnd.document.mode.put_string(wnd, result)
-        return
-
-    show_listdlg('Select', sorted_candidates, callback, query=word)
 
 
 @command('db.show_tables')
@@ -536,6 +568,7 @@ def setup_editor():
 
 def main():
     global client
+    global autocomplete
     global asyncloop_thread
 
     args_parser = build_parser()
@@ -601,6 +634,8 @@ def main():
         args_parser.print_help(sys.stderr)
         print('Invalid engine specified')
         sys.exit(1)
+
+    autocomplete = AutoComplete(client)
 
     setup_editor()
 
