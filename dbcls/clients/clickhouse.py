@@ -19,8 +19,9 @@ class ClickhouseClient(ClientClass):
         'any', 'toDateTime'
     ]
 
-    def __init__(self, host, username, password, dbname, port='8123'):
+    def __init__(self, host, username, password, dbname, port='8123', compress=True):
         super().__init__(host, username, password, dbname, port)
+        self.compress = compress
 
         if not dbname:
             self.dbname = 'default'
@@ -88,7 +89,8 @@ class ClickhouseClient(ClientClass):
             port=self.port,
             username=self.username,
             password=self.password,
-            database=db
+            database=db,
+            compress=self.compress
         )
 
         raw_data = await client.query(query=sql)

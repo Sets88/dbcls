@@ -587,6 +587,8 @@ def main():
         choices=['clickhouse', 'mysql', 'postgres', 'sqlite3'])
     args_parser.add_argument('--dbname', '-d', dest='dbname', help='specify db name', required=False)
     args_parser.add_argument('--filepath', '-f', dest='filepath', help='specify db filepath', required=False)
+    args_parser.add_argument('--no-compress', dest='compress', action='store_false', default=True,
+        help='disable compression for ClickHouse')
 
     args = args_parser.parse_args()
 
@@ -601,6 +603,7 @@ def main():
     engine = args.engine
     dbname = args.dbname
     filepath = args.filepath
+    compress = args.compress
 
     if args.config:
         with open(args.config) as f:
@@ -624,7 +627,7 @@ def main():
     # imported here to make db libs dependencies optional
     if engine == 'clickhouse':
         from .clients.clickhouse import ClickhouseClient
-        client = ClickhouseClient(host, username, password, dbname, port=port)
+        client = ClickhouseClient(host, username, password, dbname, port=port, compress=compress)
     if engine == 'mysql':
         from .clients.mysql import MysqlClient
         client = MysqlClient(host, username, password, dbname, port=port)
