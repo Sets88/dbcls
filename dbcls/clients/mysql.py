@@ -1,7 +1,7 @@
 from typing import Optional
 
 import aiomysql
-from aiomysql import InterfaceError
+from aiomysql import InterfaceError, MySQLError
 
 from .base import (
     CommandParams,
@@ -97,6 +97,9 @@ class MysqlClient(ClientClass):
     async def command_schema(self, command: CommandParams):
         table = command.params
         return await self.execute('SHOW CREATE TABLE %s' % table)
+
+    def is_db_error_exception(self, exc: Exception) -> bool:
+        return isinstance(exc, MySQLError)
 
     async def execute(self, sql) -> Result:
         result = await self.if_command_process(sql)

@@ -97,6 +97,9 @@ class ClickhouseClient(ClientClass):
 
         return Result(data=data, message=" ".join([f'{x[0]}: {x[1]}' for x in raw_data.summary.items()]))
 
+    def is_db_error_exception(self, exc: Exception) -> bool:
+        return isinstance(exc, clickhouse_connect.driver.exceptions.ClickHouseError)
+
     async def execute(self, sql) -> Result:
         result = await self.if_command_process(sql)
 

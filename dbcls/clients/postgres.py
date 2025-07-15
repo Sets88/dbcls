@@ -2,7 +2,7 @@ import re
 from typing import Optional
 
 import aiopg
-from psycopg2 import InterfaceError
+from psycopg2 import InterfaceError, DatabaseError
 from psycopg2.extras import RealDictCursor
 
 from .base import (
@@ -228,6 +228,9 @@ class PostgresClient(ClientClass):
     async def command_schema(self, command: CommandParams):
         table_name = command.params
         return await self.get_schema(table_name)
+
+    def is_db_error_exception(self, exc: Exception) -> bool:
+        return isinstance(exc, DatabaseError)
 
     async def execute(self, sql) -> Result:
         result = await self.if_command_process(sql)

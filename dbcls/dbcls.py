@@ -388,6 +388,10 @@ def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines
     except Exception as exc:
         end = time.time()
         message = str(exc)
+
+        if not client.is_db_error_exception(exc):
+            message = "".join(traceback.format_exception(exc))
+
         msgboxmode.MsgBoxMode.show_msgbox(
             message, ['&Ok'], lambda c: c,
                 ['\r', '\n', '\x1b'],

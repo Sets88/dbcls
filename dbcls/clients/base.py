@@ -86,6 +86,10 @@ class ClientClass(abc.ABC):
     def get_tables(self, database: Optional[str] = None) -> Result:
         pass
 
+    @abc.abstractmethod
+    def is_db_error_exception(self, exc: Exception) -> bool:
+        pass
+
     def get_internal_command_params(self, sql: str) -> list[str]:
         command = sql.strip().rstrip(';')
         if not command or not command.startswith('.'):

@@ -62,6 +62,9 @@ class Sqlite3Client(ClientClass):
 
         return Result(data, rowcount)
 
+    def is_db_error_exception(self, exc: Exception) -> bool:
+        return isinstance(exc, sqlite3.DatabaseError)
+
     async def execute(self, sql) -> Result:
         result = await self.if_command_process(sql)
 
