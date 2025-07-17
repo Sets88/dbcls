@@ -45,6 +45,7 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-d, --database` | Database name |
 | `-P, --port` | Port number (optional) |
 | `-c, --config` | Path to configuration file |
+| `--no-compress` | Disable compression for ClickHouse connections |
 
 ## Configuration
 
@@ -101,6 +102,18 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Ctrl + s` | Save file |
 
 For more kaaedit hotkeys, visit: https://github.com/kaaedit/kaa
+
+### Navigation in Database and Table Listings
+
+When using `Alt + e` (database list) or `Alt + t` (table list), you can navigate through the listings
+
+**Database List Navigation:**
+- Select a database and press `Enter` to proceed to the table list for that database
+
+**Table List Navigation:**
+- Select a table and press `Enter` to access options:
+  - View table schema
+  - Show sample data
 
 ## Data Visualization (visidata)
 
