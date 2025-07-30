@@ -285,9 +285,11 @@ class SyncClient:
                     return Result('Timeout', None)
 
             return task.result()
-        except BaseException:
-            task.cancel()
+        except asyncio.CancelledError:
             return Result('Canceled', None)
+        finally:
+            if not task.cancelled():
+                task.cancel()
 
 
 def await_and_print_time(

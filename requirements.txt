@@ -4,3 +4,4 @@ clickhouse-connect==0.8.18
 ciso8601==2.3.0
 aiomysql==0.2.0
 aiopg==1.4.0
+cryptography
