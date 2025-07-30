@@ -288,8 +288,7 @@ class SyncClient:
         except asyncio.CancelledError:
             return Result('Canceled', None)
         finally:
-            if not task.cancelled():
-                task.cancel()
+            task.cancel()
 
 
 def await_and_print_time(
