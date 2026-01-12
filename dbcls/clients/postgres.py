@@ -30,6 +30,7 @@ class PostgresClient(ClientClass):
             user=self.username,
             password=self.password,
             dbname=self.dbname,
+            timeout=86400
         )
 
     async def change_database(self, database: str):

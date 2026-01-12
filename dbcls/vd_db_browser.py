@@ -1,7 +1,8 @@
 import time
 from .utils import prettify
+from copy import deepcopy
 
-from visidata import VisiData, Sheet, PyobjSheet, Column, ColumnItem
+from visidata import VisiData, Sheet, PyobjSheet, Column, ColumnItem, TypedExceptionWrapper
 from visidata import asyncthread, ENTER, AttrDict, deduceType, Progress
 
 
@@ -120,6 +121,47 @@ class TableSchemaSheet(Sheet):
 
 
 @VisiData.api
+class ExpandVert(Sheet):
+    def __init__(self, source, curcol):
+        super().__init__(source.name + "_expver", source=source)
+        self.curcol = curcol
+
+    def resetCols(self):
+        self.columns = []
+        for i, col in enumerate(self.source.visibleCols):
+            colcopy = ColumnItem(col.name)
+            colcopy.__setstate__(col.__getstate__())
+            colcopy.expr = i
+            self.addColumn(colcopy)
+            if col in self.source.keyCols:
+                self.setKeys([colcopy])
+
+    def iterload(self):
+        with Progress(gerund='expanding vertically'):
+            curcol_idx = None
+            for row in self.source.rows:
+                new_row = []
+                for col in self.source.visibleCols:
+                    if curcol_idx is None and col == self.curcol:
+                        curcol_idx = self.source.visibleCols.index(col)
+
+                    val = col.getTypedValue(row)
+                    if isinstance(val, TypedExceptionWrapper):
+                        new_row.append(None)
+                    else:
+                        new_row.append(val)
+
+                if curcol_idx is not None and isinstance(new_row[curcol_idx], list):
+                    for item in new_row[curcol_idx]:
+                        new_row_copy = deepcopy(new_row)
+                        new_row_copy[curcol_idx] = item
+                        yield new_row_copy
+                else:
+                    yield new_row
+
+
+
+@VisiData.api
 def make_formated_table(sheet, col, row):
     if not row:
         raise Exception('No data found')
@@ -135,3 +177,4 @@ def make_formated_table(sheet, col, row):
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
 Sheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')
+Sheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')

@@ -122,6 +122,7 @@ When using `Alt + e` (database list) or `Alt + t` (table list), you can navigate
 | Hotkey | Action |
 |--------|--------|
 | `zf` | Format current cell (JSON indentation, number prettification) |
+| `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
 
 For more visidata hotkeys, visit: https://www.visidata.org/man/
 
