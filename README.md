@@ -124,6 +124,17 @@ When using `Alt + e` (database list) or `Alt + t` (table list), you can navigate
 | `zf` | Format current cell (JSON indentation, number prettification) |
 | `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
 
+### Exporting Data
+
+DbCls supports exporting data from visidata in multiple formats:
+
+**SQL INSERT Export:**
+1. After executing a query and viewing results in visidata, press either `Ctrl+S` to save or `gY` to copy to the clipboard
+2. Enter filename with `.sql` extension (e.g., `output.sql`)
+3. The data will be saved as SQL INSERT statements
+
+The SQL export uses the sheet name as the table name and includes all visible columns. Each row is exported as a separate INSERT statement.
+
 For more visidata hotkeys, visit: https://www.visidata.org/man/
 
 ## SQL Commands
