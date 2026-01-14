@@ -1,5 +1,6 @@
 import sqlite3
 import asyncio
+from typing import Optional
 
 from .base import (
     CommandParams,
@@ -23,14 +24,14 @@ class Sqlite3Client(ClientClass):
             "SELECT name AS 'table', '%s' AS database FROM sqlite_master WHERE type='table';" % self.dbname
         )
 
-    async def get_sample_data(
-        self,
+    def get_sampla_data_sql(self,
         table: str,
-        database=None,
-        limit: int = 200,
-        offset: int = 0
-    ) -> Result:
-        return await self.execute(f"SELECT * FROM `{table}` LIMIT {offset},{limit};")
+        database: Optional[str] = None,
+    ):
+        return f"SELECT * FROM `{table}`"
+
+    def get_limit_sql(self, limit: int, offset: int = 0):
+        return f'LIMIT {offset},{limit}'
 
     async def get_databases(self) -> Result:
         return Result([{'database': self.dbname}], 0)

@@ -123,6 +123,7 @@ When using `Alt + e` (database list) or `Alt + t` (table list), you can navigate
 |--------|--------|
 | `zf` | Format current cell (JSON indentation, number prettification) |
 | `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
+| `E` | Edit the SQL query used to fetch sample data for the current table(in `Alt + t` page only) |
 
 ### Exporting Data
 

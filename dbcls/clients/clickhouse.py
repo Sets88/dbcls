@@ -58,16 +58,14 @@ class ClickhouseClient(ClientClass):
             result.data = [{'schema': list(x.values())[-1]} for x in result.data]
         return result
 
-    async def get_sample_data(
-        self,
+    def get_sampla_data_sql(self,
         table: str,
         database: Optional[str] = None,
-        limit: int = 200,
-        offset: int = 0
-    ) -> Result:
-        if not database:
-            database = self.dbname
-        return await self.execute(f"SELECT * FROM `{database}`.`{table}` LIMIT {offset},{limit};")
+    ):
+        return f"SELECT * FROM `{database}`.`{table}`"
+
+    def get_limit_sql(self, limit: int, offset: int = 0):
+        return f'LIMIT {offset},{limit}'
 
     async def command_use(self, command: CommandParams):
         return await self.change_database(command.params)

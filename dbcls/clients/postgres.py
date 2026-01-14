@@ -63,16 +63,16 @@ class PostgresClient(ClientClass):
         sql = "SELECT datname AS database FROM pg_database;"
         return await self.execute(sql)
 
-    async def get_sample_data(
-        self,
+    def get_sampla_data_sql(self,
         table: str,
         database: Optional[str] = None,
-        limit: int = 200,
-        offset: int = 0
-    ) -> Result:
+    ):
         if database and database != self.dbname:
             raise Exception("Cross-database queries are not supported")
-        return await self.execute(f"SELECT * FROM \"{table}\" LIMIT {limit} OFFSET {offset};")
+        return f"SELECT * FROM \"{table}\""
+
+    def get_limit_sql(self, limit: int, offset: int = 0):
+        return f'LIMIT {limit} OFFSET {offset}'
 
     async def get_schema(self, table_name: str, database: Optional[str] = None) -> Result:
         if database and database != self.dbname:

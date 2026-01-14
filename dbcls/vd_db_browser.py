@@ -62,11 +62,23 @@ def add_columns_from_row(row, sheet):
 class TableSampleDataSheet(Sheet):
     rowtype = 'tables'
     CHUNK_SIZE = 500
+    CUSTOM_SQL = None
+
+    def get_sample_base_sql(self, table: str, db: str):
+        if self.CUSTOM_SQL:
+            return self.CUSTOM_SQL
+        return self.client.get_sampla_data_sql(table, db)
+
+    def update_current_sql(self, sql: str):
+        self.CUSTOM_SQL = sql
+        self.reload()
 
     def iterload(self):
         loaded = False
         offset = 0
         progress = None
+        base_sql = self.get_sample_base_sql(self.table, self.db)
+
         while True:
             if (len(self.rows) -  self.cursorRowIndex) > 200:
                 if not progress:
@@ -81,12 +93,9 @@ class TableSampleDataSheet(Sheet):
                 progress = None
 
             with Progress(gerund='loading sample data chunk'):
-                chunk = self.client.get_sample_data(
-                    self.table,
-                    self.db,
-                    limit=self.CHUNK_SIZE,
-                    offset=offset
-                )
+                limit_sql = self.client.get_limit_sql(self.CHUNK_SIZE, offset)
+                full_sql = f"{base_sql} {limit_sql}"
+                chunk = self.client.execute(full_sql)
 
                 if not chunk.data and not offset:
                     raise Exception('No data found')
@@ -248,3 +257,4 @@ DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(client=sheet
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
 Sheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')
 Sheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
+TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.update_current_sql(input("current sql: ", value=sheet.get_sample_base_sql(sheet.table, sheet.db)))', 'Edit current sql')
