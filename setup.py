@@ -19,7 +19,7 @@ def get_requirements():
 
 setup(
     name='dbcls',
-    version='1.1.22',
+    version='1.1.23',
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',
