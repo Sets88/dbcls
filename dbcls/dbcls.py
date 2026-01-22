@@ -328,13 +328,22 @@ def await_and_print_time(
 
 
 def fix_visidata_curses():
+    try:
+        curses.endwin()
+    except Exception:
+        pass
+
     if visidata.color.colors.color_pairs:
         for (fg, bg), (pairnum, _) in visidata.color.colors.color_pairs.items():
             curses.init_pair(pairnum, fg, bg)
 
 
 def fix_kaa_curses(wnd: TextEditorWindow):
-    curses.endwin()
+    try:
+        curses.endwin()
+    except Exception:
+        pass
+
     kaa.app.show_cursor(1)
 
     for pairnum, (fg, bg) in enumerate(kaa.app.colors.pairs.keys()):
