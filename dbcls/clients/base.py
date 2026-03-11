@@ -58,12 +58,16 @@ class ClientClass(abc.ABC):
     SQL_COMMANDS = []
     SQL_FUNCTIONS = []
 
-    def __init__(self, host: str, username: str, password: str, dbname: str, port: str):
+    def __init__(
+        self, host: str, username: str, password: str, dbname: str,
+        port: Optional[str], unix_socket: Optional[str] = None
+    ):
         self.host = host
         self.username = username
         self.password = password
         self.dbname = dbname
         self.port = port
+        self.unix_socket = unix_socket
         self.connection = None
 
     @property

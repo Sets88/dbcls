@@ -44,6 +44,7 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-E, --engine` | Database engine (mysql, postgresql, clickhouse) |
 | `-d, --database` | Database name |
 | `-P, --port` | Port number (optional) |
+| `-S, --unix-socket` | Path to Unix socket file (optional, overrides host/port) |
 | `-c, --config` | Path to configuration file |
 | `--no-compress` | Disable compression for ClickHouse connections |
 
@@ -154,6 +155,100 @@ For more visidata hotkeys, visit: https://www.visidata.org/man/
 - ClickHouse
 - SQLite
 
+
+## Unix Socket Connections
+
+DbCls supports connecting to MySQL and PostgreSQL via a Unix domain socket using the `-S` / `--unix-socket` option. When a socket path is provided, it takes precedence over `--host` and `--port`.
+
+```bash
+dbcls -S /tmp/mysql.sock -u user -d mydb -E mysql mydb.sql
+```
+
+### Forwarding a Remote Unix Socket Over SSH
+
+If the database server is remote and only accessible via Unix socket, you can forward the socket to your local machine using SSH local socket forwarding:
+
+**MySQL:**
+```bash
+ssh -L /tmp/mysql.sock:/var/run/mysqld/mysqld.sock -N user@11.22.33.44
+```
+
+**PostgreSQL:**
+```bash
+ssh -L /tmp/pg.sock:/var/run/postgresql/.s.PGSQL.5432 -N user@11.22.33.44
+```
+
+Then connect using the forwarded local socket:
+
+```bash
+# MySQL
+dbcls -S /tmp/mysql.sock -u user -d mydb -E mysql mydb.sql
+
+# PostgreSQL
+dbcls -S /tmp/pg.sock -u user -d mydb -E postgres mydb.sql
+```
+
+> **Note for PostgreSQL:** DbCls automatically creates the required symlink (`.s.PGSQL.5432`) in the system temp directory so that the `aiopg` driver can locate the socket correctly. The symlink is recreated on each connection.
+
+### Wrapper Script with Auto SSH Tunnel
+
+The script below automatically starts an SSH tunnel, runs dbcls, and kills the tunnel on exit:
+
+**MySQL (`mysql_ssh.sh`):**
+```bash
+#!/bin/bash
+
+REMOTE_USER=user
+REMOTE_HOST=11.22.33.44
+REMOTE_SOCKET=/var/run/mysqld/mysqld.sock
+LOCAL_SOCKET=/tmp/dbcls_mysql_$$.sock
+
+ssh -fNM -S /tmp/dbcls_ssh_ctl_$$ \
+    -L "$LOCAL_SOCKET:$REMOTE_SOCKET" \
+    "$REMOTE_USER@$REMOTE_HOST"
+
+trap "ssh -S /tmp/dbcls_ssh_ctl_$$ -O exit $REMOTE_HOST 2>/dev/null; rm -f $LOCAL_SOCKET" EXIT
+
+dbcls -S "$LOCAL_SOCKET" -u dbuser -d mydb -E mysql "$@"
+```
+
+**PostgreSQL (`pg_ssh.sh`):**
+```bash
+#!/bin/bash
+
+REMOTE_USER=user
+REMOTE_HOST=11.22.33.44
+REMOTE_SOCKET=/var/run/postgresql/.s.PGSQL.5432
+LOCAL_SOCKET=/tmp/dbcls_pg_$$.sock
+
+ssh -fNM -S /tmp/dbcls_ssh_ctl_$$ \
+    -L "$LOCAL_SOCKET:$REMOTE_SOCKET" \
+    "$REMOTE_USER@$REMOTE_HOST"
+
+trap "ssh -S /tmp/dbcls_ssh_ctl_$$ -O exit $REMOTE_HOST 2>/dev/null; rm -f $LOCAL_SOCKET" EXIT
+
+dbcls -S "$LOCAL_SOCKET" -u dbuser -d mydb -E postgres "$@"
+```
+
+How it works:
+- `ssh -fNM` — starts SSH in background (`-f`) with a master control socket (`-M`) for easy cleanup
+- `-S /tmp/dbcls_ssh_ctl_$$` — control socket path (unique per process via `$$`)
+- `trap ... EXIT` — kills the SSH tunnel and removes the local socket file when the script exits for any reason
+- `"$@"` — passes any extra arguments through to dbcls (e.g. a SQL file path)
+
+### Using a Config File with Unix Socket
+
+You can also specify the socket path in a JSON config file:
+
+```json
+{
+    "username": "user",
+    "password": "mypasswd",
+    "dbname": "mydb",
+    "engine": "mysql",
+    "unix_socket": "/tmp/mysql.sock"
+}
+```
 
 ## Password safety
 To ensure password safety, I recommend using the project [ssh-crypt](https://github.com/Sets88/ssh-crypt) to encrypt your config file. This way, you can store your password securely and use it with dbcls.

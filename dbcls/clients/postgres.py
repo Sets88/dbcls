@@ -1,4 +1,6 @@
 import re
+import os
+import tempfile
 from typing import Optional
 
 import aiopg
@@ -18,14 +20,30 @@ SHOW_CR_TAB_RE = re.compile('SHOW\s+CREATE\s+TABLE\s+(.*)$', re.IGNORECASE)
 class PostgresClient(ClientClass):
     ENGINE = 'PostgreSQL'
 
-    def __init__(self, host, username, password, dbname, port='5432'):
-        super().__init__(host, username, password, dbname, port)
+    def __init__(
+        self, host: str, username: str, password: str, dbname: str,
+        port: str = '5432', unix_socket: Optional[str] = None
+    ):
+        super().__init__(host, username, password, dbname, port, unix_socket=unix_socket)
         if not port:
             self.port = '5432'
 
     async def connect(self):
+        host = self.host
+
+        if self.unix_socket:
+            tmpdir = tempfile.gettempdir()
+            simlink_path = os.path.join(tmpdir, '.s.PGSQL.5432')
+
+            if os.path.exists(simlink_path) and os.path.islink(simlink_path):
+                os.unlink(simlink_path)
+
+            os.symlink(self.unix_socket, simlink_path)
+            host = tmpdir
+            self.port = '5432'
+
         self.connection = await aiopg.connect(
-            host=self.host,
+            host=host,
             port=int(self.port),
             user=self.username,
             password=self.password,

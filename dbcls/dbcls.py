@@ -591,6 +591,7 @@ def main():
     args_parser.description = 'DB connection tool'
     args_parser.add_argument('--config', '-c', dest='config', help='specify config path', default='')
     args_parser.add_argument('--host', '-H', dest='host', help='specify host name', default='')
+    args_parser.add_argument('--unix-socket', '-S', dest='unix_socket', help='specify unix socket', default=None)
     args_parser.add_argument('--user', '-u', dest='user', help='specify user name', required=False)
     args_parser.add_argument('--password', '-p', dest='password', default='', help='specify raw password')
     args_parser.add_argument('--port', '-P', dest='port', default='', help='specify port')
@@ -615,6 +616,7 @@ def main():
     dbname = args.dbname
     filepath = args.filepath
     compress = args.compress
+    unix_socket = args.unix_socket
 
     if args.config:
         with open(args.config) as f:
@@ -641,10 +643,10 @@ def main():
         client = ClickhouseClient(host, username, password, dbname, port=port, compress=compress)
     if engine == 'mysql':
         from .clients.mysql import MysqlClient
-        client = MysqlClient(host, username, password, dbname, port=port)
+        client = MysqlClient(host, username, password, dbname, port=port, unix_socket=unix_socket)
     if engine == 'postgres':
         from .clients.postgres import PostgresClient
-        client = PostgresClient(host, username, password, dbname, port=port)
+        client = PostgresClient(host, username, password, dbname, port=port, unix_socket=unix_socket)
     if engine == 'sqlite3':
         client = Sqlite3Client(filepath)
 

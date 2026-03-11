@@ -17,20 +17,31 @@ class MysqlClient(ClientClass):
         'CONCAT', 'GROUP_CONCAT', 'UNIX_TIMESTAMP', 'FROM_UNIXTIME', 'DATE_FORMAT'
     ]
 
-    def __init__(self, host, username, password, dbname, port='3306'):
-        super().__init__(host, username, password, dbname, port)
+    def __init__(
+        self, host: str, username: str, password: str, dbname: str,
+        port: Optional[str] = None, unix_socket: Optional[str] = None
+    ):
+        super().__init__(host, username, password, dbname, port, unix_socket)
         if not port:
             self.port = '3306'
 
     async def connect(self):
-        self.connection = await aiomysql.connect(
-            host=self.host,
-            port=int(self.port),
-            user=self.username,
-            password=self.password,
-            db=self.dbname,
-            autocommit=True
-        )
+        params = {
+            'user': self.username,
+            'db': self.dbname,
+            'autocommit': True
+        }
+
+        if self.password:
+            params['password'] = self.password
+
+        if not self.unix_socket:
+            params['host'] = self.host
+            params['port'] = int(self.port)
+        else:
+            params['unix_socket'] = self.unix_socket
+
+        self.connection = await aiomysql.connect(**params)
 
     async def change_database(self, database: str):
         self.connection = None
