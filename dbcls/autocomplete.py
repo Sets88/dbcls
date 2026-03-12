@@ -46,9 +46,6 @@ class DbStructureCache:
         return self.cache['columns'].get(database, {}).get(table, {}).get('list', None)
 
     def set(self, value: list[str], database: str = None, table_name: str = None):
-        if database not in self.cache:
-            self.cache[database] = {}
-
         if database is None and table_name is None:
             self.cache['databases'] = {
                 "list": value,
