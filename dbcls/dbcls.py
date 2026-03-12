@@ -394,8 +394,8 @@ def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines
 
         fix_visidata_curses()
 
-        visidata.vd.run()
-        visidata.vd.view(result.data)
+        sheet = visidata.vd.view(result.data)
+        visidata.vd.run(sheet)
     except Exception as exc:
         end = time.time()
         message = str(exc)
