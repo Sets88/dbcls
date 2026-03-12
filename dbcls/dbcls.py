@@ -85,9 +85,11 @@ class AsyncLoopThread(threading.Thread):
         self.result_queue = LifoQueue()
         self.current_running_task = None
         self.loop = None
+        self._loop_ready = threading.Event()
 
     async def _run(self):
         self.loop = asyncio.get_event_loop()
+        self._loop_ready.set()
 
         while True:
             await asyncio.sleep(0.1)
@@ -104,6 +106,7 @@ class AsyncLoopThread(threading.Thread):
         return False
 
     def submit(self, coro: asyncio.coroutines):
+        self._loop_ready.wait()
         task = Task(coro, self.loop)
         asyncio.run_coroutine_threadsafe(task.run(), loop=self.loop)
         return task
