@@ -17,7 +17,7 @@ class Sqlite3Client(ClientClass):
 
     async def get_table_columns(self, table_name: str, database: str = None):
         result = await self.execute(f"PRAGMA table_info({table_name})")
-        return [f"{row['name']} (COLUMN)" for row in result.data]
+        return [row['name'] for row in result.data]
 
     async def get_tables(self, database=None) -> Result:
         return await self.execute(

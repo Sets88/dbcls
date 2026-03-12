@@ -65,7 +65,7 @@ class PostgresClient(ClientClass):
             AND table_schema = 'public'
             ORDER BY ordinal_position
         """)
-        return [f"{row['column_name']} (COLUMN)" for row in result.data]
+        return [row['column_name'] for row in result.data]
 
     async def get_tables(self, database: Optional[str] = None) -> Result:
         if database and database != self.dbname:
