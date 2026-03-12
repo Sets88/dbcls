@@ -357,7 +357,7 @@ def get_word_parts(wnd: TextEditorWindow) -> list[str]:
     pos = wnd.cursor.pos
 
     while (
-        pos >= 0 and (
+        pos > 0 and (
             wnd.document.buf[pos - 1].isalnum() or
             wnd.document.buf[pos - 1] == '_' or
             wnd.document.buf[pos - 1] == '.'
