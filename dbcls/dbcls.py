@@ -375,7 +375,7 @@ def get_word_parts(wnd: TextEditorWindow) -> list[str]:
 
 def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines):
     start = time.time()
-    end = None
+    end = start
     message = ''
 
     try:
