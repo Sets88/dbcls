@@ -636,6 +636,8 @@ def main():
             engine = config.get('engine', '')
         if not filepath:
             filepath = config.get('filepath', '')
+        if not unix_socket:
+            unix_socket = config.get('unix_socket', None)
 
     # imported here to make db libs dependencies optional
     if engine == 'clickhouse':
