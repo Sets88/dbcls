@@ -48,9 +48,19 @@ class TableOptionsSheet(Sheet):
 
     def openRow(self, row):
         if row.option == 'Schema':
-            return TableSchemaSheet(client=self.client, db=self.db, table=self.table)
+            return TableSchemaSheet(
+                f"schema__{self.db}__{self.table}",
+                client=self.client,
+                db=self.db,
+                table=self.table
+            )
         if row.option == 'Sample data':
-            return TableSampleDataSheet(client=self.client, db=self.db, table=self.table)
+            return TableSampleDataSheet(
+                self.table,
+                client=self.client,
+                db=self.db,
+                table=self.table
+            )
 
 
 def add_columns_from_row(row, sheet):
@@ -253,8 +263,8 @@ def save_sql(vd, p, *vsheets):
             vd.status(f'Saved {vs.nRows} row(s) as SQL INSERT to {p.given}')
 
 
-DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(client=sheet.client, db=cursorRow["database"]))', '')
-TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
+DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')
+TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(f\'table_options__{cursorRow["database"]}__{cursorRow["table"]}\', client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
 Sheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')
 Sheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
 TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.update_current_sql(input("current sql: ", value=sheet.get_sample_base_sql(sheet.table, sheet.db)))', 'Edit current sql')
