@@ -14,8 +14,6 @@ from .base import (
 )
 
 
-SHOW_CR_TAB_RE = re.compile('SHOW\s+CREATE\s+TABLE\s+(.*)$', re.IGNORECASE)
-
 
 class PostgresClient(ClientClass):
     ENGINE = 'PostgreSQL'

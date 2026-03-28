@@ -213,22 +213,6 @@ class DbEditor(Editor):
         else:
             self.set_cursor_line(0, 0)
 
-    def _fix_curses_after_visidata(self) -> None:
-        try:
-            curses.endwin()
-        except Exception:
-            pass
-
-        try:
-            curses.curs_set(1)        # visidata hides the cursor; restore it
-        except curses.error:
-            pass
-
-        self.stdscr.clearok(True)
-        self.stdscr.refresh()         # re-enter curses mode before drawing
-        self.renderer.resize()
-        self.lexer.invalidate(0)
-
     def _fix_visidata_curses(self) -> None:
         try:
             curses.endwin()
@@ -250,10 +234,6 @@ class DbEditor(Editor):
             pass
 
         self.colors.reset()
-        # self.stdscr.clearok(True)
-        # self.stdscr.refresh()         # re-enter curses mode before drawing
-        # self.renderer.resize()
-        # self.lexer.invalidate(0)
 
     def _db_query(self):
         sel = self.buf.get_selected_text() if self.buf.has_selection() else ''
