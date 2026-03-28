@@ -1,55 +1,38 @@
+import argparse
 import asyncio
 import threading
-import operator
 import json
 import sys
+import os
 import curses
+import locale
 import traceback
 from functools import partial
 import time
-from typing import Callable
 from typing import Optional
 import logging
+import warnings
 from queue import LifoQueue
 
-import kaa
-import kaa.cui.main
-from kaa.ui.msgbox import msgboxmode
-from kaa.ui.selectlist import filterlist
+warnings.filterwarnings('ignore')
+
 import visidata
-from kaa.addon import (
-    alt,
-    backspace,
-    command,
-    ctrl,
-    right,
-    shift,
-    setup,
-)
-from kaa.cui.editor import TextEditorWindow
-from kaa.cui.keydef import KeyEvent
-from kaa.filetype.default.defaultmode import DefaultMode
-from kaa.options import build_parser
-from kaa.syntax_highlight import DefaultToken
 
 from .clients.base import Result
 from .vd_db_browser import DataBaseSheet, TablesSheet
-from .sql_tokenizer import (
-    CaseInsensitiveKeywords,
-    NonSqlComment,
-    CommandSpan,
-    make_tokenizer,
-    sql_editor_themes,
-)
 from .clients.sqlite3 import Sqlite3Client
 from .autocomplete import AutoComplete
+from .editor import Editor, EDITOR_HELP
 
 
 client = None
 autocomplete: Optional[AutoComplete] = None
 asyncloop_thread = None
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.ERROR)
+logging.captureWarnings(True)
+logging.getLogger('py.warnings').addHandler(logging.NullHandler())
+logging.getLogger('py.warnings').propagate = False
 
 
 class Task:
@@ -109,155 +92,6 @@ class AsyncLoopThread(threading.Thread):
         return task
 
 
-def show_listdlg(title, candidates, callback, query=''):
-    doc = filterlist.FilterListInputDlgMode.build(
-        title, callback)
-    dlg = kaa.app.show_dialog(doc)
-
-    filterlistdoc = filterlist.FilterListMode.build()
-    list = dlg.add_doc('dlg_filterlist', 0, filterlistdoc)
-
-    filterlistdoc.mode.set_candidates(candidates)
-    filterlistdoc.mode.set_query(list, query.strip())
-    dlg.on_console_resized()
-
-    return dlg
-
-
-def get_sel(wnd: TextEditorWindow) -> str:
-    selection = wnd.screen.selection
-    if not selection.is_selected():
-        return
-    if not selection.is_rectangular():
-        selected_from, selected_to = selection.get_selrange()
-        return wnd.document.gettext(selected_from, selected_to)
-    data = []
-    position_from, position_to, column_from, column_to = selection.get_rect_range()
-
-    while position_from < position_to:
-        position_and_col_string = selection.get_col_string(position_from, column_from, column_to)
-        if position_and_col_string:
-            *_, col_string = position_and_col_string
-            data.append(col_string.rstrip('\n'))
-        else:
-            data.append('')
-        position_from = wnd.document.geteol(position_from)
-
-    return '\n'.join(data)
-
-
-def get_current_sql_rows_pos(wnd: TextEditorWindow) -> list[int]:
-    """Analze current editor position to find rows of sql query under the cursor"""
-    pos = wnd.cursor.pos
-    start_pos = pos
-    rows = set()
-    back_only = False
-
-    if (
-        pos < len(wnd.document.buf) and
-        (
-            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), CommandSpan) or
-            (
-                pos > 0 and
-                wnd.document.buf[pos] == '\n' and
-                isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos - 1), CommandSpan)
-            )
-        )
-    ):
-        return [wnd.document.gettol(pos)]
-
-    if (
-        pos < len(wnd.document.buf) and
-        (
-            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), NonSqlComment) or
-            (
-                pos > 0 and
-                wnd.document.buf[pos] == '\n' and
-                isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos - 1), NonSqlComment)
-            )
-        )
-    ):
-        return []
-
-    for pos in range(pos, 0, -1):
-        if pos >= len(wnd.document.buf):
-            continue
-
-        if (
-            wnd.document.buf[pos] == ';' and
-            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), DefaultToken) and
-            wnd.document.gettol(pos) == wnd.document.gettol(start_pos)
-        ):
-            rows.add(wnd.document.gettol(pos))
-            back_only = True
-
-        if (
-            (
-                (
-                    (
-                        wnd.document.buf[pos - 1] == ';' and
-                        wnd.document.gettol(pos) != wnd.document.gettol(start_pos)
-                    ) or
-                    (wnd.document.buf[pos] == '\n' and (pos - 1) <= 0) or
-                    (wnd.document.buf[pos] == '\n' and wnd.document.buf[pos - 1] == '\n')
-                ) and
-                isinstance(
-                    wnd.document.mode.tokenizer.get_token_at(wnd.document, pos - 1),
-                    (DefaultToken, CaseInsensitiveKeywords)
-                )
-            ) or
-            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), (NonSqlComment, CommandSpan)) or
-            (
-                wnd.document.buf[pos] == '\n' and
-                isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos - 1), (NonSqlComment, CommandSpan))
-            )
-        ):
-            break
-
-        rows.add(wnd.document.gettol(pos))
-
-    if back_only:
-        return list(sorted(rows))
-
-    pos = start_pos
-
-    for pos in range(pos, len(wnd.document.buf)):
-        if (
-            isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), (NonSqlComment, CommandSpan)) or
-            (
-                (
-                    wnd.document.buf[pos] == ';' or
-                    (wnd.document.buf[pos] == '\n' and len(wnd.document.buf) <= pos + 1) or
-                    (wnd.document.buf[pos] == '\n' and wnd.document.buf[pos + 1] == '\n')
-                ) and
-                isinstance(wnd.document.mode.tokenizer.get_token_at(wnd.document, pos), DefaultToken)
-            )
-        ):
-            break
-
-        rows.add(wnd.document.gettol(pos))
-
-    return list(sorted(rows))
-
-
-def get_expression_under_cursor(wnd: TextEditorWindow) -> str:
-    line = ''
-    for row in get_current_sql_rows_pos(wnd):
-        _, sel = wnd.screen.document.getline(row)
-        if sel:
-            line += sel
-
-    return line
-
-
-def print_center(window: curses.window, text: str):
-    num_rows, num_cols = window.getmaxyx()
-    x = num_cols // 2 - len(text) // 2
-    y = num_rows // 2
-    window.addstr(y, x, text)
-    window.refresh()
-
-
 class SyncClient:
     def __init__(self, asyncloop_th, async_client):
         self.asyncloop_thread = asyncloop_th
@@ -292,292 +126,211 @@ class SyncClient:
                 task.cancel()
 
 
-def await_and_print_time(
-        wnd: TextEditorWindow,
-        coro: asyncio.coroutines
-) -> Result:
-    start = time.time()
-
-    posy, _ = wnd.get_cursor_loc()
-
-    win = curses.newwin(3, 50, max(posy - 3, 0), 5)
-
-    task = asyncloop_thread.submit(coro)
-
-    while time.time() - start < 0.3:
-        time.sleep(0.1)
-        if task.is_done():
-            return task.result()
-
-    try:
-        win.box()
-
-        while not task.is_done():
-            wnd.mainframe._cwnd.timeout(0)
-            key = wnd.mainframe._cwnd.getch()
-
-            if key == 27:
-                task.cancel()
-
-            print_center(win, f'Running (press ESC to cancel): {round(time.time() - start, 2)}s'.ljust(45, ' '))
-
-            time.sleep(0.1)
-    finally:
-        del win
-    return task.result()
+def print_center(window: curses.window, text: str):
+    num_rows, num_cols = window.getmaxyx()
+    x = num_cols // 2 - len(text) // 2
+    y = num_rows // 2
+    window.addstr(y, x, text)
+    window.refresh()
 
 
-def fix_visidata_curses():
-    try:
-        curses.endwin()
-    except Exception:
-        pass
+def get_sql_rows(buf) -> list:
+    """Return sorted list of row indices that form the SQL statement under the cursor."""
+    lines = buf.lines
+    row = buf.cursor_row
+    stripped = lines[row].strip()
 
-    if visidata.color.colors.color_pairs:
-        for (fg, bg), (pairnum, _) in visidata.color.colors.color_pairs.items():
-            curses.init_pair(pairnum, fg, bg)
-
-
-def fix_kaa_curses(wnd: TextEditorWindow):
-    try:
-        curses.endwin()
-    except Exception:
-        pass
-
-    kaa.app.show_cursor(1)
-
-    for pairnum, (fg, bg) in enumerate(kaa.app.colors.pairs.keys()):
-        curses.init_pair(pairnum, fg, bg)
-
-    wnd.draw_screen(force=True)
-
-
-def get_word_parts(wnd: TextEditorWindow) -> list[str]:
-    """Get database name from the current editor context"""
-    pos = wnd.cursor.pos
-
-    while (
-        pos >= 0 and (
-            wnd.document.buf[pos - 1].isalnum() or
-            wnd.document.buf[pos - 1] == '_' or
-            wnd.document.buf[pos - 1] == '.'
-        )
-    ):
-        pos -= 1
-
-    string = wnd.document.gettext(pos, wnd.cursor.pos).strip()
-
-    if not string:
+    # Cursor is on a blank/separator/comment line — nothing to highlight
+    if not stripped or stripped == ';' or stripped.startswith('#'):
         return []
 
-    return string.split('.')
+    # dot-command — single line only
+    if stripped.startswith('.') and not stripped.startswith('--'):
+        return [row]
+
+    def is_separator(i):
+        s = lines[i].strip()
+        return not s or s == ';' or s.startswith('#')
+
+    start = row
+    while start > 0 and not is_separator(start - 1):
+        start -= 1
+
+    end = row
+    while end < len(lines) - 1 and not is_separator(end + 1):
+        if lines[end].rstrip().endswith(';'):
+            break
+        end += 1
+
+    return list(range(start, end + 1))
 
 
-def run_corutine_and_show_result(wnd: TextEditorWindow, coro: asyncio.coroutines):
-    start = time.time()
-    end = None
-    message = ''
-
-    try:
-        try:
-            result = await_and_print_time(wnd, coro)
-        except asyncio.CancelledError:
-            end = time.time()
-            message = 'Cancelled'
-            return
-
-        end = time.time()
-        message = str(result)
-
-        if not result or not result.data:
-            return
-
-        fix_visidata_curses()
-
-        visidata.vd.view(result.data)
-    except Exception as exc:
-        end = time.time()
-        message = str(exc)
-
-        if not client.is_db_error_exception(exc):
-            message = "".join(traceback.format_exception(exc))
-
-        msgboxmode.MsgBoxMode.show_msgbox(
-            message, ['&Ok'], lambda c: c,
-                ['\r', '\n', '\x1b'],
-                border=True
-        )
-    finally:
-        wnd.document.set_title(client.get_title())
-        kaa.app.messagebar.set_message(f'{round(end - start, 2)}s {message}')
-        fix_kaa_curses(wnd)
+def get_expression_under_cursor(buf) -> str:
+    return '\n'.join(buf.lines[i] for i in get_sql_rows(buf))
 
 
-@command('db.query')
-def db_query(wnd: TextEditorWindow):
-    sel = get_sel(wnd)
-
-    if not sel:
-        sel = get_expression_under_cursor(wnd)
-
-    if not sel or not sel.strip():
-        kaa.app.messagebar.set_message("Nothing to execute")
-        return
-
-    selection = sel.strip()
-    run_corutine_and_show_result(wnd, client.execute(selection))
+def get_word_parts(buf) -> list:
+    """Return dot-separated identifier parts ending at the cursor."""
+    line = buf.lines[buf.cursor_row]
+    col = buf.cursor_col
+    i = col
+    while i > 0 and (line[i - 1].isalnum() or line[i - 1] in ('_', '.')):
+        i -= 1
+    fragment = line[i:col].strip()
+    return fragment.split('.') if fragment else []
 
 
-@command('db.show_prediction')
-def show_prediction(wnd: TextEditorWindow):
-    try:
-        from_pos = None
-        to_pos = None
-        word = ''
-
-        res = wnd.document.mode.get_word_at(wnd.cursor.pos)
-
-        if wnd.document.gettol(wnd.cursor.pos) == '.':
-            res = wnd.document.mode.get_word_at(wnd.cursor.pos - 1)
-
-        if res:
-            from_pos, to_pos, _ = res
-            if from_pos != to_pos:
-                word = wnd.document.gettext(from_pos, to_pos)
-
-        if word == '.':
-            word = ''
-            from_pos = None
-            to_pos = None
-
-        parts = get_word_parts(wnd)
-
-        candidates = await_and_print_time(wnd, autocomplete.get_suggestions(parts))
-
-        def callback(result):
-            if not result:
-                return
-
-            type_idx = operator.indexOf(reversed(result), '(') + 2
-            result = result[:-type_idx]
-
-            pos = wnd.cursor.pos
-
-            if from_pos is not None and from_pos < pos:
-                wnd.cursor.left(word=True)
-
-                wnd.document.mode.delete_string(wnd, from_pos, to_pos)
-
-            wnd.document.mode.put_string(wnd, result)
-            return
-
-        show_listdlg('Select', candidates, callback)
-    except Exception as exc:
-        message = "".join(traceback.format_exception(exc))
-        msgboxmode.MsgBoxMode.show_msgbox(
-            message, ['&Ok'], lambda c: c,
-                ['\r', '\n', '\x1b'],
-                border=True
-        )
+DB_HELP_EXTRA = """
+Database
+  Alt+R               Execute query at cursor (or selection)
+  Alt+1               DB autocomplete (tables, columns, functions)
+  Alt+T               Browse tables
+  Alt+E               Browse databases
+  Esc                 Cancel running query\n\n"""
 
 
+class DbEditor(Editor):
+    def __init__(self, stdscr, filepath=None):
+        super().__init__(stdscr, filepath)
+        self.add_keybinding(('alt', 'r'), lambda e: e._db_query())
+        self.add_keybinding(('alt', 't'), lambda e: e._db_show_tables())
+        self.add_keybinding(('alt', 'e'), lambda e: e._db_show_databases())
+        self.add_keybinding(('alt', '1'), lambda e: e._db_show_prediction())
+        if client:
+            self.set_status_name(client.get_title())
+            self.set_words(keywords=client.all_commands, functions=client.all_functions)
 
-@command('db.show_tables')
-def db_show_tables(wnd: TextEditorWindow):
-    try:
-        fix_visidata_curses()
-        visidata.vd.run(TablesSheet(
-                client=SyncClient(asyncloop_thread, client), db=getattr(client, 'dbname', None)
+    def _help_text(self) -> str:
+        return DB_HELP_EXTRA + EDITOR_HELP
+
+    def on_before_draw(self):
+        rows = get_sql_rows(self.buf)
+        if rows:
+            self.set_cursor_line(
+                rows[0] - self.buf.cursor_row,
+                rows[-1] - self.buf.cursor_row + 1,
             )
-        )
-    finally:
-        fix_kaa_curses(wnd)
+        else:
+            self.set_cursor_line(0, 0)
 
+    def _fix_curses_after_visidata(self) -> None:
+        try:
+            curses.endwin()
+        except Exception:
+            pass
 
-@command('db.show_databases')
-def db_show_databases(wnd: TextEditorWindow):
-    try:
-        fix_visidata_curses()
-        visidata.vd.run(DataBaseSheet(client=SyncClient(asyncloop_thread, client)))
-    finally:
-        fix_kaa_curses(wnd)
+        try:
+            curses.curs_set(1)        # visidata hides the cursor; restore it
+        except curses.error:
+            pass
 
+        self.stdscr.clearok(True)
+        self.stdscr.refresh()         # re-enter curses mode before drawing
+        self.renderer.resize()
+        self.lexer.invalidate(0)
 
-def on_keypressed(
-        self: DefaultMode,
-        original_fn: Callable,
-        wnd: TextEditorWindow,
-        event: KeyEvent,
-        key: Optional[str],
-        commands: list[str],
-        candidate: list[tuple]
-):
-    pos = wnd.cursor.pos
-    tol = wnd.document.gettol(pos)
-    wnd.document.marks['current_script'] = (0, tol)
-    wnd.document.style_updated()
-    wnd.document.set_title(client.get_title())
-    return original_fn(wnd, event, key, commands, candidate)
+    def _fix_visidata_curses(self) -> None:
+        try:
+            curses.endwin()
+        except Exception:
+            pass
+        if visidata.color.colors.color_pairs:
+            for (fg, bg), (pairnum, _) in visidata.color.colors.color_pairs.items():
+                curses.init_pair(pairnum, fg, bg)
 
+    def _fix_curses_after_visidata(self) -> None:
+        try:
+            curses.endwin()
+        except Exception:
+            pass
 
-def on_cursor_located(
-        self: DefaultMode,
-        original_fn: Callable,
-        wnd: TextEditorWindow,
-        *args, **kwargs
-):
-    wnd.document.highlights = []
-    for id, row_pos in enumerate(get_current_sql_rows_pos(wnd)):
-        wnd.document.highlights.append(
-            row_pos
-        )
-    return original_fn(wnd, *args, **kwargs)
+        try:
+            curses.curs_set(1)        # visidata hides the cursor; restore it
+        except curses.error:
+            pass
 
+        self.colors.reset()
+        # self.stdscr.clearok(True)
+        # self.stdscr.refresh()         # re-enter curses mode before drawing
+        # self.renderer.resize()
+        # self.lexer.invalidate(0)
 
-def get_line_overlays(self: DefaultMode, original_fn: Callable) -> dict[int, str]:
-    highlights = {}
-    highlights.update(original_fn())
+    def _db_query(self):
+        sel = self.buf.get_selected_text() if self.buf.has_selection() else ''
+        if not sel:
+            sel = get_expression_under_cursor(self.buf)
+        if not sel or not sel.strip():
+            self.set_status_notification('Nothing to execute')
+            return
+        start = time.time()
+        task = asyncloop_thread.submit(client.execute(sel.strip()))
 
-    if not hasattr(self.document, 'highlights'):
-        self.document.highlights = []
+        def on_done():
+            end = time.time()
+            message = ''
+            try:
+                if self.running_popup.cancelled:
+                    message = 'Cancelled'
+                    return
+                result = task.result()
+                message = str(result)
+                if not result or not result.data:
+                    return
+                self._fix_visidata_curses()
+                visidata.vd.view(result.data)
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                message = 'Cancelled'
+            except Exception as exc:
+                if client.is_db_error_exception(exc):
+                    message = str(exc)
+                else:
+                    message = ''.join(traceback.format_exception(exc))
+                self.show_popup('Error', message)
+            finally:
+                self.set_status_name(client.get_title())
+                self.set_status_notification(f'{round(end - start, 2)}s  {message[:80]}')
+                self._fix_curses_after_visidata()
 
-    for pos in self.document.highlights:
-        highlights[pos] = 'cursor-row'
+        self.open_running_popup(task, start, on_done)
 
-    return highlights
+    def _db_show_prediction(self):
+        parts = get_word_parts(self.buf)
+        task = asyncloop_thread.submit(autocomplete.get_suggestions(parts))
+        start = time.time()
 
+        def on_done():
+            if self.running_popup.cancelled:
+                return
+            try:
+                candidates = task.result()
+            except Exception as exc:
+                self.show_popup('Error', str(exc))
+                return
+            items = []
+            for c in candidates:
+                paren = c.rfind(' (')
+                insert = c[:paren] if paren != -1 else c
+                items.append((c, insert, 0))
+            self.show_autocomplete(items)
 
-def setup_editor():
-    @setup('kaa.filetype.default.defaultmode.DefaultMode')
-    def editor(mode: DefaultMode):
-        # register command to the mode
-        mode.add_command(db_query)
-        mode.add_command(db_show_tables)
-        mode.add_command(db_show_databases)
-        mode.on_keypressed = partial(on_keypressed, mode, mode.on_keypressed)
-        # To determine sql expression under current cursor after each key press
-        mode.on_cursor_located = partial(on_cursor_located, mode, mode.on_cursor_located)
-        # To highligt lines determined in on_cursor_located
-        mode.get_line_overlays = partial(get_line_overlays, mode, mode.get_line_overlays)
+        self.open_running_popup(task, start, on_done)
 
+    def _db_show_tables(self):
+        try:
+            self._fix_visidata_curses()
+            visidata.vd.run(TablesSheet(
+                client=SyncClient(asyncloop_thread, client),
+                db=getattr(client, 'dbname', None),
+            ))
+        finally:
+            self._fix_curses_after_visidata()
 
-        # add key bind th execute 'run.query'
-        mode.add_keybinds(keys={
-            (alt, '1'): 'db.show_prediction',
-            (alt, 'r'): 'db.query',
-            (alt, 't'): 'db.show_tables',
-            (alt, 'e'): 'db.show_databases',
-            (ctrl, 's'): 'file.save',
-            (ctrl, 'f'): 'search.showsearch',
-            (ctrl, 'r'): 'search.showreplace',
-            (ctrl, 'q'): 'file.quit',
-            (alt, backspace): 'edit.backspace.word'
-        })
-
-        mode.SHOW_LINENO = True
-        # Syntax highlight
-        mode.tokenizer = make_tokenizer(client)
-        mode.themes.append(sql_editor_themes)
+    def _db_show_databases(self):
+        try:
+            self._fix_visidata_curses()
+            visidata.vd.run(DataBaseSheet(client=SyncClient(asyncloop_thread, client)))
+        finally:
+            self._fix_curses_after_visidata()
 
 
 def main():
@@ -585,23 +338,22 @@ def main():
     global autocomplete
     global asyncloop_thread
 
-    args_parser = build_parser()
-
-    args_parser.description = 'DB connection tool'
-    args_parser.add_argument('--config', '-c', dest='config', help='specify config path', default='')
-    args_parser.add_argument('--host', '-H', dest='host', help='specify host name', default='')
-    args_parser.add_argument('--unix-socket', '-S', dest='unix_socket', help='specify unix socket', default=None)
-    args_parser.add_argument('--user', '-u', dest='user', help='specify user name', required=False)
-    args_parser.add_argument('--password', '-p', dest='password', default='', help='specify raw password')
-    args_parser.add_argument('--port', '-P', dest='port', default='', help='specify port')
-    args_parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=False,
+    parser = argparse.ArgumentParser(description='DB connection tool')
+    parser.add_argument('filepath', nargs='?', default=None, help='SQL file to edit')
+    parser.add_argument('--config', '-c', dest='config', help='specify config path', default='')
+    parser.add_argument('--host', '-H', dest='host', help='specify host name', default='')
+    parser.add_argument('--unix-socket', '-S', dest='unix_socket', help='specify unix socket', default=None)
+    parser.add_argument('--user', '-u', dest='user', help='specify user name', required=False)
+    parser.add_argument('--password', '-p', dest='password', default='', help='specify raw password')
+    parser.add_argument('--port', '-P', dest='port', default='', help='specify port')
+    parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=False,
         choices=['clickhouse', 'mysql', 'postgres', 'sqlite3'])
-    args_parser.add_argument('--dbname', '-d', dest='dbname', help='specify db name', required=False)
-    args_parser.add_argument('--filepath', '-f', dest='filepath', help='specify db filepath', required=False)
-    args_parser.add_argument('--no-compress', dest='compress', action='store_false', default=True,
+    parser.add_argument('--dbname', '-d', dest='dbname', help='specify db name', required=False)
+    parser.add_argument('--filepath', '-f', dest='dbfilepath', help='specify db filepath', required=False)
+    parser.add_argument('--no-compress', dest='compress', action='store_false', default=True,
         help='disable compression for ClickHouse')
 
-    args = args_parser.parse_args()
+    args = parser.parse_args()
 
     host = args.host
     username = args.user
@@ -613,7 +365,7 @@ def main():
     port = args.port
     engine = args.engine
     dbname = args.dbname
-    filepath = args.filepath
+    filepath = args.dbfilepath
     compress = args.compress
     unix_socket = args.unix_socket
 
@@ -652,20 +404,18 @@ def main():
         client = Sqlite3Client(filepath)
 
     if not client:
-        args_parser.print_help(sys.stderr)
+        parser.print_help(sys.stderr)
         print('Invalid engine specified')
         sys.exit(1)
 
     autocomplete = AutoComplete(client)
 
-    setup_editor()
-
     asyncloop_thread = AsyncLoopThread(daemon=True)
     asyncloop_thread.start()
 
-    kaa.cui.main.opt = args
-    kaa.cui.main._init_term()
-    curses.wrapper(kaa.cui.main.main)
+    locale.setlocale(locale.LC_ALL, '')
+    os.environ.setdefault('ESCDELAY', '25')
+    curses.wrapper(lambda stdscr: DbEditor(stdscr, args.filepath).run())
 
 
 if __name__ == '__main__':

@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 import clickhouse_connect
@@ -7,6 +8,9 @@ from .base import (
     ClientClass,
     Result
 )
+
+
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 
 
 class ClickhouseClient(ClientClass):
