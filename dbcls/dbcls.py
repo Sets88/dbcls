@@ -11,10 +11,7 @@ from functools import partial
 import time
 from typing import Optional
 import logging
-import warnings
 from queue import LifoQueue
-
-warnings.filterwarnings('ignore')
 
 import visidata
 
@@ -30,9 +27,6 @@ autocomplete: Optional[AutoComplete] = None
 asyncloop_thread = None
 
 logging.basicConfig(level=logging.ERROR)
-logging.captureWarnings(True)
-logging.getLogger('py.warnings').addHandler(logging.NullHandler())
-logging.getLogger('py.warnings').propagate = False
 
 
 class Task:
