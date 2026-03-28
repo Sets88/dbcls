@@ -1,6 +1,8 @@
+from datetime import datetime, timezone
 import time
 from .utils import prettify
 from copy import deepcopy
+from typing import Union
 
 from visidata import VisiData, Sheet, PyobjSheet, Column, ColumnItem, TypedExceptionWrapper
 from visidata import asyncthread, ENTER, AttrDict, deduceType, Progress
@@ -261,6 +263,22 @@ def save_sql(vd, p, *vsheets):
                     prog.addProgress(1)
 
             vd.status(f'Saved {vs.nRows} row(s) as SQL INSERT to {p.given}')
+
+
+@VisiData.api
+def ts_to_dt_utc(_, ts: Union[str, float, int]) -> datetime:
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).replace(tzinfo=None)
+
+
+@VisiData.api
+def dt_to_start_of_inteval(_, dt: datetime, interval: int) -> datetime:
+    return datetime.fromtimestamp(dt.timestamp() - (dt.timestamp() % interval))
+
+
+@VisiData.api
+def ts_to_start_of_inteval(_, ts: Union[str, float, int], interval: int) -> datetime:
+    type_ts = type(ts)
+    return type_ts(float(ts) - (float(ts) % interval))
 
 
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')

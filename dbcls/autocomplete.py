@@ -106,6 +106,9 @@ class AutoComplete:
 
         return columns
 
+    async def get_all_functions(self) -> list[str]:
+        return self.client.all_functions
+
     async def get_suggestions(self, parts: list[str]) -> list[str]:
         part1 = None
         part2 = None
@@ -124,6 +127,10 @@ class AutoComplete:
             part2 = parts[1]
 
         suggestions = [f"{x} (COMMAND)" for x in self.client.all_commands]
+
+        functions_list = await self.get_all_functions()
+        if functions_list:
+            suggestions += [f"{x} (FUNCTION)" for x in functions_list]
 
         if part1 is None:
             databases_list = await self.get_cached_databases()

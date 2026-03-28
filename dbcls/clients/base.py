@@ -47,8 +47,9 @@ class ClientClass(abc.ABC):
         'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WHERE', 'TRUNCATE', 'USE', 'SHOW', 'DESCRIBE',
         'EXPLAIN', 'DESC', 'RENAME', 'GRANT', 'REVOKE', 'SET', 'BEGIN', 'COMMIT', 'ROLLBACK', 'ANALYZE', 'OPTIMIZE',
         'KILL', 'FROM', 'GROUP BY', 'ORDER BY', 'LIMIT', 'OFFSET', 'HAVING', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN',
-        'FULL JOIN', 'INNER JOIN', 'OUTER JOIN', 'CROSS JOIN', 'ON', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN',
-        'PARTITION BY', 'WITH', 'TABLE', 'OF', 'OPTIMIZE', 'INTERVAL', 'AS', 'DISTINCT', 'COLUMN'
+        'JOIN', 'JOIN', 'ON', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN', 'OUTER', 'CROSS', 'FULL', 'INNER',
+        'PARTITION BY', 'WITH', 'TABLE', 'OF', 'OPTIMIZE', 'INTERVAL', 'AS', 'DISTINCT', 'COLUMN', 'NULL', 'IS',
+        'UNION', 'ALL', 'ANY', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END'
     ]
 
     SQL_COMMON_FUNCTIONS = [
