@@ -79,7 +79,7 @@ class PostgresClient(ClientClass):
         sql = "SELECT datname AS database FROM pg_database;"
         return await self.execute(sql)
 
-    def get_sampla_data_sql(self,
+    def get_sample_data_sql(self,
         table: str,
         database: Optional[str] = None,
     ):
@@ -232,15 +232,6 @@ class PostgresClient(ClientClass):
                 create_table_query += f"\n\nCREATE TABLE {partition[0]} PARTITION OF {table_name}\n    {partition[1]};"
 
         return Result(data=[{'schema': create_table_query}], rowcount=1)
-
-    async def command_use(self, command: CommandParams):
-        return await self.change_database(command.params)
-
-    async def command_tables(self, command: CommandParams):
-        return await self.get_tables()
-
-    async def command_databases(self, command: CommandParams):
-        return await self.get_databases()
 
     async def command_schema(self, command: CommandParams):
         table_name = command.params

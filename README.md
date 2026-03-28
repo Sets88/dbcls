@@ -7,7 +7,7 @@ DbCls is a powerful database client that combines the functionality of a SQL edi
 - SQL query editing with syntax highlighting
 - Direct query execution from the editor
 - Data visualization with interactive tables
-- Support for multiple database engines (MySQL, PostgreSQL, ClickHouse)
+- Support for multiple database engines (MySQL, PostgreSQL, ClickHouse, SQLite)
 - Configuration via command line or config file
 - Table schema inspection
 - Database and table browsing
@@ -41,8 +41,9 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-H, --host` | Database host address |
 | `-u, --user` | Database username |
 | `-p, --password` | Database password |
-| `-E, --engine` | Database engine (mysql, postgresql, clickhouse) |
-| `-d, --database` | Database name |
+| `-E, --engine` | Database engine (mysql, postgres, clickhouse, sqlite3) |
+| `-d, --dbname` | Database name |
+| `-f, --filepath` | Database file path (SQLite only) |
 | `-P, --port` | Port number (optional) |
 | `-S, --unix-socket` | Path to Unix socket file (optional, overrides host/port) |
 | `-c, --config` | Path to configuration file |
@@ -89,7 +90,7 @@ CONFIG='{
 dbcls -c <(echo "$CONFIG") mydb.sql
 ```
 
-## Editor Commands (kaaedit)
+## Editor Commands
 
 ### Hotkeys
 
@@ -101,8 +102,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Alt + t` | Show tables list with schema and sample data options |
 | `Ctrl + q` | Quit application |
 | `Ctrl + s` | Save file |
-
-For more kaaedit hotkeys, visit: https://github.com/kaaedit/kaa
+| `Ctrl + h` / `F1` | Show all available hotkeys |
 
 ### Navigation in Database and Table Listings
 

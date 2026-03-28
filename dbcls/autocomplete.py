@@ -23,14 +23,15 @@ class DbStructureCache:
         }
 
     def get(self, database: str = None, table: str = None) -> list[str]:
+        now = time()
         if database is None:
-            if not self.cache['databases'] or time() - self.cache['databases'].get('last_updated', 0) > self.CACHE_TTL:
+            if not self.cache['databases'] or now - self.cache['databases'].get('last_updated', 0) > self.CACHE_TTL:
                 return None
             return self.cache['databases']['list']
         if table is None:
             if (
                 database in self.cache['tables'] and
-                time() - self.cache['tables'].get(database, {}).get('last_updated', 0) > self.CACHE_TTL
+                now - self.cache['tables'].get(database, {}).get('last_updated', 0) > self.CACHE_TTL
             ):
                 return None
 
@@ -39,7 +40,7 @@ class DbStructureCache:
         if (
             database not in self.cache['columns'] or
             table not in self.cache['columns'][database] or
-            time() - self.cache['columns'][database][table].get('last_updated', 0) > self.CACHE_TTL
+            now - self.cache['columns'][database][table].get('last_updated', 0) > self.CACHE_TTL
         ):
             return None
 

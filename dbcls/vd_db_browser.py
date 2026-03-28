@@ -79,7 +79,7 @@ class TableSampleDataSheet(Sheet):
     def get_sample_base_sql(self, table: str, db: str):
         if self.CUSTOM_SQL:
             return self.CUSTOM_SQL
-        return self.client.get_sampla_data_sql(table, db)
+        return self.client.get_sample_data_sql(table, db)
 
     def update_current_sql(self, sql: str):
         self.CUSTOM_SQL = sql

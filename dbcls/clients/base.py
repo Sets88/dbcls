@@ -95,15 +95,19 @@ class ClientClass(abc.ABC):
     def is_db_error_exception(self, exc: Exception) -> bool:
         pass
 
-    def get_internal_command_params(self, sql: str) -> list[str]:
+    def get_internal_command_params(self, sql: str) -> Optional[CommandParams]:
         command = sql.strip().rstrip(';')
         if not command or not command.startswith('.'):
-            return
+            return None
 
-        command, params = COMMAND_RE.match(command).groups()
+        match = COMMAND_RE.match(command)
+        if not match:
+            return None
+
+        command, params = match.groups()
         command = command.lower()
         if command not in self.COMMANDS:
-            return
+            return None
 
         return CommandParams(command, params)
 
@@ -115,6 +119,15 @@ class ClientClass(abc.ABC):
 
         if hasattr(self, f'command_{command.command}'):
             return await getattr(self, f'command_{command.command}')(command)
+
+    async def command_use(self, command: CommandParams):
+        return await self.change_database(command.params)
+
+    async def command_tables(self, command: CommandParams):
+        return await self.get_tables()
+
+    async def command_databases(self, command: CommandParams):
+        return await self.get_databases()
 
     async def change_database(self, database: str):
         old_db = self.dbname

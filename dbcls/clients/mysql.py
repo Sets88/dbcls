@@ -85,7 +85,7 @@ class MysqlClient(ClientClass):
             result.data = [{'schema': list(x.values())[-1]} for x in result.data]
         return result
 
-    def get_sampla_data_sql(self,
+    def get_sample_data_sql(self,
         table: str,
         database: Optional[str] = None,
     ):
@@ -93,15 +93,6 @@ class MysqlClient(ClientClass):
 
     def get_limit_sql(self, limit: int, offset: int = 0):
         return f'LIMIT {offset},{limit}'
-
-    async def command_use(self, command: CommandParams):
-        return await self.change_database(command.params)
-
-    async def command_tables(self, command: CommandParams):
-        return await self.get_tables()
-
-    async def command_databases(self, command: CommandParams):
-        return await self.get_databases()
 
     async def command_schema(self, command: CommandParams):
         table = command.params

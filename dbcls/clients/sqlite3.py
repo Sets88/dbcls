@@ -24,7 +24,7 @@ class Sqlite3Client(ClientClass):
             "SELECT name AS 'table', '%s' AS database FROM sqlite_master WHERE type='table';" % self.dbname
         )
 
-    def get_sampla_data_sql(self,
+    def get_sample_data_sql(self,
         table: str,
         database: Optional[str] = None,
     ):

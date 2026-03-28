@@ -73,11 +73,12 @@ def prettify_number(number):
     # Format integer part
     integer_part = parts[0]
     # Insert spaces from right to left, every 3 digits
-    formatted_integer = ''
+    parts_list = []
     for i, digit in enumerate(reversed(integer_part)):
         if i > 0 and i % 3 == 0:
-            formatted_integer = ' ' + formatted_integer
-        formatted_integer = digit + formatted_integer
+            parts_list.append(' ')
+        parts_list.append(digit)
+    formatted_integer = ''.join(reversed(parts_list))
 
     # Add decimal part if it exists
     if len(parts) > 1:
