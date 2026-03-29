@@ -21,7 +21,7 @@ Navigation
   Ctrl+Left / Right       Move by word
   Alt+Left / Right        Move by word (alternate)
   Home / End              Line start / end
-  Ctrl+A / Cmd + Left     Line start
+  Ctrl+A / Cmd+Left       Line start
   Ctrl+E / Cmd + Right    Line end
   Ctrl+Home               File start
   Ctrl+End                File end
@@ -32,6 +32,7 @@ Selection
   Shift+Ctrl+Left/Right   Select by word
   Shift+Alt+Left/Right    Select by word (alternate)
   Shift+Home / End        Select to line start / end
+  Cmd+Shift+Left / Right  Select to line start / end
   Shift+Page Up / Down    Select by page
   Esc+Ctrl+A              Select all
 
@@ -46,7 +47,7 @@ Editing
 
 File
   Ctrl+S                  Save
-  Ctrl+O                  Open file
+  Ctrl+G                  Open file / browse directory files
   Ctrl+Q                  Quit
 
 Search
@@ -281,7 +282,7 @@ class Lexer:
                 continue
 
             # Line comments: -- (SQL), # (MySQL/shell style)
-            if line[pos:pos+2] == '--' or line[pos] == '#':
+            if line[pos:pos+3] == '-- ' or line[pos] == '#':
                 push(pos, n, 'comment')
                 pos = n
                 continue
@@ -963,11 +964,14 @@ class AutocompletePopup:
         self.filtered: List[Tuple[str, str, int]] = []
         self.selected_idx = 0
         self.scroll_offset = 0
+        self._on_select = None
 
-    def open(self, items: 'List[Tuple[str, str, int]]', filter_text: str = '') -> None:
+    def open(self, items: 'List[Tuple[str, str, int]]', filter_text: str = '',
+             on_select=None) -> None:
         self.active = True
         self.items = list(items)
         self.filter_text = filter_text
+        self._on_select = on_select
         self._refilter()
 
     def close(self):
@@ -976,6 +980,7 @@ class AutocompletePopup:
         self.filtered = []
         self.selected_idx = 0
         self.scroll_offset = 0
+        self._on_select = None
 
     def _refilter(self):
         q = self.filter_text.upper()
@@ -1202,6 +1207,7 @@ class Renderer:
         self.debug_text = ''
         self.status_name: Optional[str] = None
         self.status_notification: Optional[str] = None
+        self.directory_label: Optional[str] = None
         self.cursor_line_range: tuple = (0, 1)
         self.resize()
 
@@ -1210,7 +1216,7 @@ class Renderer:
 
     @property
     def text_rows(self) -> int:
-        # Reserve 2 rows: 1 for status bar, 1 for search bar (always)
+        # Reserve 2 rows: status bar + filename/search bar
         return max(1, self._height - 2)
 
     @property
@@ -1241,6 +1247,8 @@ class Renderer:
         self._draw_text_area()
         if search and search.active:
             self._draw_search_bar(search)
+        else:
+            self._draw_filename_bar()
         if popup and popup.active:
             popup.draw(self.stdscr, self.colors, self._height, self._width)
         if running_popup and running_popup.active:
@@ -1427,21 +1435,28 @@ class Renderer:
         bar = bar.ljust(W)
         self._safe_addstr(y, 0, bar, curses.color_pair(colors.status_bar))
 
+    def _draw_filename_bar(self):
+        y = self._height - 2
+        W = self._width
+        buf = self.buf
+        colors = self.colors
+        filepath = os.path.basename(buf.filepath) if buf.filepath else '[No Name]'
+        dirty = '*' if buf.dirty else ''
+        bar = f' {filepath}{dirty} '.ljust(W)[:W]
+        self._safe_addstr(y, 0, bar, curses.color_pair(colors.status_bar))
+
     def _draw_status_bar(self, search: Optional['SearchBar'] = None):
         y = self._height - 1
         W = self._width
         buf = self.buf
         colors = self.colors
-        raw_name = self.status_name if self.status_name is not None else (buf.filepath if buf.filepath else '[No Name]')
-        name = raw_name if self.status_name is not None else os.path.basename(raw_name)
-        dirty = '*' if buf.dirty else ' '
         ln = buf.cursor_row + 1
         col = buf.cursor_col + 1
         total_lines = len(buf.lines)
-        left = f' {name}{dirty} '
+        conn = f' {self.status_name} ' if self.status_name else ' '
         right = f' Ln {ln}/{total_lines}  Col {col} '
         hints = '^H/F1 Help ^S Save ^F Find ^N AC ^K Mark ^Z Undo ^Q Quit'
-        mid_space = W - len(left) - len(right)
+        mid_space = W - len(conn) - len(right)
         if mid_space > len(hints):
             mid = hints.center(mid_space)
         elif mid_space > 0:
@@ -1453,14 +1468,14 @@ class Renderer:
         elif self.debug_text:
             bar = f' [DBG] {self.debug_text} '.ljust(W)[:W]
         else:
-            bar = (left + mid + right)[:W]
+            bar = (conn + mid + right)[:W]
             bar = bar.ljust(W)
         self._safe_addstr(y, 0, bar, curses.color_pair(colors.status_bar))
 
 
 # ─── Editor ───────────────────────────────────────────────────────────────────
 class Editor:
-    def __init__(self, stdscr, filepath: Optional[str] = None):
+    def __init__(self, stdscr, filepath: Optional[str] = None, directory: Optional[str] = None):
         self.stdscr = stdscr
         stdscr.keypad(True)
         stdscr.timeout(50)
@@ -1490,18 +1505,8 @@ class Editor:
                     curses.define_key(seq, code)
                 except Exception:
                     pass
-        # Disable terminal signal generation and flow control so Ctrl+C/Z/S/Q
-        # reach the app instead of being intercepted by the TTY driver.
-        try:
-            fd = sys.stdin.fileno()
-            attrs = termios.tcgetattr(fd)
-            attrs[0] &= ~termios.IXON    # disable Ctrl+S freeze
-            attrs[0] &= ~termios.IXOFF   # disable Ctrl+Q resume
-            attrs[3] &= ~termios.ISIG    # disable SIGINT/SIGTSTP from Ctrl+C/Z
-            attrs[6][termios.VLNEXT] = 0 # disable Ctrl+V literal-next
-            termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        except Exception:
-            pass
+        self._apply_termios()
+
 
         self.colors = ColorManager()
         self.buf = TextBuffer()
@@ -1520,8 +1525,30 @@ class Editor:
         self._running_done_cb = None
         self._init_ac_words([], [], [])
 
+        self._directory: Optional[str] = directory
+        if directory:
+            self.renderer.directory_label = os.path.basename(directory)
+
         if filepath:
             self.buf.load(filepath)
+            # If no explicit directory was given, default to the file's parent directory
+            if not self._directory:
+                self._directory = os.path.dirname(os.path.abspath(filepath))
+
+    @staticmethod
+    def _apply_termios():
+        """Disable terminal signal generation and flow control so Ctrl+C/Z/S/Q
+        reach the app instead of being intercepted by the TTY driver."""
+        try:
+            fd = sys.stdin.fileno()
+            attrs = termios.tcgetattr(fd)
+            attrs[0] &= ~termios.IXON    # disable Ctrl+S freeze
+            attrs[0] &= ~termios.IXOFF   # disable Ctrl+Q resume
+            attrs[3] &= ~termios.ISIG    # disable SIGINT/SIGTSTP from Ctrl+C/Z
+            attrs[6][termios.VLNEXT] = 0 # disable Ctrl+V literal-next
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass
 
     def _init_ac_words(self, keywords, types, functions) -> None:
         entries, seen = [], set()
@@ -1720,9 +1747,16 @@ class Editor:
             if action == 'insert':
                 word = self.popup.selected_word()
                 if word:
-                    self.buf.delete_word_before_cursor()
-                    self.buf.insert_text(word)
-                self.popup.close()
+                    if self.popup._on_select:
+                        on_select = self.popup._on_select
+                        self.popup.close()
+                        on_select(word)
+                    else:
+                        self.buf.delete_word_before_cursor()
+                        self.buf.insert_text(word)
+                        self.popup.close()
+                else:
+                    self.popup.close()
             elif action == 'cancel':
                 self.popup.close()
             return
@@ -1823,8 +1857,10 @@ class Editor:
             buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]))
 
         # ── Ctrl shortcuts ────────────────────────────────────────────────────
-        elif key == ord('\x01'):  # Ctrl+A / Super+Left → Home
+        elif key == ord('\x01'):  # Ctrl+A / Cmd+Left → line start
             buf.move_cursor(buf.cursor_row, 0)
+        elif key == ord('\x07'):  # Ctrl+G → open file / browse directory
+            self._open_from_directory()
         elif key == ord('\x05'):  # Ctrl+E / Super+Right → End
             buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]))
         elif key == ord('\x03'):  # Ctrl+C
@@ -1847,8 +1883,6 @@ class Editor:
             self.lexer.invalidate(0)
         elif key == ord('\x13'):  # Ctrl+S
             self._save_file()
-        elif key == ord('\x0f'):  # Ctrl+O
-            self._open_file()
         elif key == ord('\x06'):  # Ctrl+F
             self.search.open()
         elif key in (ord('\x0e'), ord('\x00')):  # Ctrl+N or Ctrl+Space
@@ -1912,6 +1946,24 @@ class Editor:
                 buf.move_word_right()
             elif nk in (1, '\x01'):  # ESC+Ctrl+A → Select All
                 buf.select_all()
+            elif nk in (ord('['), '['):  # ESC+[ → CSI sequence, read remainder
+                seq = ''
+                self.stdscr.timeout(30)
+                try:
+                    while True:
+                        try:
+                            ch = self.stdscr.get_wch()
+                        except curses.error:
+                            break
+                        seq += ch if isinstance(ch, str) else chr(ch)
+                        if seq[-1].isalpha():
+                            break
+                finally:
+                    self.stdscr.timeout(50)
+                if seq == '1;10D':    # Cmd+Shift+Left → select to line start
+                    buf.move_cursor(buf.cursor_row, 0, extend_selection=True)
+                elif seq == '1;10C':  # Cmd+Shift+Right → select to line end
+                    buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]), extend_selection=True)
             elif nk in (curses.KEY_DC, curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')):
                 # Alt+Delete / Alt+Backspace → delete one token forward/backward
                 row_before = buf.cursor_row
@@ -1956,14 +2008,46 @@ class Editor:
     def _help_text(self) -> str:
         return EDITOR_HELP
 
-    def _open_file(self):
-        if self.buf.dirty:
-            if not self._confirm('Unsaved changes. Discard? (y/n): '):
-                return
-        path = self._prompt('Open file: ')
-        if path:
-            self.buf.load(path)
+    def _prompt_save_before_close(self) -> str:
+        """Prompt to save unsaved changes before closing/switching the current file.
+        Returns 'saved', 'discarded', or 'cancel'."""
+        answer = self._confirm_3way('Unsaved changes. Save? (y)es / (n)o / (c)ancel: ')
+        if answer == 'cancel':
+            return 'cancel'
+        if answer == 'yes':
+            self._save_file()
+            if self.buf.dirty:
+                return 'cancel'
+            return 'saved'
+        return 'discarded'
+
+    def _open_from_directory(self):
+        """Open the file browser popup for self._directory."""
+        if not self._directory:
+            return
+
+        try:
+            all_entries = os.listdir(self._directory)
+        except OSError:
+            return
+
+        files = sorted(f for f in all_entries if os.path.isfile(os.path.join(self._directory, f)))
+        if not files:
+            self.set_status_notification('Directory is empty')
+            return
+
+        items = [(f, f, 0) for f in files]
+
+        def on_select(filename):
+            new_path = os.path.join(self._directory, filename)
+            if self.buf.dirty:
+                result = self._prompt_save_before_close()
+                if result == 'cancel':
+                    return
+            self.buf.load(new_path)
             self.lexer.invalidate(0)
+
+        self.popup.open(items, filter_text='', on_select=on_select)
 
     def _quit(self):
         if self.buf.dirty:

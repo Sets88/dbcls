@@ -139,7 +139,7 @@ def get_sql_rows(buf) -> list:
         return []
 
     # dot-command — single line only
-    if stripped.startswith('.') and not stripped.startswith('--'):
+    if stripped.startswith('.') and not stripped.startswith('-- '):
         return [row]
 
     def is_separator(i):
@@ -147,7 +147,7 @@ def get_sql_rows(buf) -> list:
         return not s or s == ';' or s.startswith('#')
 
     start = row
-    while start > 0 and not is_separator(start - 1):
+    while start > 0 and not is_separator(start - 1) and not lines[start - 1].rstrip().endswith(';'):
         start -= 1
 
     end = row
@@ -184,8 +184,8 @@ Database
 
 
 class DbEditor(Editor):
-    def __init__(self, stdscr, filepath=None):
-        super().__init__(stdscr, filepath)
+    def __init__(self, stdscr, filepath=None, directory=None):
+        super().__init__(stdscr, filepath, directory=directory)
         self.add_keybinding(('alt', 'r'), lambda e: e._db_query())
         self.add_keybinding(('alt', 't'), lambda e: e._db_show_tables())
         self.add_keybinding(('alt', 'e'), lambda e: e._db_show_databases())
@@ -228,6 +228,7 @@ class DbEditor(Editor):
             pass
 
         self.colors.reset()
+        self._apply_termios()         # restore termios after visidata resets it
 
     def _db_query(self):
         sel = self.buf.get_selected_text() if self.buf.has_selection() else ''
@@ -242,6 +243,7 @@ class DbEditor(Editor):
         def on_done():
             end = time.time()
             message = ''
+            vd_launched = False
             try:
                 if self.running_popup.cancelled:
                     message = 'Cancelled'
@@ -251,6 +253,7 @@ class DbEditor(Editor):
                 if not result or not result.data:
                     return
                 self._fix_visidata_curses()
+                vd_launched = True
                 visidata.vd.view(result.data)
             except (asyncio.CancelledError, asyncio.InvalidStateError):
                 message = 'Cancelled'
@@ -263,7 +266,8 @@ class DbEditor(Editor):
             finally:
                 self.set_status_name(client.get_title())
                 self.set_status_notification(f'{round(end - start, 2)}s  {message[:80]}')
-                self._fix_curses_after_visidata()
+                if vd_launched:
+                    self._fix_curses_after_visidata()
 
         self.open_running_popup(task, start, on_done)
 
@@ -389,7 +393,20 @@ def main():
 
     locale.setlocale(locale.LC_ALL, '')
     os.environ.setdefault('ESCDELAY', '25')
-    curses.wrapper(lambda stdscr: DbEditor(stdscr, args.filepath).run())
+
+    editor_filepath = args.filepath
+    editor_directory = None
+    if editor_filepath and os.path.isdir(editor_filepath):
+        editor_directory = os.path.abspath(editor_filepath)
+        files = sorted(
+            f for f in os.listdir(editor_directory)
+            if os.path.isfile(os.path.join(editor_directory, f))
+        )
+        editor_filepath = os.path.join(editor_directory, files[0]) if files else None
+    elif editor_filepath:
+        editor_directory = os.path.abspath(os.path.dirname(editor_filepath))
+
+    curses.wrapper(lambda stdscr: DbEditor(stdscr, editor_filepath, directory=editor_directory).run())
 
 
 if __name__ == '__main__':
