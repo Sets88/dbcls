@@ -1455,7 +1455,7 @@ class Renderer:
         total_lines = len(buf.lines)
         conn = f' {self.status_name} ' if self.status_name else ' '
         right = f' Ln {ln}/{total_lines}  Col {col} '
-        hints = '^H/F1 Help ^S Save ^F Find ^N AC ^K Mark ^Z Undo ^Q Quit'
+        hints = '^H/F1 Help ^S Save ^F Find Shift+Tab AC ^K Mark ^Z Undo ^Q Quit'
         mid_space = W - len(conn) - len(right)
         if mid_space > len(hints):
             mid = hints.center(mid_space)
@@ -1589,9 +1589,14 @@ class Editor:
 
     def set_status_notification(self, text: str) -> None:
         """Show a transient message in the status bar.
+        If the message is wider than the terminal, show it in a popup instead.
         The message is replaced by the normal status bar after the next keypress."""
-        self._status_notification = text
-        self.renderer.status_notification = text
+        W = self.stdscr.getmaxyx()[1]
+        if len(text) + 2 > W or '\n' in text:
+            self.show_popup('Info', text)
+        else:
+            self._status_notification = text
+            self.renderer.status_notification = text
 
     def set_words(self, keywords=None, types=None, functions=None) -> None:
         """Update syntax highlighting and autocomplete word sets.
@@ -1830,9 +1835,9 @@ class Editor:
 
         # Ctrl+Left / Ctrl+Right (escape sequences on most terminals)
         # Ctrl+Left / Ctrl+Right  (various ncurses key-code variants)
-        elif key in (553, 443, 537, 541):
+        elif key in (443, 537, 541):
             buf.move_word_left()
-        elif key in (568, 444, 552, 556):
+        elif key in (444, 552, 556):
             buf.move_word_right()
         # Alt+Left / Alt+Right as direct ncurses extended key codes
         # (iTerm2 with \E[1;3D/\E[1;3C when ncurses resolves them)
@@ -1841,9 +1846,9 @@ class Editor:
         elif key in (557,):   # kRIT3 variants (without shift)
             buf.move_word_right()
         # Shift+Alt+Left / Shift+Alt+Right — select by word
-        elif key in (558, 600):   # confirmed code 558 on macOS Terminal
+        elif key in (553, 559, 558, 600):   # confirmed code 558 on macOS Terminal
             buf.move_word_left(extend=True)
-        elif key in (573, 601):   # confirmed code 573 on macOS Terminal
+        elif key in (568, 574, 573, 601):   # confirmed code 573 on macOS Terminal
             buf.move_word_right(extend=True)
         # Shift+Ctrl+Left / Shift+Ctrl+Right — registered via define_key
         elif key == 602:

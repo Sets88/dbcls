@@ -190,6 +190,7 @@ class DbEditor(Editor):
         self.add_keybinding(('alt', 't'), lambda e: e._db_show_tables())
         self.add_keybinding(('alt', 'e'), lambda e: e._db_show_databases())
         self.add_keybinding(('alt', '1'), lambda e: e._db_show_prediction())
+        self.add_keybinding(353, lambda e: e._db_show_prediction())
         if client:
             self.set_status_name(client.get_title())
             self.set_words(keywords=client.all_commands, functions=client.all_functions)
@@ -265,7 +266,7 @@ class DbEditor(Editor):
                 self.show_popup('Error', message)
             finally:
                 self.set_status_name(client.get_title())
-                self.set_status_notification(f'{round(end - start, 2)}s  {message[:80]}')
+                self.set_status_notification(f'{round(end - start, 2)}s  {message}')
                 if vd_launched:
                     self._fix_curses_after_visidata()
 
