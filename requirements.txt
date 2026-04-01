@@ -4,3 +4,4 @@ ciso8601==2.3.0
 aiomysql==0.3.2
 aiopg==1.4.0
 cryptography
+sql_metadata==2.19.0

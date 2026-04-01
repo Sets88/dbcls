@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Terminal SQL text editor — pure Python, stdlib only."""
 
+from contextlib import contextmanager
 import curses
 import locale
 import os
 import sys
 import termios
 import time
+import threading
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -58,6 +60,24 @@ Search
 Other
   Ctrl+K                  Toggle line mark (highlight)
   F1 / Ctrl+H             This help"""
+
+
+DEBUG_PARAMS = {
+    "LOCK": None
+}
+
+
+@contextmanager
+def debug():
+    if DEBUG_PARAMS.get('LOCK') is None:
+        DEBUG_PARAMS['LOCK'] = threading.Lock()
+        DEBUG_PARAMS['LOCK'].acquire()
+
+    time.sleep(0.5)
+    curses.endwin()
+    yield
+    if DEBUG_PARAMS.get('LOCK'):
+        DEBUG_PARAMS.pop('LOCK').release()
 
 
 # ─── Data structures ──────────────────────────────────────────────────────────
@@ -985,7 +1005,7 @@ class AutocompletePopup:
     def _refilter(self):
         q = self.filter_text.upper()
         self.filtered = [(w, lbl, wt) for w, lbl, wt in self.items if q in lbl.upper()]
-        self.filtered.sort(key=lambda x: (x[2], 0 if x[1].upper().startswith(q) else 1, x[0].upper()))
+        self.filtered.sort(key=lambda x: (x[2], 0 if x[1].upper().startswith(q) else 1))
         self.selected_idx = 0
         self.scroll_offset = 0
 
@@ -1240,9 +1260,12 @@ class Renderer:
             self.scroll_col = cc - self.text_cols + margin_h + 1
         self.scroll_col = max(0, self.scroll_col)
 
-    def draw(self, popup: Optional['AutocompletePopup'] = None,
-             search: Optional['SearchBar'] = None,
-             running_popup: Optional['RunningPopup'] = None):
+    def draw(
+        self,
+        popup: Optional['AutocompletePopup'] = None,
+        search: Optional['SearchBar'] = None,
+        running_popup: Optional['RunningPopup'] = None
+    ):
         self.stdscr.erase()
         self._draw_text_area()
         if search and search.active:
@@ -1475,38 +1498,15 @@ class Renderer:
 
 # ─── Editor ───────────────────────────────────────────────────────────────────
 class Editor:
+    REMAPED_KEYS = {}
+
     def __init__(self, stdscr, filepath: Optional[str] = None, directory: Optional[str] = None):
         self.stdscr = stdscr
         stdscr.keypad(True)
         stdscr.timeout(50)
         curses.curs_set(1)
 
-        # Register Shift+Alt+Arrow escape sequences as custom key codes so
-        # ncurses returns them as a single integer before we ever see ESC.
-        # Custom codes 600/601 are well above ncurses' standard KEY_MAX (~511).
-        # Register Shift+Ctrl+Arrow and Shift+Alt+Arrow sequences as custom
-        # key codes so ncurses returns them as single integers.
-        # 600/601 = Shift+Alt+Left/Right, 602/603 = Shift+Ctrl+Left/Right
-        _custom_keys = {
-            600: ['\x1b[1;4D', '\x1b[1;10D'],          # Shift+Alt+Left
-            601: ['\x1b[1;4C', '\x1b[1;10C'],          # Shift+Alt+Right
-            602: ['\x1b[1;6D', '\x1b[1;2D'],           # Shift+Ctrl+Left
-            603: ['\x1b[1;6C', '\x1b[1;2C'],           # Shift+Ctrl+Right
-            604: ['\x1b[1;9D', '\x1b[1;13D',           # Super/Cmd+Left  → Home
-                  '\x1bOH'],
-            605: ['\x1b[1;9C', '\x1b[1;13C',           # Super/Cmd+Right → End
-                  '\x1bOF'],
-            # Ctrl+Home and Ctrl+End handled via ncurses native codes (549, 544)
-            608: ['\x1b[3;3~', '\x1b\x7f', '\x1b[3~\x1b'],  # Alt+Delete → delete word forward
-        }
-        for code, seqs in _custom_keys.items():
-            for seq in seqs:
-                try:
-                    curses.define_key(seq, code)
-                except Exception:
-                    pass
         self._apply_termios()
-
 
         self.colors = ColorManager()
         self.buf = TextBuffer()
@@ -1692,6 +1692,13 @@ class Editor:
 
     def run(self):
         while self.running:
+            if DEBUG_PARAMS.get('LOCK'):
+                while DEBUG_PARAMS.get('LOCK') and DEBUG_PARAMS.get('LOCK').locked():
+                    time.sleep(1)
+                curses.endwin()
+                self.colors.reset()
+                self._apply_termios()
+
             try:
                 key = self.stdscr.get_wch()
             except curses.error:
@@ -1775,7 +1782,13 @@ class Editor:
 
         self._handle_normal_key(key)
 
+    def override_remaped_keys(self, key) -> int:
+        if key in self.REMAPED_KEYS:
+            return self.REMAPED_KEYS[key]
+        return key
+
     def _handle_normal_key(self, key):
+        key = self.override_remaped_keys(key)
         buf = self.buf
 
         if key in self._custom_keybindings:

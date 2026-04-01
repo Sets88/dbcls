@@ -1,1 +1,3 @@
 include requirements.txt
+include train.py
+include dbcls/weights.json

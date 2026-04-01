@@ -18,13 +18,10 @@ import visidata
 from .clients.base import Result
 from .vd_db_browser import DataBaseSheet, TablesSheet
 from .clients.sqlite3 import Sqlite3Client
+from .clients.base import ClientClass
 from .autocomplete import AutoComplete
 from .editor import Editor, EDITOR_HELP
 
-
-client = None
-autocomplete: Optional[AutoComplete] = None
-asyncloop_thread = None
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -87,7 +84,7 @@ class AsyncLoopThread(threading.Thread):
 
 
 class SyncClient:
-    def __init__(self, asyncloop_th, async_client):
+    def __init__(self, asyncloop_th, async_client: ClientClass):
         self.asyncloop_thread = asyncloop_th
         self.client = async_client
         self.timeout = 60
@@ -110,11 +107,11 @@ class SyncClient:
                 time.sleep(0.1)
 
                 if time.time() - start > self.timeout:
-                    return Result('Timeout', None)
+                    return Result(message='Timeout')
 
             return task.result()
         except asyncio.CancelledError:
-            return Result('Canceled', None)
+            return Result(message='Canceled')
         finally:
             if task is not None and not task.is_done():
                 task.cancel()
@@ -163,6 +160,24 @@ def get_expression_under_cursor(buf) -> str:
     return '\n'.join(buf.lines[i] for i in get_sql_rows(buf))
 
 
+def get_sql_before_cursor(buf) -> str:
+    """Return SQL text from the start of the current statement up to (not including) the cursor."""
+    rows = get_sql_rows(buf)
+    if not rows:
+        return ''
+    cursor_row = buf.cursor_row
+    parts = []
+    for i in rows:
+        if i < cursor_row:
+            parts.append(buf.lines[i])
+        elif i == cursor_row:
+            parts.append(buf.lines[i][:buf.cursor_col])
+            break
+        else:
+            break
+    return '\n'.join(parts)
+
+
 def get_word_parts(buf) -> list:
     """Return dot-separated identifier parts ending at the cursor."""
     line = buf.lines[buf.cursor_row]
@@ -184,16 +199,41 @@ Database
 
 
 class DbEditor(Editor):
-    def __init__(self, stdscr, filepath=None, directory=None):
+    def __init__(
+        self,
+        stdscr,
+        filepath=None,
+        directory=None,
+        client: Optional[ClientClass] = None,
+        autocomplete: Optional[AutoComplete] = None,
+        remap_config: str = None
+    ):
+        self.client = client
+        self.autocomplete = autocomplete
+        self.asyncloop_thread = AsyncLoopThread(daemon=True)
+        self.asyncloop_thread.start()
+        if remap_config:
+            self.apply_keys_remap(remap_config)
+
         super().__init__(stdscr, filepath, directory=directory)
         self.add_keybinding(('alt', 'r'), lambda e: e._db_query())
         self.add_keybinding(('alt', 't'), lambda e: e._db_show_tables())
         self.add_keybinding(('alt', 'e'), lambda e: e._db_show_databases())
         self.add_keybinding(('alt', '1'), lambda e: e._db_show_prediction())
         self.add_keybinding(353, lambda e: e._db_show_prediction())
-        if client:
-            self.set_status_name(client.get_title())
-            self.set_words(keywords=client.all_commands, functions=client.all_functions)
+        if self.client:
+            self.set_status_name(self.client.get_title())
+            self.set_words(keywords=self.client.all_commands, functions=self.client.all_functions)
+
+    def apply_keys_remap(self, remap_str: str):
+        if not remap_str:
+            return
+        try:
+            for pair in remap_str.split(','):
+                key, seq = pair.split(':')
+                self.REMAPED_KEYS[int(key)] = int(seq)
+        except Exception:
+            print('Invalid key remap string in DBCLS_KEY_REMAP')
 
     def _help_text(self) -> str:
         return DB_HELP_EXTRA + EDITOR_HELP
@@ -239,7 +279,7 @@ class DbEditor(Editor):
             self.set_status_notification('Nothing to execute')
             return
         start = time.time()
-        task = asyncloop_thread.submit(client.execute(sel.strip()))
+        task = self.asyncloop_thread.submit(self.client.execute(sel.strip()))
 
         def on_done():
             end = time.time()
@@ -259,13 +299,13 @@ class DbEditor(Editor):
             except (asyncio.CancelledError, asyncio.InvalidStateError):
                 message = 'Cancelled'
             except Exception as exc:
-                if client.is_db_error_exception(exc):
+                if self.client.is_db_error_exception(exc):
                     message = str(exc)
                 else:
                     message = ''.join(traceback.format_exception(exc))
                 self.show_popup('Error', message)
             finally:
-                self.set_status_name(client.get_title())
+                self.set_status_name(self.client.get_title())
                 self.set_status_notification(f'{round(end - start, 2)}s  {message}')
                 if vd_launched:
                     self._fix_curses_after_visidata()
@@ -274,7 +314,13 @@ class DbEditor(Editor):
 
     def _db_show_prediction(self):
         parts = get_word_parts(self.buf)
-        task = asyncloop_thread.submit(autocomplete.get_suggestions(parts))
+        word = parts[-1] if parts else ''
+        before_cursor = get_sql_before_cursor(self.buf)
+        if word and before_cursor.endswith(word):
+            sql_context = before_cursor[:-len(word)].rstrip()
+        else:
+            sql_context = before_cursor
+        task = self.asyncloop_thread.submit(self.autocomplete.get_suggestions(parts, sql_context=sql_context, full_sql=before_cursor))
         start = time.time()
 
         def on_done():
@@ -298,8 +344,8 @@ class DbEditor(Editor):
         try:
             self._fix_visidata_curses()
             visidata.vd.run(TablesSheet(
-                client=SyncClient(asyncloop_thread, client),
-                db=getattr(client, 'dbname', None),
+                client=SyncClient(self.asyncloop_thread, self.client),
+                db=getattr(self.client, 'dbname', None),
             ))
         finally:
             self._fix_curses_after_visidata()
@@ -307,16 +353,24 @@ class DbEditor(Editor):
     def _db_show_databases(self):
         try:
             self._fix_visidata_curses()
-            visidata.vd.run(DataBaseSheet(client=SyncClient(asyncloop_thread, client)))
+            visidata.vd.run(DataBaseSheet(client=SyncClient(self.asyncloop_thread, self.client)))
         finally:
             self._fix_curses_after_visidata()
 
 
-def main():
-    global client
-    global autocomplete
-    global asyncloop_thread
+def env_override(args: argparse.Namespace):
+    try:
+        env_override = {x: y for x, y in os.environ.items() if x.startswith('DBCLS_')}
 
+        for key, value in env_override.items():
+            arg_key = key[len('DBCLS_'):].lower()
+            if hasattr(args, arg_key) and value:
+                setattr(args, arg_key, value)
+    except Exception:
+        print('Error processing environment variable overrides')
+
+
+def main():
     parser = argparse.ArgumentParser(description='DB connection tool')
     parser.add_argument('filepath', nargs='?', default=None, help='SQL file to edit')
     parser.add_argument('--config', '-c', dest='config', help='specify config path', default='')
@@ -331,8 +385,11 @@ def main():
     parser.add_argument('--filepath', '-f', dest='dbfilepath', help='specify db filepath', required=False)
     parser.add_argument('--no-compress', dest='compress', action='store_false', default=True,
         help='disable compression for ClickHouse')
+    parser.add_argument('--key-remap', dest='key_remap', default='', help='specify key remap config string,' \
+        ' e.g. "9:353,353:9" to remap Tab to behave like Shift+Tab and Shift+Tab to behave like Tab')
 
     args = parser.parse_args()
+    env_override(args)
 
     host = args.host
     username = args.user
@@ -369,6 +426,8 @@ def main():
         if not unix_socket:
             unix_socket = config.get('unix_socket', None)
 
+    client = None
+
     # imported here to make db libs dependencies optional
     if engine == 'clickhouse':
         from .clients.clickhouse import ClickhouseClient
@@ -389,9 +448,6 @@ def main():
 
     autocomplete = AutoComplete(client)
 
-    asyncloop_thread = AsyncLoopThread(daemon=True)
-    asyncloop_thread.start()
-
     locale.setlocale(locale.LC_ALL, '')
     os.environ.setdefault('ESCDELAY', '25')
 
@@ -407,7 +463,11 @@ def main():
     elif editor_filepath:
         editor_directory = os.path.abspath(os.path.dirname(editor_filepath))
 
-    curses.wrapper(lambda stdscr: DbEditor(stdscr, editor_filepath, directory=editor_directory).run())
+    curses.wrapper(lambda stdscr: DbEditor(
+            stdscr, editor_filepath, directory=editor_directory, client=client,
+            autocomplete=autocomplete, remap_config=args.key_remap
+        ).run()
+    )
 
 
 if __name__ == '__main__':

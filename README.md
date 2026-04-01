@@ -48,6 +48,7 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-S, --unix-socket` | Path to Unix socket file (optional, overrides host/port) |
 | `-c, --config` | Path to configuration file |
 | `--no-compress` | Disable compression for ClickHouse connections |
+| `--key-remap` | Remap key codes, e.g. `"9:353,353:9"` to swap Tab and Shift+Tab |
 
 ## Configuration
 
@@ -103,6 +104,18 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Ctrl + q` | Quit application |
 | `Ctrl + s` | Save file |
 | `Ctrl + h` / `F1` | Show all available hotkeys |
+
+### LM-Powered Autocomplete
+
+When `dbcls/weights.json` is present (see [Model Training](#model-training) below),
+autocomplete suggestions (`Alt+1`) are ranked by a trained language model that predicts
+the most likely next SQL token given the current query context.
+
+- Tables, columns, keywords, and functions are sorted by predicted relevance
+- When the model expects a column name next, DbCls automatically loads columns from
+  all tables referenced in the current query
+- Degrades gracefully: if `weights.json` is absent or `sql_metadata` is not installed,
+  autocomplete falls back to alphabetical/prefix ranking
 
 ### Navigation in Database and Table Listings
 
@@ -277,6 +290,55 @@ CONFIG=`cat << EOF
 
 dbcls -c <(echo "$CONFIG") mydb.sql
 ```
+
+
+## Model Training
+
+DbCls ships with a `train.py` script for training or fine-tuning the language model
+that powers LM-ranked autocomplete. The model is a small MLP trained on SQL corpora;
+its weights are stored in `dbcls/weights.json`.
+
+### Training from scratch
+
+```bash
+python train.py train --corpus my_queries.sql
+```
+
+### Fine-tuning an existing model
+
+```bash
+python train.py train --corpus my_queries.sql --finetune
+python train.py train --corpus my_queries.sql --finetune --weights custom.json --output custom.json
+```
+
+### Inspecting tokenization
+
+Use `--debug` to print how each SQL statement is tokenized during training:
+
+```bash
+python train.py train --corpus my_queries.sql --debug
+```
+
+### Running inference
+
+```bash
+python train.py infer --sql "SELECT * FROM"
+python train.py infer --sql "SELECT id FROM users WHERE" --top-k 5
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--corpus FILE` | SQL file for training, one statement per line |
+| `--finetune` | Load existing weights and continue training |
+| `--weights FILE` | Weights file to load for fine-tuning (default: `dbcls/weights.json`) |
+| `--output FILE` | Where to save trained weights (default: `dbcls/weights.json`) |
+| `--epochs N` | Number of training epochs (default: 20) |
+| `--lr FLOAT` | Learning rate (default: 0.01) |
+| `--debug` | Print tokenization for each training sentence |
+| `--sql TEXT` | *(infer only)* SQL prefix to complete |
+| `--top-k N` | *(infer only)* Number of predictions to show (default: 10) |
 
 
 ## Contributing

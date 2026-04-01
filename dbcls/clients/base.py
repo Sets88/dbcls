@@ -2,10 +2,7 @@ import abc
 import re
 from time import time
 from typing import Optional
-from dataclasses import (
-    dataclass,
-    field,
-)
+from dataclasses import dataclass, field
 
 
 COMMAND_RE = re.compile(r'\.([a-zA-Z_0-9]+)\s*(.*)', re.IGNORECASE)
@@ -44,12 +41,15 @@ class ClientClass(abc.ABC):
     ]
 
     SQL_COMMON_COMMANDS = [
-        'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WHERE', 'TRUNCATE', 'USE', 'SHOW', 'DESCRIBE',
-        'EXPLAIN', 'DESC', 'RENAME', 'GRANT', 'REVOKE', 'SET', 'BEGIN', 'COMMIT', 'ROLLBACK', 'ANALYZE', 'OPTIMIZE',
-        'KILL', 'FROM', 'GROUP BY', 'ORDER BY', 'LIMIT', 'OFFSET', 'HAVING', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN',
-        'JOIN', 'JOIN', 'ON', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN', 'OUTER', 'CROSS', 'FULL', 'INNER',
-        'PARTITION BY', 'WITH', 'TABLE', 'OF', 'OPTIMIZE', 'INTERVAL', 'AS', 'DISTINCT', 'COLUMN', 'NULL', 'IS',
-        'UNION', 'ALL', 'ANY', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END'
+        'SELECT', 'FROM', 'WHERE', 'ORDER BY', 'JOIN',
+        'INSERT', 'INTO', 'UPDATE', 'VALUES', 'SET', 'DELETE', 'LEFT JOIN', 'GROUP BY',
+        'CREATE', 'INDEX', 'LIMIT', 'NULL', 'LIKE', 'DISTINCT', 'HAVING',
+        'OFFSET', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'WITH', 'UNION',
+        'EXISTS', 'BETWEEN', 'ALL', 'ANY', 'PARTITION BY', 'RIGHT JOIN',
+        'INNER', 'OUTER', 'CROSS', 'FULL', 'DROP', 'ALTER',
+        'TRUNCATE', 'TABLE', 'COLUMN', 'BEGIN', 'COMMIT', 'ROLLBACK', 'SET',
+        'EXPLAIN', 'ANALYZE', 'DESCRIBE', 'DESC', 'SHOW', 'RENAME',
+        'GRANT', 'REVOKE', 'OPTIMIZE', 'KILL', 'INTERVAL', 'ON', 'AS', 'OF', 'AND', 'OR', 'IN', 'IS', 'NOT'
     ]
 
     SQL_COMMON_FUNCTIONS = [
