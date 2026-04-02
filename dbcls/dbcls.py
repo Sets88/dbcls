@@ -216,10 +216,10 @@ class DbEditor(Editor):
             self.apply_keys_remap(remap_config)
 
         super().__init__(stdscr, filepath, directory=directory)
-        self.add_keybinding(('alt', 'r'), lambda e: e._db_query())
-        self.add_keybinding(('alt', 't'), lambda e: e._db_show_tables())
-        self.add_keybinding(('alt', 'e'), lambda e: e._db_show_databases())
-        self.add_keybinding(('alt', '1'), lambda e: e._db_show_prediction())
+        self.add_keybinding(27114, lambda e: e._db_query()) # Alt+R
+        self.add_keybinding(27116, lambda e: e._db_show_tables()) # Alt+T
+        self.add_keybinding(27101, lambda e: e._db_show_databases()) # Alt+E
+        self.add_keybinding(27049, lambda e: e._db_show_prediction()) # Alt+1
         self.add_keybinding(353, lambda e: e._db_show_prediction())
         if self.client:
             self.set_status_name(self.client.get_title())

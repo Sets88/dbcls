@@ -1523,6 +1523,8 @@ class Editor:
         self._custom_keybindings: dict = {}
         self._ac_words: List[Tuple[str, str, int]] = []
         self._running_done_cb = None
+        self._file_change_dismissed: bool = False
+        self._file_check_counter: int = 0
         self._init_ac_words([], [], [])
 
         self._directory: Optional[str] = directory
@@ -1716,6 +1718,11 @@ class Editor:
                 if cb:
                     cb()
 
+            self._file_check_counter += 1
+            if self._file_check_counter >= 20:  # ~1 s at 50 ms timeout
+                self._file_check_counter = 0
+                self._check_external_file_change()
+
             self.renderer.ensure_cursor_visible()
             self.renderer.search_matches = self.search.matches
             self.renderer.search_current = self.search.current_idx
@@ -1733,8 +1740,7 @@ class Editor:
         of the dispatch code (which compares against ord() integers) works."""
         if isinstance(key, str) and len(key) == 1:
             o = ord(key)
-            if o < 32 or o == 127:  # control chars and DEL
-                return o
+            return o
         return key
 
     def _dispatch(self, key):
@@ -1956,15 +1962,16 @@ class Editor:
                 nk = -1
             self.stdscr.timeout(50)  # restore main timeout
 
+            if isinstance(nk, str):
+                nk = self._normalize_key(nk)
+
             if nk == -1:
                 buf.clear_selection()
-            elif nk in ('b', ord('b'), curses.KEY_LEFT):
-                buf.move_word_left()
-            elif nk in ('f', ord('f'), curses.KEY_RIGHT):
-                buf.move_word_right()
-            elif nk in (1, '\x01'):  # ESC+Ctrl+A → Select All
-                buf.select_all()
-            elif nk in (ord('['), '['):  # ESC+[ → CSI sequence, read remainder
+            else:
+                key = 27000 + nk  # distinguish ESC+key from plain ESC
+
+            if nk == ord('['):  # ESC+[ → CSI sequence, read remainder
+                key = key * 1000 + ord('[')
                 seq = ''
                 self.stdscr.timeout(30)
                 try:
@@ -1974,28 +1981,36 @@ class Editor:
                         except curses.error:
                             break
                         seq += ch if isinstance(ch, str) else chr(ch)
+                        key = key * 1000 + (ord(ch) if isinstance(ch, str) else ch)
                         if seq[-1].isalpha():
                             break
                 finally:
                     self.stdscr.timeout(50)
-                if seq == '1;10D':    # Cmd+Shift+Left → select to line start
-                    buf.move_cursor(buf.cursor_row, 0, extend_selection=True)
-                elif seq == '1;10C':  # Cmd+Shift+Right → select to line end
-                    buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]), extend_selection=True)
-            elif nk in (curses.KEY_DC, curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')):
-                # Alt+Delete / Alt+Backspace → delete one token forward/backward
-                row_before = buf.cursor_row
-                if nk == curses.KEY_DC:
-                    buf.delete_word_after_cursor()
-                else:
-                    buf.kill_word_backward()
-                self.lexer.invalidate(min(row_before, buf.cursor_row))
+
+            if key > 27000 and self._debug_mode:
+                self.renderer.debug_text = f'key={key!r}  int={key if isinstance(key,int) else ord(key)}'
+
+        # Longer ESC sequeces and custom keybindings
+        if key == 27098 or key == 27260:
+            buf.move_word_left()
+        elif key == 27102 or key == 27261:
+            buf.move_word_right()
+        elif key == 27001:  # ESC+Ctrl+A → Select All
+            buf.select_all()
+        elif key == 27091091049059049048068:    # Cmd+Shift+Left → select to line start
+            buf.move_cursor(buf.cursor_row, 0, extend_selection=True)
+        elif key == 27091091049059049048067:  # Cmd+Shift+Right → select to line end
+            buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]), extend_selection=True)
+        elif key == 27263:
+            # Alt+Delete / Alt+Backspace → delete one token forward/backward
+            row_before = buf.cursor_row
+            if nk == curses.KEY_DC:
+                buf.delete_word_after_cursor()
             else:
-                nk_str = nk if isinstance(nk, str) else (chr(nk) if isinstance(nk, int) and 32 <= nk <= 126 else None)
-                if nk_str is not None:
-                    alt_key = ('alt', nk_str)
-                    if alt_key in self._custom_keybindings:
-                        self._custom_keybindings[alt_key](self)
+                buf.kill_word_backward()
+            self.lexer.invalidate(min(row_before, buf.cursor_row))
+        elif key in self._custom_keybindings:
+            self._custom_keybindings[key](self)
 
         # ── Printable character ───────────────────────────────────────────────
         else:
@@ -2013,11 +2028,13 @@ class Editor:
                 if not self._confirm('File changed on disk. Overwrite? (y/n): '):
                     return
             self.buf.save()
+            self._file_change_dismissed = False
             self.set_status_notification(f'Saved {self.buf.filepath}')
         else:
             path = self._prompt('Save as: ')
             if path:
                 self.buf.save(path)
+                self._file_change_dismissed = False
                 self.set_status_notification(f'Saved {path}')
 
     def show_help(self) -> None:
@@ -2064,6 +2081,7 @@ class Editor:
                     return
             self.buf.load(new_path)
             self.lexer.invalidate(0)
+            self._file_change_dismissed = False
 
         self.popup.open(items, filter_text='', on_select=on_select)
 
@@ -2077,6 +2095,46 @@ class Editor:
                 if self.buf.dirty:  # save was cancelled (e.g. no filepath and prompt escaped)
                     return
         self.running = False
+
+    def _check_external_file_change(self):
+        if (self._file_change_dismissed
+                or not self.buf.filepath
+                or self.running_popup.active
+                or self.popup.active):
+            return
+        if self.buf.file_changed_on_disk():
+            self._confirm_file_change()
+
+    def _confirm_file_change(self):
+        """Prompt user when the file was modified externally."""
+        H, W = self.stdscr.getmaxyx()
+        y = H - 1
+        msg = 'File changed on disk. (r)eload / (w)rite / other=dismiss: '
+        bar = msg[:W].ljust(W)
+        try:
+            self.stdscr.addstr(y, 0, bar, curses.color_pair(self.colors.status_warn))
+            self.stdscr.move(y, min(len(msg), W - 1))
+            self.stdscr.refresh()
+        except curses.error:
+            pass
+        while True:
+            try:
+                key = self.stdscr.get_wch()
+            except curses.error:
+                continue
+            key = self._normalize_key(key)
+            if key == -1:
+                continue
+            if key in (ord('r'), ord('R'), 'r', 'R'):
+                self.buf.load(self.buf.filepath)
+                self.lexer.invalidate(0)
+                self._file_change_dismissed = False
+            elif key in (ord('w'), ord('W'), 'w', 'W'):
+                self.buf.save()
+                self._file_change_dismissed = False
+            else:
+                self._file_change_dismissed = True
+            return
 
     def _confirm_3way(self, message: str) -> str:
         """Show a y/n/c question; return 'yes', 'no', or 'cancel' on first keypress."""
