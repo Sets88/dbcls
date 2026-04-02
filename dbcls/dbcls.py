@@ -316,11 +316,15 @@ class DbEditor(Editor):
         parts = get_word_parts(self.buf)
         word = parts[-1] if parts else ''
         before_cursor = get_sql_before_cursor(self.buf)
+        full_sql = get_expression_under_cursor(self.buf)
         if word and before_cursor.endswith(word):
             sql_context = before_cursor[:-len(word)].rstrip()
         else:
             sql_context = before_cursor
-        task = self.asyncloop_thread.submit(self.autocomplete.get_suggestions(parts, sql_context=sql_context, full_sql=before_cursor))
+
+        task = self.asyncloop_thread.submit(
+            self.autocomplete.get_suggestions(parts, sql_context=sql_context, full_sql=full_sql)
+        )
         start = time.time()
 
         def on_done():
