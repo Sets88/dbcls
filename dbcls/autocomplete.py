@@ -2,14 +2,9 @@ import os
 import json
 import math
 from time import time
-from functools import partial
 
-try:
-    import sql_metadata as _sql_metadata
-    from sql_metadata.keywords_lists import TokenType
-    _SQL_METADATA_AVAILABLE = True
-except ImportError:
-    _SQL_METADATA_AVAILABLE = False
+import sql_metadata
+from sql_metadata.keywords_lists import TokenType
 
 _CONTEXT_LENGTH = 3
 _WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), 'weights.json')
@@ -142,16 +137,13 @@ def _softmax(logits: list) -> list:
 
 def _tokenize_sql(sql: str, vocab_values: set) -> list:
     """Normalize SQL string into structural tokens. Returns [] on failure."""
-    if not _SQL_METADATA_AVAILABLE:
-        return []
-
     def add_token(result_tokens, token):
         if token in vocab_values:
             result_tokens.append(token)
 
     result_tokens = []
     try:
-        parsed_tokens = _sql_metadata.Parser(sql).tokens
+        parsed_tokens = sql_metadata.Parser(sql).tokens
     except Exception:
         return []
 
@@ -249,10 +241,10 @@ def _load_weights(path: str = _WEIGHTS_PATH):
 
 def _get_tables_from_sql(sql: str) -> list[str]:
     """Extract table names from SQL using sql_metadata. Returns [] on failure."""
-    if not _SQL_METADATA_AVAILABLE or not sql or not sql.strip():
+    if not sql or not sql.strip():
         return []
     try:
-        return _sql_metadata.Parser(sql).tables
+        return sql_metadata.Parser(sql).tables
     except Exception:
         return []
 
@@ -370,8 +362,7 @@ class AutoComplete:
         if self._lm_load_attempted:
             return False
         self._lm_load_attempted = True
-        if not _SQL_METADATA_AVAILABLE:
-            return False
+
         try:
             model, t2i, i2t = _load_weights(_WEIGHTS_PATH)
             self._lm_model = model
@@ -529,7 +520,14 @@ class AutoComplete:
             query_tables = _get_tables_from_sql(full_sql)
             suggestions_set = set(suggestions)
             for table in query_tables:
-                cols = await self.get_cached_columns(table)
+                db = None
+                if '.' in table:
+                    db, table = table.split('.', 1)
+                if db is None:
+                    cols = await self.get_cached_columns(table)
+                else:
+                    cols = await self.get_cached_columns(table, db)
+
                 if cols:
                     for col in cols:
                         candidate = f"{col} (COLUMN)"
