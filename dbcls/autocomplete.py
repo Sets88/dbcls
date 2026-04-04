@@ -488,14 +488,20 @@ class AutoComplete:
             suggestions += [f"{x} (FUNCTION)" for x in functions_list]
 
         if part1 is None:
-            databases_list = sorted(await self.get_cached_databases())
-            if databases_list:
-                suggestions += [f"{x} (DATABASE)" for x in databases_list]
+            try:
+                databases_list = sorted(await self.get_cached_databases())
+                if databases_list:
+                    suggestions += [f"{x} (DATABASE)" for x in databases_list]
+            except Exception:
+                pass
 
         if part2 is None:
-            curr_tables_list = sorted(await self.get_cached_tables())
-            if len(parts) < 2 and curr_tables_list:
-                suggestions += [f"{x} (TABLE)" for x in curr_tables_list]
+            try:
+                curr_tables_list = sorted(await self.get_cached_tables())
+                if len(parts) < 2 and curr_tables_list:
+                    suggestions += [f"{x} (TABLE)" for x in curr_tables_list]
+            except Exception:
+                pass
 
         if part1 is not None and part2 is None:
             tables_list = sorted(await self.get_cached_tables(part1))

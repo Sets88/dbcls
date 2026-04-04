@@ -18,6 +18,8 @@ class CommandParams:
 class Result:
     data: list[dict] = field(default_factory=list)
     rowcount: int = 0
+    # Used only for cassandra paging
+    has_more: bool = True
     message: str = ''
 
     def __str__(self) -> str:

@@ -27,6 +27,11 @@ DbCls is a powerful database client that combines the functionality of a SQL edi
 pip install dbcls
 ```
 
+For Cassandra / ScyllaDB support:
+```bash
+pip install 'dbcls[cassandra]'
+```
+
 ## Quick Start
 
 Basic usage with command line arguments:
@@ -105,6 +110,30 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Ctrl + s` | Save file |
 | `Ctrl + h` / `F1` | Show all available hotkeys |
 
+### Key Remapping
+
+You can remap any key to act as another key using integer key codes.
+
+**Via CLI:**
+```bash
+dbcls --key-remap "9:353,353:9" mydb.sql
+```
+
+**Via environment variable:**
+```bash
+export DBCLS_KEY_REMAP="9:353,353:9"
+dbcls mydb.sql
+```
+
+The format is a comma-separated list of `from:to` pairs, where each value is an integer key code.
+The example above swaps Tab (`9`) and Shift+Tab (`353`).
+
+**Finding key codes:**
+
+Press `Ctrl+D` inside the editor to enable debug mode — the key code of every pressed key will be shown in the status bar. Press `Ctrl+D` again to turn it off.
+
+You can also open the help (`F1` / `Ctrl+H`) while debug mode is active to see a full list of all registered keybindings with their codes at the bottom of the help page.
+
 ### LM-Powered Autocomplete
 
 When `dbcls/weights.json` is present (see [Model Training](#model-training) below),
@@ -167,6 +196,7 @@ For more visidata hotkeys, visit: https://www.visidata.org/man/
 - PostgreSQL
 - ClickHouse
 - SQLite
+- Cassandra / ScyllaDB
 
 
 ## Unix Socket Connections

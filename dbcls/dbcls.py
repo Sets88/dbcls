@@ -20,7 +20,7 @@ from .vd_db_browser import DataBaseSheet, TablesSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
-from .editor import Editor, EDITOR_HELP
+from .editor import Editor
 
 
 logging.basicConfig(level=logging.ERROR)
@@ -195,7 +195,13 @@ Database
   Alt+1               DB autocomplete (tables, columns, functions)
   Alt+T               Browse tables
   Alt+E               Browse databases
-  Esc                 Cancel running query\n\n"""
+  Esc                 Cancel running query
+
+Key remapping
+  --key-remap "A:B,C:D"   Remap key A to act as key B (integer key codes)
+  DBCLS_KEY_REMAP=...      Same via environment variable
+  Example: "9:353,353:9"  Swap Tab and Shift+Tab
+  Tip: enable debug mode (Ctrl+D) to see key codes, after enabling it, help page will contain the key codes\n\n"""
 
 
 class DbEditor(Editor):
@@ -216,11 +222,11 @@ class DbEditor(Editor):
             self.apply_keys_remap(remap_config)
 
         super().__init__(stdscr, filepath, directory=directory)
-        self.add_keybinding(27114, lambda e: e._db_query()) # Alt+R
-        self.add_keybinding(27116, lambda e: e._db_show_tables()) # Alt+T
-        self.add_keybinding(27101, lambda e: e._db_show_databases()) # Alt+E
-        self.add_keybinding(27049, lambda e: e._db_show_prediction()) # Alt+1
-        self.add_keybinding(353, lambda e: e._db_show_prediction())
+        self.add_keybinding('run_query', 27114, self._db_query) # Alt+R
+        self.add_keybinding('show_tables', 27116, self._db_show_tables) # Alt+T
+        self.add_keybinding('show_databases', 27101, self._db_show_databases) # Alt+E
+        self.add_keybinding('show_prediction', 27049, self._db_show_prediction) # Alt+1
+        self.add_keybinding('show_prediction', 353, self._db_show_prediction) # Shit+Tab
         if self.client:
             self.set_status_name(self.client.get_title())
             self.set_words(keywords=self.client.all_commands, functions=self.client.all_functions)
@@ -236,7 +242,7 @@ class DbEditor(Editor):
             print('Invalid key remap string in DBCLS_KEY_REMAP')
 
     def _help_text(self) -> str:
-        return DB_HELP_EXTRA + EDITOR_HELP
+        return DB_HELP_EXTRA + super()._help_text()
 
     def on_before_draw(self):
         rows = get_sql_rows(self.buf)
@@ -302,7 +308,7 @@ class DbEditor(Editor):
                 if self.client.is_db_error_exception(exc):
                     message = str(exc)
                 else:
-                    message = ''.join(traceback.format_exception(exc))
+                    message = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
                 self.show_popup('Error', message)
             finally:
                 self.set_status_name(self.client.get_title())
@@ -362,6 +368,14 @@ class DbEditor(Editor):
             self._fix_curses_after_visidata()
 
 
+def _cassandra_available() -> bool:
+    try:
+        import cassandra  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def env_override(args: argparse.Namespace):
     try:
         env_override = {x: y for x, y in os.environ.items() if x.startswith('DBCLS_')}
@@ -384,7 +398,8 @@ def main():
     parser.add_argument('--password', '-p', dest='password', default='', help='specify raw password')
     parser.add_argument('--port', '-P', dest='port', default='', help='specify port')
     parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=False,
-        choices=['clickhouse', 'mysql', 'postgres', 'sqlite3'])
+        choices=['clickhouse', 'mysql', 'postgres', 'sqlite3']
+            + (['cassandra'] if _cassandra_available() else []))
     parser.add_argument('--dbname', '-d', dest='dbname', help='specify db name', required=False)
     parser.add_argument('--filepath', '-f', dest='dbfilepath', help='specify db filepath', required=False)
     parser.add_argument('--no-compress', dest='compress', action='store_false', default=True,
@@ -444,6 +459,12 @@ def main():
         client = PostgresClient(host, username, password, dbname, port=port, unix_socket=unix_socket)
     if engine == 'sqlite3':
         client = Sqlite3Client(filepath)
+    if engine == 'cassandra':
+        if not _cassandra_available():
+            print("cassandra-driver is not installed. Install it with: pip install 'dbcls[cassandra]'")
+            sys.exit(1)
+        from .clients.cassandra import CassandraClient
+        client = CassandraClient(host, username, password, dbname, port=port, unix_socket=unix_socket)
 
     if not client:
         parser.print_help(sys.stderr)

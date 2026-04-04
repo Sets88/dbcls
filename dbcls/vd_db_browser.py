@@ -125,6 +125,9 @@ class TableSampleDataSheet(Sheet):
                 for row in chunk.data:
                     yield AttrDict(row)
 
+                if not chunk.has_more:
+                    break
+
                 offset += self.CHUNK_SIZE
 
 

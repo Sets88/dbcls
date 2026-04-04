@@ -59,6 +59,7 @@ Search
 
 Other
   Ctrl+K                  Toggle line mark (highlight)
+  Ctrl+W                  Toggle word wrap
   F1 / Ctrl+H             This help"""
 
 
@@ -409,8 +410,6 @@ class TextBuffer:
             content = ''
             self._file_mtime = None
         self.lines = content.split('\n')
-        if self.lines and self.lines[-1] == '' and len(self.lines) > 1:
-            self.lines.pop()
         if not self.lines:
             self.lines = ['']
         self.cursor_row = 0
@@ -437,7 +436,7 @@ class TextBuffer:
         if not self.filepath:
             return False
         with open(self.filepath, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(self.lines) + '\n')
+            f.write('\n'.join(self.lines))
         self.dirty = False
         self._file_mtime = os.path.getmtime(self.filepath)
         return True
@@ -964,7 +963,7 @@ class SearchBar:
             self.find_all(buf.lines)
             self.snap_to_nearest(buf)
             return None
-        if isinstance(key, int) and 32 <= key <= 126:
+        if isinstance(key, int) and key >= 32 and chr(key).isprintable():
             self.query += chr(key)
             self.find_all(buf.lines)
             self.snap_to_nearest(buf)
@@ -1046,7 +1045,7 @@ class AutocompletePopup:
         ch = None
         if isinstance(key, str) and key.isprintable():
             ch = key
-        elif isinstance(key, int) and 32 <= key <= 126:
+        elif isinstance(key, int) and key >= 32 and chr(key).isprintable():
             ch = chr(key)
         if ch is not None:
             self.filter_text += ch
@@ -1229,6 +1228,7 @@ class Renderer:
         self.status_notification: Optional[str] = None
         self.directory_label: Optional[str] = None
         self.cursor_line_range: tuple = (0, 1)
+        self.wrap: bool = False
         self.resize()
 
     def resize(self):
@@ -1243,8 +1243,37 @@ class Renderer:
     def text_cols(self) -> int:
         return max(1, self._width - self.GUTTER)
 
+    def _visual_rows_count(self, line_len: int) -> int:
+        """Number of screen rows a document line of given length occupies in wrap mode."""
+        if line_len == 0:
+            return 1
+        tc = self.text_cols
+        return (line_len + tc - 1) // tc
+
     def ensure_cursor_visible(self):
         cr, cc = self.buf.cursor_row, self.buf.cursor_col
+        if self.wrap:
+            margin_v = 2
+            tc = self.text_cols
+            # Compute cursor visual row relative to scroll_row
+            vrow = 0
+            for i in range(self.scroll_row, cr):
+                vrow += self._visual_rows_count(len(self.buf.lines[i]))
+            vrow += cc // tc
+            # Scroll up if needed
+            while vrow < margin_v and self.scroll_row > 0:
+                self.scroll_row -= 1
+                vrow += self._visual_rows_count(len(self.buf.lines[self.scroll_row]))
+            # Scroll down if needed
+            while vrow >= self.text_rows - margin_v:
+                consumed = self._visual_rows_count(len(self.buf.lines[self.scroll_row]))
+                vrow -= consumed
+                if self.scroll_row < len(self.buf.lines) - 1:
+                    self.scroll_row += 1
+                else:
+                    break
+            self.scroll_col = 0
+            return
         # Vertical
         margin_v = 2
         if cr < self.scroll_row + margin_v:
@@ -1287,8 +1316,17 @@ class Renderer:
             except curses.error:
                 pass
         else:
-            cy = self.buf.cursor_row - self.scroll_row
-            cx = self.GUTTER + self.buf.cursor_col - self.scroll_col
+            if self.wrap:
+                tc = self.text_cols
+                vrow = 0
+                for i in range(self.scroll_row, self.buf.cursor_row):
+                    vrow += self._visual_rows_count(len(self.buf.lines[i]))
+                vrow += self.buf.cursor_col // tc
+                cy = vrow
+                cx = self.GUTTER + self.buf.cursor_col % tc
+            else:
+                cy = self.buf.cursor_row - self.scroll_row
+                cx = self.GUTTER + self.buf.cursor_col - self.scroll_col
             cy = max(0, min(cy, self.text_rows - 1))
             cx = max(self.GUTTER, min(cx, self._width - 1))
             try:
@@ -1319,7 +1357,6 @@ class Renderer:
     def _draw_text_area(self):
         buf = self.buf
         colors = self.colors
-        H = self._height
         text_rows = self.text_rows
 
         # Build set of search match positions for quick lookup
@@ -1328,96 +1365,141 @@ class Renderer:
             for c in range(mcs, mce):
                 match_set.add((mr, c))
         current_match_set = set()
-        if self.search_current >= 0 and self.search_current < len(self.search_matches):
+        if 0 <= self.search_current < len(self.search_matches):
             mr, mcs, mce = self.search_matches[self.search_current]
             for c in range(mcs, mce):
                 current_match_set.add((mr, c))
 
-        for y in range(text_rows):
-            line_idx = self.scroll_row + y
-            if line_idx >= len(buf.lines):
-                # Draw empty gutter
-                gutter_str = '~    '[: self.GUTTER]
-                self._safe_addstr(y, 0, gutter_str, curses.color_pair(colors.line_num))
-                continue
-
-            # Gutter (line numbers)
-            line_no = str(line_idx + 1).rjust(self.GUTTER - 1) + ' '
-            self._safe_addstr(y, 0, line_no, curses.color_pair(colors.line_num))
-
-            line = buf.lines[line_idx]
-            tokens = self.lexer.get_tokens(line_idx, buf.lines)
-
-            # Map token type -> color pair id
-            type_to_pair = {
-                'normal':   colors.normal,
-                'keyword':  colors.keyword,
-                'type':     colors.type_,
-                'function': colors.func,
-                'string':   colors.string,
-                'comment':  colors.comment,
-                'number':   colors.number,
-                'operator': colors.operator,
-            }
-
-            # Ensure we cover the full line (fill gaps between tokens)
-            # Build full coverage
-            full_tokens = []
-            prev_end = 0
-            for (ts, te, tt) in tokens:
-                if ts > prev_end:
-                    full_tokens.append((prev_end, ts, 'normal'))
-                full_tokens.append((ts, te, tt))
-                prev_end = te
-            if prev_end < len(line):
-                full_tokens.append((prev_end, len(line), 'normal'))
-            if not full_tokens and line == '':
-                full_tokens = []
-
-            sc = self.scroll_col
-            ec = sc + self.text_cols
-            is_marked = line_idx in buf.marked_lines
-            cl_start, cl_end = self.cursor_line_range
-            is_cursor_line = cl_start != cl_end and cl_start <= (line_idx - buf.cursor_row) < cl_end
-
-            if is_cursor_line:
-                self._safe_addstr(y, self.GUTTER, ' ' * self.text_cols,
-                                  curses.color_pair(colors.cursor_normal))
-
-            # Precompute same-row selection boundaries for fast-path correctness.
-            # When the selection start AND end both fall strictly inside a token
-            # segment, in_sel_start == in_sel_end == False even though the middle
-            # characters are selected — the fast path must not be taken in that case.
-            _line_sel_sc = _line_sel_ec = None
-            if buf.has_selection():
-                _s, _e = buf._norm_sel()
-                if _s is not None and _s[0] == line_idx == _e[0]:
-                    _line_sel_sc, _line_sel_ec = _s[1], _e[1]
-
-            for (ts, te, tt) in full_tokens:
-                # Clip to visible columns
-                vis_s = max(ts, sc)
-                vis_e = min(te, ec)
-                if vis_s >= vis_e:
+        gutter_str = '~    '[:self.GUTTER]
+        if self.wrap:
+            tc = self.text_cols
+            screen_y = 0
+            line_idx = self.scroll_row
+            while screen_y < text_rows:
+                if line_idx >= len(buf.lines):
+                    while screen_y < text_rows:
+                        self._safe_addstr(screen_y, 0, gutter_str, curses.color_pair(colors.line_num))
+                        screen_y += 1
+                    break
+                line_len = len(buf.lines[line_idx])
+                num_vrows = max(1, (line_len + tc - 1) // tc) if line_len > 0 else 1
+                for vrow in range(num_vrows):
+                    if screen_y >= text_rows:
+                        break
+                    self._draw_visual_line(screen_y, line_idx, vrow * tc,
+                                           vrow == 0, match_set, current_match_set)
+                    screen_y += 1
+                line_idx += 1
+        else:
+            for y in range(text_rows):
+                line_idx = self.scroll_row + y
+                if line_idx >= len(buf.lines):
+                    self._safe_addstr(y, 0, gutter_str, curses.color_pair(colors.line_num))
                     continue
-                screen_x = self.GUTTER + vis_s - sc
-                segment = line[vis_s:vis_e]
-                pair_id = type_to_pair.get(tt, colors.normal)
+                self._draw_visual_line(y, line_idx, self.scroll_col,
+                                       True, match_set, current_match_set)
 
-                in_sel_start = buf.is_in_selection(line_idx, vis_s)
-                in_sel_end   = buf.is_in_selection(line_idx, vis_e - 1)
-                has_match    = any((line_idx, c) in match_set for c in range(vis_s, vis_e))
+    def _draw_visual_line(self, y: int, line_idx: int, col_start: int, show_lineno: bool,
+                          match_set: set, current_match_set: set):
+        buf = self.buf
+        colors = self.colors
 
-                # Fast path is only valid when the selection doesn't start AND end
-                # strictly inside the segment (which would make both endpoints appear
-                # unselected while the middle is actually selected).
-                sel_enclosed = (_line_sel_sc is not None
-                                and vis_s < _line_sel_sc
-                                and _line_sel_ec < vis_e)
+        # Gutter
+        if show_lineno:
+            line_no = str(line_idx + 1).rjust(self.GUTTER - 1) + ' '
+        else:
+            line_no = ' ' * self.GUTTER
+        self._safe_addstr(y, 0, line_no, curses.color_pair(colors.line_num))
 
-                if not has_match and not sel_enclosed and in_sel_start == in_sel_end:
-                    # Fast path: uniform attribute for entire segment
-                    if in_sel_start:
+        line = buf.lines[line_idx]
+        tokens = self.lexer.get_tokens(line_idx, buf.lines)
+
+        # Map token type -> color pair id
+        type_to_pair = {
+            'normal':   colors.normal,
+            'keyword':  colors.keyword,
+            'type':     colors.type_,
+            'function': colors.func,
+            'string':   colors.string,
+            'comment':  colors.comment,
+            'number':   colors.number,
+            'operator': colors.operator,
+        }
+
+        # Ensure we cover the full line (fill gaps between tokens)
+        full_tokens = []
+        prev_end = 0
+        for (ts, te, tt) in tokens:
+            if ts > prev_end:
+                full_tokens.append((prev_end, ts, 'normal'))
+            full_tokens.append((ts, te, tt))
+            prev_end = te
+        if prev_end < len(line):
+            full_tokens.append((prev_end, len(line), 'normal'))
+
+        sc = col_start
+        ec = sc + self.text_cols
+        is_marked = line_idx in buf.marked_lines
+        cl_start, cl_end = self.cursor_line_range
+        is_cursor_line = cl_start != cl_end and cl_start <= (line_idx - buf.cursor_row) < cl_end
+
+        if is_cursor_line:
+            self._safe_addstr(y, self.GUTTER, ' ' * self.text_cols,
+                              curses.color_pair(colors.cursor_normal))
+
+        # Precompute same-row selection boundaries for fast-path correctness.
+        # When the selection start AND end both fall strictly inside a token
+        # segment, in_sel_start == in_sel_end == False even though the middle
+        # characters are selected — the fast path must not be taken in that case.
+        _line_sel_sc = _line_sel_ec = None
+        if buf.has_selection():
+            _s, _e = buf._norm_sel()
+            if _s is not None and _s[0] == line_idx == _e[0]:
+                _line_sel_sc, _line_sel_ec = _s[1], _e[1]
+
+        for (ts, te, tt) in full_tokens:
+            # Clip to visible columns
+            vis_s = max(ts, sc)
+            vis_e = min(te, ec)
+            if vis_s >= vis_e:
+                continue
+            screen_x = self.GUTTER + vis_s - sc
+            segment = line[vis_s:vis_e]
+            pair_id = type_to_pair.get(tt, colors.normal)
+
+            in_sel_start = buf.is_in_selection(line_idx, vis_s)
+            in_sel_end   = buf.is_in_selection(line_idx, vis_e - 1)
+            has_match    = any((line_idx, c) in match_set for c in range(vis_s, vis_e))
+
+            # Fast path is only valid when the selection doesn't start AND end
+            # strictly inside the segment (which would make both endpoints appear
+            # unselected while the middle is actually selected).
+            sel_enclosed = (_line_sel_sc is not None
+                            and vis_s < _line_sel_sc
+                            and _line_sel_ec < vis_e)
+
+            if not has_match and not sel_enclosed and in_sel_start == in_sel_end:
+                # Fast path: uniform attribute for entire segment
+                if in_sel_start:
+                    attr = curses.color_pair(colors.sel_pair_for(pair_id))
+                elif is_marked:
+                    attr = curses.color_pair(colors.mark_pair_for(pair_id))
+                elif is_cursor_line:
+                    attr = curses.color_pair(colors.cursor_pair_for(pair_id))
+                else:
+                    attr = curses.color_pair(pair_id)
+                self._safe_addstr(y, screen_x, segment, attr)
+            else:
+                # Per-character rendering — use addstr(single char) to avoid
+                # addch artefacts (wrong ACS glyphs on some terminals/ncurses).
+                for i, ch in enumerate(segment):
+                    col = vis_s + i
+                    sx  = screen_x + i
+                    if (line_idx, col) in current_match_set:
+                        attr = curses.color_pair(colors.search_match_current)
+                    elif (line_idx, col) in match_set:
+                        attr = curses.color_pair(colors.search_match)
+                    elif buf.is_in_selection(line_idx, col):
                         attr = curses.color_pair(colors.sel_pair_for(pair_id))
                     elif is_marked:
                         attr = curses.color_pair(colors.mark_pair_for(pair_id))
@@ -1425,26 +1507,7 @@ class Renderer:
                         attr = curses.color_pair(colors.cursor_pair_for(pair_id))
                     else:
                         attr = curses.color_pair(pair_id)
-                    self._safe_addstr(y, screen_x, segment, attr)
-                else:
-                    # Per-character rendering — use addstr(single char) to avoid
-                    # addch artefacts (wrong ACS glyphs on some terminals/ncurses).
-                    for i, ch in enumerate(segment):
-                        col = vis_s + i
-                        sx  = screen_x + i
-                        if (line_idx, col) in current_match_set:
-                            attr = curses.color_pair(colors.search_match_current)
-                        elif (line_idx, col) in match_set:
-                            attr = curses.color_pair(colors.search_match)
-                        elif buf.is_in_selection(line_idx, col):
-                            attr = curses.color_pair(colors.sel_pair_for(pair_id))
-                        elif is_marked:
-                            attr = curses.color_pair(colors.mark_pair_for(pair_id))
-                        elif is_cursor_line:
-                            attr = curses.color_pair(colors.cursor_pair_for(pair_id))
-                        else:
-                            attr = curses.color_pair(pair_id)
-                        self._safe_addstr(y, sx, ch, attr)
+                    self._safe_addstr(y, sx, ch, attr)
 
     def _draw_search_bar(self, search: 'SearchBar'):
         y = self._height - 2
@@ -1520,7 +1583,7 @@ class Editor:
         self._debug_mode = False
         self._debug_key = ''
         self._status_notification: Optional[str] = None
-        self._custom_keybindings: dict = {}
+        self._keybindings: dict = {}
         self._ac_words: List[Tuple[str, str, int]] = []
         self._running_done_cb = None
         self._file_change_dismissed: bool = False
@@ -1537,6 +1600,8 @@ class Editor:
             if not self._directory:
                 self._directory = os.path.dirname(os.path.abspath(filepath))
 
+        self._register_default_keybindings()
+
     @staticmethod
     def _apply_termios():
         """Disable terminal signal generation and flow control so Ctrl+C/Z/S/Q
@@ -1552,23 +1617,31 @@ class Editor:
         except Exception:
             pass
 
-    def _init_ac_words(self, keywords, types, functions) -> None:
+    def _init_ac_words(
+        self,
+        keywords: Optional[List[str]] = None,
+        types: Optional[List[str]] = None,
+        functions: Optional[List[str]] = None
+    ) -> None:
         entries, seen = [], set()
-        for w in keywords:
-            wu = w.upper()
-            if wu not in seen:
-                entries.append((wu, f'{wu}  (keyword)', 0))
-                seen.add(wu)
-        for w in types:
-            wu = w.upper()
-            if wu not in seen:
-                entries.append((wu, f'{wu}  (type)', 0))
-                seen.add(wu)
-        for w in functions:
-            wu = w.upper()
-            if wu not in seen:
-                entries.append((wu, f'{wu}  (function)', 0))
-                seen.add(wu)
+        if keywords:
+            for w in keywords:
+                wu = w.upper()
+                if wu not in seen:
+                    entries.append((wu, f'{wu}  (keyword)', 0))
+                    seen.add(wu)
+        if types:
+            for w in types:
+                wu = w.upper()
+                if wu not in seen:
+                    entries.append((wu, f'{wu}  (type)', 0))
+                    seen.add(wu)
+        if functions:
+            for w in functions:
+                wu = w.upper()
+                if wu not in seen:
+                    entries.append((wu, f'{wu}  (function)', 0))
+                    seen.add(wu)
         self._ac_words = entries
 
     # ── Public interface ───────────────────────────────────────────────────────
@@ -1683,14 +1756,69 @@ class Editor:
         popup_items = [(insert, display, weight) for display, insert, weight in items]
         self.popup.open(popup_items, filter_text=self.buf.word_at_cursor())
 
-    def add_keybinding(self, key, func) -> None:
+    def add_keybinding(self, name: str, key, func) -> None:
         """Register a keyboard shortcut.
 
-        key  – an int key code or a single-char string (e.g. '\\x10' for Ctrl+P).
-        func – callable invoked as func(editor) when the key is pressed.
-        Custom bindings take priority over built-in ones."""
+        key  – an int key code, a single-char string, or a list/tuple of ints.
+        func – callable invoked with no args when the key is pressed."""
+        if isinstance(key, (list, tuple)):
+            for k in key:
+                self.add_keybinding(name, k, func)
+            return
         k = self._normalize_key(key) if isinstance(key, str) else key
-        self._custom_keybindings[k] = func
+        self._keybindings[k] = (func, name)
+
+    def _register_default_keybindings(self):
+        add = self.add_keybinding
+        # Movement
+        add('move_up',          curses.KEY_UP,                                self._cmd_move_up)
+        add('move_down',        curses.KEY_DOWN,                              self._cmd_move_down)
+        add('move_left',        curses.KEY_LEFT,                              self._cmd_move_left)
+        add('move_right',       curses.KEY_RIGHT,                             self._cmd_move_right)
+        add('sel_move_up',      curses.KEY_SR,                                self._cmd_sel_move_up)
+        add('sel_move_down',    curses.KEY_SF,                                self._cmd_sel_move_down)
+        add('sel_move_left',    curses.KEY_SLEFT,                             self._cmd_sel_move_left)
+        add('sel_move_right',   curses.KEY_SRIGHT,                            self._cmd_sel_move_right)
+        add('move_up_5',        578,                                          self.move_up_5)
+        add('move_down_5',      537,                                          self.move_down_5)
+        add('move_home',        [curses.KEY_HOME, 604, ord('\x01')],          self._cmd_move_home)
+        add('move_end',         [curses.KEY_END,  605, ord('\x05')],          self._cmd_move_end)
+        add('sel_move_home',    [curses.KEY_SHOME, 27091091049059049048068],  self._cmd_sel_move_home)
+        add('sel_move_end',     [curses.KEY_SEND,  27091091049059049048067],  self._cmd_sel_move_end)
+        add('page_up',          curses.KEY_PPAGE,                             self._cmd_page_up)
+        add('page_down',        curses.KEY_NPAGE,                             self._cmd_page_down)
+        add('sel_page_up',      curses.KEY_SPREVIOUS,                         self._cmd_sel_page_up)
+        add('sel_page_down',    curses.KEY_SNEXT,                             self._cmd_sel_page_down)
+        add('file_start',       549,                                          self._cmd_file_start)
+        add('file_end',         544,                                          self._cmd_file_end)
+        add('word_left',        [443, 541, 542, 27098, 27260],                self._cmd_word_left)
+        add('word_right',       [444, 552, 556, 557, 27102, 27261],           self._cmd_word_right)
+        add('sel_word_left',    [553, 559, 558, 600, 602],                    self._cmd_sel_word_left)
+        add('sel_word_right',   [568, 574, 573, 601, 603],                    self._cmd_sel_word_right)
+        # Ctrl shortcuts
+        add('open_file',        ord('\x07'),                                  self._open_from_directory)
+        add('copy',             ord('\x03'),                                  self._cmd_copy)
+        add('cut',              ord('\x18'),                                  self._cmd_cut)
+        add('paste',            ord('\x16'),                                  self._cmd_paste)
+        add('undo',             ord('\x1a'),                                  self._cmd_undo)
+        add('redo',             ord('\x19'),                                  self._cmd_redo)
+        add('save',             ord('\x13'),                                  self._save_file)
+        add('search',           ord('\x06'),                                  self._cmd_search)
+        add('autocomplete',     [ord('\x0e'), ord('\x00')],                   self._cmd_autocomplete)
+        add('quit',             ord('\x11'),                                  self._quit)
+        add('help',             [curses.KEY_F1, ord('\x08')],                 self.show_help)
+        add('toggle_wrap',      ord('\x17'),                                  self._cmd_toggle_wrap)
+        add('toggle_mark',      ord('\x0b'),                                  self._cmd_toggle_mark)
+        add('select_all',       27001,                                        self._cmd_select_all)
+        # Editing
+        add('backspace',        [curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')], self._cmd_backspace)
+        add('delete',           curses.KEY_DC,                                self._cmd_delete_forward)
+        add('delete_word_fwd',  608,                                          self._cmd_delete_word_forward)
+        add('kill_word_bwd',    27263,                                        self._cmd_kill_word_backward)
+        add('newline',          [curses.KEY_ENTER, ord('\n'), ord('\r')],     self._cmd_newline)
+        add('tab',              ord('\t'),                                     self._cmd_tab)
+        add('resize',           curses.KEY_RESIZE,                            self._cmd_resize)
+        add('clear_selection',  27,                                           self.buf.clear_selection)
 
     def run(self):
         while self.running:
@@ -1743,8 +1871,51 @@ class Editor:
             return o
         return key
 
+    def _resolve_key(self, key):
+        """If key is ESC (27), peek ahead to build a unified composite code.
+        Returns the resolved composite int, or 27 for a plain bare ESC."""
+        if key != 27:
+            return key
+
+        self.stdscr.timeout(30)
+        try:
+            nk = self.stdscr.get_wch()
+        except curses.error:
+            nk = -1
+        self.stdscr.timeout(50)
+
+        if isinstance(nk, str):
+            nk = self._normalize_key(nk)
+
+        if nk == -1:
+            return 27  # bare ESC
+
+        key = 27000 + nk
+
+        if nk == ord('['):  # CSI sequence — consume until alpha terminator
+            key = key * 1000 + ord('[')
+            seq = ''
+            self.stdscr.timeout(30)
+            try:
+                while True:
+                    try:
+                        ch = self.stdscr.get_wch()
+                    except curses.error:
+                        break
+                    seq += ch if isinstance(ch, str) else chr(ch)
+                    key = key * 1000 + (ord(ch) if isinstance(ch, str) else ch)
+                    if seq[-1].isalpha():
+                        break
+            finally:
+                self.stdscr.timeout(50)
+
+        return key
+
     def _dispatch(self, key):
         key = self._normalize_key(key)
+        key = self._resolve_key(key)
+        key = self._override_remaped_keys(key)
+
         if self._status_notification is not None:
             self._status_notification = None
             self.renderer.status_notification = None
@@ -1788,239 +1959,209 @@ class Editor:
 
         self._handle_normal_key(key)
 
-    def override_remaped_keys(self, key) -> int:
+    def _override_remaped_keys(self, key) -> int:
         if key in self.REMAPED_KEYS:
             return self.REMAPED_KEYS[key]
         return key
 
-    def _handle_normal_key(self, key):
-        key = self.override_remaped_keys(key)
-        buf = self.buf
+    # ── Movement commands ─────────────────────────────────────────────────────
 
-        if key in self._custom_keybindings:
-            self._custom_keybindings[key](self)
-            return
-
-        # ── Movement ──────────────────────────────────────────────────────────
-        if key == curses.KEY_UP:
-            buf.move_up()
-        elif key == curses.KEY_DOWN:
-            buf.move_down()
-        elif key == curses.KEY_LEFT:
-            buf.move_left()
-        elif key == curses.KEY_RIGHT:
-            buf.move_right()
-        elif key == curses.KEY_SR:  # Shift+Up
-            buf.move_up(extend=True)
-        elif key == curses.KEY_SF:  # Shift+Down
-            buf.move_down(extend=True)
-        elif key == curses.KEY_SLEFT:  # Shift+Left
-            buf.move_left(extend=True)
-        elif key == curses.KEY_SRIGHT:  # Shift+Right
-            buf.move_right(extend=True)
-        elif key == curses.KEY_HOME:
-            buf.move_cursor(buf.cursor_row, 0)
-        elif key == curses.KEY_END:
-            buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]))
-        elif key == curses.KEY_SHOME:  # Shift+Home — select to line start
-            buf.move_cursor(buf.cursor_row, 0, extend_selection=True)
-        elif key == curses.KEY_SEND:   # Shift+End — select to line end
-            buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]), extend_selection=True)
-        elif key == curses.KEY_PPAGE:  # Page Up
-            rows = self.renderer.text_rows - 3
-            pc = buf.preferred_col
-            buf.move_cursor(max(0, buf.cursor_row - rows), pc)
-            buf.preferred_col = pc
-        elif key == curses.KEY_NPAGE:  # Page Down
-            rows = self.renderer.text_rows - 3
-            pc = buf.preferred_col
-            buf.move_cursor(min(len(buf.lines) - 1, buf.cursor_row + rows), pc)
-            buf.preferred_col = pc
-        elif key == curses.KEY_SPREVIOUS:  # Shift+Page Up — select up by page
-            rows = self.renderer.text_rows - 3
-            pc = buf.preferred_col
-            buf.move_cursor(max(0, buf.cursor_row - rows), pc, extend_selection=True)
-            buf.preferred_col = pc
-        elif key == curses.KEY_SNEXT:  # Shift+Page Down — select down by page
-            rows = self.renderer.text_rows - 3
-            pc = buf.preferred_col
-            buf.move_cursor(min(len(buf.lines) - 1, buf.cursor_row + rows), pc, extend_selection=True)
-            buf.preferred_col = pc
-        elif key == 549:  # Ctrl+Home → file start
-            buf.move_cursor(0, 0)
-        elif key == 544:  # Ctrl+End → file end
-            last = len(buf.lines) - 1
-            buf.move_cursor(last, len(buf.lines[last]))
-
-        # Ctrl+Left / Ctrl+Right (escape sequences on most terminals)
-        # Ctrl+Left / Ctrl+Right  (various ncurses key-code variants)
-        elif key in (443, 537, 541):
-            buf.move_word_left()
-        elif key in (444, 552, 556):
-            buf.move_word_right()
-        # Alt+Left / Alt+Right as direct ncurses extended key codes
-        # (iTerm2 with \E[1;3D/\E[1;3C when ncurses resolves them)
-        elif key in (542,):   # kLFT3 variants (without shift)
-            buf.move_word_left()
-        elif key in (557,):   # kRIT3 variants (without shift)
-            buf.move_word_right()
-        # Shift+Alt+Left / Shift+Alt+Right — select by word
-        elif key in (553, 559, 558, 600):   # confirmed code 558 on macOS Terminal
-            buf.move_word_left(extend=True)
-        elif key in (568, 574, 573, 601):   # confirmed code 573 on macOS Terminal
-            buf.move_word_right(extend=True)
-        # Shift+Ctrl+Left / Shift+Ctrl+Right — registered via define_key
-        elif key == 602:
-            buf.move_word_left(extend=True)
-        elif key == 603:
-            buf.move_word_right(extend=True)
-        # Super+Left / Super+Right → Home / End
-        elif key == 604:
-            buf.move_cursor(buf.cursor_row, 0)
-        elif key == 605:
-            buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]))
-
-        # ── Ctrl shortcuts ────────────────────────────────────────────────────
-        elif key == ord('\x01'):  # Ctrl+A / Cmd+Left → line start
-            buf.move_cursor(buf.cursor_row, 0)
-        elif key == ord('\x07'):  # Ctrl+G → open file / browse directory
-            self._open_from_directory()
-        elif key == ord('\x05'):  # Ctrl+E / Super+Right → End
-            buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]))
-        elif key == ord('\x03'):  # Ctrl+C
-            if buf.has_selection():
-                self.clipboard.copy(buf.get_selected_text())
-        elif key == ord('\x18'):  # Ctrl+X
-            if buf.has_selection():
-                self.clipboard.copy(buf.get_selected_text())
-                buf._push_undo('cut')
-                buf.delete_selection()
-        elif key == ord('\x16'):  # Ctrl+V
-            text = self.clipboard.paste()
-            if text is not None:
-                buf.insert_text(text)
-        elif key == ord('\x1a'):  # Ctrl+Z
-            buf.undo()
-            self.lexer.invalidate(0)
-        elif key == ord('\x19'):  # Ctrl+Y
-            buf.redo()
-            self.lexer.invalidate(0)
-        elif key == ord('\x13'):  # Ctrl+S
-            self._save_file()
-        elif key == ord('\x06'):  # Ctrl+F
-            self.search.open()
-        elif key in (ord('\x0e'), ord('\x00')):  # Ctrl+N or Ctrl+Space
-            if self.popup.active:
-                self.popup.close()
-            else:
-                items = list(self._ac_words)
-                seen = {w.upper() for w, _, _ in items}
-                for w in buf.document_words():
-                    wu = w.upper()
-                    if wu not in seen:
-                        items.append((wu, f'{wu}  (word)', 0))
-                        seen.add(wu)
-                self.popup.open(items, filter_text=buf.word_at_cursor())
-        elif key == ord('\x11'):  # Ctrl+Q
-            self._quit()
-        elif key in (curses.KEY_F1, ord('\x08')):  # F1 or Ctrl+H
-            self.show_help()
-        elif key == ord('\x0b'):  # Ctrl+K — toggle line mark
-            r = buf.cursor_row
-            if r in buf.marked_lines:
-                buf.marked_lines.discard(r)
-            else:
-                buf.marked_lines.add(r)
-
-        # ── Editing ───────────────────────────────────────────────────────────
-        elif key in (curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')):
-            buf.delete_char()
-            self.lexer.invalidate(max(0, buf.cursor_row - 1))
-        elif key == curses.KEY_DC:  # Delete
-            buf.delete_char_forward()
-            self.lexer.invalidate(buf.cursor_row)
-        elif key == 608:  # Alt+Delete — delete word forward
-            buf.delete_word_after_cursor()
-            self.lexer.invalidate(buf.cursor_row)
-        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
-            buf.insert_newline()
-            self.lexer.invalidate(max(0, buf.cursor_row - 1))
-        elif key == ord('\t'):  # Tab
-            buf.insert_char(' ' * TAB_SIZE)
-        elif key == curses.KEY_RESIZE:
-            self.renderer.resize()
-        elif key == 27:  # ESC — may be Alt+Arrow sequence or plain Escape
-            # Peek at the next character with a short timeout to detect Alt combos.
-            # Terminal.app sends ESC+b / ESC+f for Alt+Left / Alt+Right.
-            # iTerm2 with "Esc+" option key sends ESC+[1;3D / ESC+[1;3C which
-            # ncurses keypad() resolves before we see ESC, so those come as
-            # extended KEY_* integers handled separately.
-            self.stdscr.timeout(30)
-            try:
-                nk = self.stdscr.get_wch()
-            except curses.error:
-                nk = -1
-            self.stdscr.timeout(50)  # restore main timeout
-
-            if isinstance(nk, str):
-                nk = self._normalize_key(nk)
-
-            if nk == -1:
-                buf.clear_selection()
-            else:
-                key = 27000 + nk  # distinguish ESC+key from plain ESC
-
-            if nk == ord('['):  # ESC+[ → CSI sequence, read remainder
-                key = key * 1000 + ord('[')
-                seq = ''
-                self.stdscr.timeout(30)
-                try:
-                    while True:
-                        try:
-                            ch = self.stdscr.get_wch()
-                        except curses.error:
-                            break
-                        seq += ch if isinstance(ch, str) else chr(ch)
-                        key = key * 1000 + (ord(ch) if isinstance(ch, str) else ch)
-                        if seq[-1].isalpha():
-                            break
-                finally:
-                    self.stdscr.timeout(50)
-
-            if key > 27000 and self._debug_mode:
-                self.renderer.debug_text = f'key={key!r}  int={key if isinstance(key,int) else ord(key)}'
-
-        # Longer ESC sequeces and custom keybindings
-        if key == 27098 or key == 27260:
-            buf.move_word_left()
-        elif key == 27102 or key == 27261:
-            buf.move_word_right()
-        elif key == 27001:  # ESC+Ctrl+A → Select All
-            buf.select_all()
-        elif key == 27091091049059049048068:    # Cmd+Shift+Left → select to line start
-            buf.move_cursor(buf.cursor_row, 0, extend_selection=True)
-        elif key == 27091091049059049048067:  # Cmd+Shift+Right → select to line end
-            buf.move_cursor(buf.cursor_row, len(buf.lines[buf.cursor_row]), extend_selection=True)
-        elif key == 27263:
-            # Alt+Delete / Alt+Backspace → delete one token forward/backward
-            row_before = buf.cursor_row
-            if nk == curses.KEY_DC:
-                buf.delete_word_after_cursor()
-            else:
-                buf.kill_word_backward()
-            self.lexer.invalidate(min(row_before, buf.cursor_row))
-        elif key in self._custom_keybindings:
-            self._custom_keybindings[key](self)
-
-        # ── Printable character ───────────────────────────────────────────────
+    def _cmd_move_up(self):
+        if self.renderer.wrap:
+            self._move_up_wrap()
         else:
-            ch = None
-            if isinstance(key, str) and key.isprintable():
-                ch = key
-            elif isinstance(key, int) and 32 <= key <= 126:
-                ch = chr(key)
-            if ch is not None:
-                buf.insert_char(ch)
+            self.buf.move_up()
+
+    def _cmd_move_down(self):
+        if self.renderer.wrap:
+            self._move_down_wrap()
+        else:
+            self.buf.move_down()
+
+    def _cmd_move_left(self):
+        self.buf.move_left()
+
+    def _cmd_move_right(self):
+        self.buf.move_right()
+
+    def _cmd_move_home(self):
+        self.buf.move_cursor(self.buf.cursor_row, 0)
+
+    def _cmd_move_end(self):
+        self.buf.move_cursor(self.buf.cursor_row, len(self.buf.lines[self.buf.cursor_row]))
+
+    def _cmd_page_up(self):
+        rows = self.renderer.text_rows - 3
+        pc = self.buf.preferred_col
+        self.buf.move_cursor(max(0, self.buf.cursor_row - rows), pc)
+        self.buf.preferred_col = pc
+
+    def _cmd_page_down(self):
+        rows = self.renderer.text_rows - 3
+        pc = self.buf.preferred_col
+        self.buf.move_cursor(min(len(self.buf.lines) - 1, self.buf.cursor_row + rows), pc)
+        self.buf.preferred_col = pc
+
+    def _cmd_file_start(self):
+        self.buf.move_cursor(0, 0)
+
+    def _cmd_file_end(self):
+        last = len(self.buf.lines) - 1
+        self.buf.move_cursor(last, len(self.buf.lines[last]))
+
+    def _cmd_word_left(self):
+        self.buf.move_word_left()
+
+    def _cmd_word_right(self):
+        self.buf.move_word_right()
+
+    # ── Selection movement commands ───────────────────────────────────────────
+
+    def _cmd_sel_move_up(self):
+        if self.renderer.wrap:
+            self._move_up_wrap(extend=True)
+        else:
+            self.buf.move_up(extend=True)
+
+    def _cmd_sel_move_down(self):
+        if self.renderer.wrap:
+            self._move_down_wrap(extend=True)
+        else:
+            self.buf.move_down(extend=True)
+
+    def _cmd_sel_move_left(self):
+        self.buf.move_left(extend=True)
+
+    def _cmd_sel_move_right(self):
+        self.buf.move_right(extend=True)
+
+    def _cmd_sel_move_home(self):
+        self.buf.move_cursor(self.buf.cursor_row, 0, extend_selection=True)
+
+    def _cmd_sel_move_end(self):
+        self.buf.move_cursor(self.buf.cursor_row, len(self.buf.lines[self.buf.cursor_row]), extend_selection=True)
+
+    def _cmd_sel_page_up(self):
+        rows = self.renderer.text_rows - 3
+        pc = self.buf.preferred_col
+        self.buf.move_cursor(max(0, self.buf.cursor_row - rows), pc, extend_selection=True)
+        self.buf.preferred_col = pc
+
+    def _cmd_sel_page_down(self):
+        rows = self.renderer.text_rows - 3
+        pc = self.buf.preferred_col
+        self.buf.move_cursor(min(len(self.buf.lines) - 1, self.buf.cursor_row + rows), pc, extend_selection=True)
+        self.buf.preferred_col = pc
+
+    def _cmd_sel_word_left(self):
+        self.buf.move_word_left(extend=True)
+
+    def _cmd_sel_word_right(self):
+        self.buf.move_word_right(extend=True)
+
+    # ── Editing commands ──────────────────────────────────────────────────────
+
+    def _cmd_copy(self):
+        if self.buf.has_selection():
+            self.clipboard.copy(self.buf.get_selected_text())
+
+    def _cmd_cut(self):
+        if self.buf.has_selection():
+            self.clipboard.copy(self.buf.get_selected_text())
+            self.buf._push_undo('cut')
+            self.buf.delete_selection()
+
+    def _cmd_paste(self):
+        text = self.clipboard.paste()
+        if text is not None:
+            self.buf.insert_text(text)
+
+    def _cmd_undo(self):
+        self.buf.undo()
+        self.lexer.invalidate(0)
+
+    def _cmd_redo(self):
+        self.buf.redo()
+        self.lexer.invalidate(0)
+
+    def _cmd_backspace(self):
+        self.buf.delete_char()
+        self.lexer.invalidate(max(0, self.buf.cursor_row - 1))
+
+    def _cmd_delete_forward(self):
+        self.buf.delete_char_forward()
+        self.lexer.invalidate(self.buf.cursor_row)
+
+    def _cmd_delete_word_forward(self):
+        self.buf.delete_word_after_cursor()
+        self.lexer.invalidate(self.buf.cursor_row)
+
+    def _cmd_kill_word_backward(self):
+        row_before = self.buf.cursor_row
+        self.buf.kill_word_backward()
+        self.lexer.invalidate(min(row_before, self.buf.cursor_row))
+
+    def _cmd_newline(self):
+        self.buf.insert_newline()
+        self.lexer.invalidate(max(0, self.buf.cursor_row - 1))
+
+    def _cmd_tab(self):
+        self.buf.insert_char(' ' * TAB_SIZE)
+
+    # ── Other commands ────────────────────────────────────────────────────────
+
+    def _cmd_search(self):
+        self.search.open()
+
+    def _cmd_autocomplete(self):
+        if self.popup.active:
+            self.popup.close()
+        else:
+            items = list(self._ac_words)
+            seen = {w.upper() for w, _, _ in items}
+            for w in self.buf.document_words():
+                wu = w.upper()
+                if wu not in seen:
+                    items.append((wu, f'{wu}  (word)', 0))
+                    seen.add(wu)
+            self.popup.open(items, filter_text=self.buf.word_at_cursor())
+
+    def _cmd_toggle_wrap(self):
+        self.renderer.wrap = not self.renderer.wrap
+        self.renderer.scroll_col = 0
+
+    def _cmd_toggle_mark(self):
+        r = self.buf.cursor_row
+        if r in self.buf.marked_lines:
+            self.buf.marked_lines.discard(r)
+        else:
+            self.buf.marked_lines.add(r)
+
+    def _cmd_select_all(self):
+        self.buf.select_all()
+
+    def _cmd_resize(self):
+        self.renderer.resize()
+
+    # ── Printable character ───────────────────────────────────────────────────
+
+    def _handle_printable(self, key):
+        ch = None
+        if isinstance(key, str) and key.isprintable():
+            ch = key
+        elif isinstance(key, int) and key >= 32 and chr(key).isprintable():
+            ch = chr(key)
+        if ch is not None:
+            self.buf.insert_char(ch)
+
+    # ── Key dispatch ──────────────────────────────────────────────────────────
+
+    def _handle_normal_key(self, key):
+        if key in self._keybindings:
+            fn, _name = self._keybindings[key]
+            fn()
+            return
+        self._handle_printable(key)
 
     def _save_file(self):
         if self.buf.filepath:
@@ -2041,7 +2182,17 @@ class Editor:
         self.show_popup('Help', self._help_text())
 
     def _help_text(self) -> str:
-        return EDITOR_HELP
+        text = EDITOR_HELP
+        if self._debug_mode:
+            by_name: dict = {}
+            for key, (fn, name) in self._keybindings.items():
+                by_name.setdefault(name, []).append(key)
+            lines = ['\n\nKeybindings (debug mode)']
+            for name, keys in sorted(by_name.items()):
+                keys_str = ', '.join(str(k) for k in sorted(keys))
+                lines.append(f'  {name.ljust(20)}{keys_str}')
+            text += '\n'.join(lines)
+        return text
 
     def _prompt_save_before_close(self) -> str:
         """Prompt to save unsaved changes before closing/switching the current file.
@@ -2095,6 +2246,43 @@ class Editor:
                 if self.buf.dirty:  # save was cancelled (e.g. no filepath and prompt escaped)
                     return
         self.running = False
+
+    def move_up_5(self, extend: bool = False):
+        buf = self.buf
+        pc = buf.preferred_col
+        buf.move_cursor(max(0, buf.cursor_row - 5), pc, extend)
+        buf.preferred_col = pc
+
+    def move_down_5(self, extend: bool = False):
+        buf = self.buf
+        pc = buf.preferred_col
+        buf.move_cursor(min(len(buf.lines) - 1, buf.cursor_row + 5), pc, extend)
+        buf.preferred_col = pc
+
+    def _move_up_wrap(self, extend: bool = False):
+        tc = self.renderer.text_cols
+        buf = self.buf
+        if buf.cursor_col >= tc:
+            buf.move_cursor(buf.cursor_row, buf.cursor_col - tc, extend)
+        elif buf.cursor_row > 0:
+            visual_col = buf.cursor_col % tc
+            prev_len = len(buf.lines[buf.cursor_row - 1])
+            last_vline_start = (prev_len // tc) * tc
+            new_col = min(last_vline_start + visual_col, prev_len)
+            buf.move_cursor(buf.cursor_row - 1, new_col, extend)
+
+    def _move_down_wrap(self, extend: bool = False):
+        tc = self.renderer.text_cols
+        buf = self.buf
+        line_len = len(buf.lines[buf.cursor_row])
+        next_vline_start = (buf.cursor_col // tc + 1) * tc
+        if next_vline_start <= line_len:
+            new_col = min(buf.cursor_col + tc, line_len)
+            buf.move_cursor(buf.cursor_row, new_col, extend)
+        elif buf.cursor_row < len(buf.lines) - 1:
+            visual_col = buf.cursor_col % tc
+            new_col = min(visual_col, len(buf.lines[buf.cursor_row + 1]))
+            buf.move_cursor(buf.cursor_row + 1, new_col, extend)
 
     def _check_external_file_change(self):
         if (self._file_change_dismissed
@@ -2210,7 +2398,7 @@ class Editor:
                 result = result[:-1]
             elif isinstance(key, str) and key.isprintable():
                 result += key
-            elif isinstance(key, int) and 32 <= key <= 126:
+            elif isinstance(key, int) and key >= 32 and chr(key).isprintable():
                 result += chr(key)
 
 

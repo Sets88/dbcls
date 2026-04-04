@@ -19,7 +19,7 @@ def get_requirements():
 
 setup(
     name='dbcls',
-    version='1.2.5',
+    version='1.2.6',
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',
@@ -32,6 +32,9 @@ setup(
     zip_safe=False,
     platforms='any',
     install_requires=get_requirements(),
+    extras_require={
+        'cassandra': ['cassandra-driver==3.29.3'],
+    },
     python_requires='>=3.9',
     url="https://github.com/Sets88/dbcls",
     entry_points={
