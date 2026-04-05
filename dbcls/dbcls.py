@@ -20,7 +20,16 @@ from .vd_db_browser import DataBaseSheet, TablesSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
-from .editor import Editor
+from .editor import Editor, Fn  # noqa: F401 (Fn re-exported for subclasses)
+import enum
+
+
+class DbFn(str, enum.Enum):
+    """Named DbEditor functions."""
+    RUN_QUERY       = 'run_query'
+    SHOW_TABLES     = 'show_tables'
+    SHOW_DATABASES  = 'show_databases'
+    SHOW_PREDICTION = 'show_prediction'
 
 
 logging.basicConfig(level=logging.ERROR)
@@ -192,7 +201,7 @@ def get_word_parts(buf) -> list:
 DB_HELP_EXTRA = """
 Database
   Alt+R               Execute query at cursor (or selection)
-  Alt+1               DB autocomplete (tables, columns, functions)
+  Shift+Tab / Alt+1   DB autocomplete (tables, columns, functions)
   Alt+T               Browse tables
   Alt+E               Browse databases
   Esc                 Cancel running query
@@ -222,11 +231,14 @@ class DbEditor(Editor):
             self.apply_keys_remap(remap_config)
 
         super().__init__(stdscr, filepath, directory=directory)
-        self.add_keybinding('run_query', 27114, self._db_query) # Alt+R
-        self.add_keybinding('show_tables', 27116, self._db_show_tables) # Alt+T
-        self.add_keybinding('show_databases', 27101, self._db_show_databases) # Alt+E
-        self.add_keybinding('show_prediction', 27049, self._db_show_prediction) # Alt+1
-        self.add_keybinding('show_prediction', 353, self._db_show_prediction) # Shit+Tab
+        self.add_editor_function(DbFn.RUN_QUERY,       self._db_query,          'Execute query',  'Alt+R')
+        self.add_editor_function(DbFn.SHOW_TABLES,     self._db_show_tables,    'Browse tables',  'Alt+T')
+        self.add_editor_function(DbFn.SHOW_DATABASES,  self._db_show_databases, 'Browse databases', 'Alt+E')
+        self.add_editor_function(DbFn.SHOW_PREDICTION, self._db_show_prediction,'Autocomplete','Shift+Tab / Alt+1')
+        self.add_keybinding(DbFn.RUN_QUERY,       27114)           # Alt+R
+        self.add_keybinding(DbFn.SHOW_TABLES,     27116)           # Alt+T
+        self.add_keybinding(DbFn.SHOW_DATABASES,  27101)           # Alt+E
+        self.add_keybinding(DbFn.SHOW_PREDICTION, [27049, 353])    # Alt+1, Shift+Tab
         if self.client:
             self.set_status_name(self.client.get_title())
             self.set_words(keywords=self.client.all_commands, functions=self.client.all_functions)

@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 import curses
+import enum
 import locale
 import os
 import sys
@@ -11,7 +12,7 @@ import time
 import threading
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 MAX_UNDO = 200
@@ -60,7 +61,8 @@ Search
 Other
   Ctrl+K                  Toggle line mark (highlight)
   Ctrl+W                  Toggle word wrap
-  F1 / Ctrl+H             This help"""
+  Alt+P                   Command palette (run commands by name)
+  F1 / Alt+H              This help"""
 
 
 DEBUG_PARAMS = {
@@ -1541,7 +1543,7 @@ class Renderer:
         total_lines = len(buf.lines)
         conn = f' {self.status_name} ' if self.status_name else ' '
         right = f' Ln {ln}/{total_lines}  Col {col} '
-        hints = '^H/F1 Help ^S Save ^F Find Shift+Tab AC ^K Mark ^Z Undo ^Q Quit'
+        hints = 'Alt+H/F1 Help Alt+P Command palette ^S Save ^Q Quit'
         mid_space = W - len(conn) - len(right)
         if mid_space > len(hints):
             mid = hints.center(mid_space)
@@ -1557,6 +1559,58 @@ class Renderer:
             bar = (conn + mid + right)[:W]
             bar = bar.ljust(W)
         self._safe_addstr(y, 0, bar, curses.color_pair(colors.status_bar))
+
+
+# ─── Function name enum ───────────────────────────────────────────────────────
+class Fn(str, enum.Enum):
+    """Named editor functions. Values are the string keys used in the function registry."""
+    MOVE_UP          = 'move_up'
+    MOVE_DOWN        = 'move_down'
+    MOVE_LEFT        = 'move_left'
+    MOVE_RIGHT       = 'move_right'
+    SEL_MOVE_UP      = 'sel_move_up'
+    SEL_MOVE_DOWN    = 'sel_move_down'
+    SEL_MOVE_LEFT    = 'sel_move_left'
+    SEL_MOVE_RIGHT   = 'sel_move_right'
+    MOVE_UP_5        = 'move_up_5'
+    MOVE_DOWN_5      = 'move_down_5'
+    MOVE_HOME        = 'move_home'
+    MOVE_END         = 'move_end'
+    SEL_MOVE_HOME    = 'sel_move_home'
+    SEL_MOVE_END     = 'sel_move_end'
+    PAGE_UP          = 'page_up'
+    PAGE_DOWN        = 'page_down'
+    SEL_PAGE_UP      = 'sel_page_up'
+    SEL_PAGE_DOWN    = 'sel_page_down'
+    FILE_START       = 'file_start'
+    FILE_END         = 'file_end'
+    WORD_LEFT        = 'word_left'
+    WORD_RIGHT       = 'word_right'
+    SEL_WORD_LEFT    = 'sel_word_left'
+    SEL_WORD_RIGHT   = 'sel_word_right'
+    OPEN_FILE        = 'open_file'
+    COPY             = 'copy'
+    CUT              = 'cut'
+    PASTE            = 'paste'
+    UNDO             = 'undo'
+    REDO             = 'redo'
+    SAVE             = 'save'
+    SEARCH           = 'search'
+    AUTOCOMPLETE     = 'autocomplete'
+    QUIT             = 'quit'
+    HELP             = 'help'
+    TOGGLE_WRAP      = 'toggle_wrap'
+    TOGGLE_MARK      = 'toggle_mark'
+    SELECT_ALL       = 'select_all'
+    BACKSPACE        = 'backspace'
+    DELETE           = 'delete'
+    DELETE_WORD_FWD  = 'delete_word_fwd'
+    KILL_WORD_BWD    = 'kill_word_bwd'
+    NEWLINE          = 'newline'
+    TAB              = 'tab'
+    RESIZE           = 'resize'
+    CLEAR_SELECTION  = 'clear_selection'
+    COMMAND_PALETTE  = 'command_palette'
 
 
 # ─── Editor ───────────────────────────────────────────────────────────────────
@@ -1589,6 +1643,7 @@ class Editor:
         self._file_change_dismissed: bool = False
         self._file_check_counter: int = 0
         self._init_ac_words([], [], [])
+        self._editor_functions: dict = {}
 
         self._directory: Optional[str] = directory
         if directory:
@@ -1600,6 +1655,7 @@ class Editor:
             if not self._directory:
                 self._directory = os.path.dirname(os.path.abspath(filepath))
 
+        self._register_default_functions()
         self._register_default_keybindings()
 
     @staticmethod
@@ -1756,69 +1812,123 @@ class Editor:
         popup_items = [(insert, display, weight) for display, insert, weight in items]
         self.popup.open(popup_items, filter_text=self.buf.word_at_cursor())
 
-    def add_keybinding(self, name: str, key, func) -> None:
+    def add_editor_function(self, name: str, func: Callable[[], None], description: str = '', keybinding: str = '') -> None:
+        self._editor_functions[name] = {'func': func, 'description': description, 'keybinding': keybinding}
+
+    def add_keybinding(self, name: str, key: Union[int, List[int]]) -> None:
         """Register a keyboard shortcut.
 
         key  – an int key code, a single-char string, or a list/tuple of ints.
         func – callable invoked with no args when the key is pressed."""
         if isinstance(key, (list, tuple)):
             for k in key:
-                self.add_keybinding(name, k, func)
+                self.add_keybinding(name, k)
             return
         k = self._normalize_key(key) if isinstance(key, str) else key
-        self._keybindings[k] = (func, name)
+        self._keybindings[k] = name
+
+    def _register_default_functions(self):
+        add = self.add_editor_function
+        add(Fn.MOVE_UP,         self._cmd_move_up,              'Move cursor up')
+        add(Fn.MOVE_DOWN,       self._cmd_move_down,            'Move cursor down')
+        add(Fn.MOVE_LEFT,       self._cmd_move_left,            'Move cursor left')
+        add(Fn.MOVE_RIGHT,      self._cmd_move_right,           'Move cursor right')
+        add(Fn.SEL_MOVE_UP,     self._cmd_sel_move_up,          'Extend selection up')
+        add(Fn.SEL_MOVE_DOWN,   self._cmd_sel_move_down,        'Extend selection down')
+        add(Fn.SEL_MOVE_LEFT,   self._cmd_sel_move_left,        'Extend selection left')
+        add(Fn.SEL_MOVE_RIGHT,  self._cmd_sel_move_right,       'Extend selection right')
+        add(Fn.MOVE_UP_5,       self.move_up_5,                 'Move 5 lines up',        'Alt+Up')
+        add(Fn.MOVE_DOWN_5,     self.move_down_5,               'Move 5 lines down',      'Alt+Down')
+        add(Fn.MOVE_HOME,       self._cmd_move_home,            'Move to line start',     '^A / Cmd+Left')
+        add(Fn.MOVE_END,        self._cmd_move_end,             'Move to line end',       '^E / Cmd+Right')
+        add(Fn.SEL_MOVE_HOME,   self._cmd_sel_move_home,        'Select to line start',   'Shift+Home')
+        add(Fn.SEL_MOVE_END,    self._cmd_sel_move_end,         'Select to line end',     'Shift+End')
+        add(Fn.PAGE_UP,         self._cmd_page_up,              'Page up')
+        add(Fn.PAGE_DOWN,       self._cmd_page_down,            'Page down')
+        add(Fn.SEL_PAGE_UP,     self._cmd_sel_page_up,          'Select page up')
+        add(Fn.SEL_PAGE_DOWN,   self._cmd_sel_page_down,        'Select page down')
+        add(Fn.FILE_START,      self._cmd_file_start,           'Go to file start',       '^Home')
+        add(Fn.FILE_END,        self._cmd_file_end,             'Go to file end',         '^End')
+        add(Fn.WORD_LEFT,       self._cmd_word_left,            'Move word left',         '^Left / Alt+b')
+        add(Fn.WORD_RIGHT,      self._cmd_word_right,           'Move word right',        '^Right / Alt+f')
+        add(Fn.SEL_WORD_LEFT,   self._cmd_sel_word_left,        'Select word left')
+        add(Fn.SEL_WORD_RIGHT,  self._cmd_sel_word_right,       'Select word right')
+        add(Fn.OPEN_FILE,       self._open_from_directory,      'Open file',              '^G')
+        add(Fn.COPY,            self._cmd_copy,                 'Copy',                   '^C')
+        add(Fn.CUT,             self._cmd_cut,                  'Cut',                    '^X')
+        add(Fn.PASTE,           self._cmd_paste,                'Paste',                  '^V')
+        add(Fn.UNDO,            self._cmd_undo,                 'Undo',                   '^Z')
+        add(Fn.REDO,            self._cmd_redo,                 'Redo',                   '^Y')
+        add(Fn.SAVE,            self._save_file,                'Save',                   '^S')
+        add(Fn.SEARCH,          self._cmd_search,               'Search',                 '^F')
+        add(Fn.AUTOCOMPLETE,    self._cmd_autocomplete,         'Base autocomplete',      '^N')
+        add(Fn.QUIT,            self._quit,                     'Quit',                   '^Q')
+        add(Fn.HELP,            self.show_help,                 'Show help',              'F1 / Alt+H')
+        add(Fn.TOGGLE_WRAP,     self._cmd_toggle_wrap,          'Toggle word wrap',       '^W')
+        add(Fn.TOGGLE_MARK,     self._cmd_toggle_mark,          'Toggle line mark',       '^K')
+        add(Fn.SELECT_ALL,      self._cmd_select_all,           'Select all',             'Esc+^A')
+        add(Fn.BACKSPACE,       self._cmd_backspace,            'Delete char backward',   'Backspace')
+        add(Fn.DELETE,          self._cmd_delete_forward,       'Delete char forward',    'Del')
+        add(Fn.DELETE_WORD_FWD, self._cmd_delete_word_forward,  'Delete word forward',    'Alt+Del')
+        add(Fn.KILL_WORD_BWD,   self._cmd_kill_word_backward,   'Delete word backward',   'Alt+Backspace')
+        add(Fn.NEWLINE,         self._cmd_newline,              'New line',               'Enter')
+        add(Fn.TAB,             self._cmd_tab,                  'Insert tab',             'Tab')
+        add(Fn.RESIZE,          self._cmd_resize,               'Handle terminal resize')
+        add(Fn.CLEAR_SELECTION, self.buf.clear_selection,       'Clear selection',        'Esc')
+        add(Fn.COMMAND_PALETTE, self._cmd_command_palette,      'Command palette',        'Alt+P')
 
     def _register_default_keybindings(self):
         add = self.add_keybinding
         # Movement
-        add('move_up',          curses.KEY_UP,                                self._cmd_move_up)
-        add('move_down',        curses.KEY_DOWN,                              self._cmd_move_down)
-        add('move_left',        curses.KEY_LEFT,                              self._cmd_move_left)
-        add('move_right',       curses.KEY_RIGHT,                             self._cmd_move_right)
-        add('sel_move_up',      curses.KEY_SR,                                self._cmd_sel_move_up)
-        add('sel_move_down',    curses.KEY_SF,                                self._cmd_sel_move_down)
-        add('sel_move_left',    curses.KEY_SLEFT,                             self._cmd_sel_move_left)
-        add('sel_move_right',   curses.KEY_SRIGHT,                            self._cmd_sel_move_right)
-        add('move_up_5',        578,                                          self.move_up_5)
-        add('move_down_5',      537,                                          self.move_down_5)
-        add('move_home',        [curses.KEY_HOME, 604, ord('\x01')],          self._cmd_move_home)
-        add('move_end',         [curses.KEY_END,  605, ord('\x05')],          self._cmd_move_end)
-        add('sel_move_home',    [curses.KEY_SHOME, 27091091049059049048068],  self._cmd_sel_move_home)
-        add('sel_move_end',     [curses.KEY_SEND,  27091091049059049048067],  self._cmd_sel_move_end)
-        add('page_up',          curses.KEY_PPAGE,                             self._cmd_page_up)
-        add('page_down',        curses.KEY_NPAGE,                             self._cmd_page_down)
-        add('sel_page_up',      curses.KEY_SPREVIOUS,                         self._cmd_sel_page_up)
-        add('sel_page_down',    curses.KEY_SNEXT,                             self._cmd_sel_page_down)
-        add('file_start',       549,                                          self._cmd_file_start)
-        add('file_end',         544,                                          self._cmd_file_end)
-        add('word_left',        [443, 541, 542, 27098, 27260],                self._cmd_word_left)
-        add('word_right',       [444, 552, 556, 557, 27102, 27261],           self._cmd_word_right)
-        add('sel_word_left',    [553, 559, 558, 600, 602],                    self._cmd_sel_word_left)
-        add('sel_word_right',   [568, 574, 573, 601, 603],                    self._cmd_sel_word_right)
+        add(Fn.MOVE_UP,         curses.KEY_UP)
+        add(Fn.MOVE_DOWN,       curses.KEY_DOWN)
+        add(Fn.MOVE_LEFT,       curses.KEY_LEFT)
+        add(Fn.MOVE_RIGHT,      curses.KEY_RIGHT)
+        add(Fn.SEL_MOVE_UP,     curses.KEY_SR)
+        add(Fn.SEL_MOVE_DOWN,   curses.KEY_SF)
+        add(Fn.SEL_MOVE_LEFT,   curses.KEY_SLEFT)
+        add(Fn.SEL_MOVE_RIGHT,  curses.KEY_SRIGHT)
+        add(Fn.MOVE_UP_5,       578)
+        add(Fn.MOVE_DOWN_5,     537)
+        add(Fn.MOVE_HOME,       [curses.KEY_HOME, 604, ord('\x01')])
+        add(Fn.MOVE_END,        [curses.KEY_END,  605, ord('\x05')])
+        add(Fn.SEL_MOVE_HOME,   [curses.KEY_SHOME, 27091091049059049048068])
+        add(Fn.SEL_MOVE_END,    [curses.KEY_SEND,  27091091049059049048067])
+        add(Fn.PAGE_UP,         curses.KEY_PPAGE)
+        add(Fn.PAGE_DOWN,       curses.KEY_NPAGE)
+        add(Fn.SEL_PAGE_UP,     curses.KEY_SPREVIOUS)
+        add(Fn.SEL_PAGE_DOWN,   curses.KEY_SNEXT)
+        add(Fn.FILE_START,      549)
+        add(Fn.FILE_END,        544)
+        add(Fn.WORD_LEFT,       [443, 541, 542, 27098, 27260])
+        add(Fn.WORD_RIGHT,      [444, 552, 556, 557, 27102, 27261])
+        add(Fn.SEL_WORD_LEFT,   [553, 559, 558, 600, 602])
+        add(Fn.SEL_WORD_RIGHT,  [568, 574, 573, 601, 603])
         # Ctrl shortcuts
-        add('open_file',        ord('\x07'),                                  self._open_from_directory)
-        add('copy',             ord('\x03'),                                  self._cmd_copy)
-        add('cut',              ord('\x18'),                                  self._cmd_cut)
-        add('paste',            ord('\x16'),                                  self._cmd_paste)
-        add('undo',             ord('\x1a'),                                  self._cmd_undo)
-        add('redo',             ord('\x19'),                                  self._cmd_redo)
-        add('save',             ord('\x13'),                                  self._save_file)
-        add('search',           ord('\x06'),                                  self._cmd_search)
-        add('autocomplete',     [ord('\x0e'), ord('\x00')],                   self._cmd_autocomplete)
-        add('quit',             ord('\x11'),                                  self._quit)
-        add('help',             [curses.KEY_F1, ord('\x08')],                 self.show_help)
-        add('toggle_wrap',      ord('\x17'),                                  self._cmd_toggle_wrap)
-        add('toggle_mark',      ord('\x0b'),                                  self._cmd_toggle_mark)
-        add('select_all',       27001,                                        self._cmd_select_all)
+        add(Fn.OPEN_FILE,       ord('\x07'))
+        add(Fn.COPY,            ord('\x03'))
+        add(Fn.CUT,             ord('\x18'))
+        add(Fn.PASTE,           ord('\x16'))
+        add(Fn.UNDO,            ord('\x1a'))
+        add(Fn.REDO,            ord('\x19'))
+        add(Fn.SAVE,            ord('\x13'))
+        add(Fn.SEARCH,          ord('\x06'))
+        add(Fn.AUTOCOMPLETE,    [ord('\x0e'), ord('\x00')])
+        add(Fn.QUIT,            ord('\x11'))
+        add(Fn.HELP,            [curses.KEY_F1, 27104])
+        add(Fn.TOGGLE_WRAP,     ord('\x17'))
+        add(Fn.TOGGLE_MARK,     ord('\x0b'))
+        add(Fn.SELECT_ALL,      27001)
         # Editing
-        add('backspace',        [curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')], self._cmd_backspace)
-        add('delete',           curses.KEY_DC,                                self._cmd_delete_forward)
-        add('delete_word_fwd',  608,                                          self._cmd_delete_word_forward)
-        add('kill_word_bwd',    27263,                                        self._cmd_kill_word_backward)
-        add('newline',          [curses.KEY_ENTER, ord('\n'), ord('\r')],     self._cmd_newline)
-        add('tab',              ord('\t'),                                     self._cmd_tab)
-        add('resize',           curses.KEY_RESIZE,                            self._cmd_resize)
-        add('clear_selection',  27,                                           self.buf.clear_selection)
+        add(Fn.BACKSPACE,       [curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')])
+        add(Fn.DELETE,          curses.KEY_DC)
+        add(Fn.DELETE_WORD_FWD, 608)
+        add(Fn.KILL_WORD_BWD,   27263)
+        add(Fn.NEWLINE,         [curses.KEY_ENTER, ord('\n'), ord('\r')])
+        add(Fn.TAB,             ord('\t'))
+        add(Fn.RESIZE,          curses.KEY_RESIZE)
+        add(Fn.CLEAR_SELECTION, 27)
+        add(Fn.COMMAND_PALETTE, 27112)   # Alt+P
 
     def run(self):
         while self.running:
@@ -2126,6 +2236,25 @@ class Editor:
                     seen.add(wu)
             self.popup.open(items, filter_text=self.buf.word_at_cursor())
 
+    def _cmd_command_palette(self):
+        items = []
+        for name, entry in self._editor_functions.items():
+            description = entry['description']
+            if not description:
+                continue
+            label = description
+            if entry['keybinding']:
+                label += f"  [{entry['keybinding']}]"
+            items.append((name, label, 0))
+        items.sort(key=lambda x: x[1])
+
+        def on_select(func_name):
+            entry = self._editor_functions.get(func_name)
+            if entry:
+                entry['func']()
+
+        self.popup.open(items, filter_text='', on_select=on_select)
+
     def _cmd_toggle_wrap(self):
         self.renderer.wrap = not self.renderer.wrap
         self.renderer.scroll_col = 0
@@ -2157,10 +2286,12 @@ class Editor:
     # ── Key dispatch ──────────────────────────────────────────────────────────
 
     def _handle_normal_key(self, key):
-        if key in self._keybindings:
-            fn, _name = self._keybindings[key]
-            fn()
-            return
+        name = self._keybindings.get(key)
+        if name is not None:
+            entry = self._editor_functions.get(name)
+            if entry is not None:
+                entry['func']()
+                return
         self._handle_printable(key)
 
     def _save_file(self):
@@ -2185,7 +2316,7 @@ class Editor:
         text = EDITOR_HELP
         if self._debug_mode:
             by_name: dict = {}
-            for key, (fn, name) in self._keybindings.items():
+            for key, name in self._keybindings.items():
                 by_name.setdefault(name, []).append(key)
             lines = ['\n\nKeybindings (debug mode)']
             for name, keys in sorted(by_name.items()):
