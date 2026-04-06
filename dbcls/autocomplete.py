@@ -504,20 +504,26 @@ class AutoComplete:
                 pass
 
         if part1 is not None and part2 is None:
-            tables_list = sorted(await self.get_cached_tables(part1))
-            if tables_list:
-                suggestions += [f"{x} (TABLE)" for x in tables_list]
+            try:
+                tables_list = sorted(await self.get_cached_tables(part1))
+                if tables_list:
+                    suggestions += [f"{x} (TABLE)" for x in tables_list]
 
-            if curr_tables_list and part1 in curr_tables_list:
-                columns_list = sorted(await self.get_cached_columns(part1))
+                if curr_tables_list and part1 in curr_tables_list:
+                    columns_list = sorted(await self.get_cached_columns(part1))
 
-                if columns_list:
-                    suggestions += [f"{x} (COLUMN)" for x in columns_list]
+                    if columns_list:
+                        suggestions += [f"{x} (COLUMN)" for x in columns_list]
+            except Exception:
+                pass
 
         if part1 is not None and part2 is not None:
-            columns_list = sorted(await self.get_cached_columns(part2, part1))
-            if columns_list:
-                suggestions += [f"{x} (COLUMN)" for x in columns_list]
+            try:
+                columns_list = sorted(await self.get_cached_columns(part2, part1))
+                if columns_list:
+                    suggestions += [f"{x} (COLUMN)" for x in columns_list]
+            except Exception:
+                pass
 
         rank_map = self._get_lm_rank_map(sql_context)
 
@@ -527,12 +533,19 @@ class AutoComplete:
             suggestions_set = set(suggestions)
             for table in query_tables:
                 db = None
+                cols = None
                 if '.' in table:
                     db, table = table.split('.', 1)
                 if db is None:
-                    cols = await self.get_cached_columns(table)
+                    try:
+                        cols = await self.get_cached_columns(table)
+                    except Exception:
+                        pass
                 else:
-                    cols = await self.get_cached_columns(table, db)
+                    try:
+                        cols = await self.get_cached_columns(table, db)
+                    except Exception:
+                        pass
 
                 if cols:
                     for col in cols:

@@ -83,6 +83,13 @@ def debug():
         DEBUG_PARAMS.pop('LOCK').release()
 
 
+def get_wch(stdscr: curses.window):
+    try:
+        return stdscr.get_wch()
+    except AttributeError:
+        return stdscr.getch()
+
+
 # ─── Data structures ──────────────────────────────────────────────────────────
 @dataclass
 class Snapshot:
@@ -1055,7 +1062,7 @@ class AutocompletePopup:
             return None
         return None
 
-    def draw(self, stdscr, colors, H: int, W: int):
+    def draw(self, stdscr: curses.window, colors, H: int, W: int):
         total = len(self.filtered)
         visible_count = min(self.MAX_VISIBLE, total)
         # Height: top border + filter + separator + items + indicator + bottom border
@@ -1188,7 +1195,7 @@ class RunningPopup:
             return 'cancel'
         return None
 
-    def draw(self, stdscr, H: int, W: int) -> None:
+    def draw(self, stdscr: curses.window, H: int, W: int) -> None:
         elapsed = time.time() - self._start
         if elapsed < self.SHOW_DELAY:
             return
@@ -1214,7 +1221,7 @@ class RunningPopup:
 class Renderer:
     GUTTER = 5  # line number width + space
 
-    def __init__(self, stdscr, colors: ColorManager, buf: TextBuffer, lexer: Lexer):
+    def __init__(self, stdscr: curses.window, colors: ColorManager, buf: TextBuffer, lexer: Lexer):
         self.stdscr = stdscr
         self.colors = colors
         self.buf = buf
@@ -1617,7 +1624,7 @@ class Fn(str, enum.Enum):
 class Editor:
     REMAPED_KEYS = {}
 
-    def __init__(self, stdscr, filepath: Optional[str] = None, directory: Optional[str] = None):
+    def __init__(self, stdscr: curses.window, filepath: Optional[str] = None, directory: Optional[str] = None):
         self.stdscr = stdscr
         stdscr.keypad(True)
         stdscr.timeout(50)
@@ -1781,7 +1788,7 @@ class Editor:
         try:
             while True:
                 try:
-                    key = self.stdscr.get_wch()
+                    key = get_wch(self.stdscr)
                 except curses.error:
                     continue
                 if key == curses.KEY_UP:
@@ -1940,7 +1947,7 @@ class Editor:
                 self._apply_termios()
 
             try:
-                key = self.stdscr.get_wch()
+                key = get_wch(self.stdscr)
             except curses.error:
                 key = -1
 
@@ -1989,7 +1996,7 @@ class Editor:
 
         self.stdscr.timeout(30)
         try:
-            nk = self.stdscr.get_wch()
+            nk = get_wch(self.stdscr)
         except curses.error:
             nk = -1
         self.stdscr.timeout(50)
@@ -2009,7 +2016,7 @@ class Editor:
             try:
                 while True:
                     try:
-                        ch = self.stdscr.get_wch()
+                        ch = get_wch(self.stdscr)
                     except curses.error:
                         break
                     seq += ch if isinstance(ch, str) else chr(ch)
@@ -2438,7 +2445,7 @@ class Editor:
             pass
         while True:
             try:
-                key = self.stdscr.get_wch()
+                key = get_wch(self.stdscr)
             except curses.error:
                 continue
             key = self._normalize_key(key)
@@ -2468,7 +2475,7 @@ class Editor:
             pass
         while True:
             try:
-                key = self.stdscr.get_wch()
+                key = get_wch(self.stdscr)
             except curses.error:
                 continue
             key = self._normalize_key(key)
@@ -2492,7 +2499,7 @@ class Editor:
             pass
         while True:
             try:
-                key = self.stdscr.get_wch()
+                key = get_wch(self.stdscr)
             except curses.error:
                 continue
             key = self._normalize_key(key)
@@ -2517,7 +2524,7 @@ class Editor:
             except curses.error:
                 pass
             try:
-                key = self.stdscr.get_wch()
+                key = get_wch(self.stdscr)
             except curses.error:
                 continue
             key = self._normalize_key(key)
