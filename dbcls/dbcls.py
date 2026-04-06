@@ -354,10 +354,8 @@ class DbEditor(Editor):
                 self.show_popup('Error', str(exc))
                 return
             items = []
-            for c in candidates:
-                paren = c.rfind(' (')
-                insert = c[:paren] if paren != -1 else c
-                items.append((c, insert, 0))
+            for item, title in candidates:
+                items.append((title, item, 0))
             self.show_autocomplete(items)
 
         self.open_running_popup(task, start, on_done)

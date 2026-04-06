@@ -481,17 +481,17 @@ class AutoComplete:
             part1 = parts[0]
             part2 = parts[1]
 
-        suggestions = [f"{x} (COMMAND)" for x in self.client.all_commands]
+        suggestions = [(x, f"{x} (COMMAND)") for x in self.client.all_commands]
 
         functions_list = await self.get_all_functions()
         if functions_list:
-            suggestions += [f"{x} (FUNCTION)" for x in functions_list]
+            suggestions += [(x, f"{x} (FUNCTION)") for x in functions_list]
 
         if part1 is None:
             try:
                 databases_list = sorted(await self.get_cached_databases())
                 if databases_list:
-                    suggestions += [f"{x} (DATABASE)" for x in databases_list]
+                    suggestions += [(x, f"{x} (DATABASE)") for x in databases_list]
             except Exception:
                 pass
 
@@ -499,7 +499,7 @@ class AutoComplete:
             try:
                 curr_tables_list = sorted(await self.get_cached_tables())
                 if len(parts) < 2 and curr_tables_list:
-                    suggestions += [f"{x} (TABLE)" for x in curr_tables_list]
+                    suggestions += [(x, f"{x} (TABLE)") for x in curr_tables_list]
             except Exception:
                 pass
 
@@ -507,13 +507,13 @@ class AutoComplete:
             try:
                 tables_list = sorted(await self.get_cached_tables(part1))
                 if tables_list:
-                    suggestions += [f"{x} (TABLE)" for x in tables_list]
+                    suggestions += [(x, f"{x} (TABLE)") for x in tables_list]
 
                 if curr_tables_list and part1 in curr_tables_list:
                     columns_list = sorted(await self.get_cached_columns(part1))
 
                     if columns_list:
-                        suggestions += [f"{x} (COLUMN)" for x in columns_list]
+                        suggestions += [(x, f"{part1}.{x} (COLUMN)") for x in columns_list]
             except Exception:
                 pass
 
@@ -521,7 +521,7 @@ class AutoComplete:
             try:
                 columns_list = sorted(await self.get_cached_columns(part2, part1))
                 if columns_list:
-                    suggestions += [f"{x} (COLUMN)" for x in columns_list]
+                    suggestions += [(x, f"{part1}.{x} (COLUMN)") for x in columns_list]
             except Exception:
                 pass
 
@@ -549,13 +549,13 @@ class AutoComplete:
 
                 if cols:
                     for col in cols:
-                        candidate = f"{col} (COLUMN)"
+                        candidate = (col, f"{table}.{col} (COLUMN)")
                         if candidate not in suggestions_set:
                             suggestions.append(candidate)
                             suggestions_set.add(candidate)
 
-        def sort_key(candidate: str) -> tuple:
-            lm_rank = self._candidate_lm_rank(candidate, rank_map)
-            return predictions_weights(word, candidate, lm_rank)
+        def sort_key(candidate: tuple) -> tuple:
+            lm_rank = self._candidate_lm_rank(candidate[1], rank_map)
+            return predictions_weights(word, candidate[1], lm_rank)
 
         return sorted(suggestions, key=sort_key)
