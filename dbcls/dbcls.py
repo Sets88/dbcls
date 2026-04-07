@@ -20,7 +20,7 @@ from .vd_db_browser import DataBaseSheet, TablesSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
-from .editor import Editor, Fn  # noqa: F401 (Fn re-exported for subclasses)
+from .editor import Editor, Fn, K, key_alt  # noqa: F401 (Fn re-exported for subclasses)
 import enum
 
 
@@ -235,10 +235,10 @@ class DbEditor(Editor):
         self.add_editor_function(DbFn.SHOW_TABLES,     self._db_show_tables,    'Browse tables',  'Alt+T')
         self.add_editor_function(DbFn.SHOW_DATABASES,  self._db_show_databases, 'Browse databases', 'Alt+E')
         self.add_editor_function(DbFn.SHOW_PREDICTION, self._db_show_prediction,'Autocomplete','Shift+Tab / Alt+1')
-        self.add_keybinding(DbFn.RUN_QUERY,       27114)           # Alt+R
-        self.add_keybinding(DbFn.SHOW_TABLES,     27116)           # Alt+T
-        self.add_keybinding(DbFn.SHOW_DATABASES,  27101)           # Alt+E
-        self.add_keybinding(DbFn.SHOW_PREDICTION, [27049, 353])    # Alt+1, Shift+Tab
+        self.add_keybinding(DbFn.RUN_QUERY,       key_alt(ord('r')))              # Alt+R
+        self.add_keybinding(DbFn.SHOW_TABLES,     key_alt(ord('t')))              # Alt+T
+        self.add_keybinding(DbFn.SHOW_DATABASES,  key_alt(ord('e')))              # Alt+E
+        self.add_keybinding(DbFn.SHOW_PREDICTION, [key_alt(ord('1')), K(353)])   # Alt+1, Shift+Tab
         if self.client:
             self.set_status_name(self.client.get_title())
             self.set_words(keywords=self.client.all_commands, functions=self.client.all_functions)
@@ -283,6 +283,7 @@ class DbEditor(Editor):
 
         try:
             curses.curs_set(1)        # visidata hides the cursor; restore it
+            curses.mousemask(0)
         except curses.error:
             pass
 

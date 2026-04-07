@@ -18,6 +18,71 @@ from typing import Callable, List, Optional, Tuple, Union
 MAX_UNDO = 200
 TAB_SIZE = 4
 
+# ─── Key code bitfield ────────────────────────────────────────────────────────
+# Layout (LSB-first):
+#   bit 0  KEY_ESC_BIT    — ESC/Alt prefix was used (e.g. Alt+P)
+#   bit 1  KEY_PREFIX_BIT — tmux-style prefix was used
+#   bit 2+ key value      — Unicode codepoint or curses constant, shifted left 2
+#
+# Examples:
+#   plain 'p'   = K(ord('p'))  = 448
+#   Alt+P       = key_alt(ord('p'))  = 449
+#   Prefix + P  = key_pfx(ord('p')) = 450
+#   curses UP   = K(curses.KEY_UP)  (curses constant << 2)
+
+KEY_ESC_BIT      = 0b01   # bit 0
+KEY_PREFIX_BIT   = 0b10   # bit 1
+
+
+def K(k: int) -> int:
+    """Encode a plain key (curses constant or ord()) into the bitfield space."""
+    return k << 2
+
+
+def key_alt(k: int) -> int:
+    """Encode an Alt/ESC + key combination."""
+    return (k << 2) | KEY_ESC_BIT
+
+
+def key_pfx(k: int) -> int:
+    """Encode a prefix + key combination (triggered by KEY_PREFIX_TRIGGER)."""
+    return (k << 2) | KEY_PREFIX_BIT
+
+
+def key_base(k: int) -> int:
+    """Extract the key value (strip flag bits)."""
+    return k >> 2
+
+
+def key_flags(k: int) -> int:
+    """Extract the flag bits."""
+    return k & 0b11
+
+
+def key_is_alt(k: int) -> bool:
+    return bool(k & KEY_ESC_BIT)
+
+
+def key_is_pfx(k: int) -> bool:
+    return bool(k & KEY_PREFIX_BIT)
+
+
+def key_csi(*seq) -> int:
+    """Encode an ESC + byte-sequence key (e.g. CSI sequences).
+    Each element of seq is a char or byte value.
+    Example: key_csi('[', '1', ';', '2', 'H') for Shift+Home."""
+    packed = 0
+    for b in seq:
+        packed = (packed << 8) | (ord(b) if isinstance(b, str) else b)
+    return (packed << 2) | KEY_ESC_BIT
+
+
+# The key that starts a tmux-style prefix sequence.
+# After this key is pressed, the next key within 500 ms is tagged with KEY_PREFIX_BIT.
+# If the timeout fires before the next key, the trigger key itself is dispatched normally.
+KEY_PREFIX_TRIGGER = K(ord('\x18'))  # Ctrl+X
+
+
 EDITOR_HELP = """\
 Navigation
   Arrow keys              Move cursor
@@ -947,41 +1012,34 @@ class SearchBar:
         buf.move_cursor(r, cs)
 
     def handle_key(self, key, buf: 'TextBuffer') -> Optional[str]:
-        """Returns 'close', 'next', 'prev', or None."""
-        if isinstance(key, str) and len(key) == 1:
-            o = ord(key)
-            if o < 32 or o == 127:
-                key = o
-        if key == 27:  # Escape
+        """Returns 'close', 'next', 'prev', or None.
+        key is in the bitfield format produced by Editor._encode_key."""
+        if key == K(27):  # Escape
             return 'close'
-        if key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+        if key in (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))):
             return 'close'
-        if key == curses.KEY_UP:
+        if key == K(curses.KEY_UP):
             self.prev_match(buf)
             return None
-        if key == curses.KEY_DOWN:
+        if key == K(curses.KEY_DOWN):
             self.next_match(buf)
             return None
-        if key in (curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')):
+        if key in (K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))):
             self.query = self.query[:-1]
             self.find_all(buf.lines)
             self.snap_to_nearest(buf)
             return None
-        if isinstance(key, str) and key.isprintable():
-            self.query += key
-            self.find_all(buf.lines)
-            self.snap_to_nearest(buf)
-            return None
-        if isinstance(key, int) and key >= 32 and chr(key).isprintable():
-            self.query += chr(key)
-            self.find_all(buf.lines)
-            self.snap_to_nearest(buf)
-            return None
+        if key_flags(key) == 0:
+            base = key_base(key)
+            if base >= 32 and chr(base).isprintable():
+                self.query += chr(base)
+                self.find_all(buf.lines)
+                self.snap_to_nearest(buf)
         return None
 
 
-# ─── AutocompletePopup ────────────────────────────────────────────────────────
-class AutocompletePopup:
+# ─── SelectPopup ────────────────────────────────────────────────────────
+class SelectPopup:
     MAX_VISIBLE = 8
 
     def __init__(self):
@@ -1023,43 +1081,72 @@ class AutocompletePopup:
             return self.filtered[self.selected_idx][0]
         return None
 
+    def _nav_up(self):
+        if self.selected_idx > 0:
+            self.selected_idx -= 1
+            if self.selected_idx < self.scroll_offset:
+                self.scroll_offset = self.selected_idx
+
+    def _nav_down(self):
+        if self.selected_idx < len(self.filtered) - 1:
+            self.selected_idx += 1
+            if self.selected_idx >= self.scroll_offset + self.MAX_VISIBLE:
+                self.scroll_offset = self.selected_idx - self.MAX_VISIBLE + 1
+
+    def _nav_page_up(self):
+        self.selected_idx = max(0, self.selected_idx - self.MAX_VISIBLE)
+        self.scroll_offset = max(0, self.scroll_offset - self.MAX_VISIBLE)
+        if self.selected_idx < self.scroll_offset:
+            self.scroll_offset = self.selected_idx
+
+    def _nav_page_down(self):
+        last = len(self.filtered) - 1
+        self.selected_idx = min(last, self.selected_idx + self.MAX_VISIBLE)
+        if self.selected_idx >= self.scroll_offset + self.MAX_VISIBLE:
+            self.scroll_offset = self.selected_idx - self.MAX_VISIBLE + 1
+
+    def _nav_home(self):
+        self.selected_idx = 0
+        self.scroll_offset = 0
+
+    def _nav_end(self):
+        self.selected_idx = len(self.filtered) - 1
+        self.scroll_offset = max(0, self.selected_idx - self.MAX_VISIBLE + 1)
+
+    def _filter_backspace(self):
+        self.filter_text = self.filter_text[:-1]
+        self._refilter()
+
+    def _filter_char(self, key):
+        if key_flags(key) == 0:
+            base = key_base(key)
+            if base >= 32 and chr(base).isprintable():
+                self.filter_text += chr(base)
+                self._refilter()
+
     def handle_key(self, key) -> Optional[str]:
-        """Returns 'insert', 'cancel', or None."""
-        if isinstance(key, str) and len(key) == 1:
-            o = ord(key)
-            if o < 32 or o == 127:
-                key = o
-        if key == 27:  # Escape
+        """Returns 'insert', 'cancel', or None.
+        key is in the bitfield format produced by Editor._encode_key."""
+        if key == K(27):  # Escape
             return 'cancel'
-        if key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
-            if self.filtered:
-                return 'insert'
-            return 'cancel'
-        if key == curses.KEY_UP:
-            if self.selected_idx > 0:
-                self.selected_idx -= 1
-                if self.selected_idx < self.scroll_offset:
-                    self.scroll_offset = self.selected_idx
-            return None
-        if key == curses.KEY_DOWN:
-            if self.selected_idx < len(self.filtered) - 1:
-                self.selected_idx += 1
-                if self.selected_idx >= self.scroll_offset + self.MAX_VISIBLE:
-                    self.scroll_offset = self.selected_idx - self.MAX_VISIBLE + 1
-            return None
-        if key in (curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')):
-            self.filter_text = self.filter_text[:-1]
-            self._refilter()
-            return None
-        ch = None
-        if isinstance(key, str) and key.isprintable():
-            ch = key
-        elif isinstance(key, int) and key >= 32 and chr(key).isprintable():
-            ch = chr(key)
-        if ch is not None:
-            self.filter_text += ch
-            self._refilter()
-            return None
+        elif key in (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))):
+            return 'insert' if self.filtered else 'cancel'
+        elif key == K(curses.KEY_UP):
+            self._nav_up()
+        elif key == K(curses.KEY_DOWN):
+            self._nav_down()
+        elif key == K(curses.KEY_PPAGE):
+            self._nav_page_up()
+        elif key == K(curses.KEY_NPAGE):
+            self._nav_page_down()
+        elif key == K(curses.KEY_HOME):
+            self._nav_home()
+        elif key == K(curses.KEY_END):
+            self._nav_end()
+        elif key in (K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))):
+            self._filter_backspace()
+        else:
+            self._filter_char(key)
         return None
 
     def draw(self, stdscr: curses.window, colors, H: int, W: int):
@@ -1067,7 +1154,9 @@ class AutocompletePopup:
         visible_count = min(self.MAX_VISIBLE, total)
         # Height: top border + filter + separator + items + indicator + bottom border
         ph = visible_count + 4
-        pw = min(60, W)
+        max_label_len = max((len(label) for _, label, _ in self.filtered), default=0) if self.filtered else 0
+        # inner content = "  " prefix (2) + label; borders add 2 more
+        pw = min(max(max_label_len + 4, 20), W - 3)
         py = max(0, H - 1 - ph)
         px = 0
 
@@ -1187,8 +1276,9 @@ class RunningPopup:
         return self._task is None or self._task.is_done()
 
     def handle_key(self, key) -> Optional[str]:
-        """Returns 'cancel' on ESC, None otherwise."""
-        if key == 27:
+        """Returns 'cancel' on ESC, None otherwise.
+        key is in the bitfield format produced by Editor._encode_key."""
+        if key == K(27):
             if self._task:
                 self._task.cancel()
             self.cancelled = True
@@ -1300,7 +1390,7 @@ class Renderer:
 
     def draw(
         self,
-        popup: Optional['AutocompletePopup'] = None,
+        popup: Optional['SelectPopup'] = None,
         search: Optional['SearchBar'] = None,
         running_popup: Optional['RunningPopup'] = None
     ):
@@ -1637,12 +1727,13 @@ class Editor:
         self.lexer = Lexer()
         self.clipboard = Clipboard()
         self.search = SearchBar()
-        self.popup = AutocompletePopup()
+        self.popup = SelectPopup()
         self.running_popup = RunningPopup()
         self.renderer = Renderer(stdscr, self.colors, self.buf, self.lexer)
         self.running = True
         self._debug_mode = False
         self._debug_key = ''
+        self._prefix_pending = False
         self._status_notification: Optional[str] = None
         self._keybindings: dict = {}
         self._ac_words: List[Tuple[str, str, int]] = []
@@ -1825,14 +1916,13 @@ class Editor:
     def add_keybinding(self, name: str, key: Union[int, List[int]]) -> None:
         """Register a keyboard shortcut.
 
-        key  – an int key code, a single-char string, or a list/tuple of ints.
-        func – callable invoked with no args when the key is pressed."""
+        key  – an int key code already in bitfield format (use K(), key_alt(), etc.)
+               or a list/tuple of such ints."""
         if isinstance(key, (list, tuple)):
             for k in key:
                 self.add_keybinding(name, k)
             return
-        k = self._normalize_key(key) if isinstance(key, str) else key
-        self._keybindings[k] = name
+        self._keybindings[key] = name
 
     def _register_default_functions(self):
         add = self.add_editor_function
@@ -1887,55 +1977,55 @@ class Editor:
     def _register_default_keybindings(self):
         add = self.add_keybinding
         # Movement
-        add(Fn.MOVE_UP,         curses.KEY_UP)
-        add(Fn.MOVE_DOWN,       curses.KEY_DOWN)
-        add(Fn.MOVE_LEFT,       curses.KEY_LEFT)
-        add(Fn.MOVE_RIGHT,      curses.KEY_RIGHT)
-        add(Fn.SEL_MOVE_UP,     curses.KEY_SR)
-        add(Fn.SEL_MOVE_DOWN,   curses.KEY_SF)
-        add(Fn.SEL_MOVE_LEFT,   curses.KEY_SLEFT)
-        add(Fn.SEL_MOVE_RIGHT,  curses.KEY_SRIGHT)
-        add(Fn.MOVE_UP_5,       578)
-        add(Fn.MOVE_DOWN_5,     537)
-        add(Fn.MOVE_HOME,       [curses.KEY_HOME, 604, ord('\x01')])
-        add(Fn.MOVE_END,        [curses.KEY_END,  605, ord('\x05')])
-        add(Fn.SEL_MOVE_HOME,   [curses.KEY_SHOME, 27091091049059049048068])
-        add(Fn.SEL_MOVE_END,    [curses.KEY_SEND,  27091091049059049048067])
-        add(Fn.PAGE_UP,         curses.KEY_PPAGE)
-        add(Fn.PAGE_DOWN,       curses.KEY_NPAGE)
-        add(Fn.SEL_PAGE_UP,     curses.KEY_SPREVIOUS)
-        add(Fn.SEL_PAGE_DOWN,   curses.KEY_SNEXT)
-        add(Fn.FILE_START,      549)
-        add(Fn.FILE_END,        544)
-        add(Fn.WORD_LEFT,       [443, 541, 542, 27098, 27260])
-        add(Fn.WORD_RIGHT,      [444, 552, 556, 557, 27102, 27261])
-        add(Fn.SEL_WORD_LEFT,   [553, 559, 558, 600, 602])
-        add(Fn.SEL_WORD_RIGHT,  [568, 574, 573, 601, 603])
+        add(Fn.MOVE_UP,         K(curses.KEY_UP))
+        add(Fn.MOVE_DOWN,       K(curses.KEY_DOWN))
+        add(Fn.MOVE_LEFT,       K(curses.KEY_LEFT))
+        add(Fn.MOVE_RIGHT,      K(curses.KEY_RIGHT))
+        add(Fn.SEL_MOVE_UP,     K(curses.KEY_SR))
+        add(Fn.SEL_MOVE_DOWN,   K(curses.KEY_SF))
+        add(Fn.SEL_MOVE_LEFT,   K(curses.KEY_SLEFT))
+        add(Fn.SEL_MOVE_RIGHT,  K(curses.KEY_SRIGHT))
+        add(Fn.MOVE_UP_5,       K(578))
+        add(Fn.MOVE_DOWN_5,     K(537))
+        add(Fn.MOVE_HOME,       [K(curses.KEY_HOME), K(604), K(ord('\x01'))])
+        add(Fn.MOVE_END,        [K(curses.KEY_END),  K(605), K(ord('\x05'))])
+        add(Fn.SEL_MOVE_HOME,   [K(curses.KEY_SHOME), key_csi('[', '1', ';', '1', '0', 'D')])
+        add(Fn.SEL_MOVE_END,    [K(curses.KEY_SEND),  key_csi('[', '1', ';', '1', '0', 'C')])
+        add(Fn.PAGE_UP,         K(curses.KEY_PPAGE))
+        add(Fn.PAGE_DOWN,       K(curses.KEY_NPAGE))
+        add(Fn.SEL_PAGE_UP,     K(curses.KEY_SPREVIOUS))
+        add(Fn.SEL_PAGE_DOWN,   K(curses.KEY_SNEXT))
+        add(Fn.FILE_START,      K(549))
+        add(Fn.FILE_END,        K(544))
+        add(Fn.WORD_LEFT,       [K(443), K(541), K(542), key_alt(ord('b')), key_csi('[', 'D')])
+        add(Fn.WORD_RIGHT,      [K(444), K(552), K(556), K(557), key_alt(ord('f')), key_csi('[', 'C')])
+        add(Fn.SEL_WORD_LEFT,   [K(553), K(559), K(558), K(600), K(602)])
+        add(Fn.SEL_WORD_RIGHT,  [K(568), K(574), K(573), K(601), K(603)])
         # Ctrl shortcuts
-        add(Fn.OPEN_FILE,       ord('\x07'))
-        add(Fn.COPY,            ord('\x03'))
-        add(Fn.CUT,             ord('\x18'))
-        add(Fn.PASTE,           ord('\x16'))
-        add(Fn.UNDO,            ord('\x1a'))
-        add(Fn.REDO,            ord('\x19'))
-        add(Fn.SAVE,            ord('\x13'))
-        add(Fn.SEARCH,          ord('\x06'))
-        add(Fn.AUTOCOMPLETE,    [ord('\x0e'), ord('\x00')])
-        add(Fn.QUIT,            ord('\x11'))
-        add(Fn.HELP,            [curses.KEY_F1, 27104])
-        add(Fn.TOGGLE_WRAP,     ord('\x17'))
-        add(Fn.TOGGLE_MARK,     ord('\x0b'))
-        add(Fn.SELECT_ALL,      27001)
+        add(Fn.OPEN_FILE,       K(ord('\x07')))
+        add(Fn.COPY,            K(ord('\x03')))
+        add(Fn.CUT,             K(ord('\x18')))
+        add(Fn.PASTE,           K(ord('\x16')))
+        add(Fn.UNDO,            K(ord('\x1a')))
+        add(Fn.REDO,            K(ord('\x19')))
+        add(Fn.SAVE,            K(ord('\x13')))
+        add(Fn.SEARCH,          K(ord('\x06')))
+        add(Fn.AUTOCOMPLETE,    K(ord('\x0e')))
+        add(Fn.QUIT,            K(ord('\x11')))
+        add(Fn.HELP,            [K(curses.KEY_F1), key_alt(ord('h'))])
+        add(Fn.TOGGLE_WRAP,     K(ord('\x17')))
+        add(Fn.TOGGLE_MARK,     K(ord('\x0b')))
+        add(Fn.SELECT_ALL,      key_alt(ord('\x01')))  # Alt+Ctrl+A
         # Editing
-        add(Fn.BACKSPACE,       [curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')])
-        add(Fn.DELETE,          curses.KEY_DC)
-        add(Fn.DELETE_WORD_FWD, 608)
-        add(Fn.KILL_WORD_BWD,   27263)
-        add(Fn.NEWLINE,         [curses.KEY_ENTER, ord('\n'), ord('\r')])
-        add(Fn.TAB,             ord('\t'))
-        add(Fn.RESIZE,          curses.KEY_RESIZE)
-        add(Fn.CLEAR_SELECTION, 27)
-        add(Fn.COMMAND_PALETTE, 27112)   # Alt+P
+        add(Fn.BACKSPACE,       [K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))])
+        add(Fn.DELETE,          K(curses.KEY_DC))
+        add(Fn.DELETE_WORD_FWD, K(608))
+        add(Fn.KILL_WORD_BWD,   [key_alt(127), key_alt(ord('\b')), key_alt(curses.KEY_BACKSPACE)])  # Alt+Backspace (DEL or ^H)
+        add(Fn.NEWLINE,         [K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))])
+        add(Fn.TAB,             K(ord('\t')))
+        add(Fn.RESIZE,          K(curses.KEY_RESIZE))
+        add(Fn.CLEAR_SELECTION, K(27))
+        add(Fn.COMMAND_PALETTE, key_alt(ord('p')))   # Alt+P
 
     def run(self):
         while self.running:
@@ -1951,7 +2041,14 @@ class Editor:
             except curses.error:
                 key = -1
 
-            if key != -1:
+            if key == -1:
+                if self._prefix_pending:
+                    # Prefix timeout — dispatch the trigger key itself normally
+                    self._prefix_pending = False
+                    self.stdscr.timeout(50)
+                    self._dispatch(key_base(KEY_PREFIX_TRIGGER))
+                    self.lexer.invalidate(self.buf.cursor_row)
+            else:
                 self._dispatch(key)
                 # Invalidate lexer cache from cursor row
                 self.lexer.invalidate(self.buf.cursor_row)
@@ -1989,56 +2086,70 @@ class Editor:
         return key
 
     def _resolve_key(self, key):
-        """If key is ESC (27), peek ahead to build a unified composite code.
-        Returns the resolved composite int, or 27 for a plain bare ESC."""
+        """If key is ESC (27), read subsequent bytes with getch and pack them
+        8 bits per byte into a single integer.  Stops on an alpha terminator
+        (the conventional CSI final byte) or a 30 ms timeout.  No special-casing
+        for '[' — the loop handles simple Alt combos and CSI sequences uniformly.
+        Returns ('alt', packed) or plain 27 for a bare ESC."""
         if key != 27:
             return key
 
+        packed = 0
         self.stdscr.timeout(30)
         try:
-            nk = get_wch(self.stdscr)
-        except curses.error:
-            nk = -1
-        self.stdscr.timeout(50)
+            while True:
+                b = self.stdscr.getch()
+                if b == -1:
+                    break
+                packed = (packed << 8) | b
+                if chr(b).isalpha():
+                    break
+        finally:
+            self.stdscr.timeout(50)
 
-        if isinstance(nk, str):
-            nk = self._normalize_key(nk)
-
-        if nk == -1:
+        if packed == 0:
             return 27  # bare ESC
 
-        key = 27000 + nk
+        return ('alt', packed)
 
-        if nk == ord('['):  # CSI sequence — consume until alpha terminator
-            key = key * 1000 + ord('[')
-            seq = ''
-            self.stdscr.timeout(30)
-            try:
-                while True:
-                    try:
-                        ch = get_wch(self.stdscr)
-                    except curses.error:
-                        break
-                    seq += ch if isinstance(ch, str) else chr(ch)
-                    key = key * 1000 + (ord(ch) if isinstance(ch, str) else ch)
-                    if seq[-1].isalpha():
-                        break
-            finally:
-                self.stdscr.timeout(50)
+    @staticmethod
+    def _encode_key(key) -> int:
+        """Convert a raw resolved key (int or ('alt', packed) tuple) into the bitfield format.
 
-        return key
+        Bit layout (LSB-first):
+          bit 0  KEY_ESC_BIT    — Alt/ESC prefix
+          bit 1  KEY_PREFIX_BIT — tmux-style prefix (KEY_PREFIX_TRIGGER)
+          bit 2+ key value shifted left by 2
+        """
+        if isinstance(key, tuple):
+            _tag, val = key   # tag is always 'alt'
+            return (val << 2) | KEY_ESC_BIT
+        # Plain int: curses constant, ASCII code, bare ESC (27), etc.
+        return key << 2
 
     def _dispatch(self, key):
         key = self._normalize_key(key)
         key = self._resolve_key(key)
+        key = self._encode_key(key)
         key = self._override_remaped_keys(key)
+
+        # tmux-style prefix handling (KEY_PREFIX_TRIGGER)
+        if self._prefix_pending:
+            self._prefix_pending = False
+            self.stdscr.timeout(50)
+            key = key | KEY_PREFIX_BIT
+        elif key == KEY_PREFIX_TRIGGER:
+            self._prefix_pending = True
+            self.stdscr.timeout(500)
+            return
 
         if self._status_notification is not None:
             self._status_notification = None
             self.renderer.status_notification = None
         if self._debug_mode:
-            self.renderer.debug_text = f'key={key!r}  int={key if isinstance(key,int) else ord(key)}'
-        if key == ord('\x04'):  # Ctrl+D — toggle debug key display
+            flags = ('ALT ' if key_is_alt(key) else '') + ('PFX ' if key_is_pfx(key) else '')
+            self.renderer.debug_text = f'key={key} raw={flags}{key_base(key)}'
+        if key == K(ord('\x04')):  # Ctrl+D — toggle debug key display
             self._debug_mode = not self._debug_mode
             self.renderer.debug_text = 'DEBUG ON — press keys to see codes' if self._debug_mode else ''
             return
@@ -2282,13 +2393,11 @@ class Editor:
     # ── Printable character ───────────────────────────────────────────────────
 
     def _handle_printable(self, key):
-        ch = None
-        if isinstance(key, str) and key.isprintable():
-            ch = key
-        elif isinstance(key, int) and key >= 32 and chr(key).isprintable():
-            ch = chr(key)
-        if ch is not None:
-            self.buf.insert_char(ch)
+        # After encoding, printable chars have no flags and base >= 32
+        if isinstance(key, int) and key_flags(key) == 0:
+            base = key_base(key)
+            if base >= 32 and chr(base).isprintable():
+                self.buf.insert_char(chr(base))
 
     # ── Key dispatch ──────────────────────────────────────────────────────────
 
