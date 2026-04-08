@@ -8,6 +8,7 @@ import locale
 import os
 import sys
 import termios
+import textwrap
 import time
 import threading
 from copy import deepcopy
@@ -1307,6 +1308,156 @@ class RunningPopup:
             pass
 
 
+# ─── InfoPopup ────────────────────────────────────────────────────────────────
+class InfoPopup:
+    """Centered, scrollable info/error popup driven by the main dispatch loop."""
+
+    def __init__(self):
+        self.active = False
+        self._title: str = ''
+        self._message: str = ''
+        self._lines: List[str] = []
+        self._inner_w: int = 0       # used to detect re-wrap needed on resize
+        self._scroll: int = 0
+        self._visible: int = 1       # updated each draw(); safe default = 1
+
+    def open(self, title: str, message: str) -> None:
+        self.active = True
+        self._title = title
+        self._message = message
+        self._lines = []
+        self._inner_w = 0
+        self._scroll = 0
+
+    def close(self) -> None:
+        self.active = False
+        self._title = ''
+        self._message = ''
+        self._lines = []
+        self._scroll = 0
+
+    # ── scroll helpers ────────────────────────────────────────────────────────
+
+    def _total(self) -> int:
+        return len(self._lines)
+
+    def _scroll_up(self):
+        if self._scroll > 0:
+            self._scroll -= 1
+
+    def _scroll_down(self):
+        if self._scroll + self._visible < self._total():
+            self._scroll += 1
+
+    def _page_up(self):
+        self._scroll = max(0, self._scroll - max(1, self._visible))
+
+    def _page_down(self):
+        self._scroll = min(max(0, self._total() - self._visible),
+                           self._scroll + max(1, self._visible))
+
+    def _go_home(self):
+        self._scroll = 0
+
+    def _go_end(self):
+        self._scroll = max(0, self._total() - self._visible)
+
+    # ── key handling ─────────────────────────────────────────────────────────
+
+    def handle_key(self, key) -> Optional[str]:
+        """Return 'close' to dismiss; None to keep open."""
+        can_scroll = self._total() > self._visible
+        if can_scroll and key == K(curses.KEY_UP):
+            self._scroll_up()
+        elif can_scroll and key == K(curses.KEY_DOWN):
+            self._scroll_down()
+        elif can_scroll and key == K(curses.KEY_PPAGE):
+            self._page_up()
+        elif can_scroll and key == K(curses.KEY_NPAGE):
+            self._page_down()
+        elif can_scroll and key == K(curses.KEY_HOME):
+            self._go_home()
+        elif can_scroll and key == K(curses.KEY_END):
+            self._go_end()
+        else:
+            return 'close'
+        return None
+
+    # ── drawing ──────────────────────────────────────────────────────────────
+
+    def draw(self, stdscr: curses.window, colors, H: int, W: int) -> None:
+        max_w = min(W - 4, 80)
+        inner_w = max_w - 2
+
+        # Lazy wrap; re-wrap if inner_w changed (terminal resize)
+        if not self._lines or self._inner_w != inner_w:
+            self._lines = []
+            for raw in self._message.splitlines():
+                self._lines.extend(textwrap.wrap(raw, inner_w) or [''])
+            self._inner_w = inner_w
+
+        total = self._total()
+        max_visible = max(1, min(H - 4, total))
+        self._visible = max_visible
+        self._scroll = max(0, min(self._scroll, max(0, total - max_visible)))
+
+        win_h = max_visible + 2   # top border + content rows + bottom border
+        win_w = max_w
+        win_y = max(0, H // 2 - win_h // 2)
+        win_x = max(0, W // 2 - win_w // 2)
+
+        ba = curses.color_pair(colors.popup_border)
+        ia = curses.color_pair(colors.popup_item) | curses.A_BOLD
+
+        def ach(y, x, ch, attr=0):
+            ry, rx = win_y + y, win_x + x
+            if 0 <= ry < H and 0 <= rx < W:
+                try:
+                    stdscr.addch(ry, rx, ch | attr)
+                except curses.error:
+                    pass
+
+        def astr(y, x, s, attr=0):
+            ry, rx = win_y + y, win_x + x
+            if ry < 0 or ry >= H or rx >= W:
+                return
+            try:
+                stdscr.addstr(ry, rx, s[:max(0, W - rx)], attr)
+            except curses.error:
+                pass
+
+        def hl(y, x, n, attr=0):
+            ry, rx = win_y + y, win_x + x
+            if 0 <= ry < H:
+                try:
+                    stdscr.hline(ry, rx, curses.ACS_HLINE | attr, min(n, W - rx))
+                except curses.error:
+                    pass
+
+        can_scroll = total > max_visible
+        hint = ' ↑↓/PgUp/PgDn/Home/End scroll · any key close ' if can_scroll else ' any key to close '
+        title_str = f' {self._title} —{hint}'[:win_w - 4]
+        ach(0, 0, curses.ACS_ULCORNER, ba)
+        hl (0, 1, win_w - 2, ba)
+        ach(0, win_w - 1, curses.ACS_URCORNER, ba)
+        astr(0, 2, title_str, ba)
+
+        for i in range(max_visible):
+            row_y = i + 1
+            idx = self._scroll + i
+            text = (self._lines[idx] if idx < total else '').ljust(win_w - 2)[:win_w - 2]
+            ach (row_y, 0, curses.ACS_VLINE, ba)
+            astr(row_y, 1, text, ia)
+            ach (row_y, win_w - 1, curses.ACS_VLINE, ba)
+
+        ach(win_h - 1, 0, curses.ACS_LLCORNER, ba)
+        hl (win_h - 1, 1, win_w - 2, ba)
+        ach(win_h - 1, win_w - 1, curses.ACS_LRCORNER, ba)
+        if can_scroll:
+            indicator = f' {self._scroll + max_visible}/{total} '
+            astr(win_h - 1, win_w - len(indicator) - 1, indicator, ba)
+
+
 # ─── Renderer ─────────────────────────────────────────────────────────────────
 class Renderer:
     GUTTER = 5  # line number width + space
@@ -1392,7 +1543,8 @@ class Renderer:
         self,
         popup: Optional['SelectPopup'] = None,
         search: Optional['SearchBar'] = None,
-        running_popup: Optional['RunningPopup'] = None
+        running_popup: Optional['RunningPopup'] = None,
+        info_popup: Optional['InfoPopup'] = None,
     ):
         self.stdscr.erase()
         self._draw_text_area()
@@ -1404,6 +1556,8 @@ class Renderer:
             popup.draw(self.stdscr, self.colors, self._height, self._width)
         if running_popup and running_popup.active:
             running_popup.draw(self.stdscr, self._height, self._width)
+        if info_popup and info_popup.active:
+            info_popup.draw(self.stdscr, self.colors, self._height, self._width)
         self._draw_status_bar(search)
         # Position physical cursor
         if search and search.active:
@@ -1719,6 +1873,7 @@ class Editor:
         stdscr.keypad(True)
         stdscr.timeout(50)
         curses.curs_set(1)
+        curses.mousemask(0xffffffff)
 
         self._apply_termios()
 
@@ -1729,6 +1884,7 @@ class Editor:
         self.search = SearchBar()
         self.popup = SelectPopup()
         self.running_popup = RunningPopup()
+        self.info_popup = InfoPopup()
         self.renderer = Renderer(stdscr, self.colors, self.buf, self.lexer)
         self.running = True
         self._debug_mode = False
@@ -1822,7 +1978,7 @@ class Editor:
         The message is replaced by the normal status bar after the next keypress."""
         W = self.stdscr.getmaxyx()[1]
         if len(text) + 2 > W or '\n' in text:
-            self.show_popup('Info', text)
+            self.info_popup.open('Info', text)
         else:
             self._status_notification = text
             self.renderer.status_notification = text
@@ -1832,71 +1988,6 @@ class Editor:
         Each argument, if given, replaces the corresponding set entirely."""
         self.lexer.set_words(keywords=keywords, types=types, functions=functions)
         self._init_ac_words(self.lexer._keywords, self.lexer._types, self.lexer._functions)
-
-    def show_popup(self, title: str, message: str) -> None:
-        """Show a centered scrollable popup. Up/Down scroll; any other key closes."""
-        import textwrap
-        H, W = self.stdscr.getmaxyx()
-        max_w = min(W - 4, 80)
-        inner_w = max_w - 4
-        wrapped = []
-        for line in message.splitlines():
-            wrapped.extend(textwrap.wrap(line, inner_w) or [''])
-        total = len(wrapped)
-        max_visible = min(H - 6, max(1, total))
-        win_h = max_visible + 4
-        win_w = max_w
-        win_y = max(0, H // 2 - win_h // 2)
-        win_x = max(0, W // 2 - win_w // 2)
-        win = curses.newwin(win_h, win_w, win_y, win_x)
-        scroll = 0
-
-        def redraw():
-            win.erase()
-            win.box()
-            can_scroll = total > max_visible
-            hint = ' ↑↓ scroll · any key close ' if can_scroll else ' any key to close '
-            try:
-                win.addstr(0, 2, f' {title} —{hint}'[:win_w - 4])
-            except curses.error:
-                pass
-            for i in range(max_visible):
-                ln = wrapped[scroll + i] if scroll + i < total else ''
-                try:
-                    win.addstr(i + 2, 2, ln[:win_w - 4])
-                except curses.error:
-                    pass
-            if can_scroll:
-                indicator = f' {scroll + max_visible}/{total} '
-                try:
-                    win.addstr(win_h - 1, win_w - len(indicator) - 2, indicator)
-                except curses.error:
-                    pass
-            win.refresh()
-
-        redraw()
-        self.stdscr.timeout(-1)
-        try:
-            while True:
-                try:
-                    key = get_wch(self.stdscr)
-                except curses.error:
-                    continue
-                if key == curses.KEY_UP:
-                    if scroll > 0:
-                        scroll -= 1
-                        redraw()
-                elif key == curses.KEY_DOWN:
-                    if scroll + max_visible < total:
-                        scroll += 1
-                        redraw()
-                else:
-                    break
-        finally:
-            self.stdscr.timeout(50)
-            del win
-            self.stdscr.touchwin()
-            self.stdscr.refresh()
 
     def open_running_popup(self, task, start: float, on_done) -> None:
         """Start the running overlay for *task*. *on_done()* is called when the
@@ -2073,6 +2164,7 @@ class Editor:
                 popup=self.popup if self.popup.active else None,
                 search=self.search if self.search.active else None,
                 running_popup=self.running_popup if self.running_popup.active else None,
+                info_popup=self.info_popup if self.info_popup.active else None,
             )
 
     @staticmethod
@@ -2129,6 +2221,22 @@ class Editor:
 
     def _dispatch(self, key):
         key = self._normalize_key(key)
+        if key == curses.KEY_MOUSE:
+            BUTTON5_PRESSED = 134217728
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error as exc:
+                self.set_status_notification('KEY_MOUSE but getmouse() failed — ' + str(exc))
+                return
+            if bstate & curses.BUTTON1_PRESSED or bstate & curses.BUTTON1_CLICKED:
+                self._handle_mouse_click(mx, my)
+                return
+            elif bstate & curses.BUTTON4_PRESSED:
+                key = curses.KEY_UP
+            elif bstate & BUTTON5_PRESSED:
+                key = curses.KEY_DOWN
+            else:
+                return
         key = self._resolve_key(key)
         key = self._encode_key(key)
         key = self._override_remaped_keys(key)
@@ -2156,6 +2264,12 @@ class Editor:
         # Running popup mode — only ESC passes through, all other keys are swallowed
         if self.running_popup.active:
             self.running_popup.handle_key(key)
+            return
+
+        # Info popup mode
+        if self.info_popup.active:
+            if self.info_popup.handle_key(key) == 'close':
+                self.info_popup.close()
             return
 
         # Popup mode
@@ -2191,6 +2305,39 @@ class Editor:
         if key in self.REMAPED_KEYS:
             return self.REMAPED_KEYS[key]
         return key
+
+    # ── Mouse handling ────────────────────────────────────────────────────────
+
+    def _handle_mouse_click(self, mx, my):
+        if my >= self.renderer.text_rows:
+            return  # clicked in status bar area — ignore
+
+        gutter = self.renderer.GUTTER
+        text_x = max(0, mx - gutter)  # clicks in the gutter go to start of that line
+
+        if self.renderer.wrap:
+            tc = self.renderer.text_cols
+            screen_y = 0
+            line_idx = self.renderer.scroll_row
+            while line_idx < len(self.buf.lines):
+                line_len = len(self.buf.lines[line_idx])
+                num_vrows = max(1, (line_len + tc - 1) // tc) if line_len > 0 else 1
+                for vrow in range(num_vrows):
+                    if screen_y == my:
+                        col = min(vrow * tc + text_x, len(self.buf.lines[line_idx]))
+                        self.buf.move_cursor(line_idx, col)
+                        return
+                    screen_y += 1
+                line_idx += 1
+            # Clicked below last line — go to end of buffer
+            row = len(self.buf.lines) - 1
+            self.buf.move_cursor(row, len(self.buf.lines[row]))
+        else:
+            row = my + self.renderer.scroll_row
+            row = max(0, min(row, len(self.buf.lines) - 1))
+            col = text_x + self.renderer.scroll_col
+            col = max(0, min(col, len(self.buf.lines[row])))
+            self.buf.move_cursor(row, col)
 
     # ── Movement commands ─────────────────────────────────────────────────────
 
@@ -2426,7 +2573,7 @@ class Editor:
                 self.set_status_notification(f'Saved {path}')
 
     def show_help(self) -> None:
-        self.show_popup('Help', self._help_text())
+        self.info_popup.open('Help', self._help_text())
 
     def _help_text(self) -> str:
         text = EDITOR_HELP

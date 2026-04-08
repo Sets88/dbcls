@@ -283,7 +283,7 @@ class DbEditor(Editor):
 
         try:
             curses.curs_set(1)        # visidata hides the cursor; restore it
-            curses.mousemask(0)
+            curses.mousemask(0xffffffff)
         except curses.error:
             pass
 
@@ -322,7 +322,7 @@ class DbEditor(Editor):
                     message = str(exc)
                 else:
                     message = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                self.show_popup('Error', message)
+                self.info_popup.open('Error', message)
             finally:
                 self.set_status_name(self.client.get_title())
                 self.set_status_notification(f'{round(end - start, 2)}s  {message}')
@@ -352,7 +352,7 @@ class DbEditor(Editor):
             try:
                 candidates = task.result()
             except Exception as exc:
-                self.show_popup('Error', str(exc))
+                self.info_popup.open('Error', str(exc))
                 return
             items = []
             for item, title in candidates:
