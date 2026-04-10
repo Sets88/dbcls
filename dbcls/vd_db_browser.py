@@ -1,15 +1,29 @@
 from datetime import datetime, timezone
 import time
 from .utils import prettify
-from copy import deepcopy
+from copy import deepcopy, copy
 from typing import Union
+from collections import namedtuple
 
-from visidata import VisiData, Sheet, PyobjSheet, Column, ColumnItem, TypedExceptionWrapper
+import visidata
+from visidata import VisiData, TableSheet, PyobjSheet, Column, ColumnItem, TypedExceptionWrapper, IndexSheet, ItemColumn
+from visidata import BaseSheet, UNLOADED
 from visidata import asyncthread, ENTER, AttrDict, deduceType, Progress
 
 
+def _openCell(self, col, row, rowidx=None):
+    cell = col.getValue(row)
+    if isinstance(cell, BaseSheet):
+        return cell
+    return self._openCell(col, row, rowidx)
+
+
+TableSheet._openCell = TableSheet.openCell
+TableSheet.openCell = _openCell
+
+
 @VisiData.api
-class DataBaseSheet(Sheet):
+class DataBaseSheet(TableSheet):
     columns = [
         Column('database', getter=lambda col, row: row.database),
     ]
@@ -23,7 +37,7 @@ class DataBaseSheet(Sheet):
 
 
 @VisiData.api
-class TablesSheet(Sheet):
+class TablesSheet(TableSheet):
     columns = [
         Column('table', getter=lambda col, row: row.table),
         Column('database', getter=lambda col, row: row.database),
@@ -38,7 +52,7 @@ class TablesSheet(Sheet):
 
 
 @VisiData.api
-class TableOptionsSheet(Sheet):
+class TableOptionsSheet(TableSheet):
     columns = [
         Column('option', getter=lambda col, row: row.option),
     ]
@@ -71,7 +85,7 @@ def add_columns_from_row(row, sheet):
         sheet.addColumn(ColumnItem(name, type=deduceType(value)))
 
 
-class TableSampleDataSheet(Sheet):
+class TableSampleDataSheet(TableSheet):
     rowtype = 'tables'
     CHUNK_SIZE = 500
     CUSTOM_SQL = None
@@ -132,7 +146,7 @@ class TableSampleDataSheet(Sheet):
 
 
 @VisiData.api
-class TableSchemaSheet(Sheet):
+class TableSchemaSheet(TableSheet):
     columns = [
         Column('schema', getter=lambda col, row: row.schema),
     ]
@@ -145,7 +159,7 @@ class TableSchemaSheet(Sheet):
 
 
 @VisiData.api
-class ExpandVert(Sheet):
+class ExpandVert(TableSheet):
     def __init__(self, source, curcol):
         super().__init__(source.name + "_expver", source=source)
         self.curcol = curcol
@@ -196,6 +210,22 @@ def make_formated_table(sheet, col, row):
         'formated',
         source=data.split('\n'),
     )
+
+
+@VisiData.api
+def reference(_, sheet_name, field, value):
+    other_sheet = visidata.vd.getSheet(sheet_name)
+    return reference_sheets(_, other_sheet, field, value)
+
+
+def reference_sheets(right_sheet, field, value):
+    rows = []
+    for row in right_sheet:
+        if getattr(row, field) == value:
+            rows.append(row.as_dict())
+    if rows:
+        return PyobjSheet(f'{right_sheet.name}_reference[{len(rows)}]', source=rows)
+    return None
 
 
 def escape_sql_value(value):
@@ -284,8 +314,47 @@ def ts_to_start_of_inteval(_, ts: Union[str, float, int], interval: int) -> date
     return type_ts(float(ts) - (float(ts) % interval))
 
 
+@VisiData.api
+class SheetWithReference(TableSheet):
+    def __init__(self, left_sheet, other_sheets):
+        super().__init__('')
+        self.left_sheet = left_sheet
+        if not left_sheet or not other_sheets:
+            raise Exception('Two sheets must be provided')
+
+        self.left_sheet = left_sheet
+        self.right_sheet = other_sheets[0]
+
+        if (
+            len(left_sheet.keyCols) == 0 or
+            len(self.right_sheet.keyCols) == 0 or
+            len(left_sheet.keyCols) > 1 or
+            len(self.right_sheet.keyCols) > 1
+        ):
+            raise Exception('Both sheets must have one key column')
+
+    def loader(self):
+        left_key_col = self.left_sheet.keyCols[0]
+        right_key_col = self.right_sheet.keyCols[0]
+
+        self.rows = copy(self.left_sheet.rows)
+        self.columns = copy(self.left_sheet.columns)
+
+        self.ref_col = ItemColumn(
+            f'{left_key_col.name}_reference',
+        )
+        self.addColumn(self.ref_col, index=0)
+
+        for row in Progress(self.rows, 'transposing'):
+            self.ref_col.putValue(row, reference_sheets(self.right_sheet, self.right_sheet.keyCols[0].name, row[self.left_sheet.keyCols[0].name]))
+
+
+IndexSheet.guide += '''- `^` to make new sheet with reference column between two sheets'''
+
+
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(f\'table_options__{cursorRow["database"]}__{cursorRow["table"]}\', client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
-Sheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')
-Sheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
+TableSheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')
+TableSheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
 TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.update_current_sql(input("current sql: ", value=sheet.get_sample_base_sql(sheet.table, sheet.db)))', 'Edit current sql')
+IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')

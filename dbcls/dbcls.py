@@ -30,6 +30,7 @@ class DbFn(str, enum.Enum):
     SHOW_TABLES     = 'show_tables'
     SHOW_DATABASES  = 'show_databases'
     SHOW_PREDICTION = 'show_prediction'
+    SHOW_VD_SHEETS  = 'show_vd_sheets'
 
 
 logging.basicConfig(level=logging.ERROR)
@@ -204,6 +205,8 @@ Database
   Shift+Tab / Alt+1   DB autocomplete (tables, columns, functions)
   Alt+T               Browse tables
   Alt+E               Browse databases
+  Alt+S               Browse currently open VisiData sheets
+        (To keep sheets open, quit from visidata with Ctrl+q instead of q)
   Esc                 Cancel running query
 
 Key remapping
@@ -239,6 +242,8 @@ class DbEditor(Editor):
         self.add_keybinding(DbFn.SHOW_TABLES,     key_alt(ord('t')))              # Alt+T
         self.add_keybinding(DbFn.SHOW_DATABASES,  key_alt(ord('e')))              # Alt+E
         self.add_keybinding(DbFn.SHOW_PREDICTION, [key_alt(ord('1')), K(353)])   # Alt+1, Shift+Tab
+        self.add_editor_function(DbFn.SHOW_VD_SHEETS, self._db_show_vd_sheets, 'Browse VisiData sheets', 'Alt+S')
+        self.add_keybinding(DbFn.SHOW_VD_SHEETS, key_alt(ord('s')))              # Alt+S
         if self.client:
             self.set_status_name(self.client.get_title())
             self.set_words(keywords=self.client.all_commands, functions=self.client.all_functions)
@@ -360,6 +365,32 @@ class DbEditor(Editor):
             self.show_autocomplete(items)
 
         self.open_running_popup(task, start, on_done)
+
+    def get_sheets(self) -> 'List[str]':
+        """Return names of currently open VisiData sheets. Override to provide actual data."""
+        return [f'{x.name} <{x.__class__.__name__}>' for x in visidata.vd.sheets]
+
+    def open_sheet(self, sheet_index: str) -> None:
+        """Open VisiData on the given sheet. Override to provide actual behaviour."""
+        try:
+            self._fix_visidata_curses()
+            visidata.vd.run(visidata.vd.sheets[sheet_index])
+        except Exception as exc:
+            self.info_popup.open('Error', str(exc))
+        finally:
+            self._fix_curses_after_visidata()
+
+    def _db_show_vd_sheets(self):
+        sheets = self.get_sheets()
+        if not sheets:
+            self.set_status_notification('No VisiData sheets')
+            return
+        items = [(str(i), name, i) for i, name in enumerate(sheets)]
+
+        def on_select(sheet_index):
+            self.open_sheet(int(sheet_index))
+
+        self.popup.open(items, filter_text='', on_select=on_select, title='Open VisiData sheet')
 
     def _db_show_tables(self):
         try:

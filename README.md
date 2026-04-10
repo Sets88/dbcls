@@ -106,6 +106,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Alt + r` | Execute query under cursor or selected text |
 | `Alt + e` | Show database list with table submenu |
 | `Alt + t` | Show tables list with schema and sample data options |
+| `Alt + s` | Show list of open VisiData sheets |
 | `Ctrl + q` | Quit application |
 | `Ctrl + s` | Save file |
 | `Ctrl + h` / `F1` | Show all available hotkeys |
@@ -158,6 +159,12 @@ When using `Alt + e` (database list) or `Alt + t` (table list), you can navigate
   - View table schema
   - Show sample data
 
+## VisiData Sheets
+
+Press `Alt + s` to open a list of currently open VisiData sheets. Use the arrow keys to navigate and press `Enter` to switch to the selected sheet.
+
+To keep sheets open when navigating between them, quit VisiData with `Ctrl + q` instead of `q`. Pressing `q` closes the current sheet, while `Ctrl + q` exits VisiData entirely while leaving all sheets in memory so they remain accessible via `Alt + s`.
+
 ## Data Visualization (visidata)
 
 ### Hotkeys
@@ -180,6 +187,17 @@ DbCls supports exporting data from visidata in multiple formats:
 The SQL export uses the sheet name as the table name and includes all visible columns. Each row is exported as a separate INSERT statement.
 
 For more visidata hotkeys, visit: https://www.visidata.org/man/
+
+### VisiData API Functions
+
+The following functions are available in visidata expressions (press `=` to create an expression column, then use `function_name(...)`):
+
+| Function | Description |
+|----------|-------------|
+| `reference(sheet_name, field, value)` | Make a reference to another sheet where `field == value`, on cell open, opens referenced rows in a new sheet |
+| `ts_to_dt_utc(ts)` | Convert Unix timestamp (str/float/int) to UTC datetime |
+| `dt_to_start_of_inteval(dt, interval)` | Round a datetime to the start of an interval (interval in seconds) |
+| `ts_to_start_of_inteval(ts, interval)` | Round a Unix timestamp to the start of an interval (interval in seconds), preserving input type |
 
 ## SQL Commands
 

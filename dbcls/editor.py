@@ -1052,13 +1052,15 @@ class SelectPopup:
         self.selected_idx = 0
         self.scroll_offset = 0
         self._on_select = None
+        self._title: str = ''
 
     def open(self, items: 'List[Tuple[str, str, int]]', filter_text: str = '',
-             on_select=None) -> None:
+             on_select=None, title: str = '') -> None:
         self.active = True
         self.items = list(items)
         self.filter_text = filter_text
         self._on_select = on_select
+        self._title = title
         self._refilter()
 
     def close(self):
@@ -1157,7 +1159,8 @@ class SelectPopup:
         ph = visible_count + 4
         max_label_len = max((len(label) for _, label, _ in self.filtered), default=0) if self.filtered else 0
         # inner content = "  " prefix (2) + label; borders add 2 more
-        pw = min(max(max_label_len + 4, 20), W - 3)
+        min_pw = max(20, len(self._title) + 6 if self._title else 0)
+        pw = min(max(max_label_len + 4, min_pw), W - 3)
         py = max(0, H - 1 - ph)
         px = 0
 
@@ -1204,6 +1207,8 @@ class SelectPopup:
         ach(py, px,          ACS_UL, ba)
         hl (py, px + 1,      pw - 2, ba)
         ach(py, px + pw - 1, ACS_UR, ba)
+        if self._title:
+            astr(py, px + 2, f' {self._title} '[:pw - 4], ba)
 
         # Filter line
         filter_display = f' Filter: {self.filter_text}_'
@@ -1999,7 +2004,7 @@ class Editor:
         """Open autocomplete with a custom item list.
         Each item: (display_word, insert_word, weight) — lower weight sorts first."""
         popup_items = [(insert, display, weight) for display, insert, weight in items]
-        self.popup.open(popup_items, filter_text=self.buf.word_at_cursor())
+        self.popup.open(popup_items, filter_text=self.buf.word_at_cursor(), title='Autocomplete')
 
     def add_editor_function(self, name: str, func: Callable[[], None], description: str = '', keybinding: str = '') -> None:
         self._editor_functions[name] = {'func': func, 'description': description, 'keybinding': keybinding}
@@ -2499,7 +2504,7 @@ class Editor:
                 if wu not in seen:
                     items.append((wu, f'{wu}  (word)', 0))
                     seen.add(wu)
-            self.popup.open(items, filter_text=self.buf.word_at_cursor())
+            self.popup.open(items, filter_text=self.buf.word_at_cursor(), title='Autocomplete')
 
     def _cmd_command_palette(self):
         items = []
@@ -2518,7 +2523,7 @@ class Editor:
             if entry:
                 entry['func']()
 
-        self.popup.open(items, filter_text='', on_select=on_select)
+        self.popup.open(items, filter_text='', on_select=on_select, title='Commands')
 
     def _cmd_toggle_wrap(self):
         self.renderer.wrap = not self.renderer.wrap
@@ -2628,7 +2633,7 @@ class Editor:
             self.lexer.invalidate(0)
             self._file_change_dismissed = False
 
-        self.popup.open(items, filter_text='', on_select=on_select)
+        self.popup.open(items, filter_text='', on_select=on_select, title='Open File')
 
     def _quit(self):
         if self.buf.dirty:
