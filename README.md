@@ -1,17 +1,18 @@
 # DbCls
 
-DbCls is a powerful database client that combines the functionality of a SQL editor and data visualization tool. It integrates the kaa editor for SQL query editing and the visidata tool for data representation, providing a seamless experience for database management and data analysis.
+DbCls is a terminal-based database client that pairs a built-in SQL editor with [visidata](https://www.visidata.org/) for exploring query results. The editor offers syntax highlighting, LM-ranked autocomplete, and customizable keybindings, while visidata turns query output into an interactive, spreadsheet-like view you can filter, sort, pivot, reshape and drill into — all without leaving the terminal. Together they make writing queries and inspecting their results a single, seamless workflow.
 
 ## Features
 
-- SQL query editing with syntax highlighting
-- Direct query execution from the editor
-- Data visualization with interactive tables
-- Support for multiple database engines (MySQL, PostgreSQL, ClickHouse, SQLite)
-- Configuration via command line or config file
-- Table schema inspection
-- Database and table browsing
-- Query history and file-based query storage
+- Built-in SQL editor with syntax highlighting and customizable keybindings
+- LM-ranked autocomplete for tables, columns, keywords, and functions
+- Direct query execution from the editor, results opened straight in visidata
+- Powerful interactive data exploration via visidata (filter, sort, pivot, frequency tables, cross-sheet references)
+- Support for multiple database engines (MySQL, PostgreSQL, ClickHouse, SQLite, Cassandra / ScyllaDB)
+- Unix socket connections with optional auto-SSH tunneling
+- Configuration via command line arguments or JSON config file
+- Table schema inspection and database / table browsing
+- Export results to SQL `INSERT` statements or any visidata-supported format
 
 ## Screenshots
 
@@ -149,7 +150,7 @@ the most likely next SQL token given the current query context.
 
 ### Navigation in Database and Table Listings
 
-When using `Alt + e` (database list) or `Alt + t` (table list), you can navigate through the listings
+When using `Alt + e` (database list) or `Alt + t` (table list), use the arrow keys to navigate through the entries and `Enter` to drill in.
 
 **Database List Navigation:**
 - Select a database and press `Enter` to proceed to the table list for that database
@@ -166,6 +167,10 @@ Press `Alt + s` to open a list of currently open VisiData sheets. Use the arrow 
 To keep sheets open when navigating between them, quit VisiData with `Ctrl + q` instead of `q`. Pressing `q` closes the current sheet, while `Ctrl + q` exits VisiData entirely while leaving all sheets in memory so they remain accessible via `Alt + s`.
 
 ## Data Visualization (visidata)
+
+[VisiData](https://www.visidata.org/) is, frankly, the most productive way to look at tabular data in a terminal. It turns a query result into a live, navigable spreadsheet: you can sort and filter on any column, build frequency tables, pivot, melt, join sheets, plot quick histograms, edit cells, follow references between sheets, and export to dozens of formats — all with a few keystrokes and no mouse. DbCls opens every query result directly in visidata, so exploring a database feels less like scrolling through a log and more like poking at a live dataset.
+
+DbCls extends visidata with a handful of DB-aware helpers (cross-sheet references, timestamp conversions, SQL `INSERT` export, an editable sample-query for each table, and a sheet switcher reachable from the editor via `Alt + s`).
 
 ### Hotkeys
 
@@ -324,9 +329,9 @@ To avoid this, you can use this technique:
 #!/bin/bash
 
 ENC_PASS='{V|B;*R$Ep:HtO~*;QAd?yR#b?V9~a34?!!sxqQT%{!x)bNby^5'
-PASS_DEC=`ssh-crypt -d -s $PASS`
+PASS_DEC=$(ssh-crypt -d -s "$ENC_PASS")
 
-CONFIG=`cat << EOF
+CONFIG=$(cat <<EOF
 {
     "host": "127.0.0.1",
     "username": "user",
@@ -334,7 +339,8 @@ CONFIG=`cat << EOF
     "dbname": "mydb",
     "engine": "mysql"
 }
-`
+EOF
+)
 
 dbcls -c <(echo "$CONFIG") mydb.sql
 ```
