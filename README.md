@@ -178,7 +178,40 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 |--------|--------|
 | `zf` | Format current cell (JSON indentation, number prettification) |
 | `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
+| `gp` | Draw a time-series chart from the current sheet's key columns (see [Plotting](#plotting) below) |
 | `E` | Edit the SQL query used to fetch sample data for the current table(in `Alt + t` page only) |
+
+### Plotting
+
+Press `gp` on any VisiData sheet to open an inline terminal chart powered by [plotext](https://github.com/piccolomo/plotext). The chart is drawn from the sheet's **key columns** — set them with `!` on a column before pressing `gp`.
+
+**Required key column layout (in order):**
+
+| Position | Type | Role |
+|----------|------|------|
+| 1st key column | `date`, `datetime`, `int`, or `float` | X axis (time) |
+| 2nd key column *(optional)* | any | Bucket / series grouping |
+| Last key column | `int` or `float` | Y axis (value) |
+
+**Two-column mode** (`datetime` + `value`): draws a single line chart.
+
+**Three-column mode** (`datetime` + `bucket` + `value`): draws one line per unique bucket value. Each series is assigned a number (`1`, `2`, …). Press the corresponding number key to toggle that series on/off.
+
+If rows are selected (`s` / `t`), only the selected rows are plotted; otherwise all rows are used.
+
+**Example query:**
+
+```sql
+SELECT
+    DATE_TRUNC('hour', created_at) AS dt,
+    status,
+    COUNT(*) AS cnt
+FROM orders
+GROUP BY 1, 2
+ORDER BY 1, 2
+```
+
+Open the result in VisiData, mark `dt`, `status`, and `cnt` as key columns (press `!` on each), then press `gp`.
 
 ### Exporting Data
 

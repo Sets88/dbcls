@@ -1,14 +1,11 @@
-from datetime import datetime, timezone
 import time
-from .utils import prettify
 from copy import deepcopy, copy
-from typing import Union
-from collections import namedtuple
 
-import visidata
-from visidata import VisiData, TableSheet, PyobjSheet, Column, ColumnItem, TypedExceptionWrapper, IndexSheet, ItemColumn
-from visidata import BaseSheet, UNLOADED
+from visidata import VisiData, TableSheet, Column, ColumnItem, TypedExceptionWrapper, ItemColumn
+from visidata import BaseSheet
 from visidata import asyncthread, ENTER, AttrDict, deduceType, Progress
+
+from .vd_utils import reference_sheets
 
 
 def _openCell(self, col, row, rowidx=None):
@@ -198,122 +195,6 @@ class ExpandVert(TableSheet):
                     yield new_row
 
 
-
-@VisiData.api
-def make_formated_table(sheet, col, row):
-    if not row:
-        raise Exception('No data found')
-
-    cell = col.getValue(row)
-    data = prettify(cell)
-    return PyobjSheet(
-        'formated',
-        source=data.split('\n'),
-    )
-
-
-@VisiData.api
-def reference(_, sheet_name, field, value):
-    other_sheet = visidata.vd.getSheet(sheet_name)
-    return reference_sheets(_, other_sheet, field, value)
-
-
-def reference_sheets(right_sheet, field, value):
-    rows = []
-    for row in right_sheet:
-        if getattr(row, field) == value:
-            rows.append(row.as_dict())
-    if rows:
-        return PyobjSheet(f'{right_sheet.name}_reference[{len(rows)}]', source=rows)
-    return None
-
-
-def escape_sql_value(value):
-    """Escape a value for SQL INSERT statement"""
-    if value is None:
-        return 'NULL'
-    elif isinstance(value, bool):
-        # Handle booleans before numbers since bool is subclass of int
-        return '1' if value else '0'
-    elif isinstance(value, (int, float)):
-        return str(value)
-    else:
-        # Convert to string and escape special characters
-        escaped = str(value)
-
-        # Escape backslashes first (important to do this before quotes)
-        escaped = escaped.replace('\\', '\\\\')
-
-        # Escape single quotes by doubling them (SQL standard)
-        escaped = escaped.replace("'", "''")
-
-        # Escape other special characters
-        escaped = escaped.replace('\n', '\\n')
-        escaped = escaped.replace('\r', '\\r')
-        escaped = escaped.replace('\t', '\\t')
-        escaped = escaped.replace('\0', '\\0')
-
-        return f"'{escaped}'"
-
-
-@VisiData.api
-def save_sql(vd, p, *vsheets):
-    """Save sheets as SQL INSERT statements"""
-    for vs in vsheets:
-        with p.open(mode='w', encoding=vs.options.save_encoding) as fp:
-            # Use sheet name as table name, cleaned for SQL
-            table_name = vd.cleanName(vs.name) or 'table'
-
-            # Get visible columns
-            columns = vs.visibleCols
-            if not columns:
-                vd.warning(f'No columns to export in sheet {vs.name}')
-                continue
-
-            # Generate column names for INSERT statement
-            col_names = ', '.join(f'`{col.name}`' for col in columns)
-
-            # Iterate through rows with progress indicator
-            with Progress(gerund='saving', total=vs.nRows) as prog:
-                for row in vs.rows:
-                    values = []
-                    for col in columns:
-                        try:
-                            val = col.getTypedValue(row)
-                            if isinstance(val, TypedExceptionWrapper):
-                                # Handle errors in cell values
-                                values.append('NULL')
-                            else:
-                                values.append(escape_sql_value(val))
-                        except Exception:
-                            values.append('NULL')
-
-                    # Build INSERT statement
-                    vals_str = ', '.join(values)
-                    sql = f"INSERT INTO `{table_name}` ({col_names}) VALUES ({vals_str});\n"
-                    fp.write(sql)
-
-                    prog.addProgress(1)
-
-            vd.status(f'Saved {vs.nRows} row(s) as SQL INSERT to {p.given}')
-
-
-@VisiData.api
-def ts_to_dt_utc(_, ts: Union[str, float, int]) -> datetime:
-    return datetime.fromtimestamp(float(ts), tz=timezone.utc).replace(tzinfo=None)
-
-
-@VisiData.api
-def dt_to_start_of_inteval(_, dt: datetime, interval: int) -> datetime:
-    return datetime.fromtimestamp(dt.timestamp() - (dt.timestamp() % interval))
-
-
-@VisiData.api
-def ts_to_start_of_inteval(_, ts: Union[str, float, int], interval: int) -> datetime:
-    type_ts = type(ts)
-    return type_ts(float(ts) - (float(ts) % interval))
-
-
 @VisiData.api
 class SheetWithReference(TableSheet):
     def __init__(self, left_sheet, other_sheets):
@@ -349,12 +230,6 @@ class SheetWithReference(TableSheet):
             self.ref_col.putValue(row, reference_sheets(self.right_sheet, self.right_sheet.keyCols[0].name, row[self.left_sheet.keyCols[0].name]))
 
 
-IndexSheet.guide += '''- `^` to make new sheet with reference column between two sheets'''
-
-
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(f\'table_options__{cursorRow["database"]}__{cursorRow["table"]}\', client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
-TableSheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')
-TableSheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
 TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.update_current_sql(input("current sql: ", value=sheet.get_sample_base_sql(sheet.table, sheet.db)))', 'Edit current sql')
-IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')

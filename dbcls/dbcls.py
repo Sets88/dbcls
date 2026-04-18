@@ -16,7 +16,7 @@ from queue import LifoQueue
 import visidata
 
 from .clients.base import Result
-from .vd_db_browser import DataBaseSheet, TablesSheet
+from .vd_modules import DataBaseSheet, TablesSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
