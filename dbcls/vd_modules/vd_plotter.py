@@ -133,7 +133,7 @@ class Plot(BaseSheet):
                 dates = [to_dt_str(p[0]) for p in points_sorted]
                 vals = [p[1] for p in points_sorted]
 
-                plt.plot(dates, vals, xside='lower', yside='left', label=str(bucket), color=index + 1)
+                plt.plot(dates, vals, xside='lower', yside='left', label=f'({index + 1}) {bucket}', color=index + 1)
         else:
             dt_col, val_col = cols[0], cols[1]
             points = []

@@ -18,3 +18,11 @@ TableSheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(
 TableSheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
 TableSheet.addCommand('gp', 'alt-plot', 'vd.push(Plot(source=sheet))', 'Draw plotext chart from first 2 or 3 visible columns (datetime, [bucket,] value)')
 IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')
+
+# Alt + arrow keys to move cursor faster
+TableSheet.addCommand('Alt+b', 'go-left-3', 'cursorRight(-3)')
+TableSheet.addCommand('Alt+f', 'go-right-3', 'cursorRight(3)')
+TableSheet.addCommand('Shift+Down3', 'go-down-5', 'cursorDown(+5)')
+TableSheet.addCommand('Shift+Up3', 'go-up-5', 'cursorDown(-5)')
+TableSheet.addCommand('Alt+Down', 'go-down-5', 'cursorDown(+5)')
+TableSheet.addCommand('Alt+Up', 'go-up-5', 'cursorDown(-5)')

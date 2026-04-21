@@ -23,6 +23,23 @@ logging.getLogger('cassandra.cluster').disabled = True
 class CassandraClient(ClientClass):
     ENGINE = 'Cassandra'
 
+    SQL_COMMON_COMMANDS = [
+        'SELECT', 'FROM', 'WHERE', 'ORDER BY', 'ALLOW FILTERING', 'USING', 'CUSTOM',
+        'INSERT', 'INTO', 'UPDATE', 'VALUES', 'SET', 'DELETE', 'GROUP BY', 'OPTIONS'
+        'CREATE', 'INDEX', 'LIMIT', 'NULL', 'DISTINCT', 'MATERIALIZED', 'VIEW', 'SCHEMA',
+        'KEYSPACE', 'TRIGGER', 'TYPE', 'BATCH', 'USE', 'PRIMARY KEY', 'EXISTS', 'FUNCTION',
+        'TIMESTAMP', 'APPLY', 'UNLOGGED', 'BEGIN', 'TIMEOUT', 'COMPACT', 'STORAGE', 'TABLES',
+        'PARTITION BY', 'DROP', 'ALTER', 'TRUNCATE', 'TABLE', 'COLUMN', 'SET', 'KEYSPACES',
+        'DESCRIBE', 'DESC', 'RENAME', 'LIST', 'USERS', 'ROLES', 'TRIGGER', 'WITH',
+        'GRANT', 'REVOKE', 'ROLE', 'PERMISSIONS', 'OPTIMIZE', 'KILL', 'INTERVAL',
+        'ON', 'AS', 'OF', 'AND', 'OR', 'IN', 'IS', 'NOT', 'JSON', 'TTL', 'IF'
+    ]
+
+    SQL_FUNCTIONS = [
+        'cast', 'token', 'toDate', 'toTimestamp', 'toUnixTimestamp', 'currentTimestamp', 'currentDate',
+        'currentTime', 'currentTimeUUID'
+    ]
+
     def __init__(
         self, host: str, username: str, password: str, dbname: str,
         port: Optional[str] = None, unix_socket: Optional[str] = None

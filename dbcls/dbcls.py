@@ -244,6 +244,7 @@ class DbEditor(Editor):
         self.add_keybinding(DbFn.SHOW_PREDICTION, [key_alt(ord('1')), K(353)])   # Alt+1, Shift+Tab
         self.add_editor_function(DbFn.SHOW_VD_SHEETS, self._db_show_vd_sheets, 'Browse VisiData sheets', 'Alt+S')
         self.add_keybinding(DbFn.SHOW_VD_SHEETS, key_alt(ord('s')))              # Alt+S
+
         if self.client:
             self.set_status_name(self.client.get_title())
             self.set_words(keywords=self.client.all_commands, functions=self.client.all_functions)
