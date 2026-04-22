@@ -252,6 +252,7 @@ class ColorManager:
         self.popup_input  = p(curses.COLOR_BLACK, curses.COLOR_WHITE)
         self.search_match         = p(curses.COLOR_BLACK,  curses.COLOR_YELLOW)
         self.search_match_current = p(curses.COLOR_BLACK,  218)  # pink — current match
+        self.popup_match          = p(curses.COLOR_BLACK,  curses.COLOR_YELLOW)
 
         self._sel_map = {
             self.normal:   self.sel_normal,
@@ -1072,11 +1073,33 @@ class SelectPopup:
         self._on_select = None
 
     def _refilter(self):
-        q = self.filter_text.upper()
-        self.filtered = [(w, lbl, wt) for w, lbl, wt in self.items if q in lbl.upper()]
+        parts = [p for p in self.filter_text.upper().split() if p]
+        if not parts:
+            self.filtered = list(self.items)
+        else:
+            self.filtered = [
+                (w, lbl, wt) for w, lbl, wt in self.items
+                if all(p in lbl.upper() for p in parts)
+            ]
+        q = parts[0] if parts else ''
         self.filtered.sort(key=lambda x: (x[2], 0 if x[1].upper().startswith(q) else 1))
         self.selected_idx = 0
         self.scroll_offset = 0
+
+    def _match_positions(self, label: str) -> set:
+        parts = [p for p in self.filter_text.upper().split() if p]
+        label_upper = label.upper()
+        positions = set()
+        for part in parts:
+            start = 0
+            while True:
+                pos = label_upper.find(part, start)
+                if pos == -1:
+                    break
+                for i in range(pos, pos + len(part)):
+                    positions.add(i)
+                start = pos + 1
+        return positions
 
     def selected_word(self) -> Optional[str]:
         """Returns only the insert text (without the description comment)."""
@@ -1223,20 +1246,29 @@ class SelectPopup:
         ach(py + 2, px + pw - 1, ACS_RT, ba)
 
         # Items
+        ma = curses.color_pair(colors.popup_match)
         for i in range(self.MAX_VISIBLE):
             row_y = py + 3 + i
             abs_i = i + self.scroll_offset
             ach(row_y, px, ACS_VL, ba)
             if abs_i < total:
                 _, label, _ = self.filtered[abs_i]
-                prefix = '> ' if abs_i == self.selected_idx else '  '
-                row_text = (prefix + label)[:pw - 2].ljust(pw - 2)
-                attr = sa if abs_i == self.selected_idx else ia
+                is_sel = abs_i == self.selected_idx
+                prefix = '> ' if is_sel else '  '
+                base_attr = sa if is_sel else ia
+                match_pos = self._match_positions(label)
+                astr(row_y, px + 1, prefix, base_attr)
+                avail = pw - 2 - len(prefix)
+                truncated = label[:avail]
+                x_off = px + 1 + len(prefix)
+                for ci, ch in enumerate(truncated):
+                    astr(row_y, x_off + ci, ch, ma if ci in match_pos else base_attr)
+                pad = avail - len(truncated)
+                if pad > 0:
+                    astr(row_y, x_off + len(truncated), ' ' * pad, base_attr)
             else:
-                row_text = ' ' * (pw - 2)
-                attr = ia
-            astr(row_y, px + 1,      row_text, attr)
-            ach (row_y, px + pw - 1, ACS_VL, ba)
+                astr(row_y, px + 1, ' ' * (pw - 2), ia)
+            ach(row_y, px + pw - 1, ACS_VL, ba)
 
         # Scroll indicator row
         indicator = f'[{self.selected_idx + 1}/{total}]' if total > 0 else '[0/0]'

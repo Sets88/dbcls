@@ -24,7 +24,7 @@ def make_formated_table(sheet, col, row):
 @VisiData.api
 def reference(_, sheet_name, field, value):
     other_sheet = visidata.vd.getSheet(sheet_name)
-    return reference_sheets(_, other_sheet, field, value)
+    return reference_sheets(other_sheet, (field,), (value,))
 
 
 def escape_sql_value(value):

@@ -208,26 +208,31 @@ class SheetWithReference(TableSheet):
 
         if (
             len(left_sheet.keyCols) == 0 or
-            len(self.right_sheet.keyCols) == 0 or
-            len(left_sheet.keyCols) > 1 or
-            len(self.right_sheet.keyCols) > 1
+            len(self.right_sheet.keyCols) != len(left_sheet.keyCols) > 1
         ):
-            raise Exception('Both sheets must have one key column')
+            raise Exception('Both sheets must have same key column')
 
     def loader(self):
-        left_key_col = self.left_sheet.keyCols[0]
-        right_key_col = self.right_sheet.keyCols[0]
+        left_key_col_names = tuple(x.name for x in self.left_sheet.keyCols)
+        right_key_col_names = tuple(x.name for x in self.right_sheet.keyCols)
 
         self.rows = copy(self.left_sheet.rows)
         self.columns = copy(self.left_sheet.columns)
 
+        reference_col_name = f'{"_".join(left_key_col_names)}__ref'
+
         self.ref_col = ItemColumn(
-            f'{left_key_col.name}_reference',
+            reference_col_name,
         )
         self.addColumn(self.ref_col, index=0)
 
-        for row in Progress(self.rows, 'transposing'):
-            self.ref_col.putValue(row, reference_sheets(self.right_sheet, self.right_sheet.keyCols[0].name, row[self.left_sheet.keyCols[0].name]))
+        for row in Progress(self.left_sheet, 'referencing'):
+            left_sheet_key_values = tuple(getattr(row, field) for field in left_key_col_names)
+
+            self.ref_col.putValue(
+                row.row,
+                reference_sheets(self.right_sheet, right_key_col_names, left_sheet_key_values)
+            )
 
 
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')
