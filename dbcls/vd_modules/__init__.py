@@ -1,5 +1,5 @@
 from visidata import TableSheet, IndexSheet
-from visidata.vdobj import ENTER
+from visidata import ENTER
 
 from .vd_db_browser import (
     DataBaseSheet, TablesSheet, TableOptionsSheet,
