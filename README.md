@@ -226,6 +226,34 @@ The SQL export uses the sheet name as the table name and includes all visible co
 
 For more visidata hotkeys, visit: https://www.visidata.org/man/
 
+### Cross-Sheet References (SheetWithReference)
+
+you can join two open sheets by their key columns and navigate between related rows without writing a SQL JOIN. The result is a copy of the left sheet with an extra reference column — each cell in that column holds a live pointer to matching rows in the right sheet.
+
+**Prerequisites:**
+- Both sheets must have key columns set. Press `!` on a column to toggle it as a key column.
+- Both sheets must have the same number of key columns.
+
+**How to invoke:**
+
+1. Open both tables in VisiData (e.g., run two queries or navigate the table browser).
+2. Open the sheet list with `S` (capital S) — this is the IndexSheet.
+3. Select the **left** (source) sheet with `s`, then select the **right** (reference) sheet with `s`.
+4. Press `^` (caret). A new `SheetWithReference` opens.
+
+The new sheet contains all rows from the left sheet plus a new `{key_col_names}__ref` column prepended at position 0. Each cell in that column shows a `ReferenceSheet` object with the count of matching rows (e.g., `orders_reference[3]`).
+
+**Navigating references:**
+
+| Hotkey | Action |
+|--------|--------|
+| `z+Enter` | Open the referenced rows for the current cell in a new sheet |
+| `gz+Enter` | Open all selected reference cells merged into a single sheet |
+
+**Example:**
+
+You have an `orders` sheet (with `customer_id` as a key column) and a `customers` sheet (also keyed on `customer_id`). After pressing `^` on the IndexSheet with both selected, the result sheet has a `customer_id__ref` column. Pressing `z+Enter` on reference column opens a filtered view of `customers` containing only the rows whose `customer_id` matches that order.
+
 ### VisiData API Functions
 
 The following functions are available in visidata expressions (press `=` to create an expression column, then use `function_name(...)`):

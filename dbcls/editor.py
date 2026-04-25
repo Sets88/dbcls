@@ -310,11 +310,19 @@ class Lexer:
         self._keywords  = []
         self._types     = []
         self._functions = []
+        self._multi_keywords = {}  # first_word -> set of full multi-word keywords
 
     def set_words(self, keywords=None, types=None, functions=None):
         """Replace one or more word sets used for highlighting and autocomplete.
         Each argument, if given, must be an iterable of strings (case-insensitive)."""
-        if keywords  is not None: self._keywords  = frozenset(w.upper() for w in keywords)
+        if keywords is not None:
+            kw_upper = [w.upper() for w in keywords]
+            self._keywords = frozenset(w for w in kw_upper if ' ' not in w)
+            self._multi_keywords = {}
+            for w in kw_upper:
+                if ' ' in w:
+                    first = w.split()[0]
+                    self._multi_keywords.setdefault(first, set()).add(w)
         if types     is not None: self._types     = frozenset(w.upper() for w in types)
         if functions is not None: self._functions = frozenset(w.upper() for w in functions)
         self._cache.clear()
@@ -421,14 +429,29 @@ class Lexer:
                     pos += 1
                 word = line[start:pos]
                 wu = word.upper()
-                if wu in self._keywords:
-                    ttype = 'keyword'
-                elif wu in self._types:
-                    ttype = 'type'
-                elif wu in self._functions:
-                    ttype = 'function'
-                else:
-                    ttype = 'normal'
+
+                ttype = 'normal'
+                if wu in self._multi_keywords:
+                    look = pos
+                    while look < n and line[look] in (' ', '\t'):
+                        look += 1
+                    if look < n and (line[look].isalpha() or line[look] == '_'):
+                        w2_start = look
+                        while look < n and (line[look].isalnum() or line[look] == '_'):
+                            look += 1
+                        candidate = wu + ' ' + line[w2_start:look].upper()
+                        if candidate in self._multi_keywords[wu]:
+                            pos = look
+                            ttype = 'keyword'
+
+                if ttype == 'normal':
+                    if wu in self._keywords:
+                        ttype = 'keyword'
+                    elif wu in self._types:
+                        ttype = 'type'
+                    elif wu in self._functions:
+                        ttype = 'function'
+
                 push(start, pos, ttype)
                 continue
 
