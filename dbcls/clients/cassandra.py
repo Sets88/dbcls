@@ -18,10 +18,15 @@ from .base import (
 
 
 logging.getLogger('cassandra.cluster').disabled = True
+logging.getLogger('cassandra.connection').disabled = True
+
+
+DEFAULT_PAGER_LIMIT = 5000
 
 
 class CassandraClient(ClientClass):
     ENGINE = 'Cassandra'
+    SUPPORTS_SERVER_SIDE_PAGING = True
 
     SQL_COMMON_COMMANDS = [
         'SELECT', 'FROM', 'WHERE', 'ORDER BY', 'ALLOW FILTERING', 'USING', 'CUSTOM',
@@ -30,9 +35,9 @@ class CassandraClient(ClientClass):
         'KEYSPACE', 'TRIGGER', 'TYPE', 'BATCH', 'USE', 'PRIMARY KEY', 'EXISTS', 'FUNCTION',
         'TIMESTAMP', 'APPLY', 'UNLOGGED', 'BEGIN', 'TIMEOUT', 'COMPACT', 'STORAGE', 'TABLES',
         'PARTITION BY', 'DROP', 'ALTER', 'TRUNCATE', 'TABLE', 'COLUMN', 'SET', 'KEYSPACES',
-        'DESCRIBE', 'DESC', 'RENAME', 'LIST', 'USERS', 'ROLES', 'TRIGGER', 'WITH',
-        'GRANT', 'REVOKE', 'ROLE', 'PERMISSIONS', 'OPTIMIZE', 'KILL', 'INTERVAL',
-        'ON', 'AS', 'OF', 'AND', 'OR', 'IN', 'IS', 'NOT', 'JSON', 'TTL', 'IF'
+        'DESCRIBE', 'DESC', 'RENAME', 'LIST', 'USERS', 'ROLES', 'TRIGGER', 'WITH', 'CREATE'
+        'GRANT', 'REVOKE', 'ROLE', 'PERMISSIONS', 'OPTIMIZE', 'KILL', 'INTERVAL', 'PARTITION'
+        'ON', 'AS', 'OF', 'AND', 'OR', 'IN', 'IS', 'NOT', 'JSON', 'TTL', 'IF', 'PER'
     ]
 
     SQL_FUNCTIONS = [
@@ -46,7 +51,7 @@ class CassandraClient(ClientClass):
     ):
         super().__init__(host, username, password, dbname, port, unix_socket)
         self._pager_sql = None
-        self._pager_limit = None
+        self._pager_limit = DEFAULT_PAGER_LIMIT
         self._paging_state = None
         if not port:
             self.port = '9042'
@@ -144,12 +149,16 @@ class CassandraClient(ClientClass):
         database: Optional[str] = None,
     ):
         sql = f"SELECT * FROM {database}.{table}"
-        self._pager_sql = sql
         return sql
 
     def get_limit_sql(self, limit: int, offset: int = 0):
         self._pager_limit = limit
         return f''
+
+    def reset_pager(self) -> None:
+        self._pager_sql = None
+        self._paging_state = None
+        self._pager_limit = DEFAULT_PAGER_LIMIT
 
     def is_db_error_exception(self, exc: Exception) -> bool:
         if isinstance(exc, UnresolvableContactPoints):
@@ -167,16 +176,24 @@ class CassandraClient(ClientClass):
                 if self.connection is None:
                     await self.connect()
 
-                if self._pager_sql and sql.strip() == self._pager_sql:
+                if self._pager_limit and self._pager_sql is None:
+                    statement = SimpleStatement(sql, fetch_size=self._pager_limit)
+                    self._pager_sql = sql
+                elif self._pager_limit and self._pager_sql and self._pager_sql == sql:
                     statement = SimpleStatement(sql, fetch_size=self._pager_limit)
                 else:
-                    statement = SimpleStatement(sql)
-                    self._pager_limit = None
-                    self._pager_sql = None
+                    statement = SimpleStatement(sql, fetch_size=self._pager_limit)
+                    self._pager_limit = DEFAULT_PAGER_LIMIT
+                    self._pager_sql = sql
                     self._paging_state = None
 
                 data = self.connection.execute(statement, paging_state=self._paging_state)
                 self._paging_state = data.paging_state
+
+                if not data.has_more_pages:
+                    self._pager_sql = None
+                    self._paging_state = None
+                    self._pager_limit = DEFAULT_PAGER_LIMIT
 
                 return Result(
                     data.current_rows,

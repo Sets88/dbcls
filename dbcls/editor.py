@@ -1318,12 +1318,14 @@ class RunningPopup:
         self.cancelled = False
         self._start: float = 0.0
         self._task = None
+        self.rows_loaded: int = 0
 
     def open(self, task, start: float) -> None:
         self.active = True
         self.cancelled = False
         self._start = start
         self._task = task
+        self.rows_loaded = 0
 
     def close(self) -> None:
         self.active = False
@@ -1350,8 +1352,11 @@ class RunningPopup:
         elapsed = time.time() - self._start
         if elapsed < self.SHOW_DELAY:
             return
-        win_w = 52
-        msg = f' Running... {round(elapsed, 1)}s  (ESC to cancel) '
+        if self.rows_loaded:
+            msg = f' Running... {round(elapsed, 1)}s  {self.rows_loaded} rows  (ESC to cancel) '
+        else:
+            msg = f' Running... {round(elapsed, 1)}s  (ESC to cancel) '
+        win_w = len(msg) + 2
         y = max(0, H // 2 - 1)
         x = max(0, W // 2 - win_w // 2)
         try:

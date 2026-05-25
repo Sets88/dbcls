@@ -2,6 +2,7 @@ import os
 import json
 import math
 from time import time
+from typing import List, Optional, Tuple, Union
 
 import sql_metadata
 from sql_metadata.keywords_lists import TokenType
@@ -464,34 +465,48 @@ class AutoComplete:
     async def get_all_functions(self) -> list[str]:
         return self.client.all_functions
 
-    async def get_suggestions(self, parts: list[str], sql_context: str = "", full_sql: str = "") -> list[str]:
-        part1 = None
-        part2 = None
+    async def _fetch_columns_for_tables(
+        self,
+        table_specs: list[str],
+        *,
+        dedupe_against: Optional[set] = None,
+    ) -> list[tuple[str, str]]:
+        results = []
+        for spec in table_specs:
+            db = None
+            table = spec
+            if '.' in spec:
+                db, table = spec.split('.', 1)
+            cols = None
+            try:
+                cols = await self.get_cached_columns(table) if db is None \
+                    else await self.get_cached_columns(table, db)
+            except Exception:
+                pass
+            if cols:
+                for col in cols:
+                    candidate = (col, f"{table}.{col} (COLUMN)")
+                    if dedupe_against is None:
+                        results.append(candidate)
+                    elif candidate not in dedupe_against:
+                        results.append(candidate)
+                        dedupe_against.add(candidate)
+        return results
 
-        databases_list = None
+    async def _get_schema_suggestions(
+        self,
+        parts: list[str],
+        part1: Union[str, None],
+        part2: Union[str, None],
+    ) -> List[Tuple[str, str]]:
+        results = []
         curr_tables_list = None
-        tables_list = None
-        columns_list = None
-
-        word = parts[-1] if parts else ''
-
-        if len(parts) == 2:
-            part1 = parts[0]
-        elif len(parts) == 3:
-            part1 = parts[0]
-            part2 = parts[1]
-
-        suggestions = [(x, f"{x} (COMMAND)") for x in self.client.all_commands]
-
-        functions_list = await self.get_all_functions()
-        if functions_list:
-            suggestions += [(x, f"{x} (FUNCTION)") for x in functions_list]
 
         if part1 is None:
             try:
                 databases_list = sorted(await self.get_cached_databases())
                 if databases_list:
-                    suggestions += [(x, f"{x} (DATABASE)") for x in databases_list]
+                    results += [(x, f"{x} (DATABASE)") for x in databases_list]
             except Exception:
                 pass
 
@@ -499,7 +514,7 @@ class AutoComplete:
             try:
                 curr_tables_list = sorted(await self.get_cached_tables())
                 if len(parts) < 2 and curr_tables_list:
-                    suggestions += [(x, f"{x} (TABLE)") for x in curr_tables_list]
+                    results += [(x, f"{x} (TABLE)") for x in curr_tables_list]
             except Exception:
                 pass
 
@@ -507,13 +522,11 @@ class AutoComplete:
             try:
                 tables_list = sorted(await self.get_cached_tables(part1))
                 if tables_list:
-                    suggestions += [(x, f"{x} (TABLE)") for x in tables_list]
-
+                    results += [(x, f"{x} (TABLE)") for x in tables_list]
                 if curr_tables_list and part1 in curr_tables_list:
                     columns_list = sorted(await self.get_cached_columns(part1))
-
                     if columns_list:
-                        suggestions += [(x, f"{part1}.{x} (COLUMN)") for x in columns_list]
+                        results += [(x, f"{part1}.{x} (COLUMN)") for x in columns_list]
             except Exception:
                 pass
 
@@ -521,38 +534,38 @@ class AutoComplete:
             try:
                 columns_list = sorted(await self.get_cached_columns(part2, part1))
                 if columns_list:
-                    suggestions += [(x, f"{part1}.{x} (COLUMN)") for x in columns_list]
+                    results += [(x, f"{part1}.{x} (COLUMN)") for x in columns_list]
             except Exception:
                 pass
 
+        return results
+
+    async def get_suggestions(self, parts: list[str], sql_context: str = "", full_sql: str = "") -> list[str]:
+        word = parts[-1] if parts else ''
+
+        part1 = None
+        part2 = None
+        if len(parts) == 2:
+            part1 = parts[0]
+        elif len(parts) == 3:
+            part1 = parts[0]
+            part2 = parts[1]
+
+        suggestions = [(x, f"{x} (COMMAND)") for x in self.client.all_commands]
+        functions_list = await self.get_all_functions()
+        if functions_list:
+            suggestions += [(x, f"{x} (FUNCTION)") for x in functions_list]
+
+        query_tables = _get_tables_from_sql(full_sql)
+        suggestions += await self._fetch_columns_for_tables(query_tables)
+        suggestions += await self._get_schema_suggestions(parts, part1, part2)
+
         rank_map = self._get_lm_rank_map(sql_context)
 
-        # If LM predicts a column is most likely next, load columns from all tables in the query
         if rank_map.get('__COLUMN__', 999) == 0 and full_sql:
-            query_tables = _get_tables_from_sql(full_sql)
-            suggestions_set = set(suggestions)
-            for table in query_tables:
-                db = None
-                cols = None
-                if '.' in table:
-                    db, table = table.split('.', 1)
-                if db is None:
-                    try:
-                        cols = await self.get_cached_columns(table)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        cols = await self.get_cached_columns(table, db)
-                    except Exception:
-                        pass
-
-                if cols:
-                    for col in cols:
-                        candidate = (col, f"{table}.{col} (COLUMN)")
-                        if candidate not in suggestions_set:
-                            suggestions.append(candidate)
-                            suggestions_set.add(candidate)
+            suggestions += await self._fetch_columns_for_tables(
+                query_tables, dedupe_against=set(suggestions)
+            )
 
         def sort_key(candidate: tuple) -> tuple:
             lm_rank = self._candidate_lm_rank(candidate[1], rank_map)

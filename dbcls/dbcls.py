@@ -12,6 +12,7 @@ import time
 from typing import Optional
 import logging
 from queue import LifoQueue
+import warnings
 
 import visidata
 
@@ -22,6 +23,9 @@ from .clients.base import ClientClass
 from .autocomplete import AutoComplete
 from .editor import Editor, Fn, K, key_alt  # noqa: F401 (Fn re-exported for subclasses)
 import enum
+
+
+warnings.filterwarnings("ignore")
 
 
 class DbFn(str, enum.Enum):
@@ -304,7 +308,25 @@ class DbEditor(Editor):
             self.set_status_notification('Nothing to execute')
             return
         start = time.time()
-        task = self.asyncloop_thread.submit(self.client.execute(sel.strip()))
+
+        async def fetch_all():
+            result = await self.client.execute(sel.strip())
+            if not (self.client.SUPPORTS_SERVER_SIDE_PAGING and result.has_more):
+                return result
+            all_data = list(result.data)
+            self.running_popup.rows_loaded = result.rowcount
+            try:
+                while result.has_more:
+                    await asyncio.sleep(0)  # yield to event loop so Esc cancel is delivered
+                    result = await self.client.execute(sel.strip())
+                    all_data.extend(result.data)
+                    self.running_popup.rows_loaded += result.rowcount
+            finally:
+                self.client.reset_pager()
+
+            return Result(all_data, len(all_data), has_more=False)
+
+        task = self.asyncloop_thread.submit(fetch_all())
 
         def on_done():
             end = time.time()

@@ -37,6 +37,7 @@ class Result:
 
 class ClientClass(abc.ABC):
     ENGINE = ''
+    SUPPORTS_SERVER_SIDE_PAGING = False
 
     COMMANDS = [
         'tables', 'databases', 'schema', 'use'
@@ -140,6 +141,9 @@ class ClientClass(abc.ABC):
         except Exception:
             self.dbname = old_db
             raise
+
+    def reset_pager(self) -> None:
+        pass
 
     def get_title(self) -> str:
         return f'{self.ENGINE} {self.host}:{self.port} {self.dbname}'
