@@ -18,8 +18,8 @@ class CommandParams:
 class Result:
     data: list[dict] = field(default_factory=list)
     rowcount: int = 0
-    # Used only for cassandra paging
-    has_more: bool = True
+    # Used only for Cassandra server-side paging; False for all other engines
+    has_more: bool = False
     message: str = ''
 
     def __str__(self) -> str:
@@ -40,7 +40,7 @@ class ClientClass(abc.ABC):
     SUPPORTS_SERVER_SIDE_PAGING = False
 
     COMMANDS = [
-        'tables', 'databases', 'schema', 'use'
+        'tables', 'databases', 'schema', 'use', 'help'
     ]
 
     SQL_COMMON_COMMANDS = [
@@ -87,11 +87,11 @@ class ClientClass(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def get_databases(self) -> Result:
+    async def get_databases(self) -> Result:
         pass
 
     @abc.abstractmethod
-    def get_tables(self, database: Optional[str] = None) -> Result:
+    async def get_tables(self, database: Optional[str] = None) -> Result:
         pass
 
     @abc.abstractmethod
@@ -114,7 +114,7 @@ class ClientClass(abc.ABC):
 
         return CommandParams(command, params)
 
-    async def if_command_process(self, sql: str) -> Result:
+    async def if_command_process(self, sql: str) -> Optional[Result]:
         command = self.get_internal_command_params(sql)
 
         if not command:
@@ -122,6 +122,14 @@ class ClientClass(abc.ABC):
 
         if hasattr(self, f'command_{command.command}'):
             return await getattr(self, f'command_{command.command}')(command)
+
+    async def command_help(self, command: CommandParams):
+        from ..pipeline import HELP_ENTRIES
+        data = [
+            {'command': cmd, 'description': desc}
+            for cmd, desc in HELP_ENTRIES
+        ]
+        return Result(data, len(data))
 
     async def command_use(self, command: CommandParams):
         return await self.change_database(command.params)

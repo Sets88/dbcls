@@ -11,8 +11,8 @@ from functools import partial
 import time
 from typing import Optional
 import logging
-from queue import LifoQueue
 import warnings
+import enum
 
 import visidata
 
@@ -22,7 +22,7 @@ from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
 from .editor import Editor, Fn, K, key_alt  # noqa: F401 (Fn re-exported for subclasses)
-import enum
+from .pipeline import is_pipeline, PipelineExecutor, HELP_ENTRIES
 
 
 warnings.filterwarnings("ignore")
@@ -46,9 +46,6 @@ class Task:
         self.loop = loop
         self.task = None
 
-    async def worker(self):
-        return await self.coro
-
     def cancel(self):
         self.loop.call_soon_threadsafe(self.task.cancel)
 
@@ -62,21 +59,20 @@ class Task:
         return self.task.result()
 
     async def run(self):
-        self.task = asyncio.create_task(self.worker())
+        self.task = asyncio.create_task(self.coro)
         return self.task
 
 
 class AsyncLoopThread(threading.Thread):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.request_queue = asyncio.Queue()
-        self.result_queue = LifoQueue()
         self.current_running_task = None
         self.loop = None
 
     async def _run(self):
         self.loop = asyncio.get_event_loop()
-
+        # Keep the event loop alive so run_coroutine_threadsafe() can
+        # submit coroutines from the main thread at any time.
         while True:
             await asyncio.sleep(0.1)
 
@@ -203,21 +199,93 @@ def get_word_parts(buf) -> list:
     return fragment.split('.') if fragment else []
 
 
-DB_HELP_EXTRA = """
-Database
-  Alt+R               Execute query at cursor (or selection)
-  Shift+Tab / Alt+1   DB autocomplete (tables, columns, functions)
-  Alt+T               Browse tables
-  Alt+E               Browse databases
-  Alt+S               Browse currently open VisiData sheets
-        (To keep sheets open, quit from visidata with Ctrl+q instead of q)
-  Esc                 Cancel running query
+DB_HELP_DATABASE = """\
+  `Alt+R`               Execute query at cursor (or selection)
+  `Shift+Tab` / `Alt+1`   DB autocomplete (tables, columns, functions)
+  `Alt+T`               Browse tables
+  `Alt+E`               Browse databases
+  `Alt+S`               Browse currently open VisiData sheets
+        (To keep sheets open, quit visidata with `Ctrl+q` instead of `q`)
+  `Ctrl+P`              Open files within the current directory
+  `Alt+P`               Open command palette
+  `Esc`                 Cancel running query"""
 
-Key remapping
-  --key-remap "A:B,C:D"   Remap key A to act as key B (integer key codes)
-  DBCLS_KEY_REMAP=...      Same via environment variable
-  Example: "9:353,353:9"  Swap Tab and Shift+Tab
-  Tip: enable debug mode (Ctrl+D) to see key codes, after enabling it, help page will contain the key codes\n\n"""
+DB_HELP_KEY_REMAP = """\
+  `--key-remap "A:B,C:D"`   Remap key A to act as key B (integer key codes)
+  `DBCLS_KEY_REMAP=...`      Same via environment variable
+  Example: `"9:353,353:9"`  Swap Tab and Shift+Tab
+  Tip: enable debug mode (`Ctrl+D`) to see key codes"""
+
+DB_HELP_VISIDATA = """\
+Navigation
+  `← → ↑ ↓`              Move cursor
+  `Alt+↑ / Alt+↓`        Jump 5 rows up / down
+  `Alt+← / Alt+→`        Jump 3 columns left / right
+  `gg / G`               Go to first / last row
+  `gh / gl`              Go to first / last column
+
+Columns & sorting
+  `!`                    Toggle key column (used for joins and `gp` charts)
+  `[ / ]`                Sort ascending / descending by this column
+  `_ / g_`               Resize column / resize all columns to fit
+  `Shift+← / Shift+→`    Move column left / right
+  `Shift+f`              Frequency table for this column
+  `Shift+c`              Column configuration
+  `=`                    Add an expression column
+
+Selection
+  `s / u`               Select / unselect current row
+  `t`                   Toggle selection of current row
+  `gs / gu`             Select all / unselect all
+  `,`                   Select all rows matching current cell value
+
+Sheets & output
+  `S`                   Open sheet list
+  `q / Q`               Close current sheet / quit all
+  `Ctrl+Q`              Exit VisiData (sheets stay in memory for `Alt+S`)
+  `Ctrl+S`              Save sheet  (`.sql` extension → SQL INSERT statements)
+  `gY`                  Copy current sheet to clipboard
+
+DB-specific extensions
+  `zf`                  Format cell: JSON indentation, number prettification
+  `g+`                  Expand array column vertically (each element → new row)
+  `gp`                  Plot time-series chart from key columns
+  `E`                   Edit sample-data SQL (table browser only)
+  `z+Enter`             Open current cell as a sheet (references, JSON, …)
+  `^`                   Cross-sheet reference: select 2 sheets in `S`, then `^`
+  `gz+Enter`            Open all selected reference cells merged into one sheet
+"""
+
+
+def _pipeline_help_pages() -> str:
+    """Format pipeline.HELP_ENTRIES as markup text for the Pipelines help page."""
+    parts = [
+        '\n`Pipelines` let you chain SQL queries and data-transformation steps',
+        'with `|`. Each step receives the output of the previous step, so you',
+        'can filter, extract, iterate over rows, or post-process results —',
+        'all without leaving the editor.',
+        '',
+        'Syntax:',
+        '```',
+        '.RUN "SQL" | .RFILTER "{{col}}" "regex" | .FOR_RUN "SELECT * FROM {{_0}}"',
+        '```',
+        '',
+        'Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step.',
+        '',
+    ]
+    for cmd, desc in HELP_ENTRIES:
+        parts.append(f'`{cmd}`')
+        for line in desc.strip().splitlines():
+            stripped = line.strip()
+            # Lines that look like pipeline command examples → code block
+            if stripped.startswith('.') or (stripped.startswith('(') and '|' in stripped):
+                parts.append('```')
+                parts.append(stripped)
+                parts.append('```')
+            else:
+                parts.append(f'  {stripped}')
+        parts.append('')
+    return '\n'.join(parts)
 
 
 class DbEditor(Editor):
@@ -263,8 +331,22 @@ class DbEditor(Editor):
         except Exception:
             print('Invalid key remap string in DBCLS_KEY_REMAP')
 
-    def _help_text(self) -> str:
-        return DB_HELP_EXTRA + super()._help_text()
+    def _help_pages(self) -> dict:
+        pages = super()._help_pages()
+        # Replace main TOC with the full DB-aware version
+        pages['main'] = (
+            '   Welcome to DBCLS! Here are some tips to get you started:\n\n'
+            '-->>Database<<--\n'
+            '-->>Editor<<--\n'
+            '-->>Key remapping<<--\n'
+            '-->>Pipelines<<--\n'
+            '-->>VisiData<<--'
+        )
+        pages['Database']      = DB_HELP_DATABASE
+        pages['Key remapping'] = DB_HELP_KEY_REMAP + '\n\n' + self._keybindings_text()
+        pages['Pipelines']     = _pipeline_help_pages()
+        pages['VisiData']      = DB_HELP_VISIDATA
+        return pages
 
     def on_before_draw(self):
         rows = get_sql_rows(self.buf)
@@ -310,7 +392,12 @@ class DbEditor(Editor):
         start = time.time()
 
         async def fetch_all():
-            result = await self.client.execute(sel.strip())
+            sql = sel.strip()
+            if is_pipeline(sql):
+                executor = PipelineExecutor(self.client)
+                return await executor.execute(sql)
+
+            result = await self.client.execute(sql)
             if not (self.client.SUPPORTS_SERVER_SIDE_PAGING and result.has_more):
                 return result
             all_data = list(result.data)
@@ -318,7 +405,7 @@ class DbEditor(Editor):
             try:
                 while result.has_more:
                     await asyncio.sleep(0)  # yield to event loop so Esc cancel is delivered
-                    result = await self.client.execute(sel.strip())
+                    result = await self.client.execute(sql)
                     all_data.extend(result.data)
                     self.running_popup.rows_loaded += result.rowcount
             finally:
@@ -350,7 +437,7 @@ class DbEditor(Editor):
                     message = str(exc)
                 else:
                     message = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                self.info_popup.open('Error', message)
+                self.info_popup.open('Error', {'main': message})
             finally:
                 self.set_status_name(self.client.get_title())
                 self.set_status_notification(f'{round(end - start, 2)}s  {message}')
@@ -380,7 +467,7 @@ class DbEditor(Editor):
             try:
                 candidates = task.result()
             except Exception as exc:
-                self.info_popup.open('Error', str(exc))
+                self.info_popup.open('Error', {'main': str(exc)})
                 return
             items = []
             for item, title in candidates:
@@ -399,7 +486,7 @@ class DbEditor(Editor):
             self._fix_visidata_curses()
             visidata.vd.run(visidata.vd.sheets[sheet_index])
         except Exception as exc:
-            self.info_popup.open('Error', str(exc))
+            self.info_popup.open('Error', {'main': str(exc)})
         finally:
             self._fix_curses_after_visidata()
 

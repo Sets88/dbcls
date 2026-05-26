@@ -273,6 +273,77 @@ The following functions are available in visidata expressions (press `=` to crea
 | `.databases` | List all available databases |
 | `.use <database>` | Switch to specified database |
 | `.schema <table>` | Display schema for specified table |
+| `.help` | Show pipeline command reference |
+
+## Pipelines
+
+Pipelines let you chain SQL queries and data-transformation steps with `|`. Each step receives the output of the previous step as input, so you can filter, extract, iterate, or post-process results without leaving the editor.
+
+### Syntax
+
+```
+<step1> | <step2> | <step3> ...
+```
+
+Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-specific commands can appear anywhere in the chain.
+
+### Pipeline Commands
+
+| Command | Description |
+|---------|-------------|
+| `.RUN "SQL"` | Execute SQL. If input data exists, `{{expr}}` placeholders in the SQL are evaluated as Python expressions (`data` and `sql_in_list` are in scope). |
+| `.RFILTER "{{tmpl}}" "regex"` | Keep rows where the rendered template matches the regex. Returns the original rows unchanged. |
+| `.RGET "{{tmpl}}" "regex"` | Extract regex capture groups from the template. Returns one dict per matching row, keyed `"0"`, `"1"`, … |
+| `.FOR_RUN "SQL {{col}}"` | Execute SQL once per input row, substituting `{{column}}` placeholders. All result sets are merged. |
+| `.EVAL "python_code"` | Run arbitrary Python. `data` holds the previous result (list of dicts). Assign to `result` or modify `data` in place to pass output forward. |
+
+### Template Placeholders
+
+| Placeholder | Meaning |
+|-------------|---------|
+| `{{_0}}` | Value of the first column of the current row |
+| `{{_1}}` | Value of the second column |
+| `{{column_name}}` | Value of the column named `column_name` |
+| `{{row['any-name']}}` | Full row dict access — use for names with spaces or hyphens |
+| `{{price:.2f}}` | Python format spec support |
+
+### Helper Function
+
+`sql_in_list(data)` — converts a list of scalars or list-of-dicts to a SQL `IN`-clause string, e.g. `('val1','val2')`. Available inside `.RUN` and `.EVAL` templates.
+
+### Examples
+
+**Filter tables by prefix then sample each one:**
+```sql
+.TABLES | .RFILTER "{{_0}}" "^log_" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 5"
+```
+
+**Find IDs matching a pattern and fetch full records:**
+```sql
+.RUN "SELECT id, name FROM users"
+  | .RFILTER "{{name}}" "^admin"
+  | .RUN "SELECT * FROM users WHERE id IN {{sql_in_list(data)}}"
+```
+
+**Collect IDs across several databases and query them all at once:**
+```sql
+.RUN "SHOW DATABASES"
+  | .RFILTER "{{_0}}" "^shard_"
+  | .FOR_RUN "SELECT id FROM {{_0}}.events WHERE created_at > '2024-01-01'"
+  | .RUN "SELECT * FROM archive WHERE id IN {{sql_in_list(data)}}"
+```
+
+**Post-process results with Python:**
+```sql
+.RUN "SELECT name, score FROM results"
+  | .EVAL "sorted(data, key=lambda r: r['score'], reverse=True)[:10]"
+```
+
+**Extract capture groups from a column:**
+```sql
+.RUN "SELECT path FROM logs"
+  | .RGET "{{path}}" "/api/v\d+/([^/]+)"
+```
 
 ## Supported Database Engines
 

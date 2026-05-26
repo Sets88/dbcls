@@ -6,6 +6,7 @@ import curses
 import enum
 import locale
 import os
+import re
 import sys
 import termios
 import textwrap
@@ -86,49 +87,49 @@ KEY_PREFIX_TRIGGER = K(ord('\x18'))  # Ctrl+X
 
 EDITOR_HELP = """\
 Navigation
-  Arrow keys              Move cursor
-  Ctrl+Left / Right       Move by word
-  Alt+Left / Right        Move by word (alternate)
-  Home / End              Line start / end
-  Ctrl+A / Cmd+Left       Line start
-  Ctrl+E / Cmd + Right    Line end
-  Ctrl+Home               File start
-  Ctrl+End                File end
-  Page Up / Down          Scroll by page
+  `Arrow keys`              Move cursor
+  `Ctrl+Left / Right`       Move by word
+  `Alt+Left / Right`        Move by word (alternate)
+  `Home / End`              Line start / end
+  `Ctrl+A / Cmd+Left`       Line start
+  `Ctrl+E / Cmd + Right`    Line end
+  `Ctrl+Home`               File start
+  `Ctrl+End`                File end
+  `Page Up / Down`          Scroll by page
 
 Selection
-  Shift+Arrows            Extend selection
-  Shift+Ctrl+Left/Right   Select by word
-  Shift+Alt+Left/Right    Select by word (alternate)
-  Shift+Home / End        Select to line start / end
-  Cmd+Shift+Left / Right  Select to line start / end
-  Shift+Page Up / Down    Select by page
-  Esc+Ctrl+A              Select all
+  `Shift+Arrows`            Extend selection
+  `Shift+Ctrl+Left/Right`   Select by word
+  `Shift+Alt+Left/Right`    Select by word (alternate)
+  `Shift+Home / End`        Select to line start / end
+  `Cmd+Shift+Left / Right`  Select to line start / end
+  `Shift+Page Up / Down`    Select by page
+  `Esc+Ctrl+A`              Select all
 
 Editing
-  Backspace / Delete      Delete char backward / forward
-  Alt+Backspace           Delete word backward
-  Alt+Delete              Delete word forward
-  Tab                     Insert 4 spaces
-  Enter                   New line (auto-indent)
-  Ctrl+Z / Y              Undo / Redo
-  Ctrl+C / X / V          Copy / Cut / Paste
+  `Backspace / Delete`      Delete char backward / forward
+  `Alt+Backspace`           Delete word backward
+  `Alt+Delete`              Delete word forward
+  `Tab`                     Insert 4 spaces
+  `Enter`                   New line (auto-indent)
+  `Ctrl+Z / Y`              Undo / Redo
+  `Ctrl+C / X / V`          Copy / Cut / Paste
 
 File
-  Ctrl+S                  Save
-  Ctrl+G                  Open file / browse directory files
-  Ctrl+Q                  Quit
+  `Ctrl+S`                  Save
+  `Ctrl+G`                  Open file / browse directory files
+  `Ctrl+Q`                  Quit
 
 Search
-  Ctrl+F                  Open search bar
-  Up / Down               Previous / next match
-  Enter / Esc             Close search bar
+  `Ctrl+F`                  Open search bar
+  `Up / Down`               Previous / next match
+  `Enter / Esc`             Close search bar
 
 Other
-  Ctrl+K                  Toggle line mark (highlight)
-  Ctrl+W                  Toggle word wrap
-  Alt+P                   Command palette (run commands by name)
-  F1 / Alt+H              This help"""
+  `Ctrl+K`                  Toggle line mark (highlight)
+  `Ctrl+W`                  Toggle word wrap
+  `Alt+P`                   Command palette (run commands by name)
+  `F1 / Alt+H`              This help"""
 
 
 DEBUG_PARAMS = {
@@ -205,7 +206,7 @@ class ColorManager:
         # Normal syntax pairs (fg on default bg)
         self.normal   = p(white,               db)
         self.keyword  = p(curses.COLOR_RED,    db)
-        self.type_    = p(curses.COLOR_BLUE,   db)   # types — blue
+        self.type_    = p(curses.COLOR_YELLOW, db)   # types — yellow
         self.func     = p(orange,              db)   # functions — orange
         self.string   = p(curses.COLOR_GREEN,  db)   # strings — green
         self.comment  = p(curses.COLOR_CYAN,   db)   # comments — cyan
@@ -215,7 +216,7 @@ class ColorManager:
         # Selection pairs (same fg, gray bg)
         self.sel_normal   = p(white,               gray_bg)
         self.sel_keyword  = p(curses.COLOR_RED,    gray_bg)
-        self.sel_type_    = p(curses.COLOR_BLUE,   gray_bg)
+        self.sel_type_    = p(curses.COLOR_YELLOW, gray_bg)
         self.sel_func     = p(orange,              gray_bg)
         self.sel_string   = p(curses.COLOR_GREEN,  gray_bg)
         self.sel_comment  = p(curses.COLOR_CYAN,   gray_bg)
@@ -225,7 +226,7 @@ class ColorManager:
         # Marked-line pairs (same fg, dark-green bg)
         self.mark_normal   = p(white,               mark_bg)
         self.mark_keyword  = p(curses.COLOR_RED,    mark_bg)
-        self.mark_type_    = p(curses.COLOR_BLUE,   mark_bg)
+        self.mark_type_    = p(curses.COLOR_YELLOW, mark_bg)
         self.mark_func     = p(orange,              mark_bg)
         self.mark_string   = p(curses.COLOR_GREEN,  mark_bg)
         self.mark_comment  = p(curses.COLOR_CYAN,   mark_bg)
@@ -235,7 +236,7 @@ class ColorManager:
         # Cursor-line pairs (same fg, dark-gray bg)
         self.cursor_normal   = p(white,              cursor_bg)
         self.cursor_keyword  = p(curses.COLOR_RED,   cursor_bg)
-        self.cursor_type_    = p(curses.COLOR_BLUE,  cursor_bg)
+        self.cursor_type_    = p(curses.COLOR_YELLOW, cursor_bg)
         self.cursor_func     = p(orange,             cursor_bg)
         self.cursor_string   = p(curses.COLOR_GREEN, cursor_bg)
         self.cursor_comment  = p(curses.COLOR_CYAN,  cursor_bg)
@@ -253,6 +254,9 @@ class ColorManager:
         self.search_match         = p(curses.COLOR_BLACK,  curses.COLOR_YELLOW)
         self.search_match_current = p(curses.COLOR_BLACK,  218)  # pink — current match
         self.popup_match          = p(curses.COLOR_BLACK,  curses.COLOR_YELLOW)
+        self.popup_code_inline    = p(curses.COLOR_YELLOW, curses.COLOR_BLUE)   # inline `code`
+        self.popup_code_block     = p(curses.COLOR_WHITE,  curses.COLOR_BLACK)  # ```block```
+        self.popup_link           = p(curses.COLOR_CYAN,   curses.COLOR_BLUE)   # -->>Link<<--
 
         self._sel_map = {
             self.normal:   self.sel_normal,
@@ -365,7 +369,21 @@ class Lexer:
         self._block_comment_state[line_idx] = bc_after
         return tokens
 
-    def _tokenize_line(self, line: str, in_block_comment: bool):
+    def _tokenize_line(self, line: str, block_state):
+        """Tokenise one editor line.
+
+        *block_state* encodes any block state carried over from the previous line:
+
+        * ``False`` / ``None`` — normal mode (no open block)
+        * ``True``             — inside a ``/* … */`` block comment (legacy value)
+        * ``'/*'``             — inside a ``/* … */`` block comment
+        * ``'\"\"\"'``         — inside a ``\"\"\"…\"\"\"`` triple-quoted string
+        * ``"'''"``            — inside a ``'''…'''`` triple-quoted string
+
+        Returns ``(tokens, block_state, block_state)`` where the last two values
+        are the state *after* this line (kept as a tuple for backward compat with
+        callers that unpack three values).
+        """
         tokens = []
         pos = 0
         n = len(line)
@@ -374,8 +392,25 @@ class Lexer:
             if end > start:
                 tokens.append((start, end, ttype))
 
+        def push_string_content(start, end):
+            """Emit line[start:end] as 'string', breaking at {{…}} placeholders."""
+            seg = start
+            p = start
+            while p < end:
+                if line[p:p + 2] == '{{':
+                    close_pos = line.find('}}', p + 2)
+                    if close_pos != -1 and close_pos + 2 <= end:
+                        push(seg, p, 'string')
+                        push(p, close_pos + 2, 'type')
+                        p = close_pos + 2
+                        seg = p
+                        continue
+                p += 1
+            push(seg, end, 'string')
+
         while pos < n:
-            if in_block_comment:
+            # ── Continuation of a block state from the previous line ──────
+            if block_state in (True, '/*'):
                 end_pos = line.find('*/', pos)
                 if end_pos == -1:
                     push(pos, n, 'comment')
@@ -383,35 +418,75 @@ class Lexer:
                 else:
                     push(pos, end_pos + 2, 'comment')
                     pos = end_pos + 2
-                    in_block_comment = False
+                    block_state = False
                 continue
 
-            # Line comments: -- (SQL), # (MySQL/shell style)
+            if block_state in ('"""', "'''"):
+                close_pos = line.find(block_state, pos)
+                if close_pos == -1:
+                    push_string_content(pos, n)
+                    pos = n
+                else:
+                    push_string_content(pos, close_pos + 3)
+                    pos = close_pos + 3
+                    block_state = False
+                continue
+
+            # ── Line comments: -- (SQL), # (MySQL/shell style) ────────────
             if line[pos:pos+3] == '-- ' or line[pos] == '#':
                 push(pos, n, 'comment')
                 pos = n
                 continue
 
-            # Block comment start
+            # ── Block comment start ───────────────────────────────────────
             if line[pos:pos+2] == '/*':
-                in_block_comment = True
+                block_state = '/*'
                 pos += 2
                 continue
 
-            # String literals
+            # ── Triple-quoted strings (must be checked before single-quote)
+            # Supported: """…""" and '''…''' — content is taken verbatim.
+            if line[pos] in ('"', "'") and line[pos:pos + 3] == line[pos] * 3:
+                triple = line[pos] * 3
+                str_start = pos
+                pos += 3
+                close_pos = line.find(triple, pos)
+                if close_pos == -1:
+                    # String runs past end of line → multi-line
+                    push_string_content(str_start, n)
+                    block_state = triple
+                    pos = n
+                else:
+                    push_string_content(str_start, close_pos + 3)
+                    pos = close_pos + 3
+                continue
+
+            # ── Single-quoted string literals ─────────────────────────────
+            # With {{…}} template-placeholder highlighting.
             if line[pos] in ('"', "'", '`'):
                 quote = line[pos]
-                start = pos
+                str_start = pos
                 pos += 1
+                seg_start = str_start  # start of current 'string' segment
                 while pos < n:
                     if line[pos] == '\\' and pos + 1 < n:
                         pos += 2
                     elif line[pos] == quote:
                         pos += 1
                         break
+                    elif line[pos:pos+2] == '{{' and line.find('}}', pos+2) != -1:
+                        # Emit the string segment before the placeholder
+                        push(seg_start, pos, 'string')
+                        tmpl_start = pos
+                        close = line.find('}}', pos + 2)
+                        pos = close + 2
+                        # Emit the {{…}} placeholder as 'type' (yellow)
+                        push(tmpl_start, pos, 'type')
+                        seg_start = pos
                     else:
                         pos += 1
-                push(start, pos, 'string')
+                # Emit any remaining string segment (includes closing quote)
+                push(seg_start, pos, 'string')
                 continue
 
             # Numbers
@@ -455,10 +530,12 @@ class Lexer:
                 push(start, pos, ttype)
                 continue
 
-            # Dot-commands: .TABLES, .USE, .SCHEMA, etc. — only when the dot is
-            # the first non-whitespace character on the line.
+            # Dot-commands: .TABLES, .USE, .SCHEMA, .RUN, .RFILTER, etc.
+            # Allowed at the start of the line OR immediately after a pipeline
+            # separator '|' (with optional surrounding whitespace).
             if line[pos] == '.' and pos + 1 < n and line[pos + 1].isalpha():
-                if not line[:pos].strip():
+                prefix = line[:pos].strip()
+                if not prefix or prefix.endswith('|'):
                     start = pos
                     pos += 1  # skip '.'
                     while pos < n and (line[pos].isalnum() or line[pos] == '_'):
@@ -478,7 +555,7 @@ class Lexer:
             push(pos, pos + 1, 'normal')
             pos += 1
 
-        return tokens, in_block_comment, in_block_comment
+        return tokens, block_state, block_state
 
 
 # ─── TextBuffer ───────────────────────────────────────────────────────────────
@@ -1373,33 +1450,198 @@ class RunningPopup:
             pass
 
 
+# ─── InfoPopup inline-markup helpers ─────────────────────────────────────────
+#
+# Markup syntax supported in any page text:
+#   `code`          — inline code (yellow on blue)
+#   ```             — fenced code block toggle; lines inside: white on black
+#   -->>Name<<--    — hyperlink to another page in the same pages-dict
+#
+_INLINE_SPLIT_RE = re.compile(r'(`[^`\n]+`|-->>[^<\n]+<<--)')
+_LINK_FIND_RE    = re.compile(r'-->>(.*?)<<--')
+
+
+def _parse_markup_lines(text: str, inner_w: int) -> List[Tuple[str, str]]:
+    """Return ``(line_type, content)`` pairs.
+
+    ``line_type`` is ``'normal'`` or ``'code'``.  Normal lines are word-wrapped;
+    code-block lines are kept verbatim (truncated to *inner_w*).
+    Fenced ``` markers are consumed and not emitted.
+    Link markers ``-->>…<<--`` are preserved as-is inside normal lines so the
+    renderer can handle them.
+    """
+    result: List[Tuple[str, str]] = []
+    in_code_block = False
+    for raw in text.splitlines():
+        sraw = raw.strip()
+        # Single-line fenced block: ```content``` — treat content as a code line.
+        if sraw.startswith('```') and sraw.endswith('```') and len(sraw) > 6:
+            code_content = sraw[3:-3].strip()
+            for chunk in (textwrap.wrap(code_content, inner_w, break_long_words=True,
+                                        break_on_hyphens=False, subsequent_indent='  ')
+                          if len(code_content) > inner_w else [code_content or '']):
+                result.append(('code', chunk))
+            continue
+        if sraw == '```':
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            # Wrap long code lines so they don't get silently truncated.
+            # Each wrapped piece keeps the 'code' type (black background).
+            for chunk in (textwrap.wrap(raw, inner_w, break_long_words=True,
+                                        break_on_hyphens=False,
+                                        subsequent_indent='  ')
+                          if len(raw) > inner_w else [raw or '']):
+                result.append(('code', chunk))
+        else:
+            # Word-wrap, but treat link markers as atomic tokens so they
+            # don't get split across lines.
+            wrapped = textwrap.wrap(raw, inner_w) if raw.strip() else ['']
+            for w in wrapped:
+                result.append(('normal', w))
+    return result
+
+
+def _render_markup_line(
+    stdscr: curses.window,
+    ry: int, rx_start: int,
+    text: str, inner_w: int,
+    base_attr: int,
+    code_attr: int,
+    link_attr: int,
+    link_sel_attr: int,
+    link_idx_start: int,
+    link_sel: int,
+    H: int, W: int,
+) -> int:
+    """Render one *normal* line with inline `` `code` `` and ``-->>link<<--`` spans.
+
+    Returns *link_idx_start* + number of link spans found on this line, so the
+    caller can track the global link index across all lines.
+    """
+    if ry < 0 or ry >= H:
+        return link_idx_start
+    parts = _INLINE_SPLIT_RE.split(text)
+    x = rx_start
+    max_x = rx_start + inner_w
+    link_counter = link_idx_start
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith('-->>') and part.endswith('<<--'):
+            name = part[4:-4]
+            attr = link_sel_attr if link_counter == link_sel else link_attr
+            content = name
+            link_counter += 1
+        elif part.startswith('`') and part.endswith('`') and len(part) > 2:
+            content = part[1:-1]
+            attr = code_attr
+        else:
+            content = part
+            attr = base_attr
+        if x >= max_x:
+            break
+        clip = content[:max_x - x]
+        if clip and 0 <= x < W:
+            try:
+                stdscr.addstr(ry, x, clip, attr)
+            except curses.error:
+                pass
+        x += len(content)
+    # Pad the rest of the row with the base colour.
+    if x < max_x and 0 <= x < W:
+        try:
+            stdscr.addstr(ry, x, ' ' * (max_x - x), base_attr)
+        except curses.error:
+            pass
+    return link_counter
+
+
 # ─── InfoPopup ────────────────────────────────────────────────────────────────
 class InfoPopup:
-    """Centered, scrollable info/error popup driven by the main dispatch loop."""
+    """Centered, scrollable popup supporting multi-page navigation and markup.
+
+    Pass a *pages* dict to ``open()``.  ``'main'`` is always the start page.
+    Text can contain:
+
+    * `` `code` ``        — inline code (yellow highlight)
+    * `` ``` ``           — fenced code block (white on black bg)
+    * ``-->>Name<<--``    — hyperlink to another page in *pages*
+
+    For a plain notification just use ``{'main': 'message text'}``.
+
+    Navigation (when the current page contains links):
+      ↑ / ↓         move link selection
+      Enter / →     follow selected link
+      Esc / ←       go back (or close if on the first page)
+
+    Navigation (no links — scrollable text page):
+      ↑ / ↓ / PgUp / PgDn / Home / End   scroll
+      Esc / ←       go back (or close if on the first page)
+      any other key close
+    """
 
     def __init__(self):
-        self.active = False
-        self._title: str = ''
-        self._message: str = ''
-        self._lines: List[str] = []
-        self._inner_w: int = 0       # used to detect re-wrap needed on resize
-        self._scroll: int = 0
-        self._visible: int = 1       # updated each draw(); safe default = 1
+        self.active   = False
+        self._title   = ''
+        self._pages: dict = {}
+        self._history: List[str] = []        # stack of page keys; current = [-1]
+        self._links:   List[str] = []        # link names on current page, in order
+        self._link_sel: int = 0              # selected link index
+        self._lines:   List[Tuple[str, str]] = []
+        self._inner_w: int = 0
+        self._scroll:  int = 0
+        self._visible: int = 1
 
-    def open(self, title: str, message: str) -> None:
-        self.active = True
-        self._title = title
-        self._message = message
-        self._lines = []
-        self._inner_w = 0
-        self._scroll = 0
+    # ── open / close ─────────────────────────────────────────────────────────
+
+    def open(self, title: str, pages: dict) -> None:
+        self.active    = True
+        self._title    = title
+        self._pages    = pages
+        self._history  = ['main']
+        self._scroll   = 0
+        self._lines    = []
+        self._inner_w  = 0
+        self._rebuild_links()
 
     def close(self) -> None:
-        self.active = False
-        self._title = ''
-        self._message = ''
-        self._lines = []
-        self._scroll = 0
+        self.active   = False
+        self._pages   = {}
+        self._history = []
+        self._lines   = []
+
+    # ── internal helpers ─────────────────────────────────────────────────────
+
+    def _current_key(self) -> str:
+        return self._history[-1] if self._history else 'main'
+
+    def _current_text(self) -> str:
+        return self._pages.get(self._current_key(), '')
+
+    def _rebuild_links(self) -> None:
+        """Rebuild the link list for the current page."""
+        self._links    = _LINK_FIND_RE.findall(self._current_text())
+        self._link_sel = 0
+
+    def _navigate_to(self, key: str) -> None:
+        if key in self._pages:
+            self._history.append(key)
+            self._scroll   = 0
+            self._lines    = []
+            self._inner_w  = 0
+            self._rebuild_links()
+
+    def _go_back(self) -> Optional[str]:
+        """Pop history.  Returns 'close' when there is nowhere left to go."""
+        if len(self._history) > 1:
+            self._history.pop()
+            self._scroll  = 0
+            self._lines   = []
+            self._inner_w = 0
+            self._rebuild_links()
+            return None
+        return 'close'
 
     # ── scroll helpers ────────────────────────────────────────────────────────
 
@@ -1430,49 +1672,77 @@ class InfoPopup:
     # ── key handling ─────────────────────────────────────────────────────────
 
     def handle_key(self, key) -> Optional[str]:
-        """Return 'close' to dismiss; None to keep open."""
+        """Return ``'close'`` to dismiss; ``None`` to keep open."""
+        has_links  = bool(self._links)
         can_scroll = self._total() > self._visible
-        if can_scroll and key == K(curses.KEY_UP):
-            self._scroll_up()
-        elif can_scroll and key == K(curses.KEY_DOWN):
-            self._scroll_down()
-        elif can_scroll and key == K(curses.KEY_PPAGE):
-            self._page_up()
-        elif can_scroll and key == K(curses.KEY_NPAGE):
-            self._page_down()
-        elif can_scroll and key == K(curses.KEY_HOME):
-            self._go_home()
-        elif can_scroll and key == K(curses.KEY_END):
-            self._go_end()
+
+        back_keys = (K(27), K(curses.KEY_LEFT),
+                     K(curses.KEY_BACKSPACE), K(ord('\x7f')))
+        enter_keys = (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r')),
+                      K(curses.KEY_RIGHT))
+
+        if key in back_keys:
+            return self._go_back()
+
+        if has_links:
+            if key == K(curses.KEY_UP):
+                if self._link_sel > 0:
+                    self._link_sel -= 1
+            elif key == K(curses.KEY_DOWN):
+                if self._link_sel < len(self._links) - 1:
+                    self._link_sel += 1
+            elif key in enter_keys:
+                self._navigate_to(self._links[self._link_sel])
+            else:
+                return 'close'
         else:
-            return 'close'
+            if can_scroll and key == K(curses.KEY_UP):
+                self._scroll_up()
+            elif can_scroll and key == K(curses.KEY_DOWN):
+                self._scroll_down()
+            elif can_scroll and key == K(curses.KEY_PPAGE):
+                self._page_up()
+            elif can_scroll and key == K(curses.KEY_NPAGE):
+                self._page_down()
+            elif can_scroll and key == K(curses.KEY_HOME):
+                self._go_home()
+            elif can_scroll and key == K(curses.KEY_END):
+                self._go_end()
+            else:
+                # Root page (simple notification) — any key closes.
+                # Section page (navigated into) — ignore unknown keys so the
+                # user can read without accidentally closing.
+                if len(self._history) == 1:
+                    return 'close'
         return None
 
     # ── drawing ──────────────────────────────────────────────────────────────
 
     def draw(self, stdscr: curses.window, colors, H: int, W: int) -> None:
-        max_w = min(W - 4, 80)
+        max_w   = min(W - 4, 80)
         inner_w = max_w - 2
 
-        # Lazy wrap; re-wrap if inner_w changed (terminal resize)
+        # Lazy parse / re-parse on resize
         if not self._lines or self._inner_w != inner_w:
-            self._lines = []
-            for raw in self._message.splitlines():
-                self._lines.extend(textwrap.wrap(raw, inner_w) or [''])
+            self._lines   = _parse_markup_lines(self._current_text(), inner_w)
             self._inner_w = inner_w
 
-        total = self._total()
+        total       = self._total()
         max_visible = max(1, min(H - 4, total))
         self._visible = max_visible
-        self._scroll = max(0, min(self._scroll, max(0, total - max_visible)))
+        self._scroll  = max(0, min(self._scroll, max(0, total - max_visible)))
 
-        win_h = max_visible + 2   # top border + content rows + bottom border
+        win_h = max_visible + 2
         win_w = max_w
         win_y = max(0, H // 2 - win_h // 2)
         win_x = max(0, W // 2 - win_w // 2)
 
-        ba = curses.color_pair(colors.popup_border)
-        ia = curses.color_pair(colors.popup_item) | curses.A_BOLD
+        ba        = curses.color_pair(colors.popup_border)
+        ia        = curses.color_pair(colors.popup_item) | curses.A_BOLD
+        ca        = curses.color_pair(colors.popup_code_block)  | curses.A_BOLD
+        inline_ca = curses.color_pair(colors.popup_code_inline) | curses.A_BOLD
+        link_a    = curses.color_pair(colors.popup_link)  | curses.A_BOLD
+        lsel_a    = curses.color_pair(colors.popup_sel)
 
         def ach(y, x, ch, attr=0):
             ry, rx = win_y + y, win_x + x
@@ -1499,21 +1769,48 @@ class InfoPopup:
                 except curses.error:
                     pass
 
+        # Title hint changes depending on current page
+        has_links  = bool(self._links)
         can_scroll = total > max_visible
-        hint = ' ↑↓/PgUp/PgDn/Home/End scroll · any key close ' if can_scroll else ' any key to close '
-        title_str = f' {self._title} —{hint}'[:win_w - 4]
+        multi_page = len(self._pages) > 1
+
+        if has_links:
+            hint = ' ↑↓ select · Enter open · Esc back · any key close '
+        elif can_scroll and multi_page:
+            hint = ' ↑↓/PgUp/PgDn scroll · Esc back · any key close '
+        elif can_scroll:
+            hint = ' ↑↓/PgUp/PgDn/Home/End scroll · any key close '
+        elif multi_page:
+            hint = ' Esc back · any key close '
+        else:
+            hint = ' any key to close '
+
+        page_key  = self._current_key()
+        page_part = f' — {page_key}' if page_key != 'main' else ''
+        title_str = f' {self._title}{page_part} —{hint}'[:win_w - 4]
+
         ach(0, 0, curses.ACS_ULCORNER, ba)
         hl (0, 1, win_w - 2, ba)
         ach(0, win_w - 1, curses.ACS_URCORNER, ba)
         astr(0, 2, title_str, ba)
 
+        link_counter = 0
         for i in range(max_visible):
             row_y = i + 1
-            idx = self._scroll + i
-            text = (self._lines[idx] if idx < total else '').ljust(win_w - 2)[:win_w - 2]
-            ach (row_y, 0, curses.ACS_VLINE, ba)
-            astr(row_y, 1, text, ia)
-            ach (row_y, win_w - 1, curses.ACS_VLINE, ba)
+            idx   = self._scroll + i
+            line_type, text = self._lines[idx] if idx < total else ('normal', '')
+            ach(row_y, 0, curses.ACS_VLINE, ba)
+            if line_type == 'code':
+                astr(row_y, 1, text.ljust(inner_w)[:inner_w], ca)
+            else:
+                link_counter = _render_markup_line(
+                    stdscr, win_y + row_y, win_x + 1,
+                    text, inner_w,
+                    ia, inline_ca, link_a, lsel_a,
+                    link_counter, self._link_sel,
+                    H, W,
+                )
+            ach(row_y, win_w - 1, curses.ACS_VLINE, ba)
 
         ach(win_h - 1, 0, curses.ACS_LLCORNER, ba)
         hl (win_h - 1, 1, win_w - 2, ba)
@@ -2043,7 +2340,7 @@ class Editor:
         The message is replaced by the normal status bar after the next keypress."""
         W = self.stdscr.getmaxyx()[1]
         if len(text) + 2 > W or '\n' in text:
-            self.info_popup.open('Info', text)
+            self.info_popup.open('Info', {'main': text})
         else:
             self._status_notification = text
             self.renderer.status_notification = text
@@ -2638,20 +2935,21 @@ class Editor:
                 self.set_status_notification(f'Saved {path}')
 
     def show_help(self) -> None:
-        self.info_popup.open('Help', self._help_text())
+        self.info_popup.open('Help', self._help_pages())
 
-    def _help_text(self) -> str:
-        text = EDITOR_HELP
-        if self._debug_mode:
-            by_name: dict = {}
-            for key, name in self._keybindings.items():
-                by_name.setdefault(name, []).append(key)
-            lines = ['\n\nKeybindings (debug mode)']
-            for name, keys in sorted(by_name.items()):
-                keys_str = ', '.join(str(k) for k in sorted(keys))
-                lines.append(f'  {name.ljust(20)}{keys_str}')
-            text += '\n'.join(lines)
-        return text
+    def _help_pages(self) -> dict:
+        return {'main': '-->>Editor<<--', 'Editor': EDITOR_HELP}
+
+    def _keybindings_text(self) -> str:
+        """Return a formatted list of all registered keybindings (key codes)."""
+        by_name: dict = {}
+        for key, name in self._keybindings.items():
+            by_name.setdefault(name, []).append(key)
+        lines = ['Keybindings (key codes)']
+        for name, keys in sorted(by_name.items()):
+            keys_str = ', '.join(str(k) for k in sorted(keys))
+            lines.append(f'  {name.ljust(24)}{keys_str}')
+        return '\n'.join(lines)
 
     def _prompt_save_before_close(self) -> str:
         """Prompt to save unsaved changes before closing/switching the current file.
