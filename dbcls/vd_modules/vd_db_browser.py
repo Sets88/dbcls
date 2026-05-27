@@ -121,8 +121,14 @@ class TableSampleDataSheet(TableSheet):
                 for row in chunk.data:
                     yield AttrDict(row)
 
-                if not chunk.has_more:
-                    break
+                if self.client.SUPPORTS_SERVER_SIDE_PAGING:
+                    # Cassandra: server explicitly signals end of pages
+                    if not chunk.has_more:
+                        break
+                else:
+                    # Offset-based engines: last chunk is smaller than requested
+                    if len(chunk.data) < self.CHUNK_SIZE:
+                        break
 
                 offset += self.CHUNK_SIZE
 

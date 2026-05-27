@@ -66,53 +66,132 @@ from typing import Any, List, Optional
 #: Commands that are handled by this module (lowercase).
 PIPELINE_COMMANDS: List[str] = ['run', 'rfilter', 'rget', 'for_run', 'eval']
 
+HELP_HEADER = """`Pipelines` let you chain SQL queries and data-transformation steps
+with `|`. Each step receives the output of the previous step, so you
+can filter, extract, iterate over rows, or post-process results —
+all without leaving the editor.
+
+Example:
+```
+.RUN "SHOW TABLES" | .RFILTER "{{_0}}" "^prefix_" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"
+```
+
+Existing commands (.TABLES, .DATABASES, …) can be used as the first step.
+It is possible to use triple quotes for multi-line parameters, e.g. 
+```
+.RUN \"\"\"
+    SELECT *
+    FROM table\"\"\" | .RFILTER "{{col}}" "regex"'
+```
+
+Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step."""
+
+HELP_RUN = """
+`.RUN <SQL>`
+Execute SQL query. With input data, {expr} patterns in the SQL are
+evaluated as Python expressions (data and sql_in_list are in scope).
+
+Example:
+```
+.RUN "SELECT * FROM t WHERE id LIMIT 100"
+```
+"""
+
+HELP_RFILTER = """
+`.RFILTER <TEMPLATE> <REGEX>`
+Filter input rows: keep rows where the template string (built from
+{{column}} placeholders) matches the regex. Returns original rows.
+
+Example:
+```
+.RUN "SHOW TABLES" | .RFILTER "{{_0}}" "^prefix_"
+```
+"""
+
+HELP_RGET = """
+`.RGET <TEMPLATE> <REGEX>`
+Extract regex capture groups from the template string. Returns a
+list of dicts keyed "0","1",… for each matching row.
+
+Example:
+```
+.RUN "SHOW TABLES" | .RGET "{{_0}}" "^(prefix_.*)$"
+```
+"""
+
+HELP_FOR_RUN = """
+`.FOR_RUN <SQL>`
+Execute SQL once per input row, substituting {{column}} placeholders.
+All result sets are merged into one flat list.
+
+Example:
+```
+.RUN "SHOW TABLES" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"
+```
+"""
+
+HELP_EVAL = """
+`.EVAL <PYTHON_CODE>`
+Execute Python code. `data` holds the previous result (list of dicts).
+Assign to `result` or modify `data` to pass output to the next step.
+Bare expressions (like a list literal) are also accepted.
+
+Example:
+```
+.RUN "SELECT * FROM t" | .EVAL "[row['id'] for row in data if row['value'] > 10]"
+```
+"""
+
+HELP_SQL_IN_LIST = """
+`sql_in_list(data)`
+Helper: converts a list of scalars or list-of-dicts to a SQL IN-list
+string, e.g. ('val1','val2'). Use inside .RUN or .EVAL templates.
+
+Example:
+```
+.RUN "SELECT id FROM table" | .RUN "SELECT * FROM other_table WHERE table_id IN {{sql_in_list(data)}}"
+```"""
+
+HELP_TEMPLATE_POS = """
+`Template: {{_0}}, {{_1}}`
+Positional placeholder — value of the N-th column (0-based).
+
+Example:
+```
+.RUN "SELECT id, val, name FROM table" | .RFILTER "{{_1}}__{{_2}}" "^someval__somename$"
+```
+"""
+
+HELP_TEMPLATE_NAMED = """
+`Template: {{column_name}}`
+Named placeholder — value of the column named "column_name".
+
+Example:
+```
+.RUN "SELECT id, val FROM table" | .RFILTER "{{val}}" "^someval$"
+```
+"""
+
+HELP_PIPE_SYNTAX = """
+`Pipe syntax`
+Chain commands with |:
+```  .RUN "SHOW TABLES" | .RFILTER "{{_0}}" "^prefix_" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"```
+
+Existing commands (.TABLES, .DATABASES, …) can be used as the first step.
+"""
+
 #: Help text shown by .HELP — ordered list of (command_signature, description).
-HELP_ENTRIES: List[tuple] = [
-    (
-        '.RUN "SQL"',
-        'Execute SQL query. With input data, {expr} patterns in the SQL are\n'
-        'evaluated as Python expressions (data and sql_in_list are in scope).',
-    ),
-    (
-        '.RFILTER "{{tmpl}}" "REGEX"',
-        'Filter input rows: keep rows where the template string (built from\n'
-        '{{column}} placeholders) matches the regex. Returns original rows.',
-    ),
-    (
-        '.RGET "{{tmpl}}" "REGEX"',
-        'Extract regex capture groups from the template string. Returns a\n'
-        'list of dicts keyed "0","1",… for each matching row.',
-    ),
-    (
-        '.FOR_RUN "SQL {{col}}"',
-        'Execute SQL once per input row, substituting {{column}} placeholders.\n'
-        'All result sets are merged into one flat list.',
-    ),
-    (
-        '.EVAL "python_code"',
-        'Execute Python code. `data` holds the previous result (list of dicts).\n'
-        'Assign to `result` or modify `data` to pass output to the next step.\n'
-        'Bare expressions (like a list literal) are also accepted.',
-    ),
-    (
-        'sql_in_list(data)',
-        'Helper: converts a list of scalars or list-of-dicts to a SQL IN-list\n'
-        "string, e.g. ('val1','val2'). Use inside .RUN or .EVAL templates.",
-    ),
-    (
-        'Template: {{_0}}, {{_1}}',
-        'Positional placeholder — value of the N-th column (0-based).',
-    ),
-    (
-        'Template: {{column_name}}',
-        'Named placeholder — value of the column named "column_name".',
-    ),
-    (
-        'Pipe syntax',
-        'Chain commands with |:\n'
-        '```  .RUN "SHOW TABLES" | .RFILTER "{{_0}}" "^prefix_" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"```\n'
-        'Existing commands (.TABLES, .DATABASES, …) can be used as the first step.',
-    ),
+HELP_ENTRIES: List[str] = [
+    HELP_HEADER,
+    HELP_PIPE_SYNTAX,
+    HELP_TEMPLATE_POS,
+    HELP_TEMPLATE_NAMED,
+    HELP_RUN,
+    HELP_RFILTER,
+    HELP_RGET,
+    HELP_FOR_RUN,
+    HELP_EVAL,
+    HELP_SQL_IN_LIST,
 ]
 
 # ── Regex used to detect a pipeline expression ────────────────────────────────

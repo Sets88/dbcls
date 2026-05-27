@@ -40,7 +40,7 @@ class ClientClass(abc.ABC):
     SUPPORTS_SERVER_SIDE_PAGING = False
 
     COMMANDS = [
-        'tables', 'databases', 'schema', 'use', 'help'
+        'tables', 'databases', 'schema', 'use'
     ]
 
     SQL_COMMON_COMMANDS = [
@@ -122,14 +122,6 @@ class ClientClass(abc.ABC):
 
         if hasattr(self, f'command_{command.command}'):
             return await getattr(self, f'command_{command.command}')(command)
-
-    async def command_help(self, command: CommandParams):
-        from ..pipeline import HELP_ENTRIES
-        data = [
-            {'command': cmd, 'description': desc}
-            for cmd, desc in HELP_ENTRIES
-        ]
-        return Result(data, len(data))
 
     async def command_use(self, command: CommandParams):
         return await self.change_database(command.params)

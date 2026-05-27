@@ -21,8 +21,10 @@ from .vd_modules import DataBaseSheet, TablesSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
-from .editor import Editor, Fn, K, key_alt  # noqa: F401 (Fn re-exported for subclasses)
-from .pipeline import is_pipeline, PipelineExecutor, HELP_ENTRIES
+from .editor import Editor, K, key_alt
+from .pipeline import is_pipeline
+from .pipeline import PipelineExecutor
+from .pipeline import HELP_ENTRIES
 
 
 warnings.filterwarnings("ignore")
@@ -257,37 +259,6 @@ DB-specific extensions
 """
 
 
-def _pipeline_help_pages() -> str:
-    """Format pipeline.HELP_ENTRIES as markup text for the Pipelines help page."""
-    parts = [
-        '\n`Pipelines` let you chain SQL queries and data-transformation steps',
-        'with `|`. Each step receives the output of the previous step, so you',
-        'can filter, extract, iterate over rows, or post-process results —',
-        'all without leaving the editor.',
-        '',
-        'Syntax:',
-        '```',
-        '.RUN "SQL" | .RFILTER "{{col}}" "regex" | .FOR_RUN "SELECT * FROM {{_0}}"',
-        '```',
-        '',
-        'Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step.',
-        '',
-    ]
-    for cmd, desc in HELP_ENTRIES:
-        parts.append(f'`{cmd}`')
-        for line in desc.strip().splitlines():
-            stripped = line.strip()
-            # Lines that look like pipeline command examples → code block
-            if stripped.startswith('.') or (stripped.startswith('(') and '|' in stripped):
-                parts.append('```')
-                parts.append(stripped)
-                parts.append('```')
-            else:
-                parts.append(f'  {stripped}')
-        parts.append('')
-    return '\n'.join(parts)
-
-
 class DbEditor(Editor):
     def __init__(
         self,
@@ -344,7 +315,7 @@ class DbEditor(Editor):
         )
         pages['Database']      = DB_HELP_DATABASE
         pages['Key remapping'] = DB_HELP_KEY_REMAP + '\n\n' + self._keybindings_text()
-        pages['Pipelines']     = _pipeline_help_pages()
+        pages['Pipelines']     = "\n".join(HELP_ENTRIES)
         pages['VisiData']      = DB_HELP_VISIDATA
         return pages
 

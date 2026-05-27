@@ -273,7 +273,7 @@ The following functions are available in visidata expressions (press `=` to crea
 | `.databases` | List all available databases |
 | `.use <database>` | Switch to specified database |
 | `.schema <table>` | Display schema for specified table |
-| `.help` | Show pipeline command reference |
+
 
 ## Pipelines
 
