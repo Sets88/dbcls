@@ -13,7 +13,7 @@ Pipeline commands
 -----------------
 .RUN "SQL"
     Execute SQL. If there is input data from a previous step the SQL
-    template may contain {expr} patterns (single braces) that are
+    template may contain {{expr}} placeholders (double braces) that are
     evaluated as Python expressions with `data` and helper functions
     (e.g. sql_in_list) in scope.
 
@@ -39,11 +39,28 @@ Pipeline commands
     `result`.  Expressions are also supported
     (e.g. .EVAL "['a', 'b', 'c']").
 
+.SET_VAR KEY [python_code]
+    Store the current data (or the result of python_code) into _vars[KEY].
+    Data passes through unchanged so .SET_VAR can appear mid-pipeline.
+    If python_code is omitted and there is no input data, deletes the key.
+
+.GET_VAR KEY
+    Retrieve _vars[KEY] and inject it into the pipeline.
+    If input data exists, appends the variable's data after it.
+
+.VOID
+    Discard input data. The next step receives no data (as if it were
+    the first step in the pipeline).
+
+.VARS
+    Return all stored pipeline variables as a list of {key, value} dicts.
+
 Template placeholders
 ---------------------
-{{_0}}          first column value of the current row
-{{_1}}          second column value
-{{column_name}} value of column named "column_name"
+{{_0}}             first column value of the current row
+{{_1}}             second column value
+{{column_name}}    value of column named "column_name"
+{{_vars['key']}}   value of a variable stored by .SET_VAR
 
 Helper functions (available inside .RUN / .EVAL)
 -------------------------------------------------
@@ -59,46 +76,65 @@ import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
-from typing import Any, List, Optional
+from typing import Any, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .dbcls import DbEditor
 
 # ── Public constants ──────────────────────────────────────────────────────────
 
 #: Commands that are handled by this module (lowercase).
-PIPELINE_COMMANDS: List[str] = ['run', 'rfilter', 'rget', 'for_run', 'eval']
+PIPELINE_COMMANDS: List[str] = ['run', 'rfilter', 'rget', 'for_run', 'eval', 'set_var', 'vars', 'get_var', 'void']
+
+#: Syntax hint shown in the autocomplete popup for each pipeline command.
+PIPELINE_COMMAND_HINTS: dict = {
+    'run':      '.RUN <SQL>',
+    'rfilter':  '.RFILTER <TEMPLATE> <REGEX>',
+    'rget':     '.RGET <TEMPLATE> <REGEX>',
+    'for_run':  '.FOR_RUN <SQL>',
+    'eval':     '.EVAL <PYTHON_CODE>',
+    'set_var':  '.SET_VAR <KEY> [<PYTHON_CODE>]',
+    'get_var':  '.GET_VAR <KEY>',
+    'void':     '.VOID',
+    'vars':     '.VARS',
+}
 
 HELP_HEADER = """`Pipelines` let you chain SQL queries and data-transformation steps
 with `|`. Each step receives the output of the previous step, so you
 can filter, extract, iterate over rows, or post-process results —
 all without leaving the editor.
 
+Commands: `.RUN` `.RFILTER` `.RGET` `.FOR_RUN` `.EVAL`
+          `.SET_VAR` `.GET_VAR` `.VARS` `.VOID`
+
 Example:
 ```
 .RUN "SHOW TABLES" | .RFILTER "{{_0}}" "^prefix_" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"
 ```
 
-Existing commands (.TABLES, .DATABASES, …) can be used as the first step.
-It is possible to use triple quotes for multi-line parameters, e.g. 
+Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step.
+Triple quotes are supported for multi-line parameters:
 ```
 .RUN \"\"\"
     SELECT *
-    FROM table\"\"\" | .RFILTER "{{col}}" "regex"'
-```
+    FROM table\"\"\" | .RFILTER "{{col}}" "regex"
+```"""
 
-Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step."""
-
-HELP_RUN = """
-`.RUN <SQL>`
-Execute SQL query. With input data, {expr} patterns in the SQL are
-evaluated as Python expressions (data and sql_in_list are in scope).
+HELP_RUN = f"""
+`{PIPELINE_COMMAND_HINTS['run']}`
+Execute SQL query. With input data from a previous step, `{{expr}}`
+placeholders in the SQL are evaluated as Python expressions
+(`data` and `sql_in_list` are in scope).
 
 Example:
 ```
-.RUN "SELECT * FROM t WHERE id LIMIT 100"
+.RUN "SELECT * FROM t LIMIT 100"
+.RUN "SELECT id FROM t" | .RUN "SELECT * FROM other WHERE id IN {{sql_in_list(data)}}"
 ```
 """
 
-HELP_RFILTER = """
-`.RFILTER <TEMPLATE> <REGEX>`
+HELP_RFILTER = f"""
+`{PIPELINE_COMMAND_HINTS['rfilter']}`
 Filter input rows: keep rows where the template string (built from
 {{column}} placeholders) matches the regex. Returns original rows.
 
@@ -108,8 +144,8 @@ Example:
 ```
 """
 
-HELP_RGET = """
-`.RGET <TEMPLATE> <REGEX>`
+HELP_RGET = f"""
+`{PIPELINE_COMMAND_HINTS['rget']}`
 Extract regex capture groups from the template string. Returns a
 list of dicts keyed "0","1",… for each matching row.
 
@@ -119,8 +155,8 @@ Example:
 ```
 """
 
-HELP_FOR_RUN = """
-`.FOR_RUN <SQL>`
+HELP_FOR_RUN = f"""
+`{PIPELINE_COMMAND_HINTS['for_run']}`
 Execute SQL once per input row, substituting {{column}} placeholders.
 All result sets are merged into one flat list.
 
@@ -130,8 +166,8 @@ Example:
 ```
 """
 
-HELP_EVAL = """
-`.EVAL <PYTHON_CODE>`
+HELP_EVAL = f"""
+`{PIPELINE_COMMAND_HINTS['eval']}`
 Execute Python code. `data` holds the previous result (list of dicts).
 Assign to `result` or modify `data` to pass output to the next step.
 Bare expressions (like a list literal) are also accepted.
@@ -151,6 +187,58 @@ Example:
 ```
 .RUN "SELECT id FROM table" | .RUN "SELECT * FROM other_table WHERE table_id IN {{sql_in_list(data)}}"
 ```"""
+
+HELP_SET_VAR = f"""
+`{PIPELINE_COMMAND_HINTS['set_var']}`
+Store data (or the result of PYTHON_CODE) into _vars[KEY].
+`data` and `_vars` are in scope. Data passes through unchanged so
+.SET_VAR can appear mid-pipeline without breaking the chain.
+If PYTHON_CODE is omitted and there is no input data, deletes KEY from _vars.
+
+Example:
+```
+.RUN "SELECT id FROM t" | .SET_VAR my_ids "sql_in_list(data)" | .RUN "SELECT * FROM t2 WHERE id IN {{_vars['my_ids']}}"
+```
+"""
+
+HELP_GET_VAR = f"""
+`{PIPELINE_COMMAND_HINTS['get_var']}`
+Retrieve a variable stored by .SET_VAR and inject it into the pipeline.
+If there is input data from a previous step, the variable's rows are
+appended after the input: result = data + _vars[KEY].
+If there is no input data, returns _vars[KEY] as the pipeline data.
+Raises an error if KEY is not set.
+
+Example:
+```
+.RUN "SELECT id FROM a" | .SET_VAR ids | .RUN "SELECT id FROM b" | .GET_VAR ids
+```
+"""
+
+HELP_VOID = f"""
+`{PIPELINE_COMMAND_HINTS['void']}`
+Discard input data. The next step receives no data (as if it were the
+first step). Useful after side-effect steps (.SET_VAR, .EVAL) when
+you want to continue the pipeline with a clean state.
+
+Example:
+```
+.RUN "SELECT id FROM t" | .SET_VAR ids | .VOID | .RUN "SELECT COUNT(*) FROM t"
+```
+"""
+
+HELP_VARS = f"""
+`{PIPELINE_COMMAND_HINTS['vars']}`
+Show all pipeline variables stored with .SET_VAR.
+Returns a list of dicts with `key` and `value` columns.
+Can be used as a standalone command or as the last step in a pipeline.
+
+Example:
+```
+.VARS
+.RUN "SELECT id FROM t" | .SET_VAR ids | .VARS
+```
+"""
 
 HELP_TEMPLATE_POS = """
 `Template: {{_0}}, {{_1}}`
@@ -191,13 +279,17 @@ HELP_ENTRIES: List[str] = [
     HELP_RGET,
     HELP_FOR_RUN,
     HELP_EVAL,
+    HELP_SET_VAR,
+    HELP_GET_VAR,
+    HELP_VOID,
+    HELP_VARS,
     HELP_SQL_IN_LIST,
 ]
 
 # ── Regex used to detect a pipeline expression ────────────────────────────────
 _DOT_CMD_RE = re.compile(r'^\s*\.([a-zA-Z_][a-zA-Z_0-9]*)', re.IGNORECASE)
 _PIPELINE_CMD_RE = re.compile(
-    r'^\s*\.(run|rfilter|rget|for_run|eval)\b', re.IGNORECASE
+    r'^\s*\.(run|rfilter|rget|for_run|eval|set_var|vars|get_var|void)\b', re.IGNORECASE
 )
 _ANY_DOT_CMD_RE = re.compile(r'^\s*\.[a-zA-Z_]', re.IGNORECASE)
 
@@ -240,7 +332,7 @@ def sql_in_list(data: Any) -> str:
     return '(' + ','.join(_fmt(v) for v in items) + ')'
 
 
-def render_template(template: str, row: dict, data: Optional[list] = None) -> str:
+def render_template(template: str, row: dict = None, data: Optional[list] = None) -> str:
     """Render a pipeline template by evaluating every ``{{expr}}`` placeholder.
 
     Every ``{{expr}}`` is evaluated as a Python expression.  The evaluation
@@ -254,6 +346,9 @@ def render_template(template: str, row: dict, data: Optional[list] = None) -> st
     * ``data``          — the full input data list from the previous step
     * ``sql_in_list``   — helper that formats a list as a SQL ``IN (…)`` clause
 
+    When *row* is omitted (or ``None``) only ``data`` and ``sql_in_list`` are
+    in scope — useful for SQL-level templates like ``.RUN``.
+
     Examples::
 
         render_template('{{name.upper()}}', {'name': 'alice'})
@@ -264,7 +359,11 @@ def render_template(template: str, row: dict, data: Optional[list] = None) -> st
 
         render_template("{{row['has-hyphen']}}", {'has-hyphen': 'val'})
         # → 'val'
+
+        render_template("SELECT * FROM t WHERE id IN {{sql_in_list(data)}}", data=[1, 2])
+        # → "SELECT * FROM t WHERE id IN (1,2)"
     """
+    row = row or {}
     values = list(row.values())
     positional = {f'_{i}': v for i, v in enumerate(values)}
     named = {k: v for k, v in row.items()
@@ -293,41 +392,6 @@ def render_template(template: str, row: dict, data: Optional[list] = None) -> st
             ) from exc
 
     return re.sub(r'\{\{([^}]*)\}\}', _replacer, template)
-
-
-def evaluate_run_template(sql: str, data: list) -> str:
-    """Expand ``{{expr}}`` placeholders in *sql* as Python expressions.
-
-    Only **double-brace** ``{{expr}}`` is recognised.  Single braces
-    ``{expr}`` are left untouched so that SQL containing literal ``{}``
-    (e.g. PostgreSQL format strings, JSON operators, etc.) is not affected.
-
-    ``data`` (the list of dicts from the previous step) and the helper
-    function ``sql_in_list`` are always in scope.
-
-    Example::
-
-        .RUN \"SELECT * FROM t WHERE id IN {{sql_in_list(data)}}\"
-
-    Note: ``sql_in_list(data)`` already returns the parentheses, e.g.
-    ``(1,2,3)``.  Do **not** add extra parentheses around the placeholder.
-    """
-    helpers = {
-        'data': data,
-        'sql_in_list': sql_in_list,
-        **DEFAULT_CONTEXT,
-    }
-
-    def _replacer(match: re.Match) -> str:
-        expr = match.group(1)
-        try:
-            return eval('f"""' + '{' + expr + '}' + '"""', helpers)  # noqa: S307
-        except Exception as exc:
-            raise ValueError(
-                f'Error evaluating expression {match.group(0)!r}: {exc}'
-            ) from exc
-
-    return re.sub(r'\{\{([^}]*)\}\}', _replacer, sql)
 
 
 def normalize_to_dicts(value: Any) -> List[dict]:
@@ -559,15 +623,16 @@ class PipelineExecutor:
 
     Parameters
     ----------
-    client:
-        Any :class:`~dbcls.clients.base.ClientClass` instance.  The
-        executor calls ``client.execute(sql)`` for each ``.RUN`` /
-        ``.FOR_RUN`` step and delegates unknown dot-commands back to
-        the client as well.
+    dbeditor:
+        The :class:`~dbcls.dbcls.DbEditor` instance.  The executor
+        calls ``dbeditor.client.execute(sql)`` for each ``.RUN`` /
+        ``.FOR_RUN`` step and accesses ``dbeditor.vars`` for ``_vars``
+        support in templates and ``.EVAL`` / ``.SET_VAR``.
     """
 
-    def __init__(self, client: Any) -> None:
-        self.client = client
+    def __init__(self, dbeditor: 'DbEditor') -> None:
+        self.dbeditor = dbeditor
+        self.client = dbeditor.client
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -589,17 +654,53 @@ class PipelineExecutor:
 
     async def _execute_step(
         self, step: PipelineStep, data: Optional[List[dict]]
-    ) -> List[dict]:
+    ) -> Optional[List[dict]]:
         if step.command in PIPELINE_COMMANDS:
             handler = getattr(self, f'_cmd_{step.command}')
             return await handler(step.args, data)
 
+        if data is not None:
+            known = ', '.join(f'.{c.upper()}' for c in PIPELINE_COMMANDS)
+            raise ValueError(
+                f'Unknown pipeline command .{step.command.upper()!r}. '
+                f'Known pipeline commands: {known}'
+            )
+
         # Fall back to the client's own command handling
-        # (e.g. .TABLES, .DATABASES, .SCHEMA …)
+        # (e.g. .TABLES, .DATABASES, .SCHEMA …) — only valid as the first step
         result = await self.client.execute(step.original_text)
         if result is None:
             return []
         return result.data or []
+
+    # ── Template helpers (methods so they can access self.dbeditor.vars) ─────────
+
+    def _render_template(self, template: str, row: dict = None, data: Optional[list] = None) -> str:
+        row = row or {}
+        values = list(row.values())
+        positional = {f'_{i}': v for i, v in enumerate(values)}
+        named = {k: v for k, v in row.items()
+                 if isinstance(k, str) and k.isidentifier()}
+        context: dict = {
+            **positional,
+            **named,
+            **DEFAULT_CONTEXT,
+            'row': row,
+            'data': data if data is not None else [],
+            'sql_in_list': sql_in_list,
+            '_vars': self.dbeditor.vars,
+        }
+
+        def _replacer(m: re.Match) -> str:
+            expr = m.group(1)
+            try:
+                return eval('f"""' + '{' + expr + '}' + '"""', context)  # noqa: S307
+            except Exception as exc:
+                raise ValueError(
+                    f'Error in template expression {{{expr!r}}}: {exc}'
+                ) from exc
+
+        return re.sub(r'\{\{([^}]*)\}\}', _replacer, template)
 
     # ── Individual command implementations ────────────────────────────────────
 
@@ -610,7 +711,7 @@ class PipelineExecutor:
             raise ValueError('.RUN requires a SQL argument')
         sql = args[0]
         if data is not None:
-            sql = evaluate_run_template(sql, data)
+            sql = self._render_template(sql, data=data)
         result = await self.client.execute(sql)
         return (result.data or []) if result else []
 
@@ -627,7 +728,7 @@ class PipelineExecutor:
 
         return [
             row for row in (data or [])
-            if pattern.search(render_template(template, row, data))
+            if pattern.search(self._render_template(template, row, data))
         ]
 
     async def _cmd_rget(
@@ -643,7 +744,7 @@ class PipelineExecutor:
 
         result: List[dict] = []
         for row in (data or []):
-            m = pattern.search(render_template(template, row, data))
+            m = pattern.search(self._render_template(template, row, data))
             if m:
                 groups = m.groups()
                 if groups:
@@ -661,7 +762,7 @@ class PipelineExecutor:
         sql_template = args[0]
         result: List[dict] = []
         for row in (data or []):
-            sql = render_template(sql_template, row, data)
+            sql = self._render_template(sql_template, row, data)
             res = await self.client.execute(sql)
             if res and res.data:
                 result.extend(res.data)
@@ -677,7 +778,7 @@ class PipelineExecutor:
         code = args[0]
         context: dict = {
             'data': list(data or []),
-            'sql_in_list': sql_in_list,
+            '_vars': self.dbeditor.vars,
             **DEFAULT_CONTEXT
         }
         try:
@@ -686,4 +787,52 @@ class PipelineExecutor:
         except SyntaxError:
             exec(code, context)  # noqa: S102 — intentional scripting feature
             out = context.get('result', context.get('data', []))
+
         return normalize_to_dicts(out)
+
+    async def _cmd_set_var(
+        self, args: List[str], data: Optional[List[dict]]
+    ) -> List[dict]:
+        if not args:
+            raise ValueError('.SET_VAR requires a KEY argument')
+        key = args[0]
+        if len(args) >= 2:
+            code = args[1]
+            context: dict = {
+                'data': list(data or []),
+                '_vars': self.dbeditor.vars,
+                **DEFAULT_CONTEXT,
+            }
+            try:
+                value = eval(code, context)  # noqa: S307 — intentional scripting feature
+            except SyntaxError:
+                exec(code, context)  # noqa: S102 — intentional scripting feature
+                value = context.get('result', context.get('data', []))
+            self.dbeditor.vars[key] = value
+        elif data:
+            self.dbeditor.vars[key] = data
+        else:
+            self.dbeditor.vars.pop(key, None)
+        return list(data or [])
+
+    async def _cmd_vars(self, args: List[str], data: Optional[List[dict]]) -> List[dict]:
+        """Return the current variables as a list of dicts with 'key' and 'value'."""
+        return [{'key': k, 'value': v} for k, v in self.dbeditor.vars.items()]
+
+    async def _cmd_get_var(
+        self, args: List[str], data: Optional[List[dict]]
+    ) -> List[dict]:
+        if not args:
+            raise ValueError('.GET_VAR requires a KEY argument')
+        key = args[0]
+        if key not in self.dbeditor.vars:
+            raise ValueError(f'.GET_VAR: variable {key!r} is not set')
+        var_list = normalize_to_dicts(self.dbeditor.vars[key])
+        if data is not None:
+            return list(data) + var_list
+        return var_list
+
+    async def _cmd_void(
+        self, args: List[str], data: Optional[List[dict]]
+    ) -> Optional[List[dict]]:
+        return None

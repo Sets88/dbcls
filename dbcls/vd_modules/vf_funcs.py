@@ -98,6 +98,28 @@ def save_sql(vd, p, *vsheets):
 
 
 @VisiData.api
+def save_rows_to_vars(vd, sheet, rows):
+    from visidata import dbeditor
+    name = vd.input('variable name: ', 'varname')
+    if not name:
+        return
+    result = [{col.name: col.getValue(row) for col in sheet.visibleCols} for row in rows]
+    dbeditor.vars[name] = result
+    vd.status(f'Saved {len(result)} rows to _vars[{name!r}]')
+
+
+@VisiData.api
+def save_col_values_to_vars(vd, sheet, col, rows):
+    name = vd.input('variable name: ', 'varname')
+    if not name:
+        return
+    from visidata import dbeditor
+    result = [col.getValue(row) for row in rows]
+    dbeditor.vars[name] = result
+    vd.status(f'Saved {len(result)} values to _vars[{name!r}]')
+
+
+@VisiData.api
 def ts_to_dt_utc(_, ts: Union[str, float, int]) -> datetime:
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).replace(tzinfo=None)
 
@@ -111,3 +133,9 @@ def dt_to_start_of_inteval(_, dt: datetime, interval: int) -> datetime:
 def ts_to_start_of_inteval(_, ts: Union[str, float, int], interval: int) -> datetime:
     type_ts = type(ts)
     return type_ts(float(ts) - (float(ts) % interval))
+
+
+@VisiData.api
+def get_var(_, key: str):
+    from visidata import dbeditor
+    return dbeditor.vars.get(key)

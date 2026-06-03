@@ -180,6 +180,8 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 | `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
 | `gp` | Draw a time-series chart from the current sheet's key columns (see [Plotting](#plotting) below) |
 | `E` | Edit the SQL query used to fetch sample data for the current table(in `Alt + t` page only) |
+| `gT` | Save current or selected rows to pipeline vars |
+| `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
 
 ### Plotting
 
@@ -296,6 +298,10 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | `.RGET "{{tmpl}}" "regex"` | Extract regex capture groups from the template. Returns one dict per matching row, keyed `"0"`, `"1"`, … |
 | `.FOR_RUN "SQL {{col}}"` | Execute SQL once per input row, substituting `{{column}}` placeholders. All result sets are merged. |
 | `.EVAL "python_code"` | Run arbitrary Python. `data` holds the previous result (list of dicts). Assign to `result` or modify `data` in place to pass output forward. |
+| `.SET_VAR KEY [code]` | Store data (or the result of `code`) into a named variable. Data passes through unchanged, so `.SET_VAR` can appear mid-pipeline. |
+| `.GET_VAR KEY` | Inject a stored variable into the pipeline. If input data exists, the variable's rows are appended after it. |
+| `.VOID` | Discard input data. The next step starts fresh with no data (as if it were the first step). |
+| `.VARS` | Show all stored pipeline variables as a `key` / `value` list. |
 
 ### Template Placeholders
 
@@ -306,6 +312,7 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | `{{column_name}}` | Value of the column named `column_name` |
 | `{{row['any-name']}}` | Full row dict access — use for names with spaces or hyphens |
 | `{{price:.2f}}` | Python format spec support |
+| `{{_vars['key']}}` | Value of a pipeline variable stored by `.SET_VAR` |
 
 ### Helper Function
 
@@ -343,6 +350,23 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 ```sql
 .RUN "SELECT path FROM logs"
   | .RGET "{{path}}" "/api/v\d+/([^/]+)"
+```
+
+**Save IDs mid-pipeline and reuse them later:**
+```sql
+.RUN "SELECT id FROM users WHERE active = 1"
+  | .SET_VAR user_ids "sql_in_list(data)"
+  | .RUN "SELECT * FROM orders WHERE user_id IN {{_vars['user_ids']}}"
+```
+
+**Run a query, then continue the pipeline with a fresh start:**
+```sql
+.RUN "SELECT id FROM t" | .SET_VAR ids | .VOID | .RUN "SELECT COUNT(*) FROM t"
+```
+
+**Merge results from two sources:**
+```sql
+.RUN "SELECT id FROM table_a" | .SET_VAR a_ids | .RUN "SELECT id FROM table_b" | .GET_VAR a_ids
 ```
 
 ## Supported Database Engines

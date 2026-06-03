@@ -50,8 +50,8 @@ class ClientClass(abc.ABC):
         'OFFSET', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'WITH', 'UNION',
         'EXISTS', 'BETWEEN', 'ALL', 'ANY', 'PARTITION BY', 'RIGHT JOIN',
         'INNER', 'OUTER', 'CROSS', 'FULL', 'DROP', 'ALTER',
-        'TRUNCATE', 'TABLE', 'COLUMN', 'BEGIN', 'COMMIT', 'ROLLBACK', 'SET',
-        'EXPLAIN', 'ANALYZE', 'DESCRIBE', 'ASC', 'DESC', 'SHOW', 'RENAME',
+        'TRUNCATE', 'TABLE', 'COLUMN', 'BEGIN', 'COMMIT', 'ROLLBACK', 'SET', 'DATABASE',
+        'EXPLAIN', 'ANALYZE', 'DESCRIBE', 'ASC', 'DESC', 'RENAME',
         'GRANT', 'REVOKE', 'OPTIMIZE', 'KILL', 'INTERVAL', 'ON', 'AS', 'OF', 'AND', 'OR', 'IN', 'IS', 'NOT'
     ]
 

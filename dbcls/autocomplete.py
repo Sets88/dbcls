@@ -7,6 +7,8 @@ from typing import List, Optional, Tuple, Union
 import sql_metadata
 from sql_metadata.keywords_lists import TokenType
 
+from .pipeline import PIPELINE_COMMANDS, PIPELINE_COMMAND_HINTS
+
 _CONTEXT_LENGTH = 3
 _WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), 'weights.json')
 
@@ -551,21 +553,29 @@ class AutoComplete:
             part1 = parts[0]
             part2 = parts[1]
 
-        suggestions = [(x, f"{x} (COMMAND)") for x in self.client.all_commands]
+        suggestions = [(x, f"{x} (COMMAND)", '') for x in self.client.all_commands]
         functions_list = await self.get_all_functions()
         if functions_list:
-            suggestions += [(x, f"{x} (FUNCTION)") for x in functions_list]
+            suggestions += [(x, f"{x} (FUNCTION)", '') for x in functions_list]
+        suggestions += [
+            (f'.{cmd.upper()}', f'.{cmd.upper()} (PIPELINE)', PIPELINE_COMMAND_HINTS.get(cmd, ''))
+            for cmd in PIPELINE_COMMANDS
+        ]
 
         query_tables = _get_tables_from_sql(full_sql)
-        suggestions += await self._fetch_columns_for_tables(query_tables)
-        suggestions += await self._get_schema_suggestions(parts, part1, part2)
+        suggestions += [(ins, lbl, '') for ins, lbl in await self._fetch_columns_for_tables(query_tables)]
+        suggestions += [(ins, lbl, '') for ins, lbl in await self._get_schema_suggestions(parts, part1, part2)]
 
         rank_map = self._get_lm_rank_map(sql_context)
 
         if rank_map.get('__COLUMN__', 999) == 0 and full_sql:
-            suggestions += await self._fetch_columns_for_tables(
-                query_tables, dedupe_against=set(suggestions)
-            )
+            suggestions += [
+                (ins, lbl, '') for ins, lbl in
+                await self._fetch_columns_for_tables(
+                    query_tables,
+                    dedupe_against={(ins, lbl) for ins, lbl, _ in suggestions},
+                )
+            ]
 
         def sort_key(candidate: tuple) -> tuple:
             lm_rank = self._candidate_lm_rank(candidate[1], rank_map)

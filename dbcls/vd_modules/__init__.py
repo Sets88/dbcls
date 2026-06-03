@@ -10,6 +10,7 @@ from .vd_plotter import Plot
 from .vf_funcs import (
     make_formated_table, reference, escape_sql_value, save_sql,
     ts_to_dt_utc, dt_to_start_of_inteval, ts_to_start_of_inteval,
+    save_rows_to_vars,
 )
 from .vd_utils import SheetWithReference, ExpandVert
 
@@ -22,6 +23,9 @@ TableSheet.addCommand('gp', 'alt-plot', 'vd.push(Plot(source=sheet))', 'Draw plo
 IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')
 SheetWithReference.addCommand('gz'+ENTER, 'dive-selected-cells', 'openRefCells(cursorCol, selectedRows)', 'open combined reference sheet for selected cells')
 TableSheet.addCommand('z'+ENTER, 'open-cell', 'vd.push(openCellAltered(sheet, cursorCol, cursorRow))', 'open sheet with copies of rows referenced in current cell')
+
+TableSheet.addCommand('gT', 'save-to-vars', 'save_rows_to_vars(sheet, selectedRows or [cursorRow])', 'Save selected rows (or current row) to _vars under a prompted name')
+TableSheet.addCommand('gzT', 'save-col-to-vars', 'save_col_values_to_vars(sheet, cursorCol, selectedRows or [cursorRow])', 'Save selected values of current column (or current cell) to _vars as a flat list')
 
 # Alt + arrow keys to move cursor faster
 TableSheet.addCommand('Alt+b', 'go-left-3', 'cursorRight(-3)')

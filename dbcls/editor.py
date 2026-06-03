@@ -16,6 +16,15 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple, Union
 
+@dataclass
+class PopupItem:
+    """A single item in a SelectPopup list."""
+    insert: str        # text inserted into the buffer on selection
+    label:  str        # text displayed in the list
+    weight: int = 0    # sort weight (lower = higher priority)
+    hint:   str = ''   # optional one-line syntax hint shown above the popup
+
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 MAX_UNDO = 200
 TAB_SIZE = 4
@@ -941,6 +950,12 @@ class TextBuffer:
         start = c
         while start > 0 and (line[start-1].isalnum() or line[start-1] == '_'):
             start -= 1
+        # Also consume a lone '.' that is a command prefix (e.g. "| .RUN"), but
+        # not a schema separator (e.g. "table.column" where '.' is preceded by alnum).
+        if start > 0 and line[start - 1] == '.' and (
+            start < 2 or not (line[start - 2].isalnum() or line[start - 2] == '_')
+        ):
+            start -= 1
         if start < c:
             self._push_undo('delete_word')
             self.lines[r] = line[:start] + line[c:]
@@ -1147,15 +1162,14 @@ class SelectPopup:
     def __init__(self):
         self.active = False
         self.filter_text = ''
-        # Each item: (insert_text, label, weight)  e.g. ('SELECT', 'SELECT  (keyword)', 0)
-        self.items: List[Tuple[str, str, int]] = []
-        self.filtered: List[Tuple[str, str, int]] = []
+        self.items:    List[PopupItem] = []
+        self.filtered: List[PopupItem] = []
         self.selected_idx = 0
         self.scroll_offset = 0
         self._on_select = None
         self._title: str = ''
 
-    def open(self, items: 'List[Tuple[str, str, int]]', filter_text: str = '',
+    def open(self, items: 'List[PopupItem]', filter_text: str = '',
              on_select=None, title: str = '') -> None:
         self.active = True
         self.items = list(items)
@@ -1178,11 +1192,11 @@ class SelectPopup:
             self.filtered = list(self.items)
         else:
             self.filtered = [
-                (w, lbl, wt) for w, lbl, wt in self.items
-                if all(p in lbl.upper() for p in parts)
+                item for item in self.items
+                if all(p in item.label.upper() for p in parts)
             ]
         q = parts[0] if parts else ''
-        self.filtered.sort(key=lambda x: (x[2], 0 if x[1].upper().startswith(q) else 1))
+        self.filtered.sort(key=lambda item: (item.weight, 0 if item.label.upper().startswith(q) else 1))
         self.selected_idx = 0
         self.scroll_offset = 0
 
@@ -1204,7 +1218,7 @@ class SelectPopup:
     def selected_word(self) -> Optional[str]:
         """Returns only the insert text (without the description comment)."""
         if 0 <= self.selected_idx < len(self.filtered):
-            return self.filtered[self.selected_idx][0]
+            return self.filtered[self.selected_idx].insert
         return None
 
     def _nav_up(self):
@@ -1280,7 +1294,7 @@ class SelectPopup:
         visible_count = min(self.MAX_VISIBLE, total)
         # Height: top border + filter + separator + items + indicator + bottom border
         ph = visible_count + 4
-        max_label_len = max((len(label) for _, label, _ in self.filtered), default=0) if self.filtered else 0
+        max_label_len = max((len(item.label) for item in self.filtered), default=0) if self.filtered else 0
         # inner content = "  " prefix (2) + label; borders add 2 more
         min_pw = max(20, len(self._title) + 6 if self._title else 0)
         pw = min(max(max_label_len + 4, min_pw), W - 3)
@@ -1326,6 +1340,20 @@ class SelectPopup:
                 except curses.error:
                     pass
 
+        # Hint lines — drawn above the popup box when the focused item has a hint
+        hint_text = self.filtered[self.selected_idx].hint if 0 <= self.selected_idx < total else ''
+        hint_lines: List[str] = []
+        if hint_text:
+            avail = pw - 2
+            remaining = hint_text
+            while remaining and len(hint_lines) < 2:
+                hint_lines.append(remaining[:avail])
+                remaining = remaining[avail:]
+        hint_y_start = py - len(hint_lines)
+        if hint_y_start >= 0:
+            for i, line in enumerate(hint_lines):
+                astr(hint_y_start + i, px, (' ' + line).ljust(pw), ina)
+
         # Top border
         ach(py, px,          ACS_UL, ba)
         hl (py, px + 1,      pw - 2, ba)
@@ -1352,14 +1380,14 @@ class SelectPopup:
             abs_i = i + self.scroll_offset
             ach(row_y, px, ACS_VL, ba)
             if abs_i < total:
-                _, label, _ = self.filtered[abs_i]
+                item = self.filtered[abs_i]
                 is_sel = abs_i == self.selected_idx
                 prefix = '> ' if is_sel else '  '
                 base_attr = sa if is_sel else ia
-                match_pos = self._match_positions(label)
+                match_pos = self._match_positions(item.label)
                 astr(row_y, px + 1, prefix, base_attr)
                 avail = pw - 2 - len(prefix)
-                truncated = label[:avail]
+                truncated = item.label[:avail]
                 x_off = px + 1 + len(prefix)
                 for ci, ch in enumerate(truncated):
                     astr(row_y, x_off + ci, ch, ma if ci in match_pos else base_attr)
@@ -2254,7 +2282,7 @@ class Editor:
         self._prefix_pending = False
         self._status_notification: Optional[str] = None
         self._keybindings: dict = {}
-        self._ac_words: List[Tuple[str, str, int]] = []
+        self._ac_words: List[PopupItem] = []
         self._running_done_cb = None
         self._file_change_dismissed: bool = False
         self._file_check_counter: int = 0
@@ -2300,19 +2328,19 @@ class Editor:
             for w in keywords:
                 wu = w.upper()
                 if wu not in seen:
-                    entries.append((wu, f'{wu}  (keyword)', 0))
+                    entries.append(PopupItem(insert=wu, label=f'{wu}  (keyword)', weight=0))
                     seen.add(wu)
         if types:
             for w in types:
                 wu = w.upper()
                 if wu not in seen:
-                    entries.append((wu, f'{wu}  (type)', 0))
+                    entries.append(PopupItem(insert=wu, label=f'{wu}  (type)', weight=0))
                     seen.add(wu)
         if functions:
             for w in functions:
                 wu = w.upper()
                 if wu not in seen:
-                    entries.append((wu, f'{wu}  (function)', 0))
+                    entries.append(PopupItem(insert=wu, label=f'{wu}  (function)', weight=0))
                     seen.add(wu)
         self._ac_words = entries
 
@@ -2357,11 +2385,9 @@ class Editor:
         self._running_done_cb = on_done
         self.running_popup.open(task, start)
 
-    def show_autocomplete(self, items) -> None:
-        """Open autocomplete with a custom item list.
-        Each item: (display_word, insert_word, weight) — lower weight sorts first."""
-        popup_items = [(insert, display, weight) for display, insert, weight in items]
-        self.popup.open(popup_items, filter_text=self.buf.word_at_cursor(), title='Autocomplete')
+    def show_autocomplete(self, items: 'List[PopupItem]') -> None:
+        """Open autocomplete popup with a list of PopupItem objects."""
+        self.popup.open(items, filter_text=self.buf.word_at_cursor(), title='Autocomplete')
 
     def add_editor_function(self, name: str, func: Callable[[], None], description: str = '', keybinding: str = '') -> None:
         self._editor_functions[name] = {'func': func, 'description': description, 'keybinding': keybinding}
@@ -2855,11 +2881,11 @@ class Editor:
             self.popup.close()
         else:
             items = list(self._ac_words)
-            seen = {w.upper() for w, _, _ in items}
+            seen = {item.insert for item in items}
             for w in self.buf.document_words():
                 wu = w.upper()
                 if wu not in seen:
-                    items.append((wu, f'{wu}  (word)', 0))
+                    items.append(PopupItem(insert=wu, label=f'{wu}  (word)', weight=0))
                     seen.add(wu)
             self.popup.open(items, filter_text=self.buf.word_at_cursor(), title='Autocomplete')
 
@@ -2872,8 +2898,8 @@ class Editor:
             label = description
             if entry['keybinding']:
                 label += f"  [{entry['keybinding']}]"
-            items.append((name, label, 0))
-        items.sort(key=lambda x: x[1])
+            items.append(PopupItem(insert=name, label=label, weight=0))
+        items.sort(key=lambda item: item.label)
 
         def on_select(func_name):
             entry = self._editor_functions.get(func_name)
@@ -2979,7 +3005,15 @@ class Editor:
             self.set_status_notification('Directory is empty')
             return
 
-        items = [(f, f, 0) for f in files]
+        items = [
+            PopupItem(
+                insert=f,
+                label=f,
+                weight=0,
+                hint=os.path.join(self._directory, f),
+            )
+            for f in files
+        ]
 
         def on_select(filename):
             new_path = os.path.join(self._directory, filename)

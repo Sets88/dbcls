@@ -21,7 +21,7 @@ from .vd_modules import DataBaseSheet, TablesSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
-from .editor import Editor, K, key_alt
+from .editor import Editor, K, key_alt, PopupItem
 from .pipeline import is_pipeline
 from .pipeline import PipelineExecutor
 from .pipeline import HELP_ENTRIES
@@ -256,6 +256,8 @@ DB-specific extensions
   `z+Enter`             Open current cell as a sheet (references, JSON, …)
   `^`                   Cross-sheet reference: select 2 sheets in `S`, then `^`
   `gz+Enter`            Open all selected reference cells merged into one sheet
+  `gT`                  Save selected rows (or current row) to pipeline vars as list of dicts
+  `gzT`                 Save current column values from selected rows to pipeline vars as flat list
 """
 
 
@@ -269,10 +271,12 @@ class DbEditor(Editor):
         autocomplete: Optional[AutoComplete] = None,
         remap_config: str = None
     ):
+        visidata.vd.addGlobals(dbeditor=self)
         self.client = client
         self.autocomplete = autocomplete
         self.asyncloop_thread = AsyncLoopThread(daemon=True)
         self.asyncloop_thread.start()
+        self.vars = {}
         if remap_config:
             self.apply_keys_remap(remap_config)
 
@@ -307,11 +311,11 @@ class DbEditor(Editor):
         # Replace main TOC with the full DB-aware version
         pages['main'] = (
             '   Welcome to DBCLS! Here are some tips to get you started:\n\n'
-            '-->>Database<<--\n'
-            '-->>Editor<<--\n'
-            '-->>Key remapping<<--\n'
-            '-->>Pipelines<<--\n'
-            '-->>VisiData<<--'
+            '-->>Database<<--  — connect to databases, browse tables and sample data\n'
+            '-->>Editor<<--  — text editor keybindings and shortcuts\n'
+            '-->>Key remapping<<--  — customize keybindings via DBCLS_KEY_REMAP\n'
+            '-->>Pipelines<<--  — chain SQL queries, transform data, use variables\n'
+            '-->>VisiData<<--  — data navigation, selection, and DB-specific extensions'
         )
         pages['Database']      = DB_HELP_DATABASE
         pages['Key remapping'] = DB_HELP_KEY_REMAP + '\n\n' + self._keybindings_text()
@@ -365,7 +369,7 @@ class DbEditor(Editor):
         async def fetch_all():
             sql = sel.strip()
             if is_pipeline(sql):
-                executor = PipelineExecutor(self.client)
+                executor = PipelineExecutor(self)
                 return await executor.execute(sql)
 
             result = await self.client.execute(sql)
@@ -440,9 +444,10 @@ class DbEditor(Editor):
             except Exception as exc:
                 self.info_popup.open('Error', {'main': str(exc)})
                 return
-            items = []
-            for item, title in candidates:
-                items.append((title, item, 0))
+            items = [
+                PopupItem(insert=item, label=title, weight=0, hint=hint)
+                for item, title, hint in candidates
+            ]
             self.show_autocomplete(items)
 
         self.open_running_popup(task, start, on_done)
@@ -466,7 +471,7 @@ class DbEditor(Editor):
         if not sheets:
             self.set_status_notification('No VisiData sheets')
             return
-        items = [(str(i), name, i) for i, name in enumerate(sheets)]
+        items = [PopupItem(insert=str(i), label=name, weight=i) for i, name in enumerate(sheets)]
 
         def on_select(sheet_index):
             self.open_sheet(int(sheet_index))
