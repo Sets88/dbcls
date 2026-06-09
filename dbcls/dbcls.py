@@ -7,6 +7,8 @@ import os
 import curses
 import locale
 import traceback
+import secrets
+import subprocess
 from functools import partial
 import time
 from typing import Optional
@@ -21,7 +23,7 @@ from .vd_modules import DataBaseSheet, TablesSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
-from .editor import Editor, K, key_alt, PopupItem
+from .editor import Editor, K, key_alt, PopupItem, draw_box
 from .pipeline import is_pipeline
 from .pipeline import PipelineExecutor
 from .pipeline import HELP_ENTRIES
@@ -137,11 +139,42 @@ def print_center(window: curses.window, text: str):
     window.refresh()
 
 
+def _find_triple_quote_block(lines, row):
+    """Return (start_row, end_row) if `row` is inside a triple-quoted string
+    that opens on a dot-command line (e.g. .PEXEC \"\"\"...\"\"\"), else None."""
+    def block(start: int, end: int):
+        # Only blocks opened by a dot-command line count; a row can sit in at
+        # most one block, so the caller stops searching on the first hit.
+        opener = lines[start].strip()
+        if opener.startswith('.') and not opener.startswith('-- '):
+            return (start, end)
+        return None
+
+    open_line = None  # line of the current unmatched opening delimiter, or None
+    for i, line in enumerate(lines):
+        for _ in range(line.count('"""')):
+            if open_line is None:
+                open_line = i
+            else:
+                if open_line <= row <= i:
+                    return block(open_line, i)
+                open_line = None
+
+    # An unterminated block runs to the end of the buffer.
+    if open_line is not None and open_line <= row:
+        return block(open_line, len(lines) - 1)
+    return None
+
+
 def get_sql_rows(buf) -> list:
     """Return sorted list of row indices that form the SQL statement under the cursor."""
     lines = buf.lines
     row = buf.cursor_row
     stripped = lines[row].strip()
+
+    block = _find_triple_quote_block(lines, row)
+    if block is not None:
+        return list(range(block[0], block[1] + 1))
 
     # Cursor is on a blank/separator/comment line — nothing to highlight
     if not stripped or stripped == ';' or stripped.startswith('#'):
@@ -261,6 +294,178 @@ DB-specific extensions
 """
 
 
+class LockScreen:
+    """Screen lock: manages secrets, challenge-response auth, and overlay rendering."""
+
+    MAX_ATTEMPTS = 3
+    COMMAND_TIMEOUT = 60  # seconds before a lock command is abandoned
+
+    def __init__(self, init_command: str, check_command: str, timeout: float):
+        self.active = False
+        self._init_command = init_command
+        self._check_command = check_command
+        self._timeout = timeout
+        self._secret: str = ''
+        self._code: str = ''
+        self._last_check: float = time.monotonic()
+        self._attempts_left: int = self.MAX_ATTEMPTS
+        self._error_msg: str = ''
+        self._status_msg: str = ''
+
+    def initialize(self) -> None:
+        """Generate a fresh secret and store the challenge code from init_command.
+
+        Raises RuntimeError on any failure. The secret/code pair is only swapped
+        in once the command succeeds, so a failed call leaves the previous pair
+        intact.
+        """
+        secret = secrets.token_hex(16)
+        try:
+            result = subprocess.run(
+                self._init_command, shell=True, input=secret,
+                capture_output=True, text=True, timeout=self.COMMAND_TIMEOUT,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise RuntimeError(f'--lock-init-command failed to run: {exc}') from exc
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            detail = f': {stderr}' if stderr else ''
+            raise RuntimeError(
+                f'--lock-init-command exited with code {result.returncode}{detail}'
+            )
+        code = result.stdout.strip()
+        if not code:
+            raise RuntimeError('--lock-init-command produced no output')
+        self._secret = secret
+        self._code = code
+        self._last_check = time.monotonic()
+
+    def _run_check(self) -> Optional[str]:
+        """Run check_command with the stored code on stdin and return its output,
+        or None if the command could not run (timeout / OS error)."""
+        try:
+            result = subprocess.run(
+                self._check_command, shell=True, input=self._code,
+                capture_output=True, text=True, timeout=self.COMMAND_TIMEOUT,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        return result.stdout.strip()
+
+    def should_lock(self) -> bool:
+        return not self.active and time.monotonic() - self._last_check > self._timeout
+
+    def set_status(self, msg: str) -> None:
+        self._status_msg = msg
+        self._error_msg = ''
+
+    def open(self) -> None:
+        self.active = True
+        self._error_msg = ''
+        self._status_msg = ''
+        self._attempts_left = self.MAX_ATTEMPTS
+
+    def close(self) -> None:
+        self.active = False
+
+    def reset_timer(self) -> None:
+        self._last_check = time.monotonic()
+
+    def handle_key(self, key) -> Optional[str]:
+        if key in (K(ord('\n')), K(ord('\r')), K(ord(' '))):
+            return 'unlock'
+        return None
+
+    def try_unlock(self) -> str:
+        """Returns 'success', 'failed', or 'exit'.
+
+        Passes the stored code to check_command via stdin and compares the output
+        with the original secret. This supports asymmetric protocols such as:
+          init_command  = 'ssh-crypt -e'  (encrypt secret → code)
+          check_command = 'ssh-crypt -d'  (decrypt code → should equal secret)
+        """
+        self._status_msg = ''
+        response = self._run_check()
+        if response == self._secret:
+            self.close()
+            try:
+                self.initialize()
+            except RuntimeError:
+                # Unlock already succeeded — keep the current secret/code pair so a
+                # transient re-init failure doesn't lock the user back out.
+                pass
+            return 'success'
+        self._attempts_left -= 1
+        if self._attempts_left <= 0:
+            return 'exit'
+        self._error_msg = f'Invalid credentials! {self._attempts_left} attempt(s) remaining.'
+        return 'failed'
+
+    def draw(self, stdscr, H: int, W: int) -> None:
+        content_lines = [
+            '  Session Locked  ',
+            '',
+            '  Press [Enter] to unlock  ',
+            '  Press [Ctrl+Q] to exit   ',
+        ]
+        if self._status_msg:
+            content_lines += ['', f'  {self._status_msg}  ']
+        elif self._error_msg:
+            content_lines += ['', f'  {self._error_msg}  ']
+        # Blank padding rows top and bottom inside the border.
+        lines = [''] + content_lines + ['']
+        win_w = max(len(l) for l in lines) + 4
+        win_h = len(lines) + 2
+        y = max(0, H // 2 - win_h // 2)
+        x = max(0, W // 2 - win_w // 2)
+        draw_box(stdscr, y, x, lines, pad=1)
+
+    def run_blocking(self, scr) -> str:
+        """Drive the lock from a host that owns the screen (e.g. VisiData's
+        mainloop). Blocks, hiding the screen behind the overlay, until the user
+        unlocks or asks to exit. Returns 'unlocked' or 'exit'.
+
+        The editor instead pumps the lock from its own non-blocking loop via
+        _dispatch_pre_hook / _get_overlay; this method is the blocking
+        counterpart for hosts that don't expose a per-frame hook.
+        """
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        scr.timeout(-1)  # block for a key; we only redraw on state changes
+        needs_draw = True
+        while self.active:
+            if needs_draw:
+                scr.erase()
+                self.draw(scr, *scr.getmaxyx())
+                scr.refresh()
+                needs_draw = False
+            try:
+                ch = scr.get_wch()
+            except curses.error:
+                continue
+            code = ord(ch) if isinstance(ch, str) else ch
+            if code == 0x11:  # Ctrl+Q — exit even when locked
+                self.close()
+                return 'exit'
+            if code in (ord('\n'), ord('\r'), ord(' ')):
+                self.set_status('Checking...')
+                scr.erase()
+                self.draw(scr, *scr.getmaxyx())
+                scr.refresh()
+                result = self.try_unlock()
+                if result == 'success':
+                    return 'unlocked'
+                if result == 'exit':
+                    self.close()
+                    return 'exit'
+                needs_draw = True  # 'failed' — redraw with the error message
+            elif code == curses.KEY_RESIZE:
+                needs_draw = True
+        return 'unlocked'
+
+
 class DbEditor(Editor):
     def __init__(
         self,
@@ -269,7 +474,10 @@ class DbEditor(Editor):
         directory=None,
         client: Optional[ClientClass] = None,
         autocomplete: Optional[AutoComplete] = None,
-        remap_config: str = None
+        remap_config: str = None,
+        lock_init_command: Optional[str] = None,
+        lock_timeout: Optional[float] = None,
+        lock_check_command: Optional[str] = None,
     ):
         visidata.vd.addGlobals(dbeditor=self)
         self.client = client
@@ -280,7 +488,15 @@ class DbEditor(Editor):
         if remap_config:
             self.apply_keys_remap(remap_config)
 
+        self.lock_screen: Optional[LockScreen] = None
+        if lock_init_command and lock_timeout is not None and lock_check_command:
+            self.lock_screen = LockScreen(lock_init_command, lock_check_command, lock_timeout)
+
         super().__init__(stdscr, filepath, directory=directory)
+
+        if self.lock_screen:
+            self.lock_screen.initialize()
+
         self.add_editor_function(DbFn.RUN_QUERY,       self._db_query,          'Execute query',  'Alt+R')
         self.add_editor_function(DbFn.SHOW_TABLES,     self._db_show_tables,    'Browse tables',  'Alt+T')
         self.add_editor_function(DbFn.SHOW_DATABASES,  self._db_show_databases, 'Browse databases', 'Alt+E')
@@ -305,6 +521,35 @@ class DbEditor(Editor):
                 self.REMAPED_KEYS[int(key)] = int(seq)
         except Exception:
             print('Invalid key remap string in DBCLS_KEY_REMAP')
+
+    # ── Screen lock ───────────────────────────────────────────────────────────
+
+    def _dispatch_pre_hook(self, key) -> bool:
+        if self.lock_screen is None:
+            return False
+        if self.lock_screen.should_lock():
+            self.lock_screen.open()
+        if self.lock_screen.active:
+            if key != -1:
+                if key == K(ord('\x11')):  # Ctrl+Q — exit even when locked
+                    self.running = False
+                elif self.lock_screen.handle_key(key) == 'unlock':
+                    self.lock_screen.set_status('Checking...')
+                    self.stdscr.erase()
+                    H, W = self.stdscr.getmaxyx()
+                    self.lock_screen.draw(self.stdscr, H, W)
+                    self.stdscr.refresh()
+                    if self.lock_screen.try_unlock() == 'exit':
+                        self.running = False
+            return True
+        if key != -1:
+            self.lock_screen.reset_timer()
+        return False
+
+    def _get_overlay(self):
+        return self.lock_screen if self.lock_screen and self.lock_screen.active else None
+
+    # ── Help pages ────────────────────────────────────────────────────────────
 
     def _help_pages(self) -> dict:
         pages = super()._help_pages()
@@ -338,6 +583,11 @@ class DbEditor(Editor):
             curses.endwin()
         except Exception:
             pass
+        if self.lock_screen is not None:
+            # VisiData blocks indefinitely once idle (curses_timeout = -1), which
+            # would stop the lock from ever engaging. Keep its mainloop polling so
+            # our getkeystroke wrapper can check the inactivity timer (~100 ms).
+            visidata.vd.timeouts_before_idle = -1
         if visidata.color.colors.color_pairs:
             for (fg, bg), (pairnum, _) in visidata.color.colors.color_pairs.items():
                 curses.init_pair(pairnum, fg, bg)
@@ -534,6 +784,12 @@ def main():
         help='disable compression for ClickHouse')
     parser.add_argument('--key-remap', dest='key_remap', default='', help='specify key remap config string,' \
         ' e.g. "9:353,353:9" to remap Tab to behave like Shift+Tab and Shift+Tab to behave like Tab')
+    parser.add_argument('--lock-init-command', dest='lock_init_command', default=None,
+        help='shell command to initialise a lock session (receives secret via stdin, outputs code)')
+    parser.add_argument('--lock-timeout', dest='lock_timeout', type=float, default=None,
+        help='seconds of inactivity before the screen locks')
+    parser.add_argument('--lock-check-command', dest='lock_check_command', default=None,
+        help='shell command to verify a lock session (receives same secret via stdin, must output same code)')
 
     args = parser.parse_args()
     env_override(args)
@@ -572,6 +828,22 @@ def main():
             filepath = config.get('filepath', '')
         if not unix_socket:
             unix_socket = config.get('unix_socket', None)
+        if not args.lock_init_command:
+            args.lock_init_command = config.get('lock_init_command', None)
+        if args.lock_timeout is None:
+            args.lock_timeout = config.get('lock_timeout', None)
+        if not args.lock_check_command:
+            args.lock_check_command = config.get('lock_check_command', None)
+
+    # lock_timeout may arrive as a string (env var / JSON string) — coerce once
+    # so every downstream consumer gets a float.
+    if args.lock_timeout is not None:
+        try:
+            args.lock_timeout = float(args.lock_timeout)
+        except (TypeError, ValueError):
+            print(f'Error: --lock-timeout must be a number, got {args.lock_timeout!r}',
+                  file=sys.stderr)
+            sys.exit(1)
 
     client = None
 
@@ -616,11 +888,18 @@ def main():
     elif editor_filepath:
         editor_directory = os.path.abspath(os.path.dirname(editor_filepath))
 
-    curses.wrapper(lambda stdscr: DbEditor(
-            stdscr, editor_filepath, directory=editor_directory, client=client,
-            autocomplete=autocomplete, remap_config=args.key_remap
-        ).run()
-    )
+    try:
+        curses.wrapper(lambda stdscr: DbEditor(
+                stdscr, editor_filepath, directory=editor_directory, client=client,
+                autocomplete=autocomplete, remap_config=args.key_remap,
+                lock_init_command=args.lock_init_command,
+                lock_timeout=args.lock_timeout,
+                lock_check_command=args.lock_check_command,
+            ).run()
+        )
+    except RuntimeError as e:
+        print(f'Error: {e}', file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

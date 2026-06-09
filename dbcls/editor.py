@@ -1412,6 +1412,31 @@ class SelectPopup:
         ach(py + ph - 1, px + pw - 1, ACS_LR, ba)
 
 
+def draw_box(stdscr: curses.window, y: int, x: int, lines: List[str], *, pad: int = 0) -> None:
+    """Draw a single-line-border box at (y, x) wrapping the given content lines.
+
+    Width fits the longest line plus `pad` columns on each side. Content is
+    left-justified inside the border. Clips silently on a too-small screen.
+    """
+    inner_w = max((len(l) for l in lines), default=0) + 2 * pad
+    win_w = inner_w + 2
+    try:
+        stdscr.addch(y, x,             curses.ACS_ULCORNER)
+        stdscr.hline(y, x + 1,         curses.ACS_HLINE, win_w - 2)
+        stdscr.addch(y, x + win_w - 1, curses.ACS_URCORNER)
+        for i, line in enumerate(lines):
+            row = y + 1 + i
+            stdscr.addch(row, x,             curses.ACS_VLINE)
+            stdscr.addstr(row, x + 1,        f'{line:<{inner_w}}'[:inner_w])
+            stdscr.addch(row, x + win_w - 1, curses.ACS_VLINE)
+        bot = y + len(lines) + 1
+        stdscr.addch(bot, x,             curses.ACS_LLCORNER)
+        stdscr.hline(bot, x + 1,         curses.ACS_HLINE, win_w - 2)
+        stdscr.addch(bot, x + win_w - 1, curses.ACS_LRCORNER)
+    except curses.error:
+        pass
+
+
 # ─── RunningPopup ─────────────────────────────────────────────────────────────
 class RunningPopup:
     """Running-query overlay driven by the main editor loop. ESC cancels the task."""
@@ -1464,18 +1489,7 @@ class RunningPopup:
         win_w = len(msg) + 2
         y = max(0, H // 2 - 1)
         x = max(0, W // 2 - win_w // 2)
-        try:
-            stdscr.addch(y,     x,             curses.ACS_ULCORNER)
-            stdscr.hline(y,     x + 1,         curses.ACS_HLINE, win_w - 2)
-            stdscr.addch(y,     x + win_w - 1, curses.ACS_URCORNER)
-            stdscr.addch(y + 1, x,             curses.ACS_VLINE)
-            stdscr.addstr(y + 1, x + 1,        msg[:win_w - 2])
-            stdscr.addch(y + 1, x + win_w - 1, curses.ACS_VLINE)
-            stdscr.addch(y + 2, x,             curses.ACS_LLCORNER)
-            stdscr.hline(y + 2, x + 1,         curses.ACS_HLINE, win_w - 2)
-            stdscr.addch(y + 2, x + win_w - 1, curses.ACS_LRCORNER)
-        except curses.error:
-            pass
+        draw_box(stdscr, y, x, [msg])
 
 
 # ─── InfoPopup inline-markup helpers ─────────────────────────────────────────
@@ -1935,8 +1949,20 @@ class Renderer:
         search: Optional['SearchBar'] = None,
         running_popup: Optional['RunningPopup'] = None,
         info_popup: Optional['InfoPopup'] = None,
+        overlay=None,
     ):
         self.stdscr.erase()
+
+        # A full-screen overlay (e.g. the lock screen) hides everything else.
+        if overlay is not None:
+            overlay.draw(self.stdscr, self._height, self._width)
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            return
+
         self._draw_text_area()
         if search and search.active:
             self._draw_search_bar(search)
@@ -1949,6 +1975,10 @@ class Renderer:
         if info_popup and info_popup.active:
             info_popup.draw(self.stdscr, self.colors, self._height, self._width)
         self._draw_status_bar(search)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
         # Position physical cursor
         if search and search.active:
             prompt = ' Search: '
@@ -2346,6 +2376,16 @@ class Editor:
 
     # ── Public interface ───────────────────────────────────────────────────────
 
+    def _dispatch_pre_hook(self, key) -> bool:
+        """Called at the start of every dispatch cycle (including idle -1 wakeups).
+        Return True to consume the event and skip normal dispatch."""
+        return False
+
+    def _get_overlay(self):
+        """Return an object with draw(stdscr, H, W) to render as a full-screen overlay,
+        or None for normal rendering. Override in a subclass."""
+        return None
+
     def on_before_draw(self) -> None:
         """Called before every redraw, after each keypress.
         Override in a subclass to add custom behaviour."""
@@ -2527,6 +2567,8 @@ class Editor:
                     self.stdscr.timeout(50)
                     self._dispatch(key_base(KEY_PREFIX_TRIGGER))
                     self.lexer.invalidate(self.buf.cursor_row)
+                else:
+                    self._dispatch_pre_hook(-1)
             else:
                 self._dispatch(key)
                 # Invalidate lexer cache from cursor row
@@ -2553,6 +2595,7 @@ class Editor:
                 search=self.search if self.search.active else None,
                 running_popup=self.running_popup if self.running_popup.active else None,
                 info_popup=self.info_popup if self.info_popup.active else None,
+                overlay=self._get_overlay(),
             )
 
     @staticmethod
@@ -2628,6 +2671,9 @@ class Editor:
         key = self._resolve_key(key)
         key = self._encode_key(key)
         key = self._override_remaped_keys(key)
+
+        if self._dispatch_pre_hook(key):
+            return
 
         # tmux-style prefix handling (KEY_PREFIX_TRIGGER)
         if self._prefix_pending:

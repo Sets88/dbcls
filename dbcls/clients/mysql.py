@@ -13,10 +13,13 @@ from .base import (
 class MysqlClient(ClientClass):
     ENGINE = 'MySQL'
 
-    SQL_COMMANDS = ['TABLES', 'DATABASES', 'USE', 'SHOW']
+    SQL_COMMANDS = [
+        'TABLES', 'DATABASES', 'USE', 'SHOW', 'PROCESSLIST', 'DEFAULT', 'KEY', 'PRIMARY', 'CHARACTER'
+    ]
 
     SQL_FUNCTIONS = [
-        'CONCAT', 'GROUP_CONCAT', 'UNIX_TIMESTAMP', 'FROM_UNIXTIME', 'DATE_FORMAT'
+        'CONCAT', 'GROUP_CONCAT', 'UNIX_TIMESTAMP', 'FROM_UNIXTIME', 'DATE_FORMAT', 'ANY_VALUE'
+        'CAST', 'JSON_KEYS', 'JSON_CONTAINS'
     ]
 
     def __init__(

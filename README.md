@@ -55,6 +55,9 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-c, --config` | Path to configuration file |
 | `--no-compress` | Disable compression for ClickHouse connections |
 | `--key-remap` | Remap key codes, e.g. `"9:353,353:9"` to swap Tab and Shift+Tab |
+| `--lock-init-command` | Shell command run at startup to initialise a lock session |
+| `--lock-timeout` | Seconds of inactivity before the screen locks |
+| `--lock-check-command` | Shell command run when the user attempts to unlock |
 
 ## Configuration
 
@@ -297,7 +300,8 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | `.RFILTER "{{tmpl}}" "regex"` | Keep rows where the rendered template matches the regex. Returns the original rows unchanged. |
 | `.RGET "{{tmpl}}" "regex"` | Extract regex capture groups from the template. Returns one dict per matching row, keyed `"0"`, `"1"`, … |
 | `.FOR_RUN "SQL {{col}}"` | Execute SQL once per input row, substituting `{{column}}` placeholders. All result sets are merged. |
-| `.EVAL "python_code"` | Run arbitrary Python. `data` holds the previous result (list of dicts). Assign to `result` or modify `data` in place to pass output forward. |
+| `.PEVAL "python_code"` | Evaluate Python. `data` holds the previous result (list of dicts). A bare expression (e.g. a list literal) is used directly; for statement bodies assign to `result` or modify `data` in place to pass output forward. |
+| `.PEXEC "python_code"` | Execute a Python statement block. Call `result(val)` to pass output to the next step. `data` and `_vars` are in scope. If `result()` is never called, `data` passes through unchanged. Unlike `.PEVAL`, bare expressions are not supported. |
 | `.SET_VAR KEY [code]` | Store data (or the result of `code`) into a named variable. Data passes through unchanged, so `.SET_VAR` can appear mid-pipeline. |
 | `.GET_VAR KEY` | Inject a stored variable into the pipeline. If input data exists, the variable's rows are appended after it. |
 | `.VOID` | Discard input data. The next step starts fresh with no data (as if it were the first step). |
@@ -316,7 +320,7 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 
 ### Helper Function
 
-`sql_in_list(data)` — converts a list of scalars or list-of-dicts to a SQL `IN`-clause string, e.g. `('val1','val2')`. Available inside `.RUN` and `.EVAL` templates.
+`sql_in_list(data)` — converts a list of scalars or list-of-dicts to a SQL `IN`-clause string, e.g. `('val1','val2')`. Available inside `.RUN` and `.PEVAL` templates.
 
 ### Examples
 
@@ -343,7 +347,7 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 **Post-process results with Python:**
 ```sql
 .RUN "SELECT name, score FROM results"
-  | .EVAL "sorted(data, key=lambda r: r['score'], reverse=True)[:10]"
+  | .PEVAL "sorted(data, key=lambda r: r['score'], reverse=True)[:10]"
 ```
 
 **Extract capture groups from a column:**
@@ -470,6 +474,82 @@ You can also specify the socket path in a JSON config file:
     "engine": "mysql",
     "unix_socket": "/tmp/mysql.sock"
 }
+```
+
+## Screen Lock
+
+DbCls can lock the terminal after a period of inactivity and require re-authentication before continuing. Three parameters must all be provided to enable locking:
+
+| Parameter | Description |
+|-----------|-------------|
+| `--lock-init-command CMD` | Shell command that receives a random secret via stdin and outputs a challenge code to stdout |
+| `--lock-timeout SECONDS` | Inactivity timeout in seconds (float). Measured by monotonic clock — unaffected by system time changes |
+| `--lock-check-command CMD` | Shell command that receives the challenge code via stdin and outputs the recovered secret to stdout |
+
+### How it works
+
+1. **Startup** — DbCls generates a random secret, pipes it to `--lock-init-command`, and stores the output as the *code*.
+2. **Inactivity** — after `--lock-timeout` seconds without a keypress the screen locks. The timeout resets on every keypress while the editor is active.
+3. **Unlock** — a lock overlay is shown. Press `Enter` or `Space` to attempt unlock:
+   - The stored *code* is piped to `--lock-check-command`.
+   - If the output matches the original *secret*, the session is restored and a new secret/code pair is generated.
+   - On failure the remaining attempt count decreases. After 3 failed attempts the application exits.
+4. Press `Ctrl+Q` at any time to exit the application without unlocking.
+
+### Configuration
+
+All three parameters can be set via CLI flags, JSON config file, or environment variables. CLI flags take precedence over env vars, which take precedence over the config file.
+
+**Config file** (`config.json`):
+```json
+{
+    "host": "127.0.0.1",
+    "engine": "mysql",
+    "dbname": "mydb",
+    "lock_init_command": "ssh-crypt -e",
+    "lock_timeout": 300,
+    "lock_check_command": "ssh-crypt -d"
+}
+```
+
+**Environment variables:**
+```bash
+export DBCLS_LOCK_INIT_COMMAND="ssh-crypt -e"
+export DBCLS_LOCK_TIMEOUT=300
+export DBCLS_LOCK_CHECK_COMMAND="ssh-crypt -d"
+```
+
+### Example with ssh-crypt
+
+[ssh-crypt](https://github.com/Sets88/ssh-crypt) encrypts data with your SSH public key and decrypts it with your private key (via the SSH agent). This makes it a natural fit for the lock protocol:
+
+```bash
+dbcls -c config.json mydb.sql \
+  --lock-init-command  "ssh-crypt -e" \
+  --lock-timeout       300 \
+  --lock-check-command "ssh-crypt -d"
+```
+
+What happens:
+- On startup `ssh-crypt -e` encrypts the random secret → stores the ciphertext as the code.
+- On unlock `ssh-crypt -d` decrypts the ciphertext via the SSH agent → the result must equal the original secret.
+
+Because the SSH agent holds the private key in memory, `ssh-crypt -d` succeeds only while your SSH agent session is alive. If the agent is cleared (e.g. `ssh-add -D`) unlock will fail and the application will exit after three attempts.
+
+You can put the lock settings in the config file and decrypt it on the fly:
+
+```bash
+#!/bin/bash
+dbcls -c <(ssh-crypt -d -s "$ENCRYPTED_CONFIG") mydb.sql
+```
+
+### Error handling
+
+If `--lock-init-command` exits with a non-zero code or produces no output at startup, DbCls prints an error and does not open the editor:
+
+```
+Error: --lock-init-command exited with code 1: <stderr output>
+Error: --lock-init-command produced no output
 ```
 
 ## Password safety

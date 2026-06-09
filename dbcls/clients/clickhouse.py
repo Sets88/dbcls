@@ -16,6 +16,8 @@ logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 class ClickhouseClient(ClientClass):
     ENGINE = 'Clickhouse'
 
+    SQL_COMMANDS = ['TABLES', 'DATABASES', 'USE', 'SHOW', 'CLUSTERS']
+
     SQL_FUNCTIONS = [
         'today', 'yesterday', 'toStartOfDay', 'toStartOfMonth', 'toStartOfQuarter', 'toStartOfYear',
         'toStartOfMinute', 'toStartOfHour', 'toStartOfWeek', 'toDate', 'toFloat64', 'floor', 'round', 'ceil',

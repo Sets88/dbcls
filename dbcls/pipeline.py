@@ -32,12 +32,17 @@ Pipeline commands
     {{_N}} (positional) placeholders.  All results are merged into one
     flat list.
 
-.EVAL "python_code"
+.PEVAL "python_code"
     Execute arbitrary Python.  `data` (list of dicts from the previous
     step) is available as a global.  To pass a result to the next step,
     either modify `data` in-place or assign to a variable named
     `result`.  Expressions are also supported
-    (e.g. .EVAL "['a', 'b', 'c']").
+    (e.g. .PEVAL "['a', 'b', 'c']").
+
+.PEXEC "python_code"
+    Execute a Python code block.  Call `result(val)` to pass output to
+    the next pipeline step.  `data` and `_vars` are in scope.  If
+    `result()` is never called, input `data` passes through unchanged.
 
 .SET_VAR KEY [python_code]
     Store the current data (or the result of python_code) into _vars[KEY].
@@ -62,7 +67,7 @@ Template placeholders
 {{column_name}}    value of column named "column_name"
 {{_vars['key']}}   value of a variable stored by .SET_VAR
 
-Helper functions (available inside .RUN / .EVAL)
+Helper functions (available inside .RUN / .PEVAL / .PEXEC)
 -------------------------------------------------
 sql_in_list(data)
     Convert data to a SQL IN-list string, e.g. ('val1','val2').
@@ -84,7 +89,7 @@ if TYPE_CHECKING:
 # ── Public constants ──────────────────────────────────────────────────────────
 
 #: Commands that are handled by this module (lowercase).
-PIPELINE_COMMANDS: List[str] = ['run', 'rfilter', 'rget', 'for_run', 'eval', 'set_var', 'vars', 'get_var', 'void']
+PIPELINE_COMMANDS: List[str] = ['run', 'rfilter', 'rget', 'for_run', 'peval', 'pexec', 'set_var', 'vars', 'get_var', 'void']
 
 #: Syntax hint shown in the autocomplete popup for each pipeline command.
 PIPELINE_COMMAND_HINTS: dict = {
@@ -92,7 +97,8 @@ PIPELINE_COMMAND_HINTS: dict = {
     'rfilter':  '.RFILTER <TEMPLATE> <REGEX>',
     'rget':     '.RGET <TEMPLATE> <REGEX>',
     'for_run':  '.FOR_RUN <SQL>',
-    'eval':     '.EVAL <PYTHON_CODE>',
+    'peval':    '.PEVAL <PYTHON_CODE>',
+    'pexec':    '.PEXEC <PYTHON_CODE>',
     'set_var':  '.SET_VAR <KEY> [<PYTHON_CODE>]',
     'get_var':  '.GET_VAR <KEY>',
     'void':     '.VOID',
@@ -104,7 +110,7 @@ with `|`. Each step receives the output of the previous step, so you
 can filter, extract, iterate over rows, or post-process results —
 all without leaving the editor.
 
-Commands: `.RUN` `.RFILTER` `.RGET` `.FOR_RUN` `.EVAL`
+Commands: `.RUN` `.RFILTER` `.RGET` `.FOR_RUN` `.PEVAL` `.PEXEC`
           `.SET_VAR` `.GET_VAR` `.VARS` `.VOID`
 
 Example:
@@ -166,22 +172,39 @@ Example:
 ```
 """
 
-HELP_EVAL = f"""
-`{PIPELINE_COMMAND_HINTS['eval']}`
+HELP_PEVAL = f"""
+`{PIPELINE_COMMAND_HINTS['peval']}`
 Execute Python code. `data` holds the previous result (list of dicts).
 Assign to `result` or modify `data` to pass output to the next step.
 Bare expressions (like a list literal) are also accepted.
 
 Example:
 ```
-.RUN "SELECT * FROM t" | .EVAL "[row['id'] for row in data if row['value'] > 10]"
+.RUN "SELECT * FROM t" | .PEVAL "[row['id'] for row in data if row['value'] > 10]"
+```
+"""
+
+HELP_PEXEC = f"""
+`{PIPELINE_COMMAND_HINTS['pexec']}`
+Execute a Python code block. Call `result(val)` to pass output to the
+next pipeline step. `data` (list of dicts from the previous step) and
+`_vars` are in scope, along with datetime, timedelta, date, json, time.
+If `result()` is never called, input `data` passes through unchanged.
+
+Unlike .PEVAL, bare expressions are not supported — use `result(expr)`.
+
+Example:
+```
+.RUN "SELECT id, v FROM t" | .PEXEC \"\"\"
+result([row for row in data if row['v'] > 10])
+\"\"\"
 ```
 """
 
 HELP_SQL_IN_LIST = """
 `sql_in_list(data)`
 Helper: converts a list of scalars or list-of-dicts to a SQL IN-list
-string, e.g. ('val1','val2'). Use inside .RUN or .EVAL templates.
+string, e.g. ('val1','val2'). Use inside .RUN or .PEVAL templates.
 
 Example:
 ```
@@ -218,7 +241,7 @@ Example:
 HELP_VOID = f"""
 `{PIPELINE_COMMAND_HINTS['void']}`
 Discard input data. The next step receives no data (as if it were the
-first step). Useful after side-effect steps (.SET_VAR, .EVAL) when
+first step). Useful after side-effect steps (.SET_VAR, .PEVAL, .PEXEC) when
 you want to continue the pipeline with a clean state.
 
 Example:
@@ -278,7 +301,8 @@ HELP_ENTRIES: List[str] = [
     HELP_RFILTER,
     HELP_RGET,
     HELP_FOR_RUN,
-    HELP_EVAL,
+    HELP_PEVAL,
+    HELP_PEXEC,
     HELP_SET_VAR,
     HELP_GET_VAR,
     HELP_VOID,
@@ -289,7 +313,7 @@ HELP_ENTRIES: List[str] = [
 # ── Regex used to detect a pipeline expression ────────────────────────────────
 _DOT_CMD_RE = re.compile(r'^\s*\.([a-zA-Z_][a-zA-Z_0-9]*)', re.IGNORECASE)
 _PIPELINE_CMD_RE = re.compile(
-    r'^\s*\.(run|rfilter|rget|for_run|eval|set_var|vars|get_var|void)\b', re.IGNORECASE
+    r'^\s*\.(run|rfilter|rget|for_run|peval|pexec|set_var|vars|get_var|void)\b', re.IGNORECASE
 )
 _ANY_DOT_CMD_RE = re.compile(r'^\s*\.[a-zA-Z_]', re.IGNORECASE)
 
@@ -627,7 +651,7 @@ class PipelineExecutor:
         The :class:`~dbcls.dbcls.DbEditor` instance.  The executor
         calls ``dbeditor.client.execute(sql)`` for each ``.RUN`` /
         ``.FOR_RUN`` step and accesses ``dbeditor.vars`` for ``_vars``
-        support in templates and ``.EVAL`` / ``.SET_VAR``.
+        support in templates and ``.PEVAL`` / ``.PEXEC`` / ``.SET_VAR``.
     """
 
     def __init__(self, dbeditor: 'DbEditor') -> None:
@@ -709,9 +733,9 @@ class PipelineExecutor:
     ) -> List[dict]:
         if not args:
             raise ValueError('.RUN requires a SQL argument')
-        sql = args[0]
-        if data is not None:
-            sql = self._render_template(sql, data=data)
+
+        sql = self._render_template(args[0], data=data)
+
         result = await self.client.execute(sql)
         return (result.data or []) if result else []
 
@@ -770,24 +794,51 @@ class PipelineExecutor:
             await asyncio.sleep(0)
         return result
 
-    async def _cmd_eval(
-        self, args: List[str], data: Optional[List[dict]]
-    ) -> List[dict]:
-        if not args:
-            raise ValueError('.EVAL requires a Python code argument')
-        code = args[0]
+    def _python_context(self, data: Optional[List[dict]], extra: Optional[dict] = None) -> dict:
+        """Build the global namespace shared by .PEVAL / .PEXEC / .SET_VAR."""
         context: dict = {
             'data': list(data or []),
             '_vars': self.dbeditor.vars,
-            **DEFAULT_CONTEXT
+            **DEFAULT_CONTEXT,
         }
+        if extra:
+            context.update(extra)
+        return context
+
+    def _eval_user_code(self, code: str, data: Optional[List[dict]]) -> Any:
+        """Run user Python: evaluate as an expression, falling back to exec and
+        reading `result` (or the modified `data`) for statement bodies."""
+        context = self._python_context(data)
         try:
             # Try as a bare expression first (e.g. a list literal)
-            out = eval(code, context)  # noqa: S307 — intentional scripting feature
+            return eval(code, context)  # noqa: S307 — intentional scripting feature
         except SyntaxError:
             exec(code, context)  # noqa: S102 — intentional scripting feature
-            out = context.get('result', context.get('data', []))
+            return context.get('result', context.get('data', []))
 
+    async def _cmd_peval(
+        self, args: List[str], data: Optional[List[dict]]
+    ) -> List[dict]:
+        if not args:
+            raise ValueError('.PEVAL requires a Python code argument')
+        return normalize_to_dicts(self._eval_user_code(args[0], data))
+
+    async def _cmd_pexec(
+        self, args: List[str], data: Optional[List[dict]]
+    ) -> List[dict]:
+        if not args:
+            raise ValueError('.PEXEC requires a Python code argument')
+        data_list = list(data or [])
+
+        _called: list = []
+
+        def result(val: Any) -> None:
+            _called.append(val)
+
+        context = self._python_context(data_list, {'result': result})
+        exec(args[0], context)  # noqa: S102 — intentional scripting feature
+
+        out = _called[0] if _called else data_list
         return normalize_to_dicts(out)
 
     async def _cmd_set_var(
@@ -797,18 +848,7 @@ class PipelineExecutor:
             raise ValueError('.SET_VAR requires a KEY argument')
         key = args[0]
         if len(args) >= 2:
-            code = args[1]
-            context: dict = {
-                'data': list(data or []),
-                '_vars': self.dbeditor.vars,
-                **DEFAULT_CONTEXT,
-            }
-            try:
-                value = eval(code, context)  # noqa: S307 — intentional scripting feature
-            except SyntaxError:
-                exec(code, context)  # noqa: S102 — intentional scripting feature
-                value = context.get('result', context.get('data', []))
-            self.dbeditor.vars[key] = value
+            self.dbeditor.vars[key] = self._eval_user_code(args[1], data)
         elif data:
             self.dbeditor.vars[key] = data
         else:

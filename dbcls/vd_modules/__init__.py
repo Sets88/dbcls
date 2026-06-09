@@ -13,6 +13,7 @@ from .vf_funcs import (
     save_rows_to_vars,
 )
 from .vd_utils import SheetWithReference, ExpandVert
+from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 
 
 IndexSheet.guide += '''- `^` to make new sheet with reference column between two sheets'''
