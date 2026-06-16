@@ -22,7 +22,7 @@ class ClickhouseClient(ClientClass):
         'today', 'yesterday', 'toStartOfDay', 'toStartOfMonth', 'toStartOfQuarter', 'toStartOfYear',
         'toStartOfMinute', 'toStartOfHour', 'toStartOfWeek', 'toDate', 'toFloat64', 'floor', 'round', 'ceil',
         'JSONExtractInt', 'JSONExtractString', 'JSONExtract', 'JSONExtractKeys', 'arraySlice', 'splitByChar',
-        'any', 'toDateTime'
+        'any', 'toDateTime', 'quantile'
     ]
 
     def __init__(self, host, username, password, dbname, port='8123', compress=True):

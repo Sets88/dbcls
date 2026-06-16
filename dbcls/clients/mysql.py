@@ -14,7 +14,8 @@ class MysqlClient(ClientClass):
     ENGINE = 'MySQL'
 
     SQL_COMMANDS = [
-        'TABLES', 'DATABASES', 'USE', 'SHOW', 'PROCESSLIST', 'DEFAULT', 'KEY', 'PRIMARY', 'CHARACTER'
+        'TABLES', 'DATABASES', 'USE', 'SHOW', 'PROCESSLIST', 'DEFAULT', 'KEY', 'PRIMARY', 'CHARACTER',
+        'AUTO_INCREMENT', 'CHARSET', 'ENGINE', 'USING'
     ]
 
     SQL_FUNCTIONS = [
