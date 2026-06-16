@@ -644,6 +644,9 @@ class DbEditor(Editor):
             end = time.time()
             message = ''
             vd_launched = False
+            # Close any still-open live pipeline info() popup before showing
+            # results or an error (which reuses the same info popup).
+            self.clear_pipeline_info()
             try:
                 if self.running_popup.cancelled:
                     message = 'Cancelled'

@@ -89,7 +89,7 @@ if TYPE_CHECKING:
 # ── Public constants ──────────────────────────────────────────────────────────
 
 #: Commands that are handled by this module (lowercase).
-PIPELINE_COMMANDS: List[str] = ['run', 'rfilter', 'rget', 'for_run', 'peval', 'pexec', 'set_var', 'vars', 'get_var', 'void']
+PIPELINE_COMMANDS: List[str] = ['run', 'rfilter', 'rget', 'for_run', 'for', 'nofor', 'sleep', 'peval', 'pexec', 'set_var', 'vars', 'get_var', 'void']
 
 #: Syntax hint shown in the autocomplete popup for each pipeline command.
 PIPELINE_COMMAND_HINTS: dict = {
@@ -97,6 +97,9 @@ PIPELINE_COMMAND_HINTS: dict = {
     'rfilter':  '.RFILTER <TEMPLATE> <REGEX>',
     'rget':     '.RGET <TEMPLATE> <REGEX>',
     'for_run':  '.FOR_RUN <SQL>',
+    'for':      '.FOR <PYTHON_CODE>',
+    'nofor':    '.NOFOR',
+    'sleep':    '.SLEEP <PYTHON_CODE>',
     'peval':    '.PEVAL <PYTHON_CODE>',
     'pexec':    '.PEXEC <PYTHON_CODE>',
     'set_var':  '.SET_VAR <KEY> [<PYTHON_CODE>]',
@@ -110,8 +113,8 @@ with `|`. Each step receives the output of the previous step, so you
 can filter, extract, iterate over rows, or post-process results —
 all without leaving the editor.
 
-Commands: `.RUN` `.RFILTER` `.RGET` `.FOR_RUN` `.PEVAL` `.PEXEC`
-          `.SET_VAR` `.GET_VAR` `.VARS` `.VOID`
+Commands: `.RUN` `.RFILTER` `.RGET` `.FOR_RUN` `.FOR` `.NOFOR` `.SLEEP`
+          `.PEVAL` `.PEXEC` `.SET_VAR` `.GET_VAR` `.VARS` `.VOID`
 
 Example:
 ```
@@ -169,6 +172,63 @@ All result sets are merged into one flat list.
 Example:
 ```
 .RUN "SHOW TABLES" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"
+```
+"""
+
+HELP_FOR = f"""
+`{PIPELINE_COMMAND_HINTS['for']}`
+Evaluate PYTHON_CODE to an iterable and run every following step once per
+item, until a `.NOFOR` (or the end of the pipeline). The current item is
+exposed as `{{{{_i}}}}` in templates and as `_i` in Python code (innermost
+loop wins when `.FOR` is nested). `{{{{_0}}}}` / `_0` and named columns still
+refer to the previous step's result. Results from each iteration are merged
+into one flat list.
+
+Example:
+```
+.FOR "range(10)" | .RUN "SELECT '{{{{_i}}}}'"
+```
+"""
+
+HELP_NOFOR = f"""
+`{PIPELINE_COMMAND_HINTS['nofor']}`
+End the scope of the preceding `.FOR`. Steps after `.NOFOR` run once,
+receiving the merged results of the loop.
+
+Example:
+```
+.FOR "range(10)" | .RUN "SELECT '{{{{_i}}}}'" | .NOFOR | .RUN "SELECT 'done'"
+```
+"""
+
+HELP_SLEEP = f"""
+`{PIPELINE_COMMAND_HINTS['sleep']}`
+Evaluate PYTHON_CODE to a number of seconds and pause for that long, then
+pass the input data through unchanged. Useful inside `.FOR` to pace work
+(`_i` is the loop counter).
+
+Example:
+```
+.FOR "range(10)" | .SLEEP "_i" | .RUN "SELECT '{{{{_i}}}}'"
+```
+"""
+
+HELP_INFO_BR = """
+`info(msg)` and `br()`
+Available inside any Python-executing step (`.PEVAL`, `.PEXEC`, `.SLEEP`,
+`.SET_VAR`, the `.FOR` expression).
+
+`info(msg)` shows `msg` in a popup over the running overlay without
+stopping execution; calling it again updates the text. Dismiss it like any
+info popup (Esc) to reveal the running overlay again. `_i` is the `.FOR`
+loop counter; `_0` / named columns are the previous step's result.
+
+`br()` breaks out of the current `.FOR` loop and continues with the steps
+after it.
+
+Example:
+```
+.FOR "range(10)" | .RUN "SELECT COUNT(1) AS AA FROM t" | .PEXEC \"\"\"info(_0)\"\"\"
 ```
 """
 
@@ -301,6 +361,10 @@ HELP_ENTRIES: List[str] = [
     HELP_RFILTER,
     HELP_RGET,
     HELP_FOR_RUN,
+    HELP_FOR,
+    HELP_NOFOR,
+    HELP_SLEEP,
+    HELP_INFO_BR,
     HELP_PEVAL,
     HELP_PEXEC,
     HELP_SET_VAR,
@@ -313,7 +377,7 @@ HELP_ENTRIES: List[str] = [
 # ── Regex used to detect a pipeline expression ────────────────────────────────
 _DOT_CMD_RE = re.compile(r'^\s*\.([a-zA-Z_][a-zA-Z_0-9]*)', re.IGNORECASE)
 _PIPELINE_CMD_RE = re.compile(
-    r'^\s*\.(run|rfilter|rget|for_run|peval|pexec|set_var|vars|get_var|void)\b', re.IGNORECASE
+    r'^\s*\.(run|rfilter|rget|for_run|for|nofor|sleep|peval|pexec|set_var|vars|get_var|void)\b', re.IGNORECASE
 )
 _ANY_DOT_CMD_RE = re.compile(r'^\s*\.[a-zA-Z_]', re.IGNORECASE)
 
@@ -642,6 +706,10 @@ def is_pipeline(sql: str) -> bool:
 
 # ── Pipeline executor ─────────────────────────────────────────────────────────
 
+class _PipelineBreak(Exception):
+    """Raised by the ``br()`` helper to break out of the current ``.FOR`` loop."""
+
+
 class PipelineExecutor:
     """Executes a pipeline expression against a database client.
 
@@ -657,6 +725,8 @@ class PipelineExecutor:
     def __init__(self, dbeditor: 'DbEditor') -> None:
         self.dbeditor = dbeditor
         self.client = dbeditor.client
+        # Stack of raw loop items pushed by nested .FOR loops (innermost last).
+        self._loop_stack: List[Any] = []
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -665,14 +735,118 @@ class PipelineExecutor:
         # Import here to avoid circular imports at module level
         from .clients.base import Result  # noqa: PLC0415
 
-        steps = parse_pipeline(sql)
-        data: Optional[List[dict]] = None
+        self._loop_stack = []
+        self.dbeditor.reset_pipeline_info()
 
-        for step in steps:
-            data = await self._execute_step(step, data)
+        steps = parse_pipeline(sql)
+        data = await self._execute_steps(steps, None)
 
         rows = data or []
         return Result(data=rows, rowcount=len(rows))
+
+    # ── Step-list execution (handles .FOR / .NOFOR blocks) ──────────────────────
+
+    async def _execute_steps(
+        self, steps: List[PipelineStep], data: Optional[List[dict]]
+    ) -> Optional[List[dict]]:
+        """Run a list of steps sequentially, expanding ``.FOR`` blocks."""
+        i = 0
+        n = len(steps)
+        while i < n:
+            step = steps[i]
+            if step.command == 'for':
+                body, after = self._extract_for_body(steps, i)
+                data = await self._run_for(step, body, data)
+                i = after
+            elif step.command == 'nofor':
+                # Standalone marker — ends a loop scope, otherwise a no-op.
+                i += 1
+            else:
+                data = await self._execute_step(step, data)
+                i += 1
+        return data
+
+    @staticmethod
+    def _extract_for_body(
+        steps: List[PipelineStep], for_idx: int
+    ) -> 'tuple[List[PipelineStep], int]':
+        """Return ``(body, after)`` for the ``.FOR`` at *for_idx*.
+
+        *body* is the steps between the ``.FOR`` and its matching ``.NOFOR``
+        (handling nested ``.FOR``/``.NOFOR`` pairs).  *after* is the index of the
+        step following the matching ``.NOFOR`` (or ``len(steps)`` if the loop runs
+        to the end of the pipeline).
+        """
+        depth = 1
+        j = for_idx + 1
+        n = len(steps)
+        while j < n:
+            cmd = steps[j].command
+            if cmd == 'for':
+                depth += 1
+            elif cmd == 'nofor':
+                depth -= 1
+                if depth == 0:
+                    return steps[for_idx + 1:j], j + 1
+            j += 1
+        return steps[for_idx + 1:], n
+
+    async def _run_for(
+        self, for_step: PipelineStep, body: List[PipelineStep], data: Optional[List[dict]]
+    ) -> List[dict]:
+        if not for_step.args:
+            raise ValueError('.FOR requires a Python code argument')
+        items = self._eval_for_items(for_step.args[0], data)
+
+        accumulated: List[dict] = []
+        for item in items:
+            self._loop_stack.append(item)
+            try:
+                sub = await self._execute_steps(body, None)
+                accumulated.extend(sub or [])
+            except _PipelineBreak:
+                break
+            finally:
+                self._loop_stack.pop()
+            # Yield control so Esc cancellation can be delivered.
+            await asyncio.sleep(0)
+        return accumulated
+
+    def _eval_for_items(self, code: str, data: Optional[List[dict]]) -> List[Any]:
+        """Evaluate the ``.FOR`` expression and coerce it to a list of items."""
+        value = self._eval_user_code(code, data)
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes, dict)):
+            return [value]
+        try:
+            return list(value)
+        except TypeError:
+            return [value]
+
+    def _loop_vars(self) -> dict:
+        """Expose the current ``.FOR`` item as ``_i`` (innermost loop wins), or an
+        empty dict outside any loop."""
+        if not self._loop_stack:
+            return {}
+        return {'_i': self._loop_stack[-1]}
+
+    def _row_vars(self, row: Optional[dict], data: Optional[list]) -> dict:
+        """Build the ``_0``/``_1``/named-column overlay for the *current row*.
+
+        When *row* is omitted (``.RUN`` / ``.PEVAL`` / ``.PEXEC`` / ``.SLEEP`` / the
+        ``.FOR`` expression), the first row of the previous step's *data* is used, so
+        ``_0`` and named columns always refer to the previous step's result.
+        """
+        if row is None and data:
+            row = data[0]
+        if not row:
+            return {}
+        values = list(row.values())
+        positional = {f'_{i}': v for i, v in enumerate(values)}
+        named = {k: v for k, v in row.items()
+                 if isinstance(k, str) and k.isidentifier()}
+        return {**positional, **named}
 
     # ── Step dispatcher ───────────────────────────────────────────────────────
 
@@ -700,16 +874,12 @@ class PipelineExecutor:
     # ── Template helpers (methods so they can access self.dbeditor.vars) ─────────
 
     def _render_template(self, template: str, row: dict = None, data: Optional[list] = None) -> str:
-        row = row or {}
-        values = list(row.values())
-        positional = {f'_{i}': v for i, v in enumerate(values)}
-        named = {k: v for k, v in row.items()
-                 if isinstance(k, str) and k.isidentifier()}
+        effective_row = row if row is not None else ((data[0] if data else {}) or {})
         context: dict = {
-            **positional,
-            **named,
+            **self._row_vars(row, data),     # _0/_1/named from current row (or data[0])
+            **self._loop_vars(),             # _i — current .FOR item
             **DEFAULT_CONTEXT,
-            'row': row,
+            'row': effective_row,
             'data': data if data is not None else [],
             'sql_in_list': sql_in_list,
             '_vars': self.dbeditor.vars,
@@ -794,12 +964,36 @@ class PipelineExecutor:
             await asyncio.sleep(0)
         return result
 
+    async def _cmd_sleep(
+        self, args: List[str], data: Optional[List[dict]]
+    ) -> List[dict]:
+        if not args:
+            raise ValueError('.SLEEP requires a seconds argument')
+        seconds = self._eval_user_code(args[0], data)
+        await asyncio.sleep(float(seconds))
+        return list(data or [])
+
+    def _info(self, msg: Any) -> None:
+        """Show *msg* in the info popup (overlaying the running popup) without
+        halting pipeline execution.  Exposed as ``info()`` to user Python code."""
+        self.dbeditor.show_pipeline_info(str(msg))
+
+    @staticmethod
+    def _br() -> None:
+        """Break out of the current ``.FOR`` loop.  Exposed as ``br()``."""
+        raise _PipelineBreak()
+
     def _python_context(self, data: Optional[List[dict]], extra: Optional[dict] = None) -> dict:
-        """Build the global namespace shared by .PEVAL / .PEXEC / .SET_VAR."""
+        """Build the global namespace shared by .PEVAL / .PEXEC / .SET_VAR / .SLEEP
+        and the .FOR expression."""
         context: dict = {
+            **self._row_vars(None, data),     # _0/_1/named from previous step's data[0]
+            **self._loop_vars(),              # _i — current .FOR item
+            **DEFAULT_CONTEXT,
             'data': list(data or []),
             '_vars': self.dbeditor.vars,
-            **DEFAULT_CONTEXT,
+            'info': self._info,
+            'br': self._br,
         }
         if extra:
             context.update(extra)

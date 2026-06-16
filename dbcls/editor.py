@@ -2305,6 +2305,9 @@ class Editor:
         self.popup = SelectPopup()
         self.running_popup = RunningPopup()
         self.info_popup = InfoPopup()
+        # Live-pipeline info popup state (driven by the pipeline `info()` helper).
+        self._pipeline_info_live = False
+        self._pipeline_info_dismissed = False
         self.renderer = Renderer(stdscr, self.colors, self.buf, self.lexer)
         self.running = True
         self._debug_mode = False
@@ -2424,6 +2427,27 @@ class Editor:
         task finishes or is cancelled, from within the main editor loop."""
         self._running_done_cb = on_done
         self.running_popup.open(task, start)
+
+    # ── Live pipeline info popup (driven from the pipeline `info()` helper) ──────
+
+    def reset_pipeline_info(self) -> None:
+        """Reset live-info state at the start of a pipeline run."""
+        self._pipeline_info_live = False
+        self._pipeline_info_dismissed = False
+
+    def show_pipeline_info(self, text: str) -> None:
+        """Show/refresh the info popup over the running overlay without halting
+        execution. No-op once the user has dismissed it for this run."""
+        if self._pipeline_info_dismissed:
+            return
+        self.info_popup.open('Info', {'main': text})
+        self._pipeline_info_live = True
+
+    def clear_pipeline_info(self) -> None:
+        """Close a still-open live info popup once the pipeline run has finished."""
+        if self._pipeline_info_live:
+            self.info_popup.close()
+            self._pipeline_info_live = False
 
     def show_autocomplete(self, items: 'List[PopupItem]') -> None:
         """Open autocomplete popup with a list of PopupItem objects."""
@@ -2695,15 +2719,21 @@ class Editor:
             self._debug_mode = not self._debug_mode
             self.renderer.debug_text = 'DEBUG ON — press keys to see codes' if self._debug_mode else ''
             return
-        # Running popup mode — only ESC passes through, all other keys are swallowed
-        if self.running_popup.active:
-            self.running_popup.handle_key(key)
-            return
-
-        # Info popup mode
+        # Info popup mode — checked before the running popup so that a live
+        # pipeline info() popup can be dismissed without cancelling the task.
         if self.info_popup.active:
             if self.info_popup.handle_key(key) == 'close':
                 self.info_popup.close()
+                if self._pipeline_info_live:
+                    # User hid a live info popup: keep it hidden for the rest of
+                    # the run and reveal the running overlay again.
+                    self._pipeline_info_dismissed = True
+                    self._pipeline_info_live = False
+            return
+
+        # Running popup mode — only ESC passes through, all other keys are swallowed
+        if self.running_popup.active:
+            self.running_popup.handle_key(key)
             return
 
         # Popup mode
