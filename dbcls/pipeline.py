@@ -707,7 +707,16 @@ def is_pipeline(sql: str) -> bool:
 # ── Pipeline executor ─────────────────────────────────────────────────────────
 
 class _PipelineBreak(Exception):
-    """Raised by the ``br()`` helper to break out of the current ``.FOR`` loop."""
+    """Raised by the ``br()`` helper to break out of the current ``.FOR`` loop.
+
+    ``data`` carries the breaking iteration's output (e.g. the value passed to
+    ``result()`` before ``br()``); the ``.FOR`` handler returns it as the loop's
+    result, replacing the rows accumulated from earlier iterations.
+    """
+
+    def __init__(self, data: Optional[List[dict]] = None) -> None:
+        super().__init__()
+        self.data = data
 
 
 class PipelineExecutor:
@@ -804,8 +813,10 @@ class PipelineExecutor:
             try:
                 sub = await self._execute_steps(body, None)
                 accumulated.extend(sub or [])
-            except _PipelineBreak:
-                break
+            except _PipelineBreak as brk:
+                # br() stops the loop; the breaking iteration's data becomes the
+                # loop result (replacing earlier iterations).
+                return list(brk.data or [])
             finally:
                 self._loop_stack.pop()
             # Yield control so Esc cancellation can be delivered.
@@ -1004,11 +1015,20 @@ class PipelineExecutor:
         reading `result` (or the modified `data`) for statement bodies."""
         context = self._python_context(data)
         try:
-            # Try as a bare expression first (e.g. a list literal)
-            return eval(code, context)  # noqa: S307 — intentional scripting feature
-        except SyntaxError:
-            exec(code, context)  # noqa: S102 — intentional scripting feature
-            return context.get('result', context.get('data', []))
+            try:
+                # Try as a bare expression first (e.g. a list literal)
+                return eval(code, context)  # noqa: S307 — intentional scripting feature
+            except SyntaxError:
+                exec(code, context)  # noqa: S102 — intentional scripting feature
+                return context.get('result', context.get('data', []))
+        except _PipelineBreak as brk:
+            # br() inside the code: carry whatever the code produced so the .FOR
+            # loop returns it (see _PipelineBreak / _run_for).
+            if brk.data is None:
+                brk.data = normalize_to_dicts(
+                    context.get('result', context.get('data', []))
+                )
+            raise
 
     async def _cmd_peval(
         self, args: List[str], data: Optional[List[dict]]
@@ -1030,7 +1050,14 @@ class PipelineExecutor:
             _called.append(val)
 
         context = self._python_context(data_list, {'result': result})
-        exec(args[0], context)  # noqa: S102 — intentional scripting feature
+        try:
+            exec(args[0], context)  # noqa: S102 — intentional scripting feature
+        except _PipelineBreak as brk:
+            # Preserve any result()/passthrough produced before br() so the loop
+            # returns it instead of the previous step's data.
+            out = _called[0] if _called else data_list
+            brk.data = normalize_to_dicts(out)
+            raise
 
         out = _called[0] if _called else data_list
         return normalize_to_dicts(out)
