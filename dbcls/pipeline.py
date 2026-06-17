@@ -224,11 +224,18 @@ info popup (Esc) to reveal the running overlay again. `_i` is the `.FOR`
 loop counter; `_0` / named columns are the previous step's result.
 
 `br()` breaks out of the current `.FOR` loop and continues with the steps
-after it.
+after it. The breaking iteration's data (e.g. a `result(...)` set just before
+`br()`) becomes the loop's result, replacing the rows accumulated from earlier
+iterations.
 
-Example:
+Example (stop polling and return `['found']` as soon as a long query appears):
 ```
-.FOR "range(10)" | .RUN "SELECT COUNT(1) AS AA FROM t" | .PEXEC \"\"\"info(_0)\"\"\"
+.FOR "range(60)" | .SLEEP "1" | .RUN "SELECT max(TIME) AS mtime FROM ..." | .PEXEC \"\"\"
+info(mtime)
+if mtime > 1:
+    result(['found'])
+    br()
+\"\"\"
 ```
 """
 
