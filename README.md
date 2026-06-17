@@ -297,15 +297,46 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | Command | Description |
 |---------|-------------|
 | `.RUN "SQL"` | Execute SQL. If input data exists, `{{expr}}` placeholders in the SQL are evaluated as Python expressions (`data` and `sql_in_list` are in scope). |
+| `.URUN "SQL"` | UNION RUN: like `.RUN`, but **appends** the query's rows to the input data instead of replacing them (result = input + new rows). With no input it behaves like `.RUN`. |
 | `.RFILTER "{{tmpl}}" "regex"` | Keep rows where the rendered template matches the regex. Returns the original rows unchanged. |
 | `.RGET "{{tmpl}}" "regex"` | Extract regex capture groups from the template. Returns one dict per matching row, keyed `"0"`, `"1"`, … |
 | `.FOR_RUN "SQL {{col}}"` | Execute SQL once per input row, substituting `{{column}}` placeholders. All result sets are merged. |
-| `.PEVAL "python_code"` | Evaluate Python. `data` holds the previous result (list of dicts). A bare expression (e.g. a list literal) is used directly; for statement bodies assign to `result` or modify `data` in place to pass output forward. |
-| `.PEXEC "python_code"` | Execute a Python statement block. Call `result(val)` to pass output to the next step. `data` and `_vars` are in scope. If `result()` is never called, `data` passes through unchanged. Unlike `.PEVAL`, bare expressions are not supported. |
+| `.FOR "code" … .NOFOR` | Run the following steps once per item of the iterable produced by `code`; the item is exposed as `{{_i}}` / `_i`. See [Control flow](#control-flow). |
+| `.SLEEP "code"` | Evaluate `code` to a number of seconds, pause, then pass the input data through unchanged. Useful inside `.FOR` to pace work. |
+| `.PY "python_code"` | Execute Python. `data` (list of dicts), `_vars` and `_i` are in scope. Output is, in priority: the last `result(val)` call; else a single expression's value (e.g. a list literal); else `data` passes through unchanged. |
 | `.SET_VAR KEY [code]` | Store data (or the result of `code`) into a named variable. Data passes through unchanged, so `.SET_VAR` can appear mid-pipeline. |
-| `.GET_VAR KEY` | Inject a stored variable into the pipeline. If input data exists, the variable's rows are appended after it. |
+| `.GET_VAR KEY` | Inject a stored variable into the pipeline. If input data exists, the variable's rows are appended after it. A missing `KEY` contributes nothing (no error). |
 | `.VOID` | Discard input data. The next step starts fresh with no data (as if it were the first step). |
 | `.VARS` | Show all stored pipeline variables as a `key` / `value` list. |
+| `.SHEET NAME` | Open the input rows as a VisiData sheet named `NAME` (a template), then pass the data through unchanged. |
+
+### Comments
+
+`#` or `-- ` (two dashes followed by a space) start a comment that runs to the end of the line. Comments are recognised only **outside** quoted strings, so a `#`/`--` inside the SQL of a `.RUN "…"` is left untouched. A `|` hidden behind a trailing comment still continues the pipeline onto the next line.
+
+```sql
+.RUN "SELECT 1"   -- first step
+  | .URUN "SELECT 2"   # add another row
+```
+
+### Control flow
+
+`.FOR "code"` evaluates `code` to an iterable and runs every following step once per item, exposing the current item as `{{_i}}` (templates) and `_i` (Python). `.NOFOR` closes the loop; nested `.FOR` loops are supported (innermost `_i` wins).
+
+- **With `.NOFOR`** — the loop's accumulated rows are *discarded* at the boundary, so steps after it start fresh (no input), and a pipeline ending in `.NOFOR` yields an empty result.
+- **Without `.NOFOR`** — the loop runs to the end of the pipeline and its merged rows become the result.
+
+To carry loop rows forward past a `.NOFOR`, stash them with `.SET_VAR` inside the loop.
+
+### Helpers in Python steps
+
+Available inside any Python-executing step (`.PY`, `.SLEEP`, `.SET_VAR`, the `.FOR` expression):
+
+| Helper | Effect |
+|--------|--------|
+| `info(msg)` | Show `msg` in a popup without halting execution; calling it again updates the text. The popup stays until you dismiss it (Esc), including after the pipeline finishes. |
+| `br()` | Break out of the current `.FOR` loop. A `result(...)` set just before `br()` becomes the loop's result. |
+| `stop()` | Abort the entire pipeline. The current step's data (a `result(...)` set before `stop()`, else the data flowing in) becomes the final result. |
 
 ### Template Placeholders
 
@@ -314,13 +345,14 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | `{{_0}}` | Value of the first column of the current row |
 | `{{_1}}` | Value of the second column |
 | `{{column_name}}` | Value of the column named `column_name` |
+| `{{_i}}` | Current `.FOR` loop item |
 | `{{row['any-name']}}` | Full row dict access — use for names with spaces or hyphens |
 | `{{price:.2f}}` | Python format spec support |
 | `{{_vars['key']}}` | Value of a pipeline variable stored by `.SET_VAR` |
 
 ### Helper Function
 
-`sql_in_list(data)` — converts a list of scalars or list-of-dicts to a SQL `IN`-clause string, e.g. `('val1','val2')`. Available inside `.RUN` and `.PEVAL` templates.
+`sql_in_list(data)` — converts a list of scalars or list-of-dicts to a SQL `IN`-clause string, e.g. `('val1','val2')`. Available inside `.RUN` and `.PY` templates.
 
 ### Examples
 
@@ -347,7 +379,13 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 **Post-process results with Python:**
 ```sql
 .RUN "SELECT name, score FROM results"
-  | .PEVAL "sorted(data, key=lambda r: r['score'], reverse=True)[:10]"
+  | .PY "sorted(data, key=lambda r: r['score'], reverse=True)[:10]"
+```
+
+**Append rows from another query (UNION):**
+```sql
+.RUN "SELECT id, 'a' AS src FROM table_a"
+  | .URUN "SELECT id, 'b' AS src FROM table_b"
 ```
 
 **Extract capture groups from a column:**
@@ -371,6 +409,24 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 **Merge results from two sources:**
 ```sql
 .RUN "SELECT id FROM table_a" | .SET_VAR a_ids | .RUN "SELECT id FROM table_b" | .GET_VAR a_ids
+```
+
+**Run a query per item with `.FOR`:**
+```sql
+.FOR "range(1, 4)" | .RUN "SELECT * FROM shard_{{_i}}.events LIMIT 5"
+```
+
+**Poll until a condition, showing progress, then stop:**
+```sql
+.FOR "range(60)"
+  | .SLEEP "1"
+  | .RUN "SELECT max(updated_at) AS mtime FROM jobs"
+  | .PY """
+info(f'waiting… {mtime}')
+if mtime is not None:
+    result(['done'])
+    stop()
+"""
 ```
 
 ## Supported Database Engines

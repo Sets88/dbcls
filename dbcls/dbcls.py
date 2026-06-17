@@ -25,7 +25,9 @@ from .clients.base import ClientClass
 from .autocomplete import AutoComplete
 from .editor import Editor, K, key_alt, PopupItem, draw_box
 from .pipeline import is_pipeline
+from .pipeline import scan_line_code_and_triple
 from .pipeline import PipelineExecutor
+from .pipeline import PipelineStepError
 from .pipeline import HELP_ENTRIES
 
 
@@ -139,66 +141,66 @@ def print_center(window: curses.window, text: str):
     window.refresh()
 
 
-def _find_triple_quote_block(lines, row):
-    """Return (start_row, end_row) if `row` is inside a triple-quoted string
-    that opens on a dot-command line (e.g. .PEXEC \"\"\"...\"\"\"), else None."""
-    def block(start: int, end: int):
-        # Only blocks opened by a dot-command line count; a row can sit in at
-        # most one block, so the caller stops searching on the first hit.
-        opener = lines[start].strip()
-        if opener.startswith('.') and not opener.startswith('-- '):
-            return (start, end)
-        return None
-
-    open_line = None  # line of the current unmatched opening delimiter, or None
-    for i, line in enumerate(lines):
-        for _ in range(line.count('"""')):
-            if open_line is None:
-                open_line = i
-            else:
-                if open_line <= row <= i:
-                    return block(open_line, i)
-                open_line = None
-
-    # An unterminated block runs to the end of the buffer.
-    if open_line is not None and open_line <= row:
-        return block(open_line, len(lines) - 1)
-    return None
+def _is_separator(line: str) -> bool:
+    """A line that separates statements: blank, a lone ``;``, or a ``#`` comment.
+    (Only counts outside of an open triple-quoted string — the caller checks that.)"""
+    s = line.strip()
+    return not s or s == ';' or s.startswith('#')
 
 
 def get_sql_rows(buf) -> list:
-    """Return sorted list of row indices that form the SQL statement under the cursor."""
+    """Return the sorted, contiguous row indices forming the statement under the cursor.
+
+    The buffer is partitioned into statements top-down in a single pass, so a
+    statement is selected as a whole regardless of where the cursor sits in it.
+    Statement boundaries respect:
+
+    * triple-quoted strings (``\"\"\"…\"\"\"`` / ``'''…'''``) — separator-looking
+      lines and ``|`` inside them never split a statement (tracked via the shared
+      :func:`scan_line_code_and_triple`, so a pipeline may contain several triple
+      blocks, e.g. ``.PY \"\"\"…\"\"\" | .RUN \"\"\"…\"\"\"``);
+    * comments — a ``#`` or ``-- `` comment is stripped from each line's code
+      before boundaries are decided, so a ``|`` hidden behind a trailing comment
+      still continues the pipeline onto the next line;
+    * a trailing ``|`` — a line whose code ends with ``|`` continues onto the
+      next line (multi-line pipelines);
+    * dot-commands — a ``.CMD`` statement is single-line unless extended by the
+      two rules above;
+    * plain SQL — runs until a line ending in ``;`` or a separator/end of buffer.
+
+    Returns ``[]`` when the cursor is on a separator line between statements."""
     lines = buf.lines
     row = buf.cursor_row
-    stripped = lines[row].strip()
-
-    block = _find_triple_quote_block(lines, row)
-    if block is not None:
-        return list(range(block[0], block[1] + 1))
-
-    # Cursor is on a blank/separator/comment line — nothing to highlight
-    if not stripped or stripped == ';' or stripped.startswith('#'):
-        return []
-
-    # dot-command — single line only
-    if stripped.startswith('.') and not stripped.startswith('-- '):
-        return [row]
-
-    def is_separator(i):
-        s = lines[i].strip()
-        return not s or s == ';' or s.startswith('#')
-
-    start = row
-    while start > 0 and not is_separator(start - 1) and not lines[start - 1].rstrip().endswith(';'):
-        start -= 1
-
-    end = row
-    while end < len(lines) - 1 and not is_separator(end + 1):
-        if lines[end].rstrip().endswith(';'):
-            break
-        end += 1
-
-    return list(range(start, end + 1))
+    n = len(lines)
+    active = None  # open triple-quote delimiter, or None
+    i = 0
+    while i < n:
+        if active is None and _is_separator(lines[i]):
+            i += 1
+            continue
+        start = i
+        dot_kind = lines[i].strip().startswith('.')
+        end = start
+        while i < n:
+            code, active = scan_line_code_and_triple(lines[i], active)
+            end = i
+            if active is not None:
+                # Still inside an open triple string — next line continues it.
+                i += 1
+                continue
+            code = code.rstrip()
+            if code.endswith('|'):
+                # Explicit pipeline continuation onto the next line.
+                i += 1
+                continue
+            if dot_kind or code.endswith(';') \
+                    or i + 1 >= n or _is_separator(lines[i + 1]):
+                i += 1
+                break
+            i += 1
+        if start <= row <= end:
+            return list(range(start, end + 1))
+    return []
 
 
 def get_expression_under_cursor(buf) -> str:
@@ -485,6 +487,9 @@ class DbEditor(Editor):
         self.asyncloop_thread = AsyncLoopThread(daemon=True)
         self.asyncloop_thread.start()
         self.vars = {}
+        # (name, rows) sheets requested by the pipeline's .SHEET command during the
+        # current run; built into VisiData sheets in _db_query's on_done.
+        self._pipeline_sheets = []
         if remap_config:
             self.apply_keys_remap(remap_config)
 
@@ -638,30 +643,40 @@ class DbEditor(Editor):
 
             return Result(all_data, len(all_data), has_more=False)
 
+        self._pipeline_sheets = []
         task = self.asyncloop_thread.submit(fetch_all())
 
         def on_done():
             end = time.time()
             message = ''
             vd_launched = False
-            # Close any still-open live pipeline info() popup before showing
-            # results or an error (which reuses the same info popup).
-            self.clear_pipeline_info()
+            # A live pipeline info() popup is intentionally left open after the
+            # run finishes — it stays until the user dismisses it (Esc/any key).
+            # The error branch below reuses the same popup via info_popup.open().
             try:
                 if self.running_popup.cancelled:
                     message = 'Cancelled'
                     return
                 result = task.result()
                 message = str(result)
-                if not result or not result.data:
-                    return
-                self._fix_visidata_curses()
-                vd_launched = True
-                visidata.vd.view(result.data)
+                if self._pipeline_sheets:
+                    # .SHEET was used: open each requested sheet (named), plus the
+                    # pipeline's final result on top, then hand control to VisiData.
+                    self._fix_visidata_curses()
+                    vd_launched = True
+                    for name, rows in self._pipeline_sheets:
+                        visidata.vd.push(visidata.PyobjSheet(name, source=rows))
+                    if result and result.data:
+                        visidata.vd.push(visidata.PyobjSheet('result', source=result.data))
+                    visidata.vd.run(visidata.vd.sheets[0])
+                elif result and result.data:
+                    self._fix_visidata_curses()
+                    vd_launched = True
+                    visidata.vd.view(result.data)
             except (asyncio.CancelledError, asyncio.InvalidStateError):
                 message = 'Cancelled'
             except Exception as exc:
-                if self.client.is_db_error_exception(exc):
+                if isinstance(exc, PipelineStepError) or self.client.is_db_error_exception(exc):
                     message = str(exc)
                 else:
                     message = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -718,6 +733,12 @@ class DbEditor(Editor):
             self.info_popup.open('Error', {'main': str(exc)})
         finally:
             self._fix_curses_after_visidata()
+
+    def add_pipeline_sheet(self, name, rows) -> None:
+        """Pipeline host hook for the .SHEET command: remember a named result set.
+        The actual VisiData sheet is built later, on the UI thread (see _db_query's
+        on_done), since the pipeline runs on the async loop thread."""
+        self._pipeline_sheets.append((name, list(rows)))
 
     def _db_show_vd_sheets(self):
         sheets = self.get_sheets()

@@ -2437,17 +2437,15 @@ class Editor:
 
     def show_pipeline_info(self, text: str) -> None:
         """Show/refresh the info popup over the running overlay without halting
-        execution. No-op once the user has dismissed it for this run."""
+        execution. No-op once the user has dismissed it for this run.
+
+        The popup is *not* closed automatically when the pipeline finishes — it
+        stays open until the user dismisses it (Esc/any key, handled where the
+        info popup intercepts input)."""
         if self._pipeline_info_dismissed:
             return
         self.info_popup.open('Info', {'main': text})
         self._pipeline_info_live = True
-
-    def clear_pipeline_info(self) -> None:
-        """Close a still-open live info popup once the pipeline run has finished."""
-        if self._pipeline_info_live:
-            self.info_popup.close()
-            self._pipeline_info_live = False
 
     def show_autocomplete(self, items: 'List[PopupItem]') -> None:
         """Open autocomplete popup with a list of PopupItem objects."""
