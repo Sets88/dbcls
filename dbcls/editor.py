@@ -1555,11 +1555,22 @@ def _render_markup_line(
     link_idx_start: int,
     link_sel: int,
     H: int, W: int,
+    highlights: Optional[List[Tuple[int, int, bool]]] = None,
+    match_attr: int = 0,
+    match_cur_attr: int = 0,
 ) -> int:
     """Render one *normal* line with inline `` `code` `` and ``-->>link<<--`` spans.
 
     Returns *link_idx_start* + number of link spans found on this line, so the
     caller can track the global link index across all lines.
+
+    *highlights* is an optional list of ``(col_start, col_end, is_current)``
+    ranges in *display* coordinates (markup stripped, i.e. the same coordinates
+    the search matcher uses).  Characters in those ranges are overlaid with
+    *match_attr* (or *match_cur_attr* for the current match) so search hits are
+    visible.  Display column 0 corresponds to *rx_start*, and the stripped
+    content emitted here is exactly what the matcher searched, so the mapping is
+    one-to-one.
     """
     if ry < 0 or ry >= H:
         return link_idx_start
@@ -1589,6 +1600,17 @@ def _render_markup_line(
                 stdscr.addstr(ry, x, clip, attr)
             except curses.error:
                 pass
+            # Overlay search highlights that fall within this span.
+            if highlights:
+                d0 = x - rx_start
+                for c0, c1, is_cur in highlights:
+                    s, e = max(c0, d0), min(c1, d0 + len(clip))
+                    if s < e and 0 <= rx_start + s < W:
+                        try:
+                            stdscr.addstr(ry, rx_start + s, content[s - d0:e - d0],
+                                          match_cur_attr if is_cur else match_attr)
+                        except curses.error:
+                            pass
         x += len(content)
     # Pad the rest of the row with the base colour.
     if x < max_x and 0 <= x < W:
@@ -1634,6 +1656,12 @@ class InfoPopup:
         self._inner_w: int = 0
         self._scroll:  int = 0
         self._visible: int = 1
+        # less-like regex search over the current page's rendered text.
+        self._search_input: bool = False               # typing the /query
+        self._search_query: str = ''
+        self._search_re = None                          # compiled re.Pattern or None
+        self._search_matches: List[Tuple[int, int, int]] = []   # (line, col0, col1)
+        self._search_idx: int = 0
 
     # ── open / close ─────────────────────────────────────────────────────────
 
@@ -1645,6 +1673,7 @@ class InfoPopup:
         self._scroll   = 0
         self._lines    = []
         self._inner_w  = 0
+        self._reset_search()
         self._rebuild_links()
 
     def close(self) -> None:
@@ -1652,6 +1681,7 @@ class InfoPopup:
         self._pages   = {}
         self._history = []
         self._lines   = []
+        self._reset_search()
 
     # ── internal helpers ─────────────────────────────────────────────────────
 
@@ -1672,6 +1702,7 @@ class InfoPopup:
             self._scroll   = 0
             self._lines    = []
             self._inner_w  = 0
+            self._reset_search()
             self._rebuild_links()
 
     def _go_back(self) -> Optional[str]:
@@ -1681,9 +1712,96 @@ class InfoPopup:
             self._scroll  = 0
             self._lines   = []
             self._inner_w = 0
+            self._reset_search()
             self._rebuild_links()
             return None
         return 'close'
+
+    # ── search (less-like /, n, N) ───────────────────────────────────────────
+
+    def _reset_search(self) -> None:
+        self._search_input   = False
+        self._search_query   = ''
+        self._search_re      = None
+        self._search_matches = []
+        self._search_idx     = 0
+
+    @staticmethod
+    def _display_text(line: Tuple[str, str]) -> str:
+        """Plain on-screen text for a parsed ``_lines`` entry (markup stripped),
+        so search positions line up with what :meth:`draw` renders."""
+        line_type, text = line
+        if line_type == 'code':
+            return text
+        # Normal line: drop the inline-markup delimiters, keep the content —
+        # mirrors how _render_markup_line emits each part.
+        out: List[str] = []
+        for part in _INLINE_SPLIT_RE.split(text):
+            if not part:
+                continue
+            if part.startswith('-->>') and part.endswith('<<--'):
+                out.append(part[4:-4])
+            elif part.startswith('`') and part.endswith('`') and len(part) > 2:
+                out.append(part[1:-1])
+            else:
+                out.append(part)
+        return ''.join(out)
+
+    def _compile_search(self) -> None:
+        """(Re)compile the query; an empty or invalid pattern yields no matches."""
+        if not self._search_query:
+            self._search_re = None
+        else:
+            try:
+                self._search_re = re.compile(self._search_query, re.IGNORECASE)
+            except re.error:
+                self._search_re = None
+        self._recompute_matches()
+
+    def _recompute_matches(self) -> None:
+        """Find every match on the current page (display coordinates)."""
+        self._search_matches = []
+        if self._search_re is None:
+            self._search_idx = 0
+            return
+        for idx, line in enumerate(self._lines):
+            for m in self._search_re.finditer(self._display_text(line)):
+                if m.end() > m.start():        # skip zero-width matches
+                    self._search_matches.append((idx, m.start(), m.end()))
+        if self._search_idx >= len(self._search_matches):
+            self._search_idx = 0
+
+    def _line_matches(self, idx: int) -> List[Tuple[int, int]]:
+        """Display-column ranges to highlight on line *idx*."""
+        return [(c0, c1) for (ln, c0, c1) in self._search_matches if ln == idx]
+
+    def _jump_to_first_visible_match(self) -> None:
+        """After confirming a query, select the first match at/after the current
+        scroll position (else the first match) and scroll it into view."""
+        if not self._search_matches:
+            return
+        self._search_idx = next(
+            (i for i, (ln, _c0, _c1) in enumerate(self._search_matches)
+             if ln >= self._scroll),
+            0,
+        )
+        self._scroll_to_match()
+
+    def _next_match(self, step: int) -> None:
+        if not self._search_matches:
+            return
+        self._search_idx = (self._search_idx + step) % len(self._search_matches)
+        self._scroll_to_match()
+
+    def _scroll_to_match(self) -> None:
+        """Scroll so the current match's line sits within the visible window."""
+        if not self._search_matches:
+            return
+        line = self._search_matches[self._search_idx][0]
+        if line < self._scroll:
+            self._scroll = line
+        elif line >= self._scroll + self._visible:
+            self._scroll = max(0, line - self._visible + 1)
 
     # ── scroll helpers ────────────────────────────────────────────────────────
 
@@ -1722,6 +1840,44 @@ class InfoPopup:
                      K(curses.KEY_BACKSPACE), K(ord('\x7f')))
         enter_keys = (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r')),
                       K(curses.KEY_RIGHT))
+
+        # ── Search input mode: the user is typing the /query ─────────────────
+        if self._search_input:
+            if key == K(27):                          # Esc — abandon the search
+                self._reset_search()
+            elif key in (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))):
+                self._search_input = False            # confirm; keep highlights
+                self._jump_to_first_visible_match()
+            elif key in (K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))):
+                self._search_query = self._search_query[:-1]
+                self._compile_search()
+            elif key_flags(key) == 0:
+                base = key_base(key)
+                if base >= 32 and chr(base).isprintable():
+                    self._search_query += chr(base)
+                    self._compile_search()
+            return None                               # never closes while typing
+
+        # ── Start a search (scrollable text pages only; link menus keep ↑↓) ──
+        if key == K(ord('/')) and not has_links:
+            self._search_input   = True
+            self._search_query   = ''
+            self._search_re      = None
+            self._search_matches = []
+            self._search_idx     = 0
+            return None
+
+        # ── Active search: n / N cycle matches, Esc/← clears highlights ──────
+        if self._search_matches:
+            if key == K(ord('n')):
+                self._next_match(1)
+                return None
+            if key == K(ord('N')):
+                self._next_match(-1)
+                return None
+            if key in back_keys:
+                self._reset_search()                  # clear, stay open
+                return None
 
         if key in back_keys:
             return self._go_back()
@@ -1768,6 +1924,8 @@ class InfoPopup:
         if not self._lines or self._inner_w != inner_w:
             self._lines   = _parse_markup_lines(self._current_text(), inner_w)
             self._inner_w = inner_w
+            # Match coordinates depend on wrapping, so refresh them on reparse.
+            self._recompute_matches()
 
         total       = self._total()
         max_visible = max(1, min(H - 4, total))
@@ -1785,6 +1943,16 @@ class InfoPopup:
         inline_ca = curses.color_pair(colors.popup_code_inline) | curses.A_BOLD
         link_a    = curses.color_pair(colors.popup_link)  | curses.A_BOLD
         lsel_a    = curses.color_pair(colors.popup_sel)
+        match_a     = curses.color_pair(colors.popup_match)
+        match_cur_a = curses.color_pair(colors.search_match_current) | curses.A_BOLD
+
+        # Current match line/range (for the brighter "current" highlight).
+        cur_match = (self._search_matches[self._search_idx]
+                     if self._search_matches else None)
+
+        def line_highlights(idx: int) -> List[Tuple[int, int, bool]]:
+            return [(c0, c1, (ln, c0, c1) == cur_match)
+                    for (ln, c0, c1) in self._search_matches if ln == idx]
 
         def ach(y, x, ch, attr=0):
             ry, rx = win_y + y, win_x + x
@@ -1819,13 +1987,13 @@ class InfoPopup:
         if has_links:
             hint = ' ↑↓ select · Enter open · Esc back · any key close '
         elif can_scroll and multi_page:
-            hint = ' ↑↓/PgUp/PgDn scroll · Esc back · any key close '
+            hint = ' ↑↓/PgUp/PgDn scroll · / find · Esc back · any key close '
         elif can_scroll:
-            hint = ' ↑↓/PgUp/PgDn/Home/End scroll · any key close '
+            hint = ' ↑↓/PgUp/PgDn scroll · / find · any key close '
         elif multi_page:
-            hint = ' Esc back · any key close '
+            hint = ' / find · Esc back · any key close '
         else:
-            hint = ' any key to close '
+            hint = ' / find · any key to close '
 
         page_key  = self._current_key()
         page_part = f' — {page_key}' if page_key != 'main' else ''
@@ -1841,9 +2009,15 @@ class InfoPopup:
             row_y = i + 1
             idx   = self._scroll + i
             line_type, text = self._lines[idx] if idx < total else ('normal', '')
+            hls = line_highlights(idx) if idx < total else []
             ach(row_y, 0, curses.ACS_VLINE, ba)
             if line_type == 'code':
                 astr(row_y, 1, text.ljust(inner_w)[:inner_w], ca)
+                # Code display text == raw text, so cols map straight to screen.
+                for c0, c1, is_cur in hls:
+                    if c0 < inner_w:
+                        astr(row_y, 1 + c0, text[c0:min(c1, inner_w)],
+                             match_cur_a if is_cur else match_a)
             else:
                 link_counter = _render_markup_line(
                     stdscr, win_y + row_y, win_x + 1,
@@ -1851,6 +2025,7 @@ class InfoPopup:
                     ia, inline_ca, link_a, lsel_a,
                     link_counter, self._link_sel,
                     H, W,
+                    hls, match_a, match_cur_a,
                 )
             ach(row_y, win_w - 1, curses.ACS_VLINE, ba)
 
@@ -1860,6 +2035,18 @@ class InfoPopup:
         if can_scroll:
             indicator = f' {self._scroll + max_visible}/{total} '
             astr(win_h - 1, win_w - len(indicator) - 1, indicator, ba)
+
+        # Search prompt (while typing) or match indicator (after confirming),
+        # drawn on the bottom border at the left.
+        if self._search_input:
+            prompt = f' /{self._search_query} '[:win_w - 4]
+            astr(win_h - 1, 2, prompt, ba | curses.A_BOLD)
+        elif self._search_re is not None:
+            if self._search_matches:
+                tag = f' {self._search_idx + 1}/{len(self._search_matches)} matches '
+            else:
+                tag = ' no matches '
+            astr(win_h - 1, 2, tag[:win_w - 4], ba | curses.A_BOLD)
 
 
 # ─── Renderer ─────────────────────────────────────────────────────────────────

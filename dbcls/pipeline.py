@@ -49,7 +49,8 @@ Pipeline commands
 
 .SLEEP "python_code"
     Evaluate python_code to a number of seconds, pause, then pass the
-    input data through unchanged.
+    input data through unchanged.  Like every Python-executing step the
+    value may come from a `result(val)` call (e.g. .SLEEP "result(2)").
 
 .PY "python_code"
     Execute arbitrary Python.  `data` (list of dicts from the previous
@@ -59,6 +60,8 @@ Pipeline commands
 
 .SET_VAR KEY [python_code]
     Store the current data (or the result of python_code) into _vars[KEY].
+    python_code follows the usual rules: a single expression's value, or the
+    last `result(val)` call (e.g. .SET_VAR k "result(5)").
     Data passes through unchanged so .SET_VAR can appear mid-pipeline.
     If python_code is omitted and there is no input data, deletes the key.
 
@@ -96,9 +99,16 @@ sql_in_list(data)
 Helpers available inside Python-executing steps (.PY / .SLEEP / .SET_VAR /
 the .FOR expression)
 -------------------------------------------------
+result(val) set the step's output value (the last call wins).  Lets a
+            multi-statement snippet return a value, e.g.
+            .SLEEP "from random import randint; result(randint(1, 10))".
 info(msg)   show msg in a popup without halting; stays until dismissed.
 br()        break out of the current .FOR loop.
 stop()      abort the entire pipeline (current step's data is the result).
+set_var(name, value)
+            store value in the shared VARS under name (same store as .SET_VAR).
+get_var(name, default=None)
+            return the VARS value for name (default if absent).
 """
 
 import time
@@ -249,7 +259,8 @@ item, until a `.NOFOR` (or the end of the pipeline). The current item is
 exposed as `{{_i}}` in templates and as `_i` in Python code (innermost
 loop wins when `.FOR` is nested). `{{_0}}` / `_0` and named columns still
 refer to the previous step's result. Results from each iteration are merged
-into one flat list.
+into one flat list. PYTHON_CODE follows the usual rules: a single expression's
+value, or the last `result(val)` call (the value must be iterable).
 
 Example:
 ```
@@ -274,7 +285,9 @@ Example:
 HELP_SLEEP = _help_entry('sleep', """
 Evaluate PYTHON_CODE to a number of seconds and pause for that long, then
 pass the input data through unchanged. Useful inside `.FOR` to pace work
-(`_i` is the loop counter).
+(`_i` is the loop counter). PYTHON_CODE follows the usual rules: a single
+expression's value, or the last `result(val)` call — so multi-statement
+snippets work too (e.g. `result(randint(1, 10))`).
 
 Example:
 ```
@@ -283,9 +296,13 @@ Example:
 """)
 
 HELP_INFO_BR = """
-`info(msg)`, `br()` and `stop()`
+`result(val)`, `info(msg)`, `br()` and `stop()`
 Available inside any Python-executing step (`.PY`, `.SLEEP`,
 `.SET_VAR`, the `.FOR` expression).
+
+`result(val)` sets the step's output value (the last call wins). It is what
+lets a multi-statement snippet return a value — handy when the code is more
+than a single expression, e.g. `.SLEEP "from random import randint; result(randint(1, 10))"`.
 
 `info(msg)` shows `msg` in a popup over the running overlay without
 stopping execution; calling it again updates the text. Dismiss it like any
@@ -341,8 +358,9 @@ Example:
 
 HELP_SET_VAR = _help_entry('set_var', """
 Store data (or the result of PYTHON_CODE) into _vars[KEY].
-`data` and `_vars` are in scope. Data passes through unchanged so
-.SET_VAR can appear mid-pipeline without breaking the chain.
+`data` and `_vars` are in scope. PYTHON_CODE follows the usual rules: a single
+expression's value, or the last `result(val)` call. Data passes through
+unchanged so .SET_VAR can appear mid-pipeline without breaking the chain.
 If PYTHON_CODE is omitted and there is no input data, deletes KEY from _vars.
 
 Example:
@@ -1286,6 +1304,16 @@ class PipelineExecutor:
         """Abort the entire pipeline.  Exposed as ``stop()``."""
         raise _PipelineStop()
 
+    def _set_var(self, name: str, value: Any) -> None:
+        """Store *value* in the shared VARS under *name*.  Exposed as
+        ``set_var()`` to user Python code."""
+        self.host.vars[name] = value
+
+    def _get_var(self, name: str, default: Any = None) -> Any:
+        """Return the VARS value for *name* (``default`` if absent).  Exposed as
+        ``get_var()`` to user Python code."""
+        return self.host.vars.get(name, default)
+
     def _python_context(self, data: Optional[List[dict]], extra: Optional[dict] = None) -> dict:
         """Build the global namespace shared by .PY / .SET_VAR / .SLEEP
         and the .FOR expression."""
@@ -1299,52 +1327,36 @@ class PipelineExecutor:
             'info': self._info,
             'br': self._br,
             'stop': self._stop,
+            'set_var': self._set_var,
+            'get_var': self._get_var,
         }
         if extra:
             context.update(extra)
         return context
 
-    def _eval_user_code(self, code: str, data: Optional[List[dict]]) -> Any:
-        """Run user Python.  A single expression is evaluated and its value
-        returned; anything else is executed as statements, after which ``result``
-        (or the possibly-modified ``data``) is returned.
+    def _run_user_code(
+        self, code: str, data: Optional[List[dict]], extra: Optional[dict] = None
+    ) -> Any:
+        """Execute user Python for a pipeline step and return the step's value.
 
-        Classification is done up front with :func:`compile`, so a genuine
-        ``SyntaxError`` surfaces as-is instead of being masked by a second
-        eval-then-exec attempt.
-        """
-        context = self._python_context(data)
-        try:
-            try:
-                code_obj = compile(code, '<pipeline>', 'eval')
-            except SyntaxError:
-                # Not a single expression — compile/run as statements.  A real
-                # syntax error is raised by this compile() call, not hidden.
-                exec(compile(code, '<pipeline>', 'exec'), context)  # noqa: S102
-                return context.get('result', context.get('data', []))
-            return eval(code_obj, context)  # noqa: S307 — intentional scripting feature
-        except (_PipelineBreak, _PipelineStop) as flow:
-            # br()/stop() inside the code: carry whatever the code produced so the
-            # .FOR loop (br) or the executor (stop) returns it.
-            if flow.data is None:
-                flow.data = normalize_to_dicts(
-                    context.get('result', context.get('data', []))
-                )
-            raise
-
-    async def _cmd_py(self, args: List[str], data: Optional[List[dict]]) -> Any:
-        """Run user Python.  The step's output is, in priority:
+        Output precedence:
 
         1. the argument of the last ``result(...)`` call, if any;
         2. else, for a single expression, that expression's value;
-        3. else ``data``, unchanged (passthrough).
+        3. else ``data``, unchanged (the possibly-modified passthrough list).
 
-        ``data``, ``_vars``, ``_i``, ``info()``, ``br()`` and ``result()`` are in
-        scope.  Output is normalised to dicts centrally in ``_execute_nodes``.
+        ``result()`` is a callable injected here (backed by a local list), so it
+        behaves identically in ``.PY`` and in ``.SLEEP`` / ``.SET_VAR`` / the
+        ``.FOR`` expression — they all run through this one core.  ``data``,
+        ``_vars``, ``_i``, ``info()``, ``br()``, ``stop()``, ``set_var()``,
+        ``get_var()`` and ``sql_in_list`` come from :meth:`_python_context`.
+
+        Classification is done up front with :func:`compile`, so a genuine
+        ``SyntaxError`` surfaces as-is instead of being masked by a second
+        eval-then-exec attempt.  ``br()``/``stop()`` raised inside the code carry
+        whatever the code produced (the last ``result(...)`` or the passthrough
+        data) so the ``.FOR`` loop (br) or the executor (stop) can return it.
         """
-        if not args:
-            raise ValueError('.PY requires a Python code argument')
-        code = args[0]
         data_list = list(data or [])
 
         _called: list = []
@@ -1352,7 +1364,7 @@ class PipelineExecutor:
         def result(val: Any) -> None:
             _called.append(val)
 
-        context = self._python_context(data_list, {'result': result})
+        context = self._python_context(data_list, {'result': result, **(extra or {})})
 
         try:
             code_obj = compile(code, '<pipeline>', 'eval')
@@ -1372,6 +1384,29 @@ class PipelineExecutor:
             raise
 
         return _called[-1] if _called else data_list
+
+    def _eval_user_code(self, code: str, data: Optional[List[dict]]) -> Any:
+        """Run user Python and return its value (see :meth:`_run_user_code`).
+
+        Used by ``.SLEEP``, ``.SET_VAR`` and the ``.FOR`` expression.  A single
+        expression yields its value; otherwise the last ``result(...)`` call wins,
+        falling back to the passthrough ``data``."""
+        return self._run_user_code(code, data)
+
+    async def _cmd_py(self, args: List[str], data: Optional[List[dict]]) -> Any:
+        """Run user Python.  The step's output is, in priority:
+
+        1. the argument of the last ``result(...)`` call, if any;
+        2. else, for a single expression, that expression's value;
+        3. else ``data``, unchanged (passthrough).
+
+        ``data``, ``_vars``, ``_i``, ``info()``, ``br()``, ``set_var()``,
+        ``get_var()`` and ``result()`` are in scope.  Output is normalised to
+        dicts centrally in ``_execute_nodes``.
+        """
+        if not args:
+            raise ValueError('.PY requires a Python code argument')
+        return self._run_user_code(args[0], data)
 
     async def _cmd_set_var(
         self, args: List[str], data: Optional[List[dict]]
