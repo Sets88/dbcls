@@ -13,7 +13,26 @@ class Sqlite3Client(ClientClass):
     ENGINE = 'Sqlite3'
 
     def __init__(self, filename):
-        self.dbname = filename
+        if not filename:
+            # No file path → keep everything in a single in-memory database.
+            # A persistent connection is required because a fresh `:memory:`
+            # connection per statement would start from an empty DB each time.
+            self.dbname = ':memory:'
+            self.in_memory = True
+            self._conn = self.get_connection()
+        else:
+            self.dbname = filename
+            self.in_memory = False
+            self._conn = None
+
+    def get_connection(self) -> sqlite3.Connection:
+        # Reuse the persistent connection (in-memory) if one already exists,
+        # otherwise open a fresh connection for a file-based database.
+        if getattr(self, '_conn', None) is not None:
+            return self._conn
+        conn = sqlite3.connect(self.dbname, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     async def get_table_columns(self, table_name: str, database: str = None):
         result = await self.execute(f"PRAGMA table_info({table_name})")
@@ -51,15 +70,17 @@ class Sqlite3Client(ClientClass):
         return await self.get_schema(command.params)
 
     def _execute_sync(self, sql) -> Result:
-        conn = sqlite3.connect(self.dbname)
-        conn.row_factory = sqlite3.Row
+        conn = self.get_connection()
         cur = conn.cursor()
         cur.execute(sql)
         rowcount = cur.rowcount
         data = [dict(x) for x in cur.fetchall()]
         if rowcount <= 0:
             rowcount = len(data)
-        conn.close()
+        if self._conn is not None:
+            conn.commit()
+        else:
+            conn.close()
 
         return Result(data, rowcount)
 
@@ -75,4 +96,6 @@ class Sqlite3Client(ClientClass):
         return await asyncio.to_thread(self._execute_sync, sql)
 
     def get_title(self) -> str:
+        if self.in_memory:
+            return f'{self.ENGINE} (in-memory)'
         return f'{self.ENGINE} {self.dbname}'

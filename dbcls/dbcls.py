@@ -469,6 +469,9 @@ class LockScreen:
 
 
 class DbEditor(Editor):
+    # Sentinel insert value for the "+ Create new sheet" entry in the sheets popup.
+    _NEW_SHEET = '+new'
+
     def __init__(
         self,
         stdscr,
@@ -734,6 +737,16 @@ class DbEditor(Editor):
         finally:
             self._fix_curses_after_visidata()
 
+    def create_new_sheet(self) -> None:
+        """Open a new empty VisiData sheet. Override to provide actual behaviour."""
+        try:
+            self._fix_visidata_curses()
+            visidata.vd.run(visidata.vd.newSheet('unnamed', 1))
+        except Exception as exc:
+            self.info_popup.open('Error', {'main': str(exc)})
+        finally:
+            self._fix_curses_after_visidata()
+
     def add_pipeline_sheet(self, name, rows) -> None:
         """Pipeline host hook for the .SHEET command: remember a named result set.
         The actual VisiData sheet is built later, on the UI thread (see _db_query's
@@ -742,13 +755,14 @@ class DbEditor(Editor):
 
     def _db_show_vd_sheets(self):
         sheets = self.get_sheets()
-        if not sheets:
-            self.set_status_notification('No VisiData sheets')
-            return
         items = [PopupItem(insert=str(i), label=name, weight=i) for i, name in enumerate(sheets)]
+        items.append(PopupItem(insert=self._NEW_SHEET, label='+ Create new sheet', weight=len(sheets)))
 
-        def on_select(sheet_index):
-            self.open_sheet(int(sheet_index))
+        def on_select(choice):
+            if choice == self._NEW_SHEET:
+                self.create_new_sheet()
+            else:
+                self.open_sheet(int(choice))
 
         self.popup.open(items, filter_text='', on_select=on_select, title='Open VisiData sheet')
 
@@ -868,6 +882,9 @@ def main():
             print(f'Error: --lock-timeout must be a number, got {args.lock_timeout!r}',
                   file=sys.stderr)
             sys.exit(1)
+
+    if not engine:
+        engine = 'sqlite3'
 
     client = None
 
