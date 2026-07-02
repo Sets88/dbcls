@@ -309,7 +309,12 @@ class LockScreen:
         self._timeout = timeout
         self._secret: str = ''
         self._code: str = ''
-        self._last_check: float = time.monotonic()
+        # Two clocks: monotonic stops during system sleep (mach_absolute_time on
+        # macOS, CLOCK_MONOTONIC on Linux), wall clock can jump on NTP/manual
+        # adjustment. Idle time is the max of both deltas so either one expiring
+        # engages the lock (fail-safe).
+        self._last_check_mono: float = time.monotonic()
+        self._last_check_wall: float = time.time()
         self._attempts_left: int = self.MAX_ATTEMPTS
         self._error_msg: str = ''
         self._status_msg: str = ''
@@ -340,7 +345,7 @@ class LockScreen:
             raise RuntimeError('--lock-init-command produced no output')
         self._secret = secret
         self._code = code
-        self._last_check = time.monotonic()
+        self.reset_timer()
 
     def _run_check(self) -> Optional[str]:
         """Run check_command with the stored code on stdin and return its output,
@@ -354,8 +359,14 @@ class LockScreen:
             return None
         return result.stdout.strip()
 
+    def _idle_seconds(self) -> float:
+        return max(
+            time.monotonic() - self._last_check_mono,
+            time.time() - self._last_check_wall,
+        )
+
     def should_lock(self) -> bool:
-        return not self.active and time.monotonic() - self._last_check > self._timeout
+        return not self.active and self._idle_seconds() > self._timeout
 
     def set_status(self, msg: str) -> None:
         self._status_msg = msg
@@ -371,7 +382,8 @@ class LockScreen:
         self.active = False
 
     def reset_timer(self) -> None:
-        self._last_check = time.monotonic()
+        self._last_check_mono = time.monotonic()
+        self._last_check_wall = time.time()
 
     def handle_key(self, key) -> Optional[str]:
         if key in (K(ord('\n')), K(ord('\r')), K(ord(' '))):
