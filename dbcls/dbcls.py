@@ -261,9 +261,17 @@ DB_HELP_KEY_REMAP = """\
       Remap key A to act as key B (integer key codes)
   `DBCLS_KEY_REMAP=...`
       Same via environment variable
-  Example: `"9:353,353:9"`
+  Example: `"36:1412,1412:36"`
       Swap Tab and Shift+Tab
-  Tip: enable debug mode (`Ctrl+D`) to see key codes"""
+  Tip: enable debug mode (`Ctrl+D`) to see key codes
+
+Tmux-style prefix (`Ctrl+X`)
+  `Ctrl+X` followed by another key within 1 second forms a combination
+  with its own key code (`PFX` flag in debug mode). Combinations have
+  no default bindings — remap their codes to existing keys to create
+  custom shortcuts, e.g. `"42:457"` makes `Ctrl+X Enter` act as
+  `Alt+R` (execute query). If no key follows within 1 second, the
+  prefix is simply cancelled."""
 
 DB_HELP_VISIDATA = """\
 Navigation

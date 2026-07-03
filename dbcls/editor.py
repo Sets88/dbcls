@@ -88,7 +88,7 @@ def key_csi(*seq) -> int:
 
 
 # The key that starts a tmux-style prefix sequence.
-# After this key is pressed, the next key within 500 ms is tagged with KEY_PREFIX_BIT.
+# After this key is pressed, the next key within 1 second is tagged with KEY_PREFIX_BIT.
 # If the timeout fires before the next key, the trigger key itself is dispatched normally.
 KEY_PREFIX_TRIGGER = K(ord('\x18'))  # Ctrl+X
 
@@ -143,8 +143,8 @@ Editing
       New line (auto-indent)
   `Ctrl+Z / Y`
       Undo / Redo
-  `Ctrl+C / X / V`
-      Copy / Cut / Paste
+  `Ctrl+C / V`
+      Copy / Paste
 
 File
   `Ctrl+S`
@@ -165,6 +165,9 @@ Search
 Other
   `Ctrl+N`
       Base autocomplete (words from the current file)
+  `Ctrl+X <key>`
+      Tmux-style prefix: the next key within 1 second forms a remappable
+      combination (see the Key remapping help page)
   `Ctrl+K`
       Toggle line mark (highlight)
   `Ctrl+W`
@@ -2519,7 +2522,6 @@ class Fn(str, enum.Enum):
     SEL_WORD_RIGHT   = 'sel_word_right'
     OPEN_FILE        = 'open_file'
     COPY             = 'copy'
-    CUT              = 'cut'
     PASTE            = 'paste'
     UNDO             = 'undo'
     REDO             = 'redo'
@@ -2758,7 +2760,6 @@ class Editor:
         add(Fn.SEL_WORD_RIGHT,  self._cmd_sel_word_right,       'Select word right')
         add(Fn.OPEN_FILE,       self._open_from_directory,      'Open file',              '^G')
         add(Fn.COPY,            self._cmd_copy,                 'Copy',                   '^C')
-        add(Fn.CUT,             self._cmd_cut,                  'Cut',                    '^X')
         add(Fn.PASTE,           self._cmd_paste,                'Paste',                  '^V')
         add(Fn.UNDO,            self._cmd_undo,                 'Undo',                   '^Z')
         add(Fn.REDO,            self._cmd_redo,                 'Redo',                   '^Y')
@@ -2810,7 +2811,6 @@ class Editor:
         # Ctrl shortcuts
         add(Fn.OPEN_FILE,       K(ord('\x07')))
         add(Fn.COPY,            K(ord('\x03')))
-        add(Fn.CUT,             K(ord('\x18')))
         add(Fn.PASTE,           K(ord('\x16')))
         add(Fn.UNDO,            K(ord('\x1a')))
         add(Fn.REDO,            K(ord('\x19')))
@@ -2853,12 +2853,10 @@ class Editor:
 
             if key == -1:
                 if self._prefix_pending:
-                    # Prefix timeout — dispatch the trigger key itself normally
+                    # Prefix timeout — nothing is bound to the bare trigger,
+                    # just disarm the prefix
                     self._prefix_pending = False
                     self.stdscr.timeout(50)
-                    self._dispatch(key_base(KEY_PREFIX_TRIGGER))
-                    self.lexer.invalidate(self.buf.cursor_row)
-                    self._needs_redraw = True
                 else:
                     self._dispatch_pre_hook(-1)
             else:
@@ -2988,16 +2986,12 @@ class Editor:
         if self._prefix_pending:
             self._prefix_pending = False
             self.stdscr.timeout(50)
-            prefixed = self._override_remaped_keys(key | KEY_PREFIX_BIT)
-            if key_is_pfx(prefixed) and prefixed not in self._keybindings:
-                # Unbound prefix combo: run the trigger's own action and
-                # handle the second key normally instead of swallowing both.
-                self._handle_normal_key(KEY_PREFIX_TRIGGER)
-            else:
-                key = prefixed
+            # always keep the prefix bit so combos never collide with
+            # unprefixed keys; remap so pfx codes can be bound via remapping
+            key = self._override_remaped_keys(key | KEY_PREFIX_BIT)
         elif key == KEY_PREFIX_TRIGGER:
             self._prefix_pending = True
-            self.stdscr.timeout(500)
+            self.stdscr.timeout(1000)
             return
 
         if self._status_notification is not None:
@@ -3194,12 +3188,6 @@ class Editor:
     def _cmd_copy(self):
         if self.buf.has_selection():
             self.clipboard.copy(self.buf.get_selected_text())
-
-    def _cmd_cut(self):
-        if self.buf.has_selection():
-            self.clipboard.copy(self.buf.get_selected_text())
-            self.buf._push_undo('cut')
-            self.buf.delete_selection()
 
     def _cmd_paste(self):
         text = self.clipboard.paste()

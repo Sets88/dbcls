@@ -70,7 +70,7 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-S, --unix-socket` | Path to Unix socket file (optional, overrides host/port) |
 | `-c, --config` | Path to configuration file |
 | `--no-compress` | Disable compression for ClickHouse connections |
-| `--key-remap` | Remap key codes, e.g. `"9:353,353:9"` to swap Tab and Shift+Tab |
+| `--key-remap` | Remap key codes, e.g. `"36:1412,1412:36"` to swap Tab and Shift+Tab |
 | `--lock-init-command` | Shell command run at startup to initialise a lock session |
 | `--lock-timeout` | Seconds of inactivity before the screen locks |
 | `--lock-check-command` | Shell command run when the user attempts to unlock |
@@ -133,6 +133,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Ctrl+g` | Open a file from the current directory |
 | `Ctrl+f` | Search in the editor |
 | `Ctrl+d` | Toggle debug mode (shows key codes in the status bar) |
+| `Ctrl+x <key>` | Tmux-style prefix: forms a remappable key combination (see [Key Remapping](#key-remapping)) |
 | `Ctrl+q` | Quit application |
 | `Ctrl+s` | Save file |
 | `F1` / `Alt+h` | Show help with all available hotkeys |
@@ -146,23 +147,43 @@ You can remap any key to act as another key using integer key codes.
 
 **Via CLI:**
 ```bash
-dbcls --key-remap "9:353,353:9" mydb.sql
+dbcls --key-remap "36:1412,1412:36" mydb.sql
 ```
 
 **Via environment variable:**
 ```bash
-export DBCLS_KEY_REMAP="9:353,353:9"
+export DBCLS_KEY_REMAP="36:1412,1412:36"
 dbcls mydb.sql
 ```
 
-The format is a comma-separated list of `from:to` pairs, where each value is an integer key code.
-The example above swaps Tab (`9`) and Shift+Tab (`353`).
+The format is a comma-separated list of `from:to` pairs, where each value is an integer key code
+as shown in debug mode (see below). The example above swaps Tab (`36`) and Shift+Tab (`1412`).
 
 **Finding key codes:**
 
 Press `Ctrl+d` inside the editor to enable debug mode — the key code of every pressed key will be shown in the status bar. Press `Ctrl+d` again to turn it off.
 
 You can also open the help (`F1` / `Alt+h`) while debug mode is active to see a full list of all registered keybindings with their codes at the bottom of the help page.
+
+### Tmux-Style Prefix Key (Ctrl+X)
+
+`Ctrl+x` works as a tmux-like prefix key: the next key pressed within 1 second is combined
+with it into a `Ctrl+x <key>` combination that has its own key code (marked with a `PFX`
+flag in debug mode). If no key follows within 1 second, the prefix is simply cancelled.
+
+Prefix combinations have no default bindings — they exist to give you extra remappable
+key codes, which is handy when the terminal or a tmux/ssh setup swallows some
+combinations (Alt or Shift ones, for example):
+
+1. Enable debug mode (`Ctrl+d`) and press `Ctrl+x` followed by a key — the status bar
+   shows the code of the combination, e.g. `Ctrl+x Enter` → `42`.
+2. Look up the code of the key you want it to act as on the `Key remapping` help page
+   (`F1`), e.g. `Alt+r` (execute query) is `457`.
+3. Remap one to the other:
+   ```bash
+   dbcls --key-remap "42:457" mydb.sql
+   ```
+   Now `Ctrl+x Enter` executes the query under cursor.
 
 ### LM-Powered Autocomplete
 
