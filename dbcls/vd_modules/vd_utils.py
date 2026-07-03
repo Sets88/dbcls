@@ -77,7 +77,6 @@ def openRefCells(vd, cursorCol, selectedRows):
 
     if not values_list:
         vd.fail('No reference cells found')
-        return
 
     vd.push(
         ReferenceSheet(
@@ -93,7 +92,6 @@ def openRefCells(vd, cursorCol, selectedRows):
 class SheetWithReference(TableSheet):
     def __init__(self, left_sheet, other_sheets):
         super().__init__('')
-        self.left_sheet = left_sheet
         if not left_sheet or not other_sheets:
             raise Exception('Two sheets must be provided')
 
@@ -102,7 +100,7 @@ class SheetWithReference(TableSheet):
 
         if (
             len(left_sheet.keyCols) == 0 or
-            len(self.right_sheet.keyCols) != len(left_sheet.keyCols) > 1
+            len(self.right_sheet.keyCols) != len(left_sheet.keyCols)
         ):
             raise Exception('Both sheets must have same key column')
 

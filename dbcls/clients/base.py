@@ -142,6 +142,23 @@ class ClientClass(abc.ABC):
             self.dbname = old_db
             raise
 
+    async def _execute_with_reconnect(self, run_query, reconnect_exc=Exception):
+        """Run the coroutine factory `run_query`, connecting first if needed.
+
+        If `reconnect_exc` is raised, drop the connection and retry once;
+        the second failure propagates."""
+        for tries in range(2):
+            try:
+                if self.connection is None:
+                    await self.connect()
+
+                return await run_query()
+            except reconnect_exc:
+                self.connection = None
+
+                if tries == 1:
+                    raise
+
     def reset_pager(self) -> None:
         pass
 

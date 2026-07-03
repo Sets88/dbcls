@@ -1,18 +1,14 @@
 from visidata import TableSheet, IndexSheet
 from visidata import ENTER
 
-from .vd_db_browser import (
-    DataBaseSheet, TablesSheet, TableOptionsSheet,
-    TableSampleDataSheet, TableSchemaSheet,
-    add_columns_from_row,
-)
-from .vd_plotter import Plot
-from .vf_funcs import (
-    make_formated_table, reference, escape_sql_value, save_sql,
-    ts_to_dt_utc, dt_to_start_of_inteval, ts_to_start_of_inteval,
-    save_rows_to_vars,
-)
-from .vd_utils import SheetWithReference, ExpandVert
+# Importing the submodules is what registers everything with visidata (via
+# @VisiData.api decorators and module-level addCommand calls). Names used
+# inside addCommand execstrings below resolve through the VisiData API at
+# runtime, not through imports in this module.
+from . import vd_plotter  # noqa: F401
+from . import vf_funcs  # noqa: F401
+from .vd_db_browser import DataBaseSheet, TablesSheet  # re-exported for dbcls.py
+from .vd_utils import SheetWithReference
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 
 
@@ -33,5 +29,5 @@ TableSheet.addCommand('Alt+b', 'go-left-3', 'cursorRight(-3)')
 TableSheet.addCommand('Alt+f', 'go-right-3', 'cursorRight(3)')
 TableSheet.addCommand('Shift+Down3', 'go-down-5', 'cursorDown(+5)')
 TableSheet.addCommand('Shift+Up3', 'go-up-5', 'cursorDown(-5)')
-TableSheet.addCommand('Alt+Down', 'go-down-5', 'cursorDown(+5)')
-TableSheet.addCommand('Alt+Up', 'go-up-5', 'cursorDown(-5)')
+TableSheet.bindkey('Alt+Down', 'go-down-5')
+TableSheet.bindkey('Alt+Up', 'go-up-5')

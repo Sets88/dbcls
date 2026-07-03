@@ -19,7 +19,7 @@ class MysqlClient(ClientClass):
     ]
 
     SQL_FUNCTIONS = [
-        'CONCAT', 'GROUP_CONCAT', 'UNIX_TIMESTAMP', 'FROM_UNIXTIME', 'DATE_FORMAT', 'ANY_VALUE'
+        'CONCAT', 'GROUP_CONCAT', 'UNIX_TIMESTAMP', 'FROM_UNIXTIME', 'DATE_FORMAT', 'ANY_VALUE',
         'CAST', 'JSON_KEYS', 'JSON_CONTAINS'
     ]
 
@@ -85,7 +85,7 @@ class MysqlClient(ClientClass):
         if not database:
             database = self.dbname
 
-        result = await self.execute('SHOW CREATE TABLE `%s`.`%s`' % (database or self.dbname, table))
+        result = await self.execute('SHOW CREATE TABLE `%s`.`%s`' % (database, table))
 
         if result and result.data:
             result.data = [{'schema': list(x.values())[-1]} for x in result.data]
@@ -101,8 +101,7 @@ class MysqlClient(ClientClass):
         return f'LIMIT {offset},{limit}'
 
     async def command_schema(self, command: CommandParams):
-        table = command.params
-        return await self.execute('SHOW CREATE TABLE %s' % table)
+        return await self.get_schema(command.params)
 
     def is_db_error_exception(self, exc: Exception) -> bool:
         return isinstance(exc, MySQLError)
@@ -113,19 +112,11 @@ class MysqlClient(ClientClass):
         if result:
             return result
 
-        for tries in range(2):
-            try:
+        async def run_query():
+            async with self.connection.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql)
+                data = await cur.fetchall()
 
-                if self.connection is None:
-                    await self.connect()
+                return Result(data, cur.rowcount)
 
-                async with self.connection.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute(sql)
-                    data = await cur.fetchall()
-
-                    return Result(data, cur.rowcount)
-            except InterfaceError as exc:
-                self.connection = None
-
-                if tries == 1:
-                    raise exc
+        return await self._execute_with_reconnect(run_query, InterfaceError)

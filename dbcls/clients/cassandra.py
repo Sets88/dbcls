@@ -30,13 +30,13 @@ class CassandraClient(ClientClass):
 
     SQL_COMMON_COMMANDS = [
         'SELECT', 'FROM', 'WHERE', 'ORDER BY', 'ALLOW FILTERING', 'USING', 'CUSTOM',
-        'INSERT', 'INTO', 'UPDATE', 'VALUES', 'SET', 'DELETE', 'GROUP BY', 'OPTIONS'
+        'INSERT', 'INTO', 'UPDATE', 'VALUES', 'SET', 'DELETE', 'GROUP BY', 'OPTIONS',
         'CREATE', 'INDEX', 'LIMIT', 'NULL', 'DISTINCT', 'MATERIALIZED', 'VIEW', 'SCHEMA',
         'KEYSPACE', 'TRIGGER', 'TYPE', 'BATCH', 'USE', 'PRIMARY KEY', 'EXISTS', 'FUNCTION',
         'TIMESTAMP', 'APPLY', 'UNLOGGED', 'BEGIN', 'TIMEOUT', 'COMPACT', 'STORAGE', 'TABLES',
         'PARTITION BY', 'DROP', 'ALTER', 'TRUNCATE', 'TABLE', 'COLUMN', 'SET', 'KEYSPACES',
-        'DESCRIBE', 'DESC', 'RENAME', 'LIST', 'USERS', 'ROLES', 'TRIGGER', 'WITH', 'CREATE'
-        'GRANT', 'REVOKE', 'ROLE', 'PERMISSIONS', 'OPTIMIZE', 'KILL', 'INTERVAL', 'PARTITION'
+        'DESCRIBE', 'DESC', 'RENAME', 'LIST', 'USERS', 'ROLES', 'TRIGGER', 'WITH',
+        'GRANT', 'REVOKE', 'ROLE', 'PERMISSIONS', 'OPTIMIZE', 'KILL', 'INTERVAL', 'PARTITION',
         'ON', 'AS', 'OF', 'AND', 'OR', 'IN', 'IS', 'NOT', 'JSON', 'TTL', 'IF', 'PER'
     ]
 
@@ -129,7 +129,7 @@ class CassandraClient(ClientClass):
         if not database:
             database = self.dbname
 
-        result = await self.execute('DESCRIBE TABLE %s.%s' % (database or self.dbname, table))
+        result = await self.execute('DESCRIBE TABLE %s.%s' % (database, table))
 
         if result and result.data:
             result.data = [{'schema': x['create_statement']} for x in result.data]
@@ -171,37 +171,24 @@ class CassandraClient(ClientClass):
         if result:
             return result
 
-        for tries in range(2):
-            try:
-                if self.connection is None:
-                    await self.connect()
+        async def run_query():
+            statement = SimpleStatement(sql, fetch_size=self._pager_limit)
+            if self._pager_sql is not None and self._pager_sql != sql:
+                # A different query interrupts paging — reset pager state
+                self._pager_limit = DEFAULT_PAGER_LIMIT
+                self._paging_state = None
+            self._pager_sql = sql
 
-                if self._pager_limit and self._pager_sql is None:
-                    statement = SimpleStatement(sql, fetch_size=self._pager_limit)
-                    self._pager_sql = sql
-                elif self._pager_limit and self._pager_sql and self._pager_sql == sql:
-                    statement = SimpleStatement(sql, fetch_size=self._pager_limit)
-                else:
-                    statement = SimpleStatement(sql, fetch_size=self._pager_limit)
-                    self._pager_limit = DEFAULT_PAGER_LIMIT
-                    self._pager_sql = sql
-                    self._paging_state = None
+            data = self.connection.execute(statement, paging_state=self._paging_state)
+            self._paging_state = data.paging_state
 
-                data = self.connection.execute(statement, paging_state=self._paging_state)
-                self._paging_state = data.paging_state
+            if not data.has_more_pages:
+                self.reset_pager()
 
-                if not data.has_more_pages:
-                    self._pager_sql = None
-                    self._paging_state = None
-                    self._pager_limit = DEFAULT_PAGER_LIMIT
+            return Result(
+                data.current_rows,
+                len(data.current_rows),
+                has_more=data.has_more_pages
+            )
 
-                return Result(
-                    data.current_rows,
-                    len(data.current_rows),
-                    has_more=data.has_more_pages
-                )
-            except Exception as exc:
-                self.connection = None
-
-                if tries == 1:
-                    raise exc
+        return await self._execute_with_reconnect(run_query)

@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import math
 from time import time
 from typing import List, Optional, Tuple, Union
@@ -7,127 +8,14 @@ from typing import List, Optional, Tuple, Union
 import sql_metadata
 from sql_metadata.keywords_lists import TokenType
 
+# sql_metadata.Parser logs an error (e.g. "Not supported query type: SHOW")
+# before raising ValueError; the exception is handled here, so mute the log too
+logging.getLogger('Parser').setLevel(logging.CRITICAL)
+
 from .pipeline import PIPELINE_COMMANDS, PIPELINE_COMMAND_HINTS
 
 _CONTEXT_LENGTH = 3
 _WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), 'weights.json')
-
-_VOCABULARY = {
-    0: '',
-    1: '(',
-    2: ')',
-    3: '<COLUMN>',
-    4: '<FUNC>',
-    5: '<OPERATOR>',
-    6: '<TABLE>',
-    7: '<VALUE>',
-    8: 'ADD',
-    9: 'AFTER',
-    10: 'ALTER',
-    11: 'AND',
-    12: 'AS',
-    13: 'ASC',
-    14: 'AUTO_INCREMENT',
-    15: 'BEGIN',
-    16: 'BETWEEN',
-    17: 'BIGINT',
-    18: 'OUTER',
-    19: 'CROSS',
-    20: 'BY',
-    21: 'FULL',
-    22: 'CASCADE',
-    23: 'CASE',
-    24: 'COMMIT',
-    25: 'COLUMN',
-    26: 'COMMENT',
-    27: 'CONSTRAINT',
-    28: 'CREATE',
-    29: 'ROLLBACK',
-    30: 'EXPLAIN',
-    31: 'ANALYZE',
-    32: 'DATABASE',
-    33: 'SHOW',
-    34: 'DECLARE',
-    35: 'DEFAULT',
-    36: 'DELETE',
-    37: 'DESC',
-    38: 'DETERMINISTIC',
-    39: 'DISTINCT',
-    41: 'DROP',
-    42: 'ELSE',
-    43: 'DATABASES',
-    44: 'END',
-    47: 'EXISTS',
-    49: 'FOR',
-    50: 'FOREIGN',
-    51: 'FROM',
-    52: 'FUNCTION',
-    53: 'GROUP BY',
-    54: 'HASH',
-    55: 'HAVING',
-    58: 'IF EXISTS',
-    59: 'IN',
-    60: 'INDEX',
-    61: 'INNER',
-    62: 'INSERT',
-    63: 'INT',
-    65: 'INTERVAL',
-    66: 'INTO',
-    67: 'IS',
-    68: 'JOIN',
-    69: 'JSON',
-    70: 'KEY',
-    72: 'LEFT',
-    73: 'ILIKE',
-    74: 'LIKE',
-    75: 'LIMIT',
-    77: 'LOCK',
-    80: 'MODIFY',
-    82: 'NOT',
-    83: 'NOT NULL',
-    84: 'NULL',
-    85: 'OFFSET',
-    86: 'ON',
-    87: 'OR',
-    88: 'ORDER BY',
-    89: 'OVER',
-    90: 'PARTITION',
-    93: 'PRIMARY KEY',
-    94: 'RECURSIVE',
-    95: 'REFERENCES',
-    96: 'REPLACE',
-    97: 'RETURN',
-    98: 'RETURNS',
-    99: 'RIGHT',
-    100: 'RENAME',
-    101: 'GRANT',
-    102: 'REVOKE',
-    103: 'OPTIMIZE',
-    105: 'SELECT',
-    106: 'SET',
-    108: 'SMALLINT',
-    109: 'TABLE',
-    110: 'TABLES',
-    111: 'TEMPORARY',
-    112: 'TEXT',
-    113: 'THEN',
-    114: 'TIMESTAMP',
-    115: 'TINYINT',
-    116: 'TRUNCATE',
-    119: 'UNION ALL',
-    120: 'UNION',
-    121: 'UNIQUE',
-    122: 'UNSIGNED',
-    123: 'UPDATE',
-    124: 'VALUES',
-    125: 'VIEWS',
-    126: 'WHEN',
-    127: 'WHERE',
-    128: 'WITH',
-}
-
-_VOCAB_VALUES = set(_VOCABULARY.values())
-
 
 # ── inference helpers ─────────────────────────────────────────────────────────
 
@@ -174,8 +62,6 @@ def _tokenize_sql(sql: str, vocab_values: set) -> list:
             add_token(result_tokens, '<VALUE>')
         elif token.value in ('(', ')'):
             add_token(result_tokens, token.value)
-        elif token_value in ('LIKE', 'ILIKE'):
-            add_token(result_tokens, token_value)
     return result_tokens
 
 
@@ -464,14 +350,9 @@ class AutoComplete:
 
         return columns
 
-    async def get_all_functions(self) -> list[str]:
-        return self.client.all_functions
-
     async def _fetch_columns_for_tables(
         self,
         table_specs: list[str],
-        *,
-        dedupe_against: Optional[set] = None,
     ) -> list[tuple[str, str]]:
         results = []
         for spec in table_specs:
@@ -487,12 +368,7 @@ class AutoComplete:
                 pass
             if cols:
                 for col in cols:
-                    candidate = (col, f"{table}.{col} (COLUMN)")
-                    if dedupe_against is None:
-                        results.append(candidate)
-                    elif candidate not in dedupe_against:
-                        results.append(candidate)
-                        dedupe_against.add(candidate)
+                    results.append((col, f"{table}.{col} (COLUMN)"))
         return results
 
     async def _get_schema_suggestions(
@@ -554,7 +430,7 @@ class AutoComplete:
             part2 = parts[1]
 
         suggestions = [(x, f"{x} (COMMAND)", '') for x in self.client.all_commands]
-        functions_list = await self.get_all_functions()
+        functions_list = self.client.all_functions
         if functions_list:
             suggestions += [(x, f"{x} (FUNCTION)", '') for x in functions_list]
         suggestions += [
@@ -567,15 +443,6 @@ class AutoComplete:
         suggestions += [(ins, lbl, '') for ins, lbl in await self._get_schema_suggestions(parts, part1, part2)]
 
         rank_map = self._get_lm_rank_map(sql_context)
-
-        if rank_map.get('__COLUMN__', 999) == 0 and full_sql:
-            suggestions += [
-                (ins, lbl, '') for ins, lbl in
-                await self._fetch_columns_for_tables(
-                    query_tables,
-                    dedupe_against={(ins, lbl) for ins, lbl, _ in suggestions},
-                )
-            ]
 
         def sort_key(candidate: tuple) -> tuple:
             lm_rank = self._candidate_lm_rank(candidate[1], rank_map)

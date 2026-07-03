@@ -21,6 +21,9 @@ def make_formated_table(sheet, col, row):
     )
 
 
+# NOTE: reference(), get_var() and the ts_*/dt_* helpers below have no callers
+# in this codebase by design — they are user-facing helpers meant to be typed
+# by hand in visidata expressions (e.g. `=vd.ts_to_dt_utc(ts)`).
 @VisiData.api
 def reference(_, sheet_name, field, value):
     other_sheet = visidata.vd.getSheet(sheet_name)
@@ -57,7 +60,10 @@ def escape_sql_value(value):
 
 @VisiData.api
 def save_sql(vd, p, *vsheets):
-    """Save sheets as SQL INSERT statements"""
+    """Save sheets as SQL INSERT statements.
+
+    Looks unused, but it is visidata's `save_<ext>` protocol hook: visidata
+    invokes it when the user saves a sheet to a `.sql` file."""
     for vs in vsheets:
         with p.open(mode='w', encoding=vs.options.save_encoding) as fp:
             # Use sheet name as table name, cleaned for SQL
@@ -125,12 +131,12 @@ def ts_to_dt_utc(_, ts: Union[str, float, int]) -> datetime:
 
 
 @VisiData.api
-def dt_to_start_of_inteval(_, dt: datetime, interval: int) -> datetime:
+def dt_to_start_of_interval(_, dt: datetime, interval: int) -> datetime:
     return datetime.fromtimestamp(dt.timestamp() - (dt.timestamp() % interval))
 
 
 @VisiData.api
-def ts_to_start_of_inteval(_, ts: Union[str, float, int], interval: int) -> datetime:
+def ts_to_start_of_interval(_, ts: Union[str, float, int], interval: int) -> datetime:
     type_ts = type(ts)
     return type_ts(float(ts) - (float(ts) % interval))
 

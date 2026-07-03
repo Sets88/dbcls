@@ -83,7 +83,6 @@ class Plot(BaseSheet):
         self.source_sheet = kwargs['source']
         super().__init__(*names, **kwargs)
         self._hidden_buckets = set()
-        self.src = None
 
         cols = self.source_sheet.keyCols
 
@@ -128,7 +127,6 @@ class Plot(BaseSheet):
                 if index in self._hidden_buckets:
                     continue
 
-                self.addCommand(f'{index + 1}', f'toggle-bucket-{index + 1}', f'sheet.toggle_bucket({index});', f'Toggle bucket {bucket}')
                 points_sorted = sorted(points, key=lambda p: p[0])
                 dates = [to_dt_str(p[0]) for p in points_sorted]
                 vals = [p[1] for p in points_sorted]
@@ -168,3 +166,8 @@ Plot.addCommand('Enter', 'open-row', '', '')
 
 Plot.addCommand(None, 'go-pagedown', '', '')
 Plot.addCommand(None, 'go-pageup', '', '')
+
+# Keys 1-9 toggle the visibility of the corresponding bucket (labelled in the
+# chart legend); pressing a digit with no such bucket is a no-op.
+for _n in range(1, 10):
+    Plot.addCommand(f'{_n}', f'toggle-bucket-{_n}', f'sheet.toggle_bucket({_n - 1})', f'Toggle bucket {_n}')

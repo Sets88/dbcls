@@ -200,14 +200,7 @@ class PostgresClient(ClientClass):
         create_table_query += "\n)"
 
         if partition_info:
-            part_method, part_key = list(partition_info.values())
-            part_method = part_method.upper()
-            if part_method == 'R':
-                part_method = 'RANGE'
-            elif part_method == 'L':
-                part_method = 'LIST'
-            elif part_method == 'H':
-                part_method = 'HASH'
+            _, part_key = list(partition_info.values())
             create_table_query += f"\nPARTITION BY {part_key}"
 
         create_table_query += ";"
@@ -246,21 +239,12 @@ class PostgresClient(ClientClass):
         if result:
             return result
 
-        for tries in range(2):
-            try:
-                if self.connection is None:
-                    await self.connect()
+        async def run_query():
+            async with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
+                await cur.execute(sql)
+                result = Result(rowcount=cur.rowcount)
+                result.data = await cur.fetchall()
 
-                async with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
-                    await cur.execute(sql)
-                    rowcount = cur.rowcount
-                    result = Result(rowcount=rowcount)
+                return result
 
-                    result.data = await cur.fetchall()
-
-                    return result
-            except InterfaceError as exc:
-                self.connection = None
-
-                if tries == 1:
-                    raise exc
+        return await self._execute_with_reconnect(run_query, InterfaceError)

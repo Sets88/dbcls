@@ -14,6 +14,22 @@ DbCls is a terminal-based database client that pairs a built-in SQL editor with 
 - Table schema inspection and database / table browsing
 - Export results to SQL `INSERT` statements or any visidata-supported format
 
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Editor Commands](#editor-commands)
+- [VisiData Sheets](#visidata-sheets)
+- [Data Visualization (visidata)](#data-visualization-visidata)
+- [SQL Commands](#sql-commands)
+- [Pipelines](#pipelines)
+- [Supported Database Engines](#supported-database-engines)
+- [Unix Socket Connections](#unix-socket-connections)
+- [Screen Lock](#screen-lock)
+- [Password safety](#password-safety)
+- [Model Training](#model-training)
+
 ## Screenshots
 
 ### SQL Editor
@@ -106,14 +122,23 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 
 | Hotkey | Action |
 |--------|--------|
-| `Alt + 1` | Show autocompletion suggestions |
-| `Alt + r` | Execute query under cursor or selected text |
-| `Alt + e` | Show database list with table submenu |
-| `Alt + t` | Show tables list with schema and sample data options |
-| `Alt + s` | Show list of open VisiData sheets |
-| `Ctrl + q` | Quit application |
-| `Ctrl + s` | Save file |
-| `Ctrl + h` / `F1` | Show all available hotkeys |
+| `Alt+1` / `Shift+Tab` | Show DB autocompletion suggestions (tables, columns, functions) |
+| `Ctrl+n` | Base autocomplete (words from the current file) |
+| `Alt+r` | Execute query under cursor or selected text |
+| `Esc` | Cancel running query |
+| `Alt+e` | Show database list with table submenu |
+| `Alt+t` | Show tables list with schema and sample data options |
+| `Alt+s` | Show list of open VisiData sheets |
+| `Alt+p` | Open command palette (run any editor command by name) |
+| `Ctrl+g` | Open a file from the current directory |
+| `Ctrl+f` | Search in the editor |
+| `Ctrl+d` | Toggle debug mode (shows key codes in the status bar) |
+| `Ctrl+q` | Quit application |
+| `Ctrl+s` | Save file |
+| `F1` / `Alt+h` | Show help with all available hotkeys |
+
+The full list of editor keybindings (navigation, selection, editing) is available on the
+`Editor` page of the in-app help (`F1` / `Alt+h`).
 
 ### Key Remapping
 
@@ -135,9 +160,9 @@ The example above swaps Tab (`9`) and Shift+Tab (`353`).
 
 **Finding key codes:**
 
-Press `Ctrl+D` inside the editor to enable debug mode — the key code of every pressed key will be shown in the status bar. Press `Ctrl+D` again to turn it off.
+Press `Ctrl+d` inside the editor to enable debug mode — the key code of every pressed key will be shown in the status bar. Press `Ctrl+d` again to turn it off.
 
-You can also open the help (`F1` / `Ctrl+H`) while debug mode is active to see a full list of all registered keybindings with their codes at the bottom of the help page.
+You can also open the help (`F1` / `Alt+h`) while debug mode is active to see a full list of all registered keybindings with their codes at the bottom of the help page.
 
 ### LM-Powered Autocomplete
 
@@ -153,7 +178,7 @@ the most likely next SQL token given the current query context.
 
 ### Navigation in Database and Table Listings
 
-When using `Alt + e` (database list) or `Alt + t` (table list), use the arrow keys to navigate through the entries and `Enter` to drill in.
+When using `Alt+e` (database list) or `Alt+t` (table list), use the arrow keys to navigate through the entries and `Enter` to drill in.
 
 **Database List Navigation:**
 - Select a database and press `Enter` to proceed to the table list for that database
@@ -165,15 +190,15 @@ When using `Alt + e` (database list) or `Alt + t` (table list), use the arrow ke
 
 ## VisiData Sheets
 
-Press `Alt + s` to open a list of currently open VisiData sheets. Use the arrow keys to navigate and press `Enter` to switch to the selected sheet.
+Press `Alt+s` to open a list of currently open VisiData sheets. Use the arrow keys to navigate and press `Enter` to switch to the selected sheet.
 
-To keep sheets open when navigating between them, quit VisiData with `Ctrl + q` instead of `q`. Pressing `q` closes the current sheet, while `Ctrl + q` exits VisiData entirely while leaving all sheets in memory so they remain accessible via `Alt + s`.
+To keep sheets open when navigating between them, quit VisiData with `Ctrl+q` instead of `q`. Pressing `q` closes the current sheet, while `Ctrl+q` exits VisiData entirely while leaving all sheets in memory so they remain accessible via `Alt+s`.
 
 ## Data Visualization (visidata)
 
 [VisiData](https://www.visidata.org/) is, frankly, the most productive way to look at tabular data in a terminal. It turns a query result into a live, navigable spreadsheet: you can sort and filter on any column, build frequency tables, pivot, melt, join sheets, plot quick histograms, edit cells, follow references between sheets, and export to dozens of formats — all with a few keystrokes and no mouse. DbCls opens every query result directly in visidata, so exploring a database feels less like scrolling through a log and more like poking at a live dataset.
 
-DbCls extends visidata with a handful of DB-aware helpers (cross-sheet references, timestamp conversions, SQL `INSERT` export, an editable sample-query for each table, and a sheet switcher reachable from the editor via `Alt + s`).
+DbCls extends visidata with a handful of DB-aware helpers (cross-sheet references, timestamp conversions, SQL `INSERT` export, an editable sample-query for each table, and a sheet switcher reachable from the editor via `Alt+s`).
 
 ### Hotkeys
 
@@ -182,7 +207,7 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 | `zf` | Format current cell (JSON indentation, number prettification) |
 | `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
 | `gp` | Draw a time-series chart from the current sheet's key columns (see [Plotting](#plotting) below) |
-| `E` | Edit the SQL query used to fetch sample data for the current table(in `Alt + t` page only) |
+| `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only) |
 | `gT` | Save current or selected rows to pipeline vars |
 | `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
 
@@ -223,7 +248,7 @@ Open the result in VisiData, mark `dt`, `status`, and `cnt` as key columns (pres
 DbCls supports exporting data from visidata in multiple formats:
 
 **SQL INSERT Export:**
-1. After executing a query and viewing results in visidata, press either `Ctrl+S` to save or `gY` to copy to the clipboard
+1. After executing a query and viewing results in visidata, press either `Ctrl+s` to save or `gY` to copy to the clipboard
 2. Enter filename with `.sql` extension (e.g., `output.sql`)
 3. The data will be saved as SQL INSERT statements
 
@@ -261,14 +286,17 @@ You have an `orders` sheet (with `customer_id` as a key column) and a `customers
 
 ### VisiData API Functions
 
-The following functions are available in visidata expressions (press `=` to create an expression column, then use `function_name(...)`):
+The following functions are available in visidata expressions (press `=` to create an expression column, then call them via the `vd.` prefix, e.g. `=vd.ts_to_dt_utc(created_at)`):
 
 | Function | Description |
 |----------|-------------|
-| `reference(sheet_name, field, value)` | Make a reference to another sheet where `field == value`, on cell open, opens referenced rows in a new sheet |
+| `reference(sheet_name, field, value)` | Make a reference to another sheet where `field == value`; opening the cell (`z+Enter`) opens the referenced rows in a new sheet |
 | `ts_to_dt_utc(ts)` | Convert Unix timestamp (str/float/int) to UTC datetime |
-| `dt_to_start_of_inteval(dt, interval)` | Round a datetime to the start of an interval (interval in seconds) |
-| `ts_to_start_of_inteval(ts, interval)` | Round a Unix timestamp to the start of an interval (interval in seconds), preserving input type |
+| `dt_to_start_of_interval(dt, interval)` | Round a datetime to the start of an interval (interval in seconds) |
+| `ts_to_start_of_interval(ts, interval)` | Round a Unix timestamp to the start of an interval (interval in seconds), preserving input type |
+| `get_var(key)` | Read a pipeline variable saved by `.SET_VAR`, `gT` or `gzT` |
+
+Pipeline variables tie the editor and VisiData together: rows saved with `gT` / `gzT` in VisiData (or `.SET_VAR` in a pipeline) are available both as `_vars['key']` in pipelines and as `get_var('key')` in visidata expressions.
 
 ## SQL Commands
 

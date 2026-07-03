@@ -12,8 +12,7 @@ import termios
 import textwrap
 import time
 import threading
-from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
 @dataclass
@@ -96,67 +95,111 @@ KEY_PREFIX_TRIGGER = K(ord('\x18'))  # Ctrl+X
 
 EDITOR_HELP = """\
 Navigation
-  `Arrow keys`              Move cursor
-  `Ctrl+Left / Right`       Move by word
-  `Alt+Left / Right`        Move by word (alternate)
-  `Home / End`              Line start / end
-  `Ctrl+A / Cmd+Left`       Line start
-  `Ctrl+E / Cmd + Right`    Line end
-  `Ctrl+Home`               File start
-  `Ctrl+End`                File end
-  `Page Up / Down`          Scroll by page
+  `Arrow keys`
+      Move cursor
+  `Ctrl+Left / Right`
+      Move by word
+  `Alt+Left / Right`
+      Move by word (alternate)
+  `Home / End`
+      Line start / end
+  `Ctrl+A / Cmd+Left`
+      Line start
+  `Ctrl+E / Cmd+Right`
+      Line end
+  `Ctrl+Home`
+      File start
+  `Ctrl+End`
+      File end
+  `Page Up / Down`
+      Scroll by page
 
 Selection
-  `Shift+Arrows`            Extend selection
-  `Shift+Ctrl+Left/Right`   Select by word
-  `Shift+Alt+Left/Right`    Select by word (alternate)
-  `Shift+Home / End`        Select to line start / end
-  `Cmd+Shift+Left / Right`  Select to line start / end
-  `Shift+Page Up / Down`    Select by page
-  `Esc+Ctrl+A`              Select all
+  `Shift+Arrows`
+      Extend selection
+  `Shift+Ctrl+Left / Right`
+      Select by word
+  `Shift+Alt+Left / Right`
+      Select by word (alternate)
+  `Shift+Home / End`
+      Select to line start / end
+  `Cmd+Shift+Left / Right`
+      Select to line start / end
+  `Shift+Page Up / Down`
+      Select by page
+  `Esc+Ctrl+A`
+      Select all
 
 Editing
-  `Backspace / Delete`      Delete char backward / forward
-  `Alt+Backspace`           Delete word backward
-  `Alt+Delete`              Delete word forward
-  `Tab`                     Insert 4 spaces
-  `Enter`                   New line (auto-indent)
-  `Ctrl+Z / Y`              Undo / Redo
-  `Ctrl+C / X / V`          Copy / Cut / Paste
+  `Backspace / Delete`
+      Delete char backward / forward
+  `Alt+Backspace`
+      Delete word backward
+  `Alt+Delete`
+      Delete word forward
+  `Tab`
+      Insert 4 spaces
+  `Enter`
+      New line (auto-indent)
+  `Ctrl+Z / Y`
+      Undo / Redo
+  `Ctrl+C / X / V`
+      Copy / Cut / Paste
 
 File
-  `Ctrl+S`                  Save
-  `Ctrl+G`                  Open file / browse directory files
-  `Ctrl+Q`                  Quit
+  `Ctrl+S`
+      Save
+  `Ctrl+G`
+      Open file / browse directory files
+  `Ctrl+Q`
+      Quit
 
 Search
-  `Ctrl+F`                  Open search bar
-  `Up / Down`               Previous / next match
-  `Enter / Esc`             Close search bar
+  `Ctrl+F`
+      Open search bar
+  `Up / Down`
+      Previous / next match
+  `Enter / Esc`
+      Close search bar
 
 Other
-  `Ctrl+K`                  Toggle line mark (highlight)
-  `Ctrl+W`                  Toggle word wrap
-  `Alt+P`                   Command palette (run commands by name)
-  `F1 / Alt+H`              This help"""
+  `Ctrl+N`
+      Base autocomplete (words from the current file)
+  `Ctrl+K`
+      Toggle line mark (highlight)
+  `Ctrl+W`
+      Toggle word wrap
+  `Ctrl+D`
+      Toggle debug mode (shows key codes in the status bar)
+  `Alt+P`
+      Command palette (run commands by name)
+  `F1 / Alt+H`
+      This help"""
 
 
 DEBUG_PARAMS = {
-    "LOCK": None
+    "PAUSE_REQUESTED": threading.Event(),  # set by debug() to stop the UI loop
+    "PAUSED": threading.Event(),           # set by the UI loop once drawing stopped
 }
 
 
 @contextmanager
 def debug():
-    if DEBUG_PARAMS.get('LOCK') is None:
-        DEBUG_PARAMS['LOCK'] = threading.Lock()
-        DEBUG_PARAMS['LOCK'].acquire()
+    """Dev helper: suspend the curses UI so print()/pdb output stays readable.
 
-    time.sleep(0.5)
+    Wrap any code in ``with debug():`` (from any thread). The main loop
+    acknowledges the pause and stops drawing *before* curses is torn down,
+    and reinitialises the screen after the block exits."""
+    DEBUG_PARAMS['PAUSE_REQUESTED'].set()
+    # Wait for the UI loop to acknowledge. It may not be running at all
+    # (e.g. debugging outside the editor) — hence the timeout.
+    DEBUG_PARAMS['PAUSED'].wait(timeout=2)
     curses.endwin()
-    yield
-    if DEBUG_PARAMS.get('LOCK'):
-        DEBUG_PARAMS.pop('LOCK').release()
+    try:
+        yield
+    finally:
+        DEBUG_PARAMS['PAUSED'].clear()
+        DEBUG_PARAMS['PAUSE_REQUESTED'].clear()
 
 
 def get_wch(stdscr: curses.window):
@@ -575,7 +618,8 @@ class TextBuffer:
         self.cursor_col = 0
         self.sel_start: Optional[Tuple[int, int]] = None
         self.sel_end: Optional[Tuple[int, int]] = None
-        self.dirty = False
+        self._dirty = False
+        self.version = 0  # bumped on every text modification (cache invalidation key)
         self.filepath: Optional[str] = None
         self._file_mtime: Optional[float] = None
         self._undo_stack: List[Snapshot] = []
@@ -584,6 +628,18 @@ class TextBuffer:
         self._last_action_time: float = 0.0
         self.preferred_col = 0  # target column preserved across vertical moves
         self.marked_lines: set = set()  # persistent line highlights
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    @dirty.setter
+    def dirty(self, value: bool) -> None:
+        # Every text mutation sets dirty = True, which makes this the single
+        # chokepoint for bumping the buffer version.
+        if value:
+            self.version += 1
+        self._dirty = value
 
     # ── File I/O ──────────────────────────────────────────────────────────────
     def load(self, filepath: str):
@@ -601,6 +657,7 @@ class TextBuffer:
         self.cursor_col = 0
         self.sel_start = self.sel_end = None
         self.dirty = False
+        self.version += 1  # text changed even though dirty is reset
         self.filepath = filepath
         self.marked_lines.clear()
         self._undo_stack.clear()
@@ -1168,6 +1225,9 @@ class SelectPopup:
         self.scroll_offset = 0
         self._on_select = None
         self._title: str = ''
+        # label -> highlight positions for the current filter_text; the popup
+        # is redrawn every frame, so avoid re-scanning labels each time
+        self._match_cache: dict = {}
 
     def open(self, items: 'List[PopupItem]', filter_text: str = '',
              on_select=None, title: str = '') -> None:
@@ -1185,8 +1245,10 @@ class SelectPopup:
         self.selected_idx = 0
         self.scroll_offset = 0
         self._on_select = None
+        self._match_cache = {}
 
     def _refilter(self):
+        self._match_cache = {}
         parts = [p for p in self.filter_text.upper().split() if p]
         if not parts:
             self.filtered = list(self.items)
@@ -1201,6 +1263,10 @@ class SelectPopup:
         self.scroll_offset = 0
 
     def _match_positions(self, label: str) -> set:
+        cached = self._match_cache.get(label)
+        if cached is not None:
+            return cached
+
         parts = [p for p in self.filter_text.upper().split() if p]
         label_upper = label.upper()
         positions = set()
@@ -1213,6 +1279,7 @@ class SelectPopup:
                 for i in range(pos, pos + len(part)):
                     positions.add(i)
                 start = pos + 1
+        self._match_cache[label] = positions
         return positions
 
     def selected_word(self) -> Optional[str]:
@@ -1537,8 +1604,12 @@ def _parse_markup_lines(text: str, inner_w: int) -> List[Tuple[str, str]]:
                 result.append(('code', chunk))
         else:
             # Word-wrap, but treat link markers as atomic tokens so they
-            # don't get split across lines.
-            wrapped = textwrap.wrap(raw, inner_w) if raw.strip() else ['']
+            # don't get split across lines.  Continuation lines keep the
+            # original indentation (plus 2) so wrapped list entries stay
+            # visually nested instead of jumping to column 0.
+            indent = raw[:len(raw) - len(raw.lstrip())]
+            wrapped = (textwrap.wrap(raw, inner_w, subsequent_indent=indent + '  ')
+                       if raw.strip() else [''])
             for w in wrapped:
                 result.append(('normal', w))
     return result
@@ -2067,9 +2138,20 @@ class Renderer:
         self.debug_text = ''
         self.status_name: Optional[str] = None
         self.status_notification: Optional[str] = None
-        self.directory_label: Optional[str] = None
         self.cursor_line_range: tuple = (0, 1)
         self.wrap: bool = False
+        # Map token type -> color pair id (pair ids are stable across
+        # ColorManager.reset() calls, so build the map once)
+        self.type_to_pair = {
+            'normal':   colors.normal,
+            'keyword':  colors.keyword,
+            'type':     colors.type_,
+            'function': colors.func,
+            'string':   colors.string,
+            'comment':  colors.comment,
+            'number':   colors.number,
+            'operator': colors.operator,
+        }
         self.resize()
 
     def resize(self):
@@ -2273,18 +2355,7 @@ class Renderer:
 
         line = buf.lines[line_idx]
         tokens = self.lexer.get_tokens(line_idx, buf.lines)
-
-        # Map token type -> color pair id
-        type_to_pair = {
-            'normal':   colors.normal,
-            'keyword':  colors.keyword,
-            'type':     colors.type_,
-            'function': colors.func,
-            'string':   colors.string,
-            'comment':  colors.comment,
-            'number':   colors.number,
-            'operator': colors.operator,
-        }
+        type_to_pair = self.type_to_pair
 
         # Ensure we cover the full line (fill gaps between tokens)
         full_tokens = []
@@ -2497,8 +2568,8 @@ class Editor:
         self._pipeline_info_dismissed = False
         self.renderer = Renderer(stdscr, self.colors, self.buf, self.lexer)
         self.running = True
+        self._needs_redraw = True
         self._debug_mode = False
-        self._debug_key = ''
         self._prefix_pending = False
         self._status_notification: Optional[str] = None
         self._keybindings: dict = {}
@@ -2510,8 +2581,6 @@ class Editor:
         self._editor_functions: dict = {}
 
         self._directory: Optional[str] = directory
-        if directory:
-            self.renderer.directory_label = os.path.basename(directory)
 
         if filepath:
             self.buf.load(filepath)
@@ -2588,9 +2657,16 @@ class Editor:
         (-1, 2) — line above, current line, line below"""
         self.renderer.cursor_line_range = (start, end)
 
+    def request_redraw(self) -> None:
+        """Ask the main loop to redraw on its next tick. UI state changed from
+        outside the key-dispatch path (e.g. worker-thread callbacks) must call
+        this, otherwise the change stays invisible until the next keypress."""
+        self._needs_redraw = True
+
     def set_status_name(self, name: str) -> None:
         """Set a custom name shown on the left side of the status bar."""
         self.renderer.status_name = name
+        self.request_redraw()
 
     def set_status_notification(self, text: str) -> None:
         """Show a transient message in the status bar.
@@ -2602,6 +2678,7 @@ class Editor:
         else:
             self._status_notification = text
             self.renderer.status_notification = text
+        self.request_redraw()
 
     def set_words(self, keywords=None, types=None, functions=None) -> None:
         """Update syntax highlighting and autocomplete word sets.
@@ -2633,6 +2710,7 @@ class Editor:
             return
         self.info_popup.open('Info', {'main': text})
         self._pipeline_info_live = True
+        self.request_redraw()
 
     def show_autocomplete(self, items: 'List[PopupItem]') -> None:
         """Open autocomplete popup with a list of PopupItem objects."""
@@ -2757,12 +2835,16 @@ class Editor:
 
     def run(self):
         while self.running:
-            if DEBUG_PARAMS.get('LOCK'):
-                while DEBUG_PARAMS.get('LOCK') and DEBUG_PARAMS.get('LOCK').locked():
-                    time.sleep(1)
+            if DEBUG_PARAMS['PAUSE_REQUESTED'].is_set():
+                # A debug() session wants the terminal: confirm that drawing
+                # stopped, wait for the session to end, then reinit the screen.
+                DEBUG_PARAMS['PAUSED'].set()
+                while DEBUG_PARAMS['PAUSE_REQUESTED'].is_set():
+                    time.sleep(0.1)
                 curses.endwin()
                 self.colors.reset()
                 self._apply_termios()
+                self._needs_redraw = True
 
             try:
                 key = get_wch(self.stdscr)
@@ -2776,12 +2858,14 @@ class Editor:
                     self.stdscr.timeout(50)
                     self._dispatch(key_base(KEY_PREFIX_TRIGGER))
                     self.lexer.invalidate(self.buf.cursor_row)
+                    self._needs_redraw = True
                 else:
                     self._dispatch_pre_hook(-1)
             else:
                 self._dispatch(key)
                 # Invalidate lexer cache from cursor row
                 self.lexer.invalidate(self.buf.cursor_row)
+                self._needs_redraw = True
 
             if self.running_popup.active and self.running_popup.is_done():
                 cb = self._running_done_cb
@@ -2789,11 +2873,27 @@ class Editor:
                 self.running_popup.close()
                 if cb:
                     cb()
+                self._needs_redraw = True
 
             self._file_check_counter += 1
             if self._file_check_counter >= 20:  # ~1 s at 50 ms timeout
                 self._file_check_counter = 0
                 self._check_external_file_change()
+                self._needs_redraw = True
+
+            if DEBUG_PARAMS['PAUSE_REQUESTED'].is_set():
+                # A debug() pause arrived mid-iteration — skip drawing; the
+                # branch at the top of the loop will acknowledge it.
+                continue
+
+            # Animated UI (spinner, lock overlay timers) needs a redraw on
+            # every tick; everything else redraws only on state changes.
+            if self.running_popup.active or self._get_overlay() is not None:
+                self._needs_redraw = True
+
+            if not self._needs_redraw:
+                continue
+            self._needs_redraw = False
 
             self.renderer.ensure_cursor_visible()
             self.renderer.search_matches = self.search.matches
@@ -2888,7 +2988,13 @@ class Editor:
         if self._prefix_pending:
             self._prefix_pending = False
             self.stdscr.timeout(50)
-            key = key | KEY_PREFIX_BIT
+            prefixed = self._override_remaped_keys(key | KEY_PREFIX_BIT)
+            if key_is_pfx(prefixed) and prefixed not in self._keybindings:
+                # Unbound prefix combo: run the trigger's own action and
+                # handle the second key normally instead of swallowing both.
+                self._handle_normal_key(KEY_PREFIX_TRIGGER)
+            else:
+                key = prefixed
         elif key == KEY_PREFIX_TRIGGER:
             self._prefix_pending = True
             self.stdscr.timeout(500)
@@ -3299,16 +3405,16 @@ class Editor:
                     return
         self.running = False
 
-    def move_up_5(self, extend: bool = False):
+    def move_up_5(self):
         buf = self.buf
         pc = buf.preferred_col
-        buf.move_cursor(max(0, buf.cursor_row - 5), pc, extend)
+        buf.move_cursor(max(0, buf.cursor_row - 5), pc)
         buf.preferred_col = pc
 
-    def move_down_5(self, extend: bool = False):
+    def move_down_5(self):
         buf = self.buf
         pc = buf.preferred_col
-        buf.move_cursor(min(len(buf.lines) - 1, buf.cursor_row + 5), pc, extend)
+        buf.move_cursor(min(len(buf.lines) - 1, buf.cursor_row + 5), pc)
         buf.preferred_col = pc
 
     def _move_up_wrap(self, extend: bool = False):
@@ -3345,98 +3451,62 @@ class Editor:
         if self.buf.file_changed_on_disk():
             self._confirm_file_change()
 
-    def _confirm_file_change(self):
-        """Prompt user when the file was modified externally."""
+    def _draw_status_prompt(self, message: str, color: int, extra: str = '') -> None:
+        """Draw a one-line prompt in the status bar and put the cursor after it."""
         H, W = self.stdscr.getmaxyx()
         y = H - 1
-        msg = 'File changed on disk. (r)eload / (w)rite / other=dismiss: '
-        bar = msg[:W].ljust(W)
+        bar = (message + extra)[:W].ljust(W)
         try:
-            self.stdscr.addstr(y, 0, bar, curses.color_pair(self.colors.status_warn))
-            self.stdscr.move(y, min(len(msg), W - 1))
+            self.stdscr.addstr(y, 0, bar, curses.color_pair(color))
+            self.stdscr.move(y, min(len(message) + len(extra), W - 1))
             self.stdscr.refresh()
         except curses.error:
             pass
+
+    def _read_answer(self, message: str):
+        """Draw a warning prompt and block until a key is pressed; return the
+        normalized key."""
+        self._draw_status_prompt(message, self.colors.status_warn)
         while True:
             try:
                 key = get_wch(self.stdscr)
             except curses.error:
                 continue
             key = self._normalize_key(key)
-            if key == -1:
-                continue
-            if key in (ord('r'), ord('R'), 'r', 'R'):
-                self.buf.load(self.buf.filepath)
-                self.lexer.invalidate(0)
-                self._file_change_dismissed = False
-            elif key in (ord('w'), ord('W'), 'w', 'W'):
-                self.buf.save()
-                self._file_change_dismissed = False
-            else:
-                self._file_change_dismissed = True
-            return
+            if key != -1:
+                return key
+
+    def _confirm_file_change(self):
+        """Prompt user when the file was modified externally."""
+        key = self._read_answer('File changed on disk. (r)eload / (w)rite / other=dismiss: ')
+        if key in (ord('r'), ord('R'), 'r', 'R'):
+            self.buf.load(self.buf.filepath)
+            self.lexer.invalidate(0)
+            self._file_change_dismissed = False
+        elif key in (ord('w'), ord('W'), 'w', 'W'):
+            self.buf.save()
+            self._file_change_dismissed = False
+        else:
+            self._file_change_dismissed = True
 
     def _confirm_3way(self, message: str) -> str:
         """Show a y/n/c question; return 'yes', 'no', or 'cancel' on first keypress."""
-        H, W = self.stdscr.getmaxyx()
-        y = H - 1
-        bar = message[:W].ljust(W)
-        try:
-            self.stdscr.addstr(y, 0, bar, curses.color_pair(self.colors.status_warn))
-            self.stdscr.move(y, min(len(message), W - 1))
-            self.stdscr.refresh()
-        except curses.error:
-            pass
-        while True:
-            try:
-                key = get_wch(self.stdscr)
-            except curses.error:
-                continue
-            key = self._normalize_key(key)
-            if key in (ord('y'), ord('Y'), 'y', 'Y'):
-                return 'yes'
-            if key in (ord('n'), ord('N'), 'n', 'N'):
-                return 'no'
-            if key != -1:
-                return 'cancel'
+        key = self._read_answer(message)
+        if key in (ord('y'), ord('Y'), 'y', 'Y'):
+            return 'yes'
+        if key in (ord('n'), ord('N'), 'n', 'N'):
+            return 'no'
+        return 'cancel'
 
     def _confirm(self, message: str) -> bool:
         """Show a y/n question; return True immediately on 'y'/'Y', False on anything else."""
-        H, W = self.stdscr.getmaxyx()
-        y = H - 1
-        bar = message[:W].ljust(W)
-        try:
-            self.stdscr.addstr(y, 0, bar, curses.color_pair(self.colors.status_warn))
-            self.stdscr.move(y, min(len(message), W - 1))
-            self.stdscr.refresh()
-        except curses.error:
-            pass
-        while True:
-            try:
-                key = get_wch(self.stdscr)
-            except curses.error:
-                continue
-            key = self._normalize_key(key)
-            if key in (ord('y'), ord('Y'), 'y', 'Y'):
-                return True
-            if key != -1:
-                return False
+        return self._read_answer(message) in (ord('y'), ord('Y'), 'y', 'Y')
 
     def _prompt(self, message: str) -> str:
         """Show a prompt in the status bar and read a line of input."""
-        H, W = self.stdscr.getmaxyx()
-        y = H - 1
-        colors = self.colors
         result = ''
         while True:
-            bar = (message + result)[:W]
-            bar = bar.ljust(W)
-            try:
-                self.stdscr.addstr(y, 0, bar, curses.color_pair(colors.status_bar))
-                self.stdscr.move(y, min(len(message) + len(result), W - 1))
-                self.stdscr.refresh()
-            except curses.error:
-                pass
+            self._draw_status_prompt(message, self.colors.status_bar, extra=result)
             try:
                 key = get_wch(self.stdscr)
             except curses.error:

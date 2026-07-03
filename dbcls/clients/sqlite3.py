@@ -60,12 +60,6 @@ class Sqlite3Client(ClientClass):
             f"SELECT sql AS schema FROM sqlite_master WHERE type='table' AND name='{table}';"
         )
 
-    async def command_tables(self, command: CommandParams):
-        return await self.get_tables()
-
-    async def command_databases(self, command: CommandParams):
-        return await self.get_databases()
-
     async def command_schema(self, command: CommandParams):
         return await self.get_schema(command.params)
 

@@ -185,15 +185,15 @@ Commands: `.RUN` `.URUN` `.RFILTER` `.RGET` `.FOR_RUN` `.FOR` `.NOFOR` `.SLEEP`
 
 Example:
 ```
-.RUN "SHOW TABLES" | .RFILTER "{{_0}}" "^prefix_" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"
+.RUN "SHOW TABLES" |
+.RFILTER "{{_0}}" "^prefix_" |
+.FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"
 ```
 
 Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step.
 Triple quotes are supported for multi-line parameters:
 ```
-.RUN \"\"\"
-    SELECT *
-    FROM table\"\"\" | .RFILTER "{{col}}" "regex"
+.RUN \"\"\"SELECT * FROM table\"\"\" | .RFILTER "{{col}}" "regex"
 ```
 
 Comments: `#` or `-- ` start a comment that runs to the end of the line
@@ -204,10 +204,12 @@ Execute SQL query. With input data from a previous step, `{{expr}}`
 placeholders in the SQL are evaluated as Python expressions
 (`data` and `sql_in_list` are in scope).
 
-Example:
+Examples:
 ```
 .RUN "SELECT * FROM t LIMIT 100"
-.RUN "SELECT id FROM t" | .RUN "SELECT * FROM other WHERE id IN {{sql_in_list(data)}}"
+
+.RUN "SELECT id FROM t" |
+.RUN "SELECT * FROM other WHERE id IN {{sql_in_list(data)}}"
 ```
 """)
 
@@ -295,65 +297,105 @@ Example:
 ```
 """)
 
-HELP_INFO_BR = """
-`result(val)`, `info(msg)`, `br()` and `stop()`
-Available inside any Python-executing step (`.PY`, `.SLEEP`,
-`.SET_VAR`, the `.FOR` expression).
-
-`result(val)` sets the step's output value (the last call wins). It is what
-lets a multi-statement snippet return a value — handy when the code is more
-than a single expression, e.g. `.SLEEP "from random import randint; result(randint(1, 10))"`.
-
-`info(msg)` shows `msg` in a popup over the running overlay without
-stopping execution; calling it again updates the text. Dismiss it like any
-info popup (Esc) to reveal the running overlay again. The popup is not closed
-automatically when the pipeline finishes — it stays until you dismiss it.
-`_i` is the `.FOR` loop counter; `_0` / named columns are the previous step's
-result.
-
-`br()` breaks out of the current `.FOR` loop and continues with the steps
-after it. The breaking iteration's data (e.g. a `result(...)` set just before
-`br()`) becomes the loop's result, replacing the rows accumulated from earlier
-iterations.
-
-`stop()` aborts the *entire* pipeline immediately (it does not just break the
-loop). The current step's data — a `result(...)` set before `stop()`, else the
-data flowing into the step — becomes the pipeline's final result.
-
-Example (stop polling and return `['found']` as soon as a long query appears):
-```
-.FOR "range(60)" | .SLEEP "1" | .RUN "SELECT max(TIME) AS mtime FROM ..." | .PY \"\"\"
-info(mtime)
-if mtime > 1:
-    result(['found'])
-    br()
-\"\"\"
-```
-"""
-
 HELP_PY = _help_entry('py', """
 Execute Python code. `data` (list of dicts from the previous step), `_vars`
 and `_i` are in scope, along with datetime, timedelta, date, json, time.
 The output is, in priority: the last `result(val)` call; else a single
 expression's value (e.g. a list literal); else `data` passes through unchanged.
 
-Example:
+Examples:
 ```
-.RUN "SELECT * FROM t" | .PY "[row['id'] for row in data if row['value'] > 10]"
+.RUN "SELECT * FROM t" |
+.PY "[row['id'] for row in data if row['value'] > 10]"
+
 .RUN "SELECT id, v FROM t" | .PY \"\"\"
 result([row for row in data if row['v'] > 10])
 \"\"\"
 ```
 """)
 
-HELP_SQL_IN_LIST = """
-`sql_in_list(data)`
-Helper: converts a list of scalars or list-of-dicts to a SQL IN-list
-string, e.g. ('val1','val2'). Use inside .RUN or .PY templates.
+HELP_PY_FUNCTIONS = """
+`Functions available inside Python-executing steps`
+  (.PY / .SLEEP / .SET_VAR... or in {{expr}} placeholders in .RUN / .FOR templates):
 
-Example:
+`result(val)`
+  sets the step's output value (the last call wins). It is what
+  lets a multi-statement snippet return a value — handy when the code is more
+  than a single expression, e.g. `.SLEEP "from random import randint; result(randint(1, 10))"`.
+
+  Example:
 ```
-.RUN "SELECT id FROM table" | .RUN "SELECT * FROM other_table WHERE table_id IN {{sql_in_list(data)}}"
+from random import randint
+result(randint(1, 10))
+```
+
+`info(msg)`
+  shows `msg` in a popup over the running overlay without
+  stopping execution; calling it again updates the text. Dismiss it like any
+  info popup (Esc) to reveal the running overlay again. The popup is not closed
+  automatically when the pipeline finishes — it stays until you dismiss it.
+  `_i` is the `.FOR` loop counter; `_0` / named columns are the previous step's
+  result.
+
+  Example:
+```
+info("Hello, world!")
+```
+  
+`br()`
+  breaks out of the current `.FOR` loop and continues with the steps
+  after it. The breaking iteration's data (e.g. a `result(...)` set just before
+  `br()`) becomes the loop's result, replacing the rows accumulated from earlier
+  iterations.
+
+  Example (stop polling and return `['found']` as soon as a long query appears):
+```
+.FOR "range(60)" |
+.SLEEP "1" |
+.RUN "SELECT max(TIME) AS mtime FROM ..." |
+.PY \"\"\"
+info(mtime)
+if mtime > 1:
+    result(['found'])
+    br()
+\"\"\"
+```
+
+`stop()`
+  aborts the *entire* pipeline immediately (it does not just break the
+  loop). The current step's data — a `result(...)` set before `stop()`, else the
+  data flowing into the step — becomes the pipeline's final result.
+
+  Example:
+```
+result(['done'])
+stop()
+```
+  
+`get_var(name, default=None)`
+  returns the value of a variable stored by `.SET_VAR` (or `default` if not set).
+
+  Example:
+```
+.RUN "SELECT id FROM t" | .SET_VAR ids | .PY "[x + 1 for x in get_var('ids')]"
+```
+  
+`set_var(name, value)`
+  stores a value in the shared VARS dictionary (the same store as `.SET_VAR`).
+
+  Example:
+```
+set_var('some_var', 42) 
+```
+  
+`sql_in_list(data)`
+  converts a list of scalars or list-of-dicts to a SQL IN-list
+  string, e.g. ('val1','val2'). Use inside .RUN or .PY templates.
+
+  Example:
+```
+.RUN "SELECT id FROM table" |
+.RUN "SELECT * FROM other WHERE table_id IN {{sql_in_list(data)}}"
 ```"""
 
 HELP_SET_VAR = _help_entry('set_var', """
@@ -365,7 +407,9 @@ If PYTHON_CODE is omitted and there is no input data, deletes KEY from _vars.
 
 Example:
 ```
-.RUN "SELECT id FROM t" | .SET_VAR my_ids "sql_in_list(data)" | .RUN "SELECT * FROM t2 WHERE id IN {{_vars['my_ids']}}"
+.RUN "SELECT id FROM t" |
+.SET_VAR my_ids "sql_in_list(data)" |
+.RUN "SELECT * FROM t2 WHERE id IN {{_vars['my_ids']}}"
 ```
 """)
 
@@ -379,7 +423,8 @@ through unchanged, or the result is empty when there is no input.
 
 Example:
 ```
-.RUN "SELECT id FROM a" | .SET_VAR ids | .RUN "SELECT id FROM b" | .GET_VAR ids
+.RUN "SELECT id FROM a" | .SET_VAR ids |
+.RUN "SELECT id FROM b" | .GET_VAR ids
 ```
 """)
 
@@ -390,7 +435,8 @@ you want to continue the pipeline with a clean state.
 
 Example:
 ```
-.RUN "SELECT id FROM t" | .SET_VAR ids | .VOID | .RUN "SELECT COUNT(*) FROM t"
+.RUN "SELECT id FROM t" | .SET_VAR ids | .VOID |
+.RUN "SELECT COUNT(*) FROM t"
 ```
 """)
 
@@ -399,9 +445,10 @@ Show all pipeline variables stored with .SET_VAR.
 Returns a list of dicts with `key` and `value` columns.
 Can be used as a standalone command or as the last step in a pipeline.
 
-Example:
+Examples:
 ```
 .VARS
+
 .RUN "SELECT id FROM t" | .SET_VAR ids | .VARS
 ```
 """)
@@ -415,8 +462,11 @@ names can be substituted — handy inside `.FOR`.
 
 Example:
 ```
-.RUN "SELECT * FROM a" | .SHEET a | .RUN "SELECT * FROM b" | .SHEET b
-.FOR "range(3)" | .RUN "SELECT '{{_i}}' AS i" | .SHEET "data_{{_i}}" | .NOFOR
+.RUN "SELECT * FROM a" | .SHEET a |
+.RUN "SELECT * FROM b" | .SHEET b
+.FOR "range(3)" |
+.RUN "SELECT '{{_i}}' AS i" |
+.SHEET "data_{{_i}}" | .NOFOR
 ```
 """)
 
@@ -426,7 +476,8 @@ Positional placeholder — value of the N-th column (0-based).
 
 Example:
 ```
-.RUN "SELECT id, val, name FROM table" | .RFILTER "{{_1}}__{{_2}}" "^someval__somename$"
+.RUN "SELECT id, val, name FROM table" |
+.RFILTER "{{_1}}__{{_2}}" "^someval__somename$"
 ```
 """
 
@@ -443,7 +494,11 @@ Example:
 HELP_PIPE_SYNTAX = """
 `Pipe syntax`
 Chain commands with |:
-```  .RUN "SHOW TABLES" | .RFILTER "{{_0}}" "^prefix_" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"```
+```
+.RUN "SHOW TABLES" |
+.RFILTER "{{_0}}" "^prefix_" |
+.FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"
+```
 
 Existing commands (.TABLES, .DATABASES, …) can be used as the first step.
 """
@@ -457,12 +512,12 @@ a trailing comment still continues the pipeline onto the next line.
 
 Example:
 ```
-.RUN "SELECT 1"   -- first step
-  | .URUN "SELECT 2"   # add another row
+.RUN "SELECT 1"   -- first step |
+.URUN "SELECT 2"   # add another row
 ```
 """
 
-#: Help text shown by .HELP — ordered list of (command_signature, description).
+#: Help text shown on the "Pipelines" page of the in-app help (F1 / Alt+H).
 HELP_ENTRIES: List[str] = [
     HELP_HEADER,
     HELP_PIPE_SYNTAX,
@@ -477,14 +532,13 @@ HELP_ENTRIES: List[str] = [
     HELP_FOR,
     HELP_NOFOR,
     HELP_SLEEP,
-    HELP_INFO_BR,
     HELP_PY,
     HELP_SET_VAR,
     HELP_GET_VAR,
     HELP_VOID,
     HELP_VARS,
     HELP_SHEET,
-    HELP_SQL_IN_LIST,
+    HELP_PY_FUNCTIONS,
 ]
 
 # ── Regex used to detect a pipeline expression ────────────────────────────────
@@ -574,6 +628,18 @@ def _row_overlay(row: Optional[dict]) -> dict:
     return {**positional, **named}
 
 
+def _build_context(row: Optional[dict], data: Optional[list], extra: Optional[dict] = None) -> dict:
+    """Build the ``{{expr}}`` evaluation context shared by all template rendering."""
+    return {
+        **_row_overlay(row),
+        **DEFAULT_CONTEXT,
+        'row': row or {},
+        'data': data if data is not None else [],
+        'sql_in_list': sql_in_list,
+        **(extra or {}),
+    }
+
+
 def render_template(template: str, row: dict = None, data: Optional[list] = None) -> str:
     """Render a pipeline template by evaluating every ``{{expr}}`` placeholder.
 
@@ -605,15 +671,7 @@ def render_template(template: str, row: dict = None, data: Optional[list] = None
         render_template("SELECT * FROM t WHERE id IN {{sql_in_list(data)}}", data=[1, 2])
         # → "SELECT * FROM t WHERE id IN (1,2)"
     """
-    row = row or {}
-    context: dict = {
-        **_row_overlay(row),
-        **DEFAULT_CONTEXT,
-        'row': row,                                      # full row, always
-        'data': data if data is not None else [],
-        'sql_in_list': sql_in_list,
-    }
-    return _render(template, context)
+    return _render(template, _build_context(row, data))
 
 
 def normalize_to_dicts(value: Any) -> List[dict]:
@@ -1187,15 +1245,10 @@ class PipelineExecutor:
 
     def _render_template(self, template: str, row: dict = None, data: Optional[list] = None) -> str:
         overlay_row = row if row is not None else (data[0] if data else None)
-        context: dict = {
-            **_row_overlay(overlay_row),     # _0/_1/named from current row (or data[0])
+        context = _build_context(overlay_row, data, extra={
             **self._loop_vars(),             # _i — current .FOR item
-            **DEFAULT_CONTEXT,
-            'row': overlay_row or {},
-            'data': data if data is not None else [],
-            'sql_in_list': sql_in_list,
             '_vars': self.host.vars,
-        }
+        })
         return _render(template, context)
 
     # ── Individual command implementations ────────────────────────────────────

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from contextlib import contextmanager
 import threading
 import json
 import sys
@@ -11,7 +12,7 @@ import secrets
 import subprocess
 from functools import partial
 import time
-from typing import Optional
+from typing import Coroutine, Optional
 import logging
 import warnings
 import enum
@@ -93,7 +94,7 @@ class AsyncLoopThread(threading.Thread):
             return True
         return False
 
-    def submit(self, coro: asyncio.coroutines):
+    def submit(self, coro: Coroutine):
         task = Task(coro, self.loop)
         asyncio.run_coroutine_threadsafe(task.run(), loop=self.loop)
         return task
@@ -237,62 +238,121 @@ def get_word_parts(buf) -> list:
 
 
 DB_HELP_DATABASE = """\
-  `Alt+R`               Execute query at cursor (or selection)
-  `Shift+Tab` / `Alt+1`   DB autocomplete (tables, columns, functions)
-  `Alt+T`               Browse tables
-  `Alt+E`               Browse databases
-  `Alt+S`               Browse currently open VisiData sheets
-        (To keep sheets open, quit visidata with `Ctrl+q` instead of `q`)
-  `Ctrl+P`              Open files within the current directory
-  `Alt+P`               Open command palette
-  `Esc`                 Cancel running query"""
+  `Alt+R`
+      Execute query at cursor (or selection)
+  `Shift+Tab` / `Alt+1`
+      DB autocomplete (tables, columns, functions)
+  `Alt+T`
+      Browse tables
+  `Alt+E`
+      Browse databases
+  `Alt+S`
+      Browse currently open VisiData sheets
+      (to keep sheets open, quit visidata with `Ctrl+q` instead of `q`)
+  `Ctrl+G`
+      Open files within the current directory
+  `Alt+P`
+      Open command palette
+  `Esc`
+      Cancel running query"""
 
 DB_HELP_KEY_REMAP = """\
-  `--key-remap "A:B,C:D"`   Remap key A to act as key B (integer key codes)
-  `DBCLS_KEY_REMAP=...`      Same via environment variable
-  Example: `"9:353,353:9"`  Swap Tab and Shift+Tab
+  `--key-remap "A:B,C:D"`
+      Remap key A to act as key B (integer key codes)
+  `DBCLS_KEY_REMAP=...`
+      Same via environment variable
+  Example: `"9:353,353:9"`
+      Swap Tab and Shift+Tab
   Tip: enable debug mode (`Ctrl+D`) to see key codes"""
 
 DB_HELP_VISIDATA = """\
 Navigation
-  `← → ↑ ↓`              Move cursor
-  `Alt+↑ / Alt+↓`        Jump 5 rows up / down
-  `Alt+← / Alt+→`        Jump 3 columns left / right
-  `gg / G`               Go to first / last row
-  `gh / gl`              Go to first / last column
+  `← → ↑ ↓`
+      Move cursor
+  `Alt+↑ / Alt+↓`
+      Jump 5 rows up / down
+  `Alt+← / Alt+→`
+      Jump 3 columns left / right
+  `gg / G`
+      Go to first / last row
+  `gh / gl`
+      Go to first / last column
 
 Columns & sorting
-  `!`                    Toggle key column (used for joins and `gp` charts)
-  `[ / ]`                Sort ascending / descending by this column
-  `_ / g_`               Resize column / resize all columns to fit
-  `Shift+← / Shift+→`    Move column left / right
-  `Shift+f`              Frequency table for this column
-  `Shift+c`              Column configuration
-  `=`                    Add an expression column
+  `!`
+      Toggle key column (used for joins and `gp` charts)
+  `[ / ]`
+      Sort ascending / descending by this column
+  `_ / g_`
+      Resize column / resize all columns to fit
+  `Shift+← / Shift+→`
+      Move column left / right
+  `Shift+f`
+      Frequency table for this column
+  `Shift+c`
+      Column configuration
+  `=`
+      Add an expression column
 
 Selection
-  `s / u`               Select / unselect current row
-  `t`                   Toggle selection of current row
-  `gs / gu`             Select all / unselect all
-  `,`                   Select all rows matching current cell value
+  `s / u`
+      Select / unselect current row
+  `t`
+      Toggle selection of current row
+  `gs / gu`
+      Select all / unselect all
+  `,`
+      Select all rows matching current cell value
 
 Sheets & output
-  `S`                   Open sheet list
-  `q / Q`               Close current sheet / quit all
-  `Ctrl+Q`              Exit VisiData (sheets stay in memory for `Alt+S`)
-  `Ctrl+S`              Save sheet  (`.sql` extension → SQL INSERT statements)
-  `gY`                  Copy current sheet to clipboard
+  `S`
+      Open sheet list
+  `q / Q`
+      Close current sheet / quit all
+  `Ctrl+Q`
+      Exit VisiData (sheets stay in memory for `Alt+S`)
+  `Ctrl+S`
+      Save sheet (`.sql` extension → SQL INSERT statements)
+  `gY`
+      Copy current sheet to clipboard
 
 DB-specific extensions
-  `zf`                  Format cell: JSON indentation, number prettification
-  `g+`                  Expand array column vertically (each element → new row)
-  `gp`                  Plot time-series chart from key columns
-  `E`                   Edit sample-data SQL (table browser only)
-  `z+Enter`             Open current cell as a sheet (references, JSON, …)
-  `^`                   Cross-sheet reference: select 2 sheets in `S`, then `^`
-  `gz+Enter`            Open all selected reference cells merged into one sheet
-  `gT`                  Save selected rows (or current row) to pipeline vars as list of dicts
-  `gzT`                 Save current column values from selected rows to pipeline vars as flat list
+  `zf`
+      Format cell: JSON indentation, number prettification
+  `g+`
+      Expand array column vertically (each element → new row)
+  `gp`
+      Plot time-series chart from key columns
+  `E`
+      Edit sample-data SQL (table browser only)
+  `z+Enter`
+      Open current cell as a sheet (references, JSON, …)
+  `^`
+      Cross-sheet reference: select 2 sheets in `S`, then `^`
+  `gz+Enter`
+      Open all selected reference cells merged into one sheet
+  `gT`
+      Save selected rows (or current row) to pipeline vars
+      as a list of dicts
+  `gzT`
+      Save current column values from selected rows to pipeline vars
+      as a flat list
+
+Expression helpers
+  Available in visidata expressions (`=` adds an expression column):
+  `reference(sheet, field, value)`
+      Reference to rows of another sheet where `field == value`;
+      open the cell with `z+Enter`
+  `ts_to_dt_utc(ts)`
+      Unix timestamp (str/int/float) -> UTC datetime
+  `dt_to_start_of_interval(dt, seconds)`
+      Round datetime down to interval start
+  `ts_to_start_of_interval(ts, seconds)`
+      Same for a timestamp (keeps input type)
+  `get_var(key)`
+      Pipeline variable saved by `.SET_VAR` / `gT` / `gzT`
+
+  Example: `=ts_to_dt_utc(created_ts)`
 """
 
 
@@ -505,6 +565,9 @@ class DbEditor(Editor):
         # (name, rows) sheets requested by the pipeline's .SHEET command during the
         # current run; built into VisiData sheets in _db_query's on_done.
         self._pipeline_sheets = []
+        # get_sql_rows() cache for on_before_draw (runs every frame)
+        self._sql_rows_key = None
+        self._sql_rows: list = []
         if remap_config:
             self.apply_keys_remap(remap_config)
 
@@ -589,7 +652,13 @@ class DbEditor(Editor):
         return pages
 
     def on_before_draw(self):
-        rows = get_sql_rows(self.buf)
+        # get_sql_rows() rescans the whole buffer; only recompute when the
+        # text or the cursor row actually changed since the last frame.
+        key = (self.buf.version, self.buf.cursor_row)
+        if key != self._sql_rows_key:
+            self._sql_rows_key = key
+            self._sql_rows = get_sql_rows(self.buf)
+        rows = self._sql_rows
         if rows:
             self.set_cursor_line(
                 rows[0] - self.buf.cursor_row,
@@ -626,6 +695,36 @@ class DbEditor(Editor):
 
         self.colors.reset()
         self._apply_termios()         # restore termios after visidata resets it
+
+    @contextmanager
+    def _visidata_session(self):
+        """Hand the terminal over to VisiData for the duration of the block and
+        restore curses state afterwards."""
+        self._fix_visidata_curses()
+        try:
+            yield
+        finally:
+            self._fix_curses_after_visidata()
+
+    def _open_result_in_visidata(self, result) -> None:
+        """Open pipeline .SHEET results and/or the query result in VisiData."""
+        if self._pipeline_sheets:
+            # .SHEET was used: open each requested sheet (named), plus the
+            # pipeline's final result on top, then hand control to VisiData.
+            with self._visidata_session():
+                for name, rows in self._pipeline_sheets:
+                    visidata.vd.push(visidata.PyobjSheet(name, source=rows))
+                if result and result.data:
+                    visidata.vd.push(visidata.PyobjSheet('result', source=result.data))
+                visidata.vd.run(visidata.vd.sheets[0])
+        elif result and result.data:
+            with self._visidata_session():
+                visidata.vd.view(result.data)
+
+    def _format_query_error(self, exc: Exception) -> str:
+        if isinstance(exc, PipelineStepError) or self.client.is_db_error_exception(exc):
+            return str(exc)
+        return ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
     def _db_query(self):
         sel = self.buf.get_selected_text() if self.buf.has_selection() else ''
@@ -664,7 +763,6 @@ class DbEditor(Editor):
         def on_done():
             end = time.time()
             message = ''
-            vd_launched = False
             # A live pipeline info() popup is intentionally left open after the
             # run finishes — it stays until the user dismisses it (Esc/any key).
             # The error branch below reuses the same popup via info_popup.open().
@@ -674,33 +772,15 @@ class DbEditor(Editor):
                     return
                 result = task.result()
                 message = str(result)
-                if self._pipeline_sheets:
-                    # .SHEET was used: open each requested sheet (named), plus the
-                    # pipeline's final result on top, then hand control to VisiData.
-                    self._fix_visidata_curses()
-                    vd_launched = True
-                    for name, rows in self._pipeline_sheets:
-                        visidata.vd.push(visidata.PyobjSheet(name, source=rows))
-                    if result and result.data:
-                        visidata.vd.push(visidata.PyobjSheet('result', source=result.data))
-                    visidata.vd.run(visidata.vd.sheets[0])
-                elif result and result.data:
-                    self._fix_visidata_curses()
-                    vd_launched = True
-                    visidata.vd.view(result.data)
+                self._open_result_in_visidata(result)
             except (asyncio.CancelledError, asyncio.InvalidStateError):
                 message = 'Cancelled'
             except Exception as exc:
-                if isinstance(exc, PipelineStepError) or self.client.is_db_error_exception(exc):
-                    message = str(exc)
-                else:
-                    message = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                message = self._format_query_error(exc)
                 self.info_popup.open('Error', {'main': message})
             finally:
                 self.set_status_name(self.client.get_title())
                 self.set_status_notification(f'{round(end - start, 2)}s  {message}')
-                if vd_launched:
-                    self._fix_curses_after_visidata()
 
         self.open_running_popup(task, start, on_done)
 
@@ -742,22 +822,18 @@ class DbEditor(Editor):
     def open_sheet(self, sheet_index: str) -> None:
         """Open VisiData on the given sheet. Override to provide actual behaviour."""
         try:
-            self._fix_visidata_curses()
-            visidata.vd.run(visidata.vd.sheets[sheet_index])
+            with self._visidata_session():
+                visidata.vd.run(visidata.vd.sheets[sheet_index])
         except Exception as exc:
             self.info_popup.open('Error', {'main': str(exc)})
-        finally:
-            self._fix_curses_after_visidata()
 
     def create_new_sheet(self) -> None:
         """Open a new empty VisiData sheet. Override to provide actual behaviour."""
         try:
-            self._fix_visidata_curses()
-            visidata.vd.run(visidata.vd.newSheet('unnamed', 1))
+            with self._visidata_session():
+                visidata.vd.run(visidata.vd.newSheet('unnamed', 1))
         except Exception as exc:
             self.info_popup.open('Error', {'main': str(exc)})
-        finally:
-            self._fix_curses_after_visidata()
 
     def add_pipeline_sheet(self, name, rows) -> None:
         """Pipeline host hook for the .SHEET command: remember a named result set.
@@ -779,21 +855,15 @@ class DbEditor(Editor):
         self.popup.open(items, filter_text='', on_select=on_select, title='Open VisiData sheet')
 
     def _db_show_tables(self):
-        try:
-            self._fix_visidata_curses()
+        with self._visidata_session():
             visidata.vd.run(TablesSheet(
                 client=SyncClient(self.asyncloop_thread, self.client),
                 db=getattr(self.client, 'dbname', None),
             ))
-        finally:
-            self._fix_curses_after_visidata()
 
     def _db_show_databases(self):
-        try:
-            self._fix_visidata_curses()
+        with self._visidata_session():
             visidata.vd.run(DataBaseSheet(client=SyncClient(self.asyncloop_thread, self.client)))
-        finally:
-            self._fix_curses_after_visidata()
 
 
 def _cassandra_available() -> bool:
@@ -862,28 +932,21 @@ def main():
         with open(args.config) as f:
             config = json.load(f)
 
-        if not host or host == '127.0.0.1':
-            host = config.get('host', '')
-        if not port:
-            port = config.get('port', '')
-        if not username:
-            username = config.get('username', '')
-        if not password:
-            password = config.get('password', '')
-        if not dbname:
-            dbname = config.get('dbname', '')
-        if not engine:
-            engine = config.get('engine', '')
-        if not filepath:
-            filepath = config.get('filepath', '')
-        if not unix_socket:
-            unix_socket = config.get('unix_socket', None)
-        if not args.lock_init_command:
-            args.lock_init_command = config.get('lock_init_command', None)
+        # Config fills in anything not provided on the command line.
+        if host == '127.0.0.1':  # argparse default — treat as "not set"
+            host = ''
+        host = host or config.get('host', '')
+        port = port or config.get('port', '')
+        username = username or config.get('username', '')
+        password = password or config.get('password', '')
+        dbname = dbname or config.get('dbname', '')
+        engine = engine or config.get('engine', '')
+        filepath = filepath or config.get('filepath', '')
+        unix_socket = unix_socket or config.get('unix_socket', None)
+        args.lock_init_command = args.lock_init_command or config.get('lock_init_command', None)
+        args.lock_check_command = args.lock_check_command or config.get('lock_check_command', None)
         if args.lock_timeout is None:
             args.lock_timeout = config.get('lock_timeout', None)
-        if not args.lock_check_command:
-            args.lock_check_command = config.get('lock_check_command', None)
 
     # lock_timeout may arrive as a string (env var / JSON string) — coerce once
     # so every downstream consumer gets a float.
@@ -904,15 +967,15 @@ def main():
     if engine == 'clickhouse':
         from .clients.clickhouse import ClickhouseClient
         client = ClickhouseClient(host, username, password, dbname, port=port, compress=compress)
-    if engine == 'mysql':
+    elif engine == 'mysql':
         from .clients.mysql import MysqlClient
         client = MysqlClient(host, username, password, dbname, port=port, unix_socket=unix_socket)
-    if engine == 'postgres':
+    elif engine == 'postgres':
         from .clients.postgres import PostgresClient
         client = PostgresClient(host, username, password, dbname, port=port, unix_socket=unix_socket)
-    if engine == 'sqlite3':
+    elif engine == 'sqlite3':
         client = Sqlite3Client(filepath)
-    if engine == 'cassandra':
+    elif engine == 'cassandra':
         if not _cassandra_available():
             print("cassandra-driver is not installed. Install it with: pip install 'dbcls[cassandra]'")
             sys.exit(1)

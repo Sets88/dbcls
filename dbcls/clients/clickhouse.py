@@ -58,7 +58,7 @@ class ClickhouseClient(ClientClass):
         if not database:
             database = self.dbname
 
-        result = await self.execute('SHOW CREATE TABLE `%s`.`%s`' % (database or self.dbname, table))
+        result = await self.execute('SHOW CREATE TABLE `%s`.`%s`' % (database, table))
 
         if result and result.data:
             result.data = [{'schema': list(x.values())[-1]} for x in result.data]
@@ -76,23 +76,31 @@ class ClickhouseClient(ClientClass):
     async def command_schema(self, command: CommandParams):
         return await self.get_schema(command.params)
 
-    async def _execute(self, sql):
-        db = self.dbname
-
-        client = await clickhouse_connect.get_async_client(
+    async def connect(self):
+        self.connection = await clickhouse_connect.get_async_client(
             host=self.host,
             port=self.port,
             username=self.username,
             password=self.password,
-            database=db,
+            database=self.dbname,
             compress=self.compress
         )
 
-        raw_data = await client.query(query=sql)
+    async def change_database(self, database: str):
+        # The database is fixed per connection — reconnect with the new one.
+        self.connection = None
+        return await super().change_database(database)
 
-        data = [dict(x) for x in raw_data.named_results()]
+    async def _execute(self, sql):
+        async def run_query():
+            raw_data = await self.connection.query(query=sql)
+            data = [dict(x) for x in raw_data.named_results()]
 
-        return Result(data=data, rowcount=raw_data.summary.get('result_rows', None))
+            return Result(data=data, rowcount=raw_data.summary.get('result_rows', None))
+
+        return await self._execute_with_reconnect(
+            run_query, clickhouse_connect.driver.exceptions.OperationalError
+        )
 
     def is_db_error_exception(self, exc: Exception) -> bool:
         return isinstance(exc, clickhouse_connect.driver.exceptions.ClickHouseError)
