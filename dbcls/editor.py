@@ -13,7 +13,7 @@ import textwrap
 import time
 import threading
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 @dataclass
 class PopupItem:
@@ -1126,22 +1126,69 @@ class Clipboard:
         return self._internal
 
 
-# ─── SearchBar ────────────────────────────────────────────────────────────────
-class SearchBar:
+# ─── Line input bars ──────────────────────────────────────────────────────────
+class LineInputBar:
+    """Generic single-line input state: an editable query plus the shared
+    text-editing key handling.  Subclasses decide what Enter/Esc mean and how
+    to react to edits (see :class:`SearchBar` / :class:`InputBar`)."""
+
     def __init__(self):
         self.active = False
         self.query = ''
+        self.prompt = ''
+
+    def open(self, prompt: str = ''):
+        self.active = True
+        self.query = ''
+        self.prompt = prompt
+
+    def close(self):
+        self.active = False
+
+    def _edit_key(self, key) -> bool:
+        """Apply a text-editing key to the query; True if the query changed.
+        key is in the bitfield format produced by Editor._encode_key."""
+        if key in (K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))):
+            self.query = self.query[:-1]
+            return True
+        if key_flags(key) == 0:
+            base = key_base(key)
+            if base >= 32 and chr(base).isprintable():
+                self.query += chr(base)
+                return True
+        return False
+
+
+class InputBar(LineInputBar):
+    """Free-text prompt bar (drawn in place of the filename bar).
+    Enter submits the typed text, Esc cancels."""
+
+    def display(self) -> str:
+        """The bar text as drawn; the cursor sits right after it."""
+        return f' {self.prompt}: {self.query}'
+
+    def handle_key(self, key) -> Optional[str]:
+        """Returns 'submit', 'cancel', or None.
+        key is in the bitfield format produced by Editor._encode_key."""
+        if key == K(27):  # Escape
+            return 'cancel'
+        if key in (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))):
+            return 'submit'
+        self._edit_key(key)
+        return None
+
+
+# ─── SearchBar ────────────────────────────────────────────────────────────────
+class SearchBar(LineInputBar):
+    def __init__(self):
+        super().__init__()
         self.matches: List[Tuple[int, int, int]] = []
         self.current_idx = 0
 
     def open(self):
-        self.active = True
-        self.query = ''
+        super().open()
         self.matches = []
         self.current_idx = 0
-
-    def close(self):
-        self.active = False
 
     def find_all(self, lines: List[str]):
         self.matches = []
@@ -1201,17 +1248,9 @@ class SearchBar:
         if key == K(curses.KEY_DOWN):
             self.next_match(buf)
             return None
-        if key in (K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))):
-            self.query = self.query[:-1]
+        if self._edit_key(key):
             self.find_all(buf.lines)
             self.snap_to_nearest(buf)
-            return None
-        if key_flags(key) == 0:
-            base = key_base(key)
-            if base >= 32 and chr(base).isprintable():
-                self.query += chr(base)
-                self.find_all(buf.lines)
-                self.snap_to_nearest(buf)
         return None
 
 
@@ -1228,17 +1267,23 @@ class SelectPopup:
         self.scroll_offset = 0
         self._on_select = None
         self._title: str = ''
+        # Multi-select mode: Tab toggles a mark on the highlighted item, Enter
+        # confirms all marked items (see checked_values()).
+        self.multi = False
+        self.checked: set = set()   # id(item) of every marked PopupItem
         # label -> highlight positions for the current filter_text; the popup
         # is redrawn every frame, so avoid re-scanning labels each time
         self._match_cache: dict = {}
 
     def open(self, items: 'List[PopupItem]', filter_text: str = '',
-             on_select=None, title: str = '') -> None:
+             on_select=None, title: str = '', multi: bool = False) -> None:
         self.active = True
         self.items = list(items)
         self.filter_text = filter_text
         self._on_select = on_select
         self._title = title
+        self.multi = multi
+        self.checked = set()
         self._refilter()
 
     def close(self):
@@ -1248,6 +1293,8 @@ class SelectPopup:
         self.selected_idx = 0
         self.scroll_offset = 0
         self._on_select = None
+        self.multi = False
+        self.checked = set()
         self._match_cache = {}
 
     def _refilter(self):
@@ -1290,6 +1337,21 @@ class SelectPopup:
         if 0 <= self.selected_idx < len(self.filtered):
             return self.filtered[self.selected_idx].insert
         return None
+
+    def checked_values(self) -> List[str]:
+        """Multi mode: insert texts of all marked items, in original item order
+        (marks survive refiltering — checked_values scans self.items)."""
+        return [item.insert for item in self.items if id(item) in self.checked]
+
+    def _toggle_current(self):
+        """Multi mode: toggle the mark on the highlighted item and advance."""
+        if 0 <= self.selected_idx < len(self.filtered):
+            iid = id(self.filtered[self.selected_idx])
+            if iid in self.checked:
+                self.checked.discard(iid)
+            else:
+                self.checked.add(iid)
+            self._nav_down()
 
     def _nav_up(self):
         if self.selected_idx > 0:
@@ -1353,6 +1415,8 @@ class SelectPopup:
             self._nav_home()
         elif key == K(curses.KEY_END):
             self._nav_end()
+        elif self.multi and key == K(ord('\t')):
+            self._toggle_current()
         elif key in (K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))):
             self._filter_backspace()
         else:
@@ -1365,9 +1429,11 @@ class SelectPopup:
         # Height: top border + filter + separator + items + indicator + bottom border
         ph = visible_count + 4
         max_label_len = max((len(item.label) for item in self.filtered), default=0) if self.filtered else 0
-        # inner content = "  " prefix (2) + label; borders add 2 more
+        # inner content = prefix + label; borders add 2 more.  The prefix is
+        # "  " (2) normally, "> [x] " (6) in multi mode.
+        prefix_w = 6 if self.multi else 2
         min_pw = max(20, len(self._title) + 6 if self._title else 0)
-        pw = min(max(max_label_len + 4, min_pw), W - 3)
+        pw = min(max(max_label_len + prefix_w + 2, min_pw), W - 3)
         py = max(0, H - 1 - ph)
         px = 0
 
@@ -1452,7 +1518,11 @@ class SelectPopup:
             if abs_i < total:
                 item = self.filtered[abs_i]
                 is_sel = abs_i == self.selected_idx
-                prefix = '> ' if is_sel else '  '
+                if self.multi:
+                    mark = '[x] ' if id(item) in self.checked else '[ ] '
+                    prefix = ('> ' if is_sel else '  ') + mark
+                else:
+                    prefix = '> ' if is_sel else '  '
                 base_attr = sa if is_sel else ia
                 match_pos = self._match_positions(item.label)
                 astr(row_y, px + 1, prefix, base_attr)
@@ -1470,10 +1540,13 @@ class SelectPopup:
 
         # Scroll indicator row
         indicator = f'[{self.selected_idx + 1}/{total}]' if total > 0 else '[0/0]'
+        if self.multi:
+            indicator = f'Tab marks ({len(self.checked)}) {indicator}'
+        indicator = indicator[:pw - 2]
         ind_row = py + 3 + self.MAX_VISIBLE
         ach (ind_row, px,                            ACS_VL, ba)
         astr(ind_row, px + 1,                        ' ' * (pw - 2), ia)
-        astr(ind_row, px + pw - len(indicator) - 1,  indicator, ia)
+        astr(ind_row, max(px + 1, px + pw - len(indicator) - 1), indicator, ia)
         ach (ind_row, px + pw - 1,                   ACS_VL, ba)
 
         # Bottom border
@@ -2221,6 +2294,7 @@ class Renderer:
         search: Optional['SearchBar'] = None,
         running_popup: Optional['RunningPopup'] = None,
         info_popup: Optional['InfoPopup'] = None,
+        input_bar: Optional['InputBar'] = None,
         overlay=None,
     ):
         self.stdscr.erase()
@@ -2238,6 +2312,8 @@ class Renderer:
         self._draw_text_area()
         if search and search.active:
             self._draw_search_bar(search)
+        elif input_bar and input_bar.active:
+            self._draw_input_bar(input_bar)
         else:
             self._draw_filename_bar()
         if popup and popup.active:
@@ -2255,6 +2331,13 @@ class Renderer:
         if search and search.active:
             prompt = ' Search: '
             cx = min(len(prompt) + len(search.query), self._width - 1)
+            cy = self._height - 2
+            try:
+                self.stdscr.move(cy, cx)
+            except curses.error:
+                pass
+        elif input_bar and input_bar.active:
+            cx = min(len(input_bar.display()), self._width - 1)
             cy = self._height - 2
             try:
                 self.stdscr.move(cy, cx)
@@ -2455,6 +2538,12 @@ class Renderer:
         bar = bar.ljust(W)
         self._safe_addstr(y, 0, bar, curses.color_pair(colors.status_bar))
 
+    def _draw_input_bar(self, input_bar: 'InputBar'):
+        y = self._height - 2
+        W = self._width
+        bar = input_bar.display()[:W].ljust(W)
+        self._safe_addstr(y, 0, bar, curses.color_pair(self.colors.status_bar))
+
     def _draw_filename_bar(self):
         y = self._height - 2
         W = self._width
@@ -2565,9 +2654,14 @@ class Editor:
         self.popup = SelectPopup()
         self.running_popup = RunningPopup()
         self.info_popup = InfoPopup()
+        self.input_bar = InputBar()
         # Live-pipeline info popup state (driven by the pipeline `info()` helper).
         self._pipeline_info_live = False
-        self._pipeline_info_dismissed = False
+        # Esc on a live info popup asks the pipeline to stop at its next step.
+        self._pipeline_stop_requested = False
+        # Pending worker-thread prompt (pipeline select()/mselect()/input()/ask());
+        # see request_user_input().
+        self._ui_request: Optional[dict] = None
         self.renderer = Renderer(stdscr, self.colors, self.buf, self.lexer)
         self.running = True
         self._needs_redraw = True
@@ -2697,22 +2791,124 @@ class Editor:
     # ── Live pipeline info popup (driven from the pipeline `info()` helper) ──────
 
     def reset_pipeline_info(self) -> None:
-        """Reset live-info state at the start of a pipeline run."""
+        """Reset live-info / stop-request state at the start of a pipeline run."""
         self._pipeline_info_live = False
-        self._pipeline_info_dismissed = False
+        self._pipeline_stop_requested = False
+
+    def pipeline_stop_requested(self) -> bool:
+        """Pipeline host hook: True once the user asked the running pipeline to
+        stop (Esc on a live info() popup); the executor checks it between steps."""
+        return self._pipeline_stop_requested
 
     def show_pipeline_info(self, text: str) -> None:
         """Show/refresh the info popup over the running overlay without halting
-        execution. No-op once the user has dismissed it for this run.
+        execution.  Esc on the popup asks the pipeline to stop (see
+        pipeline_stop_requested); Backspace (or any other closing key) just
+        hides it — the next info() call shows it again.
 
         The popup is *not* closed automatically when the pipeline finishes — it
-        stays open until the user dismisses it (Esc/any key, handled where the
-        info popup intercepts input)."""
-        if self._pipeline_info_dismissed:
-            return
+        stays open until the user dismisses it (handled where the info popup
+        intercepts input)."""
         self.info_popup.open('Info', {'main': text})
         self._pipeline_info_live = True
         self.request_redraw()
+
+    # ── Worker-thread user prompts (pipeline select()/mselect()/input()/ask()) ──
+
+    def request_user_input(self, request: dict) -> Any:
+        """Show an interactive prompt and block until the user answers.
+
+        Called from a worker thread (the pipeline's async loop).  The main
+        editor loop picks the request up on its next tick, opens the matching
+        widget (SelectPopup / InputBar / y-n status prompt) and resolves the
+        request with the user's answer.
+
+        *request* needs ``kind`` (``'select'`` / ``'mselect'`` / ``'input'`` /
+        ``'ask'`` / ``'warn'``), ``title`` and, for the select kinds,
+        ``options`` (list of strings).  Returns the chosen string (select),
+        the list of marked strings (mselect), the typed string (input), a bool
+        (ask), or True once the popup is closed (warn).  Dismissing the prompt
+        with Esc resolves as None (``[]`` for mselect) — the caller decides
+        what cancellation means (the pipeline helpers abort the run via
+        ``stop()``)."""
+        if threading.current_thread() is threading.main_thread():
+            raise RuntimeError(
+                'request_user_input() must be called from a worker thread '
+                '(it blocks until the main loop collects the answer)'
+            )
+        request = dict(request)
+        request['event'] = threading.Event()
+        request['result'] = None
+        request['opened'] = False
+        self._ui_request = request
+        self.request_redraw()
+        request['event'].wait()
+        return request['result']
+
+    def _open_ui_request(self, req: dict) -> None:
+        """Open the widget for a pending worker-thread prompt (main loop tick)."""
+        req['opened'] = True
+        kind = req['kind']
+        if kind in ('select', 'mselect'):
+            items = [PopupItem(insert=o, label=o) for o in req.get('options') or []]
+            self.popup.open(items, title=req['title'], multi=(kind == 'mselect'))
+        elif kind == 'input':
+            self.input_bar.open(req['title'])
+        elif kind == 'warn':
+            # warn(): an info popup the pipeline waits on.  Closing it resolves
+            # the request in the info-popup dispatch branch (Esc → None).
+            self.info_popup.open('Warning', {'main': req['title']})
+            self._pipeline_info_live = False
+        elif kind == 'ask':
+            # Single-keypress y/n prompt — blocks the loop for one key, like
+            # every other _read_answer() prompt.  Esc means "cancelled" (None),
+            # distinct from a plain "no".
+            key = self._read_answer(f"{req['title']} (y/n): ")
+            if key in (27, '\x1b'):
+                self._resolve_ui_request(None)
+            else:
+                self._resolve_ui_request(key in (ord('y'), ord('Y'), 'y', 'Y'))
+        else:
+            self._resolve_ui_request(None)
+
+    def _resolve_ui_request(self, result: Any) -> None:
+        """Deliver *result* to the waiting worker thread and clear the request."""
+        req = self._ui_request
+        self._ui_request = None
+        if req is not None:
+            req['result'] = result
+            req['event'].set()
+
+    def _handle_ui_request_key(self, key) -> None:
+        """Route *key* to the active prompt widget; resolve when it finishes."""
+        req = self._ui_request
+        kind = req['kind']
+        if kind in ('select', 'mselect'):
+            action = self.popup.handle_key(key)
+            if action == 'insert':
+                if kind == 'mselect':
+                    # Enter confirms the marked items; with nothing marked it
+                    # selects just the highlighted one (single-choice shortcut).
+                    result = self.popup.checked_values()
+                    if not result:
+                        word = self.popup.selected_word()
+                        result = [word] if word is not None else []
+                else:
+                    result = self.popup.selected_word()
+                self.popup.close()
+                self._resolve_ui_request(result)
+            elif action == 'cancel':
+                self.popup.close()
+                self._resolve_ui_request([] if kind == 'mselect' else None)
+        elif kind == 'input':
+            action = self.input_bar.handle_key(key)
+            if action == 'submit':
+                text = self.input_bar.query
+                self.input_bar.close()
+                self._resolve_ui_request(text)
+            elif action == 'cancel':
+                self.input_bar.close()
+                self._resolve_ui_request(None)
 
     def show_autocomplete(self, items: 'List[PopupItem]') -> None:
         """Open autocomplete popup with a list of PopupItem objects."""
@@ -2865,6 +3061,12 @@ class Editor:
                 self.lexer.invalidate(self.buf.cursor_row)
                 self._needs_redraw = True
 
+            # A worker thread (pipeline select()/input()/ask()) asked for user
+            # input — open the matching widget on this tick.
+            if self._ui_request is not None and not self._ui_request['opened']:
+                self._open_ui_request(self._ui_request)
+                self._needs_redraw = True
+
             if self.running_popup.active and self.running_popup.is_done():
                 cb = self._running_done_cb
                 self._running_done_cb = None
@@ -2902,6 +3104,7 @@ class Editor:
                 search=self.search if self.search.active else None,
                 running_popup=self.running_popup if self.running_popup.active else None,
                 info_popup=self.info_popup if self.info_popup.active else None,
+                input_bar=self.input_bar if self.input_bar.active else None,
                 overlay=self._get_overlay(),
             )
 
@@ -3005,15 +3208,29 @@ class Editor:
             self.renderer.debug_text = 'DEBUG ON — press keys to see codes' if self._debug_mode else ''
             return
         # Info popup mode — checked before the running popup so that a live
-        # pipeline info() popup can be dismissed without cancelling the task.
+        # pipeline info()/warn() popup can be dismissed without cancelling the task.
         if self.info_popup.active:
             if self.info_popup.handle_key(key) == 'close':
                 self.info_popup.close()
-                if self._pipeline_info_live:
-                    # User hid a live info popup: keep it hidden for the rest of
-                    # the run and reveal the running overlay again.
-                    self._pipeline_info_dismissed = True
+                req = self._ui_request
+                if req is not None and req['opened'] and req['kind'] == 'warn':
+                    # warn() popup: Esc aborts the pipeline (resolved as None),
+                    # any other closing key resumes it.
+                    self._resolve_ui_request(None if key == K(27) else True)
+                elif self._pipeline_info_live:
+                    # Live info() popup: Esc asks the pipeline to stop at its
+                    # next step; any other closing key (Backspace, …) just hides
+                    # the popup — the next info() call reopens it.
                     self._pipeline_info_live = False
+                    if key == K(27):
+                        self._pipeline_stop_requested = True
+            return
+
+        # Worker-thread prompt mode — checked before the running popup so that
+        # pipeline select()/mselect()/input() prompts receive keys while a
+        # task is running.
+        if self._ui_request is not None and self._ui_request['opened']:
+            self._handle_ui_request_key(key)
             return
 
         # Running popup mode — only ESC passes through, all other keys are swallowed

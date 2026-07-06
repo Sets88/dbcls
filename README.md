@@ -377,15 +377,22 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 
 To carry loop rows forward past a `.NOFOR`, stash them with `.SET_VAR` inside the loop.
 
-### Helpers in Python steps
+### Helpers in Python steps and templates
 
-Available inside any Python-executing step (`.PY`, `.SLEEP`, `.SET_VAR`, the `.FOR` expression):
+Available inside any Python-executing step (`.PY`, `.SLEEP`, `.SET_VAR`, the `.FOR` expression) **and** inside `{{expr}}` template placeholders — so `.RUN "SELECT * FROM {{select('Pick a table', data)}} LIMIT 1"` prompts inline. Note that per-row templates (`.RFILTER`, `.RGET`, `.FOR_RUN`) evaluate their expression once per row.
 
 | Helper | Effect |
 |--------|--------|
-| `info(msg)` | Show `msg` in a popup without halting execution; calling it again updates the text. The popup stays until you dismiss it (Esc), including after the pipeline finishes. |
+| `info(msg)` | Show `msg` in a popup without halting execution; calling it again updates the text. `Esc` on the popup stops the pipeline; `Backspace` hides it until the next `info()` call. The popup stays after the pipeline finishes until dismissed. |
+| `warn(msg)` | Like `info()`, but pause the pipeline until the popup is closed: `Esc` stops the pipeline, any other closing key resumes it. |
 | `br()` | Break out of the current `.FOR` loop. A `result(...)` set just before `br()` becomes the loop's result. |
 | `stop()` | Abort the entire pipeline. The current step's data (a `result(...)` set before `stop()`, else the data flowing in) becomes the final result. |
+| `select(title, options)` | Pause the pipeline and open a select popup; returns the chosen option's value. `options` is a list of strings, rows from a previous step (the first column value is shown), or `(label, value)` pairs — the label is displayed, the value is returned. |
+| `mselect(title, options)` | Multi-select variant of `select()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms (with nothing marked it picks the highlighted item). Returns the list of marked options' values; `(label, value)` pairs work as in `select()`. |
+| `input(title)` | Ask the user to type a line of text in the bottom bar; returns the entered string. |
+| `ask(title)` | Ask a yes/no question in the status bar; returns `True` on `y`, `False` on any other key. |
+
+Dismissing any of these prompts with `Esc` aborts the pipeline like `stop()`.
 
 ### Template Placeholders
 

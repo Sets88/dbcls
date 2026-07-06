@@ -15,10 +15,11 @@ only outside quoted strings (so SQL inside .RUN "…" keeps its own --/#).
 Pipeline commands
 -----------------
 .RUN "SQL"
-    Execute SQL. If there is input data from a previous step the SQL
-    template may contain {{expr}} placeholders (double braces) that are
-    evaluated as Python expressions with `data` and helper functions
-    (e.g. sql_in_list) in scope.
+    Execute SQL. The SQL template may contain {{expr}} placeholders
+    (double braces) that are evaluated as Python expressions with `data`
+    (rows from the previous step) and every helper function in scope —
+    sql_in_list, get_var/set_var, info, and the user prompts
+    (e.g. .RUN "SELECT * FROM {{select('Pick a table', data)}}").
 
 .URUN "SQL"
     UNION RUN: like .RUN, but append the query rows to the input data
@@ -88,6 +89,10 @@ Template placeholders
 {{column_name}}    value of column named "column_name"
 {{_i}}             current .FOR loop item
 {{_vars['key']}}   value of a variable stored by .SET_VAR
+{{expr}}           any Python expression; the helper functions below are in
+                   scope, so e.g. {{select('Pick', data)}} works inline.
+                   In per-row templates (.RFILTER / .RGET / .FOR_RUN) the
+                   expression is evaluated once per row.
 
 Helper functions (available inside .RUN / .PY)
 -------------------------------------------------
@@ -97,18 +102,34 @@ sql_in_list(data)
     is used).
 
 Helpers available inside Python-executing steps (.PY / .SLEEP / .SET_VAR /
-the .FOR expression)
+the .FOR expression) and inside {{expr}} template placeholders
 -------------------------------------------------
 result(val) set the step's output value (the last call wins).  Lets a
             multi-statement snippet return a value, e.g.
             .SLEEP "from random import randint; result(randint(1, 10))".
-info(msg)   show msg in a popup without halting; stays until dismissed.
+info(msg)   show msg in a popup without halting.  Esc on the popup stops the
+            pipeline; Backspace hides it until the next info() call.
+warn(msg)   like info(), but pause the pipeline until the popup is closed
+            (Esc stops the pipeline, any other closing key resumes it).
 br()        break out of the current .FOR loop.
 stop()      abort the entire pipeline (current step's data is the result).
 set_var(name, value)
             store value in the shared VARS under name (same store as .SET_VAR).
 get_var(name, default=None)
             return the VARS value for name (default if absent).
+select(title, options)
+            open a select popup; pauses the pipeline and returns the chosen
+            option's value.  options may be a list of strings, rows from a
+            previous step (first column is shown), or (label, value) pairs —
+            label is displayed, value is returned.
+mselect(title, options)
+            multi-select variant of select(): Tab marks items, Enter confirms;
+            returns the list of marked options' values.
+input(title)
+            ask the user to type a line of text; returns the string.
+ask(title)  ask a yes/no question; returns True on 'y', else False.
+
+Dismissing any of these prompts with Esc aborts the pipeline like stop().
 """
 
 import time
@@ -200,9 +221,9 @@ Comments: `#` or `-- ` start a comment that runs to the end of the line
 (outside quoted SQL). See `Comments` below."""
 
 HELP_RUN = _help_entry('run', """
-Execute SQL query. With input data from a previous step, `{{expr}}`
-placeholders in the SQL are evaluated as Python expressions
-(`data` and `sql_in_list` are in scope).
+Execute SQL query. `{{expr}}` placeholders in the SQL are evaluated as
+Python expressions — `data` (rows from the previous step), `sql_in_list`
+and every helper function (`get_var`, `select`, `input`, …) are in scope.
 
 Examples:
 ```
@@ -210,6 +231,8 @@ Examples:
 
 .RUN "SELECT id FROM t" |
 .RUN "SELECT * FROM other WHERE id IN {{sql_in_list(data)}}"
+
+.RUN "SELECT * FROM {{select('Pick a table', ['t1', 't2'])}} LIMIT 1"
 ```
 """)
 
@@ -331,17 +354,28 @@ result(randint(1, 10))
 
 `info(msg)`
   shows `msg` in a popup over the running overlay without
-  stopping execution; calling it again updates the text. Dismiss it like any
-  info popup (Esc) to reveal the running overlay again. The popup is not closed
-  automatically when the pipeline finishes — it stays until you dismiss it.
-  `_i` is the `.FOR` loop counter; `_0` / named columns are the previous step's
-  result.
+  stopping execution; calling it again updates the text. `Esc` on the popup
+  stops the pipeline (like `stop()`, at the next step boundary); `Backspace`
+  (or any other closing key) hides it — the next `info()` call shows it again.
+  The popup is not closed automatically when the pipeline finishes — it stays
+  until you dismiss it. `_i` is the `.FOR` loop counter; `_0` / named columns
+  are the previous step's result.
 
   Example:
 ```
 info("Hello, world!")
 ```
-  
+
+`warn(msg)`
+  like `info()`, but *pauses* the pipeline until you close the popup:
+  `Esc` stops the pipeline, any other closing key (`Backspace`, Enter, …)
+  resumes it.
+
+  Example:
+```
+warn("About to rewrite the table!")
+```
+
 `br()`
   breaks out of the current `.FOR` loop and continues with the steps
   after it. The breaking iteration's data (e.g. a `result(...)` set just before
@@ -385,9 +419,61 @@ stop()
 
   Example:
 ```
-set_var('some_var', 42) 
+set_var('some_var', 42)
 ```
-  
+
+`select(title, options)`
+  pauses the pipeline and opens a select popup titled `title`; returns the
+  chosen option's value. `options` may be a list of strings, rows from a
+  previous step (the first column value is shown), or `(label, value)` pairs —
+  the label is displayed, the value is returned. Dismissing the popup with
+  `Esc` aborts the pipeline like `stop()`.
+
+  Example (run a query against a table the user picks):
+```
+.RUN "SHOW TABLES" | .PY \"\"\"
+result(select('Pick a table', data))
+\"\"\" |
+.RUN "SELECT * FROM {{_0}} LIMIT 10"
+```
+
+  Example with (label, value) pairs:
+```
+.PY "result([select('Row limit', [('few', 10), ('many', 1000)])])" |
+.RUN "SELECT * FROM t LIMIT {{_0}}"
+```
+
+`mselect(title, options)`
+  multi-select variant of `select()`: `Tab` marks/unmarks the highlighted
+  item, `Enter` confirms (with nothing marked it picks the highlighted item).
+  Returns the list of marked options' values; `(label, value)` pairs work as
+  in `select()`. `Esc` aborts the pipeline like `stop()`.
+
+  Example:
+```
+.RUN "SHOW TABLES" | .PY "result(mselect('Pick tables', data))"
+```
+
+`input(title)`
+  asks the user to type a line of text in the bar at the bottom; returns the
+  entered string. `Esc` aborts the pipeline like `stop()`.
+
+  Example:
+```
+.PY "result([input('Customer id')])" |
+.RUN "SELECT * FROM customers WHERE id = '{{_0}}'"
+```
+
+`ask(title)`
+  asks a yes/no question in the status bar; returns True on `y`, False on any
+  other key. `Esc` aborts the pipeline like `stop()`.
+
+  Example:
+```
+if not ask('Continue with cleanup?'):
+    stop()
+```
+
 `sql_in_list(data)`
   converts a list of scalars or list-of-dicts to a SQL IN-list
   string, e.g. ('val1','val2'). Use inside .RUN or .PY templates.
@@ -606,6 +692,10 @@ def _render(template: str, context: dict) -> str:
             # The f'"""…"""' wrapper only clashes if *expr* itself contains the
             # literal sequence '"""', which is not a realistic case.
             return eval('f"""' + '{' + expr + '}' + '"""', context)  # noqa: S307
+        except (_PipelineBreak, _PipelineStop):
+            # Control flow from br()/stop() (directly or via an Esc-dismissed
+            # user prompt) inside a template — not an error, propagate as-is.
+            raise
         except Exception as exc:
             raise ValueError(
                 f'Error in template expression {{{expr!r}}}: {exc}'
@@ -689,6 +779,36 @@ def normalize_to_dicts(value: Any) -> List[dict]:
         return [{'value': item} for item in value]
     # Scalar
     return [{'value': value}]
+
+
+def _option_pairs(options: Any) -> 'tuple[List[str], List[Any]]':
+    """Coerce *options* to the ``(labels, values)`` lists used by ``select()`` /
+    ``mselect()``: *labels* are the strings shown in the popup, *values* what
+    the helper returns for each of them.  Each option may be:
+
+    - a tuple/list ``(label, value)`` — display ``str(label)``, return *value*
+      verbatim;
+    - a dict (a row from a previous step) — the first column value is used
+      (mirroring :func:`sql_in_list`), displayed and returned as a string;
+    - a scalar — displayed and returned as a string.
+
+    A single scalar is wrapped in a one-item list."""
+    if options is None:
+        return [], []
+    if not isinstance(options, (list, tuple)):
+        options = [options]
+    labels: List[str] = []
+    values: List[Any] = []
+    for item in options:
+        if isinstance(item, (tuple, list)) and item:
+            labels.append(str(item[0]))
+            values.append(item[1] if len(item) > 1 else item[0])
+            continue
+        if isinstance(item, dict):
+            item = next(iter(item.values()), '')
+        labels.append(str(item))
+        values.append(str(item))
+    return labels, values
 
 
 #: Sentinel for "no data flowing between steps" — the first step, or a step right
@@ -1057,6 +1177,10 @@ class PipelineHost(Protocol):
 
     def add_pipeline_sheet(self, name: str, rows: List[dict]) -> None: ...
 
+    def request_user_input(self, request: dict) -> Any: ...
+
+    def pipeline_stop_requested(self) -> bool: ...
+
 
 class _PipelineBreak(Exception):
     """Raised by the ``br()`` helper to break out of the current ``.FOR`` loop.
@@ -1148,6 +1272,10 @@ class PipelineExecutor:
         the first-step / post-``.VOID`` client fallback still works.
         """
         for node in nodes:
+            # The user asked to stop (Esc on a live info() popup) — abort with
+            # stop() semantics: the data reached so far is the final result.
+            if self.host.pipeline_stop_requested():
+                raise _PipelineStop(_as_rows(data))
             try:
                 if isinstance(node, ForBlock):
                     result = await self._run_for(node, data)
@@ -1157,9 +1285,17 @@ class PipelineExecutor:
                         result = NO_DATA
                 else:
                     result = await self._execute_step(node, data)
-            except (_PipelineBreak, _PipelineStop, PipelineStepError, ValueError):
-                # Control flow, an already-annotated inner error, or a deliberate
-                # validation error (already clear) — propagate unchanged.
+            except (_PipelineBreak, _PipelineStop) as flow:
+                # Control flow — propagate.  br()/stop() raised outside
+                # _run_user_code (e.g. from an Esc-dismissed prompt in a
+                # {{...}} template) carries no data yet: the step's input
+                # rows become the result, matching the stop() contract.
+                if flow.data is None:
+                    flow.data = _as_rows(data)
+                raise
+            except (PipelineStepError, ValueError):
+                # An already-annotated inner error or a deliberate validation
+                # error (already clear) — propagate unchanged.
                 raise
             except Exception as exc:
                 raise self._step_error(node, exc) from exc
@@ -1244,10 +1380,17 @@ class PipelineExecutor:
     # ── Template helpers (methods so they can access self.host.vars) ─────────
 
     def _render_template(self, template: str, row: dict = None, data: Optional[list] = None) -> str:
+        """Render a ``{{expr}}`` template with the full pipeline context: row /
+        ``data`` overlays plus ``_i``, ``_vars`` and every helper function, so
+        templates can run the same Python as ``.PY`` — e.g.
+        ``.RUN "SELECT * FROM {{select('Pick', data)}}"``.  In per-row
+        templates (``.RFILTER`` / ``.RGET`` / ``.FOR_RUN``) the expression is
+        evaluated once per row — an interactive prompt there fires per row."""
         overlay_row = row if row is not None else (data[0] if data else None)
         context = _build_context(overlay_row, data, extra={
             **self._loop_vars(),             # _i — current .FOR item
             '_vars': self.host.vars,
+            **self._helper_context(),
         })
         return _render(template, context)
 
@@ -1325,6 +1468,8 @@ class PipelineExecutor:
         sql_template = args[0]
         result: List[dict] = []
         for row in (data or []):
+            if self.host.pipeline_stop_requested():
+                raise _PipelineStop(result)   # rows collected so far
             sql = self._render_template(sql_template, row, data)
             res = await self.client.execute(sql)
             if res and res.data:
@@ -1344,8 +1489,21 @@ class PipelineExecutor:
 
     def _info(self, msg: Any) -> None:
         """Show *msg* in the info popup (overlaying the running popup) without
-        halting pipeline execution.  Exposed as ``info()`` to user Python code."""
+        halting pipeline execution.  Esc on the popup stops the pipeline (checked
+        here so tight info() loops react promptly, and again between steps);
+        Backspace just hides it until the next ``info()`` call.  Exposed as
+        ``info()`` to user Python code."""
+        if self.host.pipeline_stop_requested():
+            raise _PipelineStop()
         self.host.show_pipeline_info(str(msg))
+
+    def _warn(self, msg: Any) -> None:
+        """Show *msg* in the info popup and *block* until the user closes it;
+        Esc aborts the pipeline like ``stop()``.  Exposed as ``warn()``."""
+        answer = self.host.request_user_input(
+            {'kind': 'warn', 'title': str(msg)})
+        if answer is None:
+            self._stop()
 
     @staticmethod
     def _br() -> None:
@@ -1367,6 +1525,84 @@ class PipelineExecutor:
         ``get_var()`` to user Python code."""
         return self.host.vars.get(name, default)
 
+    # ── Interactive prompt helpers (block until the user answers in the UI) ──
+    #
+    # Dismissing any prompt with Esc aborts the whole pipeline via stop() (the
+    # editor resolves an Esc as None — [] for mselect — and the helpers below
+    # translate that into _stop()).
+
+    @staticmethod
+    def _label_map(labels: List[str], values: List[Any]) -> dict:
+        """label → value lookup; on duplicate labels the first one wins."""
+        mapping: dict = {}
+        for label, value in zip(labels, values):
+            mapping.setdefault(label, value)
+        return mapping
+
+    def _user_select(self, title: Any, options: Any) -> Any:
+        """Show a select popup with *options*; return the chosen option's
+        value (see :func:`_option_pairs` for ``(label, value)`` support).
+        Esc aborts the pipeline like ``stop()``.  Exposed as ``select()``."""
+        labels, values = _option_pairs(options)
+        if not labels:
+            raise ValueError('select(): options must not be empty')
+        choice = self.host.request_user_input(
+            {'kind': 'select', 'title': str(title), 'options': labels})
+        if choice is None:
+            self._stop()
+        return self._label_map(labels, values).get(choice, choice)
+
+    def _user_mselect(self, title: Any, options: Any) -> List[Any]:
+        """Multi-select variant of ``select()`` (Tab marks items, Enter
+        confirms); return the list of marked options' values.  Esc aborts the
+        pipeline like ``stop()``.  Exposed as ``mselect()``."""
+        labels, values = _option_pairs(options)
+        if not labels:
+            raise ValueError('mselect(): options must not be empty')
+        marked = self.host.request_user_input(
+            {'kind': 'mselect', 'title': str(title), 'options': labels})
+        if not marked:
+            self._stop()
+        mapping = self._label_map(labels, values)
+        return [mapping.get(label, label) for label in marked]
+
+    def _user_input(self, title: Any) -> str:
+        """Ask the user to type a line of text; return the entered string.
+        Esc aborts the pipeline like ``stop()``.  Exposed as ``input()``
+        (shadows the builtin, which cannot work under curses anyway)."""
+        text = self.host.request_user_input(
+            {'kind': 'input', 'title': str(title)})
+        if text is None:
+            self._stop()
+        return text
+
+    def _user_ask(self, title: Any) -> bool:
+        """Ask a yes/no question; return ``True`` on 'y', ``False`` on any
+        other key.  Esc aborts the pipeline like ``stop()``.  Exposed as
+        ``ask()``."""
+        answer = self.host.request_user_input(
+            {'kind': 'ask', 'title': str(title)})
+        if answer is None:
+            self._stop()
+        return bool(answer)
+
+    def _helper_context(self) -> dict:
+        """The helper functions exposed to every piece of user Python — both
+        Python-executing steps (via :meth:`_python_context`) and ``{{expr}}``
+        template placeholders (via :meth:`_render_template`)."""
+        return {
+            'info': self._info,
+            'warn': self._warn,
+            'br': self._br,
+            'stop': self._stop,
+            'set_var': self._set_var,
+            'get_var': self._get_var,
+            'select': self._user_select,
+            'mselect': self._user_mselect,
+            'input': self._user_input,
+            'ask': self._user_ask,
+        }
+
     def _python_context(self, data: Optional[List[dict]], extra: Optional[dict] = None) -> dict:
         """Build the global namespace shared by .PY / .SET_VAR / .SLEEP
         and the .FOR expression."""
@@ -1377,11 +1613,7 @@ class PipelineExecutor:
             'data': list(data or []),
             '_vars': self.host.vars,
             'sql_in_list': sql_in_list,
-            'info': self._info,
-            'br': self._br,
-            'stop': self._stop,
-            'set_var': self._set_var,
-            'get_var': self._get_var,
+            **self._helper_context(),
         }
         if extra:
             context.update(extra)
@@ -1402,7 +1634,9 @@ class PipelineExecutor:
         behaves identically in ``.PY`` and in ``.SLEEP`` / ``.SET_VAR`` / the
         ``.FOR`` expression — they all run through this one core.  ``data``,
         ``_vars``, ``_i``, ``info()``, ``br()``, ``stop()``, ``set_var()``,
-        ``get_var()`` and ``sql_in_list`` come from :meth:`_python_context`.
+        ``get_var()``, the user prompts (``select()`` / ``mselect()`` /
+        ``input()`` / ``ask()``) and ``sql_in_list`` come from
+        :meth:`_python_context`.
 
         Classification is done up front with :func:`compile`, so a genuine
         ``SyntaxError`` surfaces as-is instead of being masked by a second
@@ -1454,8 +1688,9 @@ class PipelineExecutor:
         3. else ``data``, unchanged (passthrough).
 
         ``data``, ``_vars``, ``_i``, ``info()``, ``br()``, ``set_var()``,
-        ``get_var()`` and ``result()`` are in scope.  Output is normalised to
-        dicts centrally in ``_execute_nodes``.
+        ``get_var()``, ``select()``, ``mselect()``, ``input()``, ``ask()`` and
+        ``result()`` are in scope.  Output is normalised to dicts centrally in
+        ``_execute_nodes``.
         """
         if not args:
             raise ValueError('.PY requires a Python code argument')
