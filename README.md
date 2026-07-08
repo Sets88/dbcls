@@ -71,6 +71,8 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-c, --config` | Path to configuration file |
 | `--no-compress` | Disable compression for ClickHouse connections |
 | `--key-remap` | Remap key codes, e.g. `"36:1412,1412:36"` to swap Tab and Shift+Tab |
+| `--fold` | Start with `>>>` ... `<<<` block folding enabled (see [Fold Blocks](#fold-blocks)) |
+| `-R, --readonly` | Open the editor in read-only mode: the document cannot be modified or saved (`[RO]` is shown next to the file name). Also `DBCLS_READONLY=1` or `"readonly": true` in the config file |
 | `--lock-init-command` | Shell command run at startup to initialise a lock session |
 | `--lock-timeout` | Seconds of inactivity before the screen locks |
 | `--lock-check-command` | Shell command run when the user attempts to unlock |
@@ -130,6 +132,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Alt+t` | Show tables list with schema and sample data options |
 | `Alt+s` | Show list of open VisiData sheets |
 | `Alt+p` | Open command palette (run any editor command by name) |
+| `Ctrl+p` | Toggle folding of `>>>` ... `<<<` blocks (see [Fold Blocks](#fold-blocks)) |
 | `Ctrl+g` | Open a file from the current directory |
 | `Ctrl+f` | Search in the editor |
 | `Ctrl+d` | Toggle debug mode (shows key codes in the status bar) |
@@ -140,6 +143,36 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 
 The full list of editor keybindings (navigation, selection, editing) is available on the
 `Editor` page of the in-app help (`F1` / `Alt+h`).
+
+### Fold Blocks
+
+Lines starting with `>>>` and `<<<` mark a foldable block (anything after the
+marker on the same line is free-form, e.g. a comment used as the block title):
+
+```sql
+>>> -- Users
+SELECT *
+FROM User
+<<<
+```
+
+`Ctrl+p` toggles folding on and off. While folding is on, each block collapses
+to its `>>>` line — the body and the `<<<` line are hidden (the text itself is
+not modified, and cursor movement skips the hidden lines). A collapsed header
+line is marked with `-` to the left of its line number, and deletions at the
+block edges (`Backspace`/`Delete`/`Alt+Backspace`) never merge visible lines
+into the hidden block.
+
+Folding is off by default. To start with it enabled, use the `--fold` CLI flag,
+set `DBCLS_FOLD=1`, or add `"fold": true` to the JSON config file.
+
+The markers also work as statement separators for `Alt+r`:
+
+- with the cursor **on a `>>>` or `<<<` line** (e.g. on a collapsed block),
+  the whole block is executed and the `>>>`/`<<<` control lines are stripped
+  from the query sent to the DB client;
+- with the cursor **inside the block**, the statement under the cursor is
+  executed as usual.
 
 ### Key Remapping
 
@@ -387,9 +420,9 @@ Available inside any Python-executing step (`.PY`, `.SLEEP`, `.SET_VAR`, the `.F
 | `warn(msg)` | Like `info()`, but pause the pipeline until the popup is closed: `Esc` stops the pipeline, any other closing key resumes it. |
 | `br()` | Break out of the current `.FOR` loop. A `result(...)` set just before `br()` becomes the loop's result. |
 | `stop()` | Abort the entire pipeline. The current step's data (a `result(...)` set before `stop()`, else the data flowing in) becomes the final result. |
-| `select(title, options)` | Pause the pipeline and open a select popup; returns the chosen option's value. `options` is a list of strings, rows from a previous step (the first column value is shown), or `(label, value)` pairs — the label is displayed, the value is returned. |
-| `mselect(title, options)` | Multi-select variant of `select()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms (with nothing marked it picks the highlighted item). Returns the list of marked options' values; `(label, value)` pairs work as in `select()`. |
-| `input(title)` | Ask the user to type a line of text in the bottom bar; returns the entered string. |
+| `select(title, options, default=None)` | Pause the pipeline and open a select popup; returns the chosen option's value. `options` is a list of strings, rows from a previous step (the first column value is shown), or `(label, value)` pairs — the label is displayed, the value is returned. `default` pre-highlights the option with that value, e.g. `select('Limit', [('few', 10), ('many', 1000)], default=10)`. |
+| `mselect(title, options, default=None)` | Multi-select variant of `select()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms (with nothing marked it picks the highlighted item). Returns the list of marked options' values; `(label, value)` pairs work as in `select()`. `default` is a list of option values to pre-mark, e.g. `mselect('Params', [1, 2, 3, 4], default=[1, 2])`. |
+| `input(title, default=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. |
 | `ask(title)` | Ask a yes/no question in the status bar; returns `True` on `y`, `False` on any other key. |
 
 Dismissing any of these prompts with `Esc` aborts the pipeline like `stop()`.

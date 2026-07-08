@@ -25,6 +25,7 @@ from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
 from .editor import Editor, K, key_alt, PopupItem, draw_box
+from .editor import find_fold_blocks, is_fold_end, is_fold_start
 from .pipeline import is_pipeline
 from .pipeline import scan_line_code_and_triple
 from .pipeline import PipelineExecutor
@@ -143,10 +144,12 @@ def print_center(window: curses.window, text: str):
 
 
 def _is_separator(line: str) -> bool:
-    """A line that separates statements: blank, a lone ``;``, or a ``#`` comment.
+    """A line that separates statements: blank, a lone ``;``, a ``#`` comment,
+    or a ``>>>``/``<<<`` fold-block marker.
     (Only counts outside of an open triple-quoted string — the caller checks that.)"""
     s = line.strip()
-    return not s or s == ';' or s.startswith('#')
+    return not s or s == ';' or s.startswith('#') \
+        or is_fold_start(s) or is_fold_end(s)
 
 
 def get_sql_rows(buf) -> list:
@@ -169,10 +172,20 @@ def get_sql_rows(buf) -> list:
       two rules above;
     * plain SQL — runs until a line ending in ``;`` or a separator/end of buffer.
 
+    ``>>>``/``<<<`` fold-block markers act as separators, and with the cursor
+    on a marker line the whole block (markers included) is the statement —
+    :func:`get_expression_under_cursor` strips the marker lines before the
+    text reaches the DB client.
+
     Returns ``[]`` when the cursor is on a separator line between statements."""
     lines = buf.lines
     row = buf.cursor_row
     n = len(lines)
+    if is_fold_start(lines[row]) or is_fold_end(lines[row]):
+        for start, end in find_fold_blocks(lines):
+            if row in (start, end):
+                return list(range(start, end + 1))
+        return []
     active = None  # open triple-quote delimiter, or None
     i = 0
     while i < n:
@@ -205,7 +218,12 @@ def get_sql_rows(buf) -> list:
 
 
 def get_expression_under_cursor(buf) -> str:
-    return '\n'.join(buf.lines[i] for i in get_sql_rows(buf))
+    # `>>>`/`<<<` fold-marker lines are control lines: never send them to the
+    # DB client (they are part of the rows when the cursor is on a marker line).
+    return '\n'.join(
+        buf.lines[i] for i in get_sql_rows(buf)
+        if not (is_fold_start(buf.lines[i]) or is_fold_end(buf.lines[i]))
+    )
 
 
 def get_sql_before_cursor(buf) -> str:
@@ -240,6 +258,10 @@ def get_word_parts(buf) -> list:
 DB_HELP_DATABASE = """\
   `Alt+R`
       Execute query at cursor (or selection)
+  `>>>` ... `<<<`
+      Fold-block markers: `Ctrl+P` toggles folding (a folded block shows
+      only its `>>>` line); with the cursor on a marker line `Alt+R` runs
+      the whole block with the marker lines stripped
   `Shift+Tab` / `Alt+1`
       DB autocomplete (tables, columns, functions)
   `Alt+T`
@@ -563,6 +585,8 @@ class DbEditor(Editor):
         lock_init_command: Optional[str] = None,
         lock_timeout: Optional[float] = None,
         lock_check_command: Optional[str] = None,
+        fold: bool = False,
+        readonly: bool = False,
     ):
         visidata.vd.addGlobals(dbeditor=self)
         self.client = client
@@ -583,7 +607,11 @@ class DbEditor(Editor):
         if lock_init_command and lock_timeout is not None and lock_check_command:
             self.lock_screen = LockScreen(lock_init_command, lock_check_command, lock_timeout)
 
-        super().__init__(stdscr, filepath, directory=directory)
+        super().__init__(stdscr, filepath, directory=directory, readonly=readonly)
+
+        # Start with >>> ... <<< block folding on (--fold / config "fold");
+        # the folds themselves are computed by _update_folds before the first draw.
+        self.fold_enabled = fold
 
         if self.lock_screen:
             self.lock_screen.initialize()
@@ -594,6 +622,9 @@ class DbEditor(Editor):
         self.add_editor_function(DbFn.SHOW_PREDICTION, self._db_show_prediction,'Autocomplete','Shift+Tab / Alt+1')
         self.add_keybinding(DbFn.RUN_QUERY,       key_alt(ord('r')))              # Alt+R
         self.add_keybinding(DbFn.SHOW_TABLES,     key_alt(ord('t')))              # Alt+T
+        if (readonly):
+            self.add_keybinding(DbFn.RUN_QUERY,        K(ord('\n')))              # Enter(for readonly mode)
+
         self.add_keybinding(DbFn.SHOW_DATABASES,  key_alt(ord('e')))              # Alt+E
         self.add_keybinding(DbFn.SHOW_PREDICTION, [key_alt(ord('1')), K(353)])   # Alt+1, Shift+Tab
         self.add_editor_function(DbFn.SHOW_VD_SHEETS, self._db_show_vd_sheets, 'Browse VisiData sheets', 'Alt+S')
@@ -912,6 +943,10 @@ def main():
         help='disable compression for ClickHouse')
     parser.add_argument('--key-remap', dest='key_remap', default='', help='specify key remap config string,' \
         ' e.g. "9:353,353:9" to remap Tab to behave like Shift+Tab and Shift+Tab to behave like Tab')
+    parser.add_argument('--fold', dest='fold', action='store_true', default=False,
+        help='start with >>> ... <<< block folding enabled (same as pressing Ctrl+P)')
+    parser.add_argument('--readonly', '-R', dest='readonly', action='store_true', default=False,
+        help='open the editor in read-only mode (document cannot be modified or saved)')
     parser.add_argument('--lock-init-command', dest='lock_init_command', default=None,
         help='shell command to initialise a lock session (receives secret via stdin, outputs code)')
     parser.add_argument('--lock-timeout', dest='lock_timeout', type=float, default=None,
@@ -935,6 +970,13 @@ def main():
     filepath = args.dbfilepath
     compress = args.compress
     unix_socket = args.unix_socket
+    # --fold is a bool from argparse, but DBCLS_FOLD arrives as a string
+    fold = args.fold
+    if isinstance(fold, str):
+        fold = fold.strip().lower() in ('1', 'true', 'yes', 'on')
+    readonly = args.readonly
+    if isinstance(readonly, str):
+        readonly = readonly.strip().lower() in ('1', 'true', 'yes', 'on')
 
     if args.config:
         with open(args.config) as f:
@@ -951,6 +993,8 @@ def main():
         engine = engine or config.get('engine', '')
         filepath = filepath or config.get('filepath', '')
         unix_socket = unix_socket or config.get('unix_socket', None)
+        fold = fold or bool(config.get('fold', False))
+        readonly = readonly or bool(config.get('readonly', False))
         args.lock_init_command = args.lock_init_command or config.get('lock_init_command', None)
         args.lock_check_command = args.lock_check_command or config.get('lock_check_command', None)
         if args.lock_timeout is None:
@@ -1019,6 +1063,8 @@ def main():
                 lock_init_command=args.lock_init_command,
                 lock_timeout=args.lock_timeout,
                 lock_check_command=args.lock_check_command,
+                fold=fold,
+                readonly=readonly,
             ).run()
         )
     except RuntimeError as e:

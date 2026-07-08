@@ -117,16 +117,19 @@ set_var(name, value)
             store value in the shared VARS under name (same store as .SET_VAR).
 get_var(name, default=None)
             return the VARS value for name (default if absent).
-select(title, options)
+select(title, options, default=None)
             open a select popup; pauses the pipeline and returns the chosen
             option's value.  options may be a list of strings, rows from a
             previous step (first column is shown), or (label, value) pairs —
-            label is displayed, value is returned.
-mselect(title, options)
+            label is displayed, value is returned.  default pre-highlights
+            the option with that value.
+mselect(title, options, default=None)
             multi-select variant of select(): Tab marks items, Enter confirms;
-            returns the list of marked options' values.
-input(title)
-            ask the user to type a line of text; returns the string.
+            returns the list of marked options' values.  default is a list of
+            option values to pre-mark.
+input(title, default=None)
+            ask the user to type a line of text; returns the string.  default
+            pre-fills the input line.
 ask(title)  ask a yes/no question; returns True on 'y', else False.
 
 Dismissing any of these prompts with Esc aborts the pipeline like stop().
@@ -422,12 +425,14 @@ stop()
 set_var('some_var', 42)
 ```
 
-`select(title, options)`
+`select(title, options, default=None)`
   pauses the pipeline and opens a select popup titled `title`; returns the
   chosen option's value. `options` may be a list of strings, rows from a
   previous step (the first column value is shown), or `(label, value)` pairs —
-  the label is displayed, the value is returned. Dismissing the popup with
-  `Esc` aborts the pipeline like `stop()`.
+  the label is displayed, the value is returned. `default` pre-highlights the
+  option with that value, e.g. `select('Limit', [('few', 10), ('many', 1000)],
+  default=10)`. Dismissing the popup with `Esc` aborts the pipeline like
+  `stop()`.
 
   Example (run a query against a table the user picks):
 ```
@@ -443,20 +448,24 @@ result(select('Pick a table', data))
 .RUN "SELECT * FROM t LIMIT {{_0}}"
 ```
 
-`mselect(title, options)`
+`mselect(title, options, default=None)`
   multi-select variant of `select()`: `Tab` marks/unmarks the highlighted
   item, `Enter` confirms (with nothing marked it picks the highlighted item).
   Returns the list of marked options' values; `(label, value)` pairs work as
-  in `select()`. `Esc` aborts the pipeline like `stop()`.
+  in `select()`. `default` is a list of option values to pre-mark, e.g.
+  `mselect('Params', [1, 2, 3, 4], default=[1, 2])`. `Esc` aborts the
+  pipeline like `stop()`.
 
   Example:
 ```
 .RUN "SHOW TABLES" | .PY "result(mselect('Pick tables', data))"
 ```
 
-`input(title)`
+`input(title, default=None)`
   asks the user to type a line of text in the bar at the bottom; returns the
-  entered string. `Esc` aborts the pipeline like `stop()`.
+  entered string. `default` pre-fills the line (the user can edit or clear
+  it), e.g. `input('Your age', default=18)`. `Esc` aborts the pipeline like
+  `stop()`.
 
   Example:
 ```
@@ -1539,39 +1548,60 @@ class PipelineExecutor:
             mapping.setdefault(label, value)
         return mapping
 
-    def _user_select(self, title: Any, options: Any) -> Any:
+    def _user_select(self, title: Any, options: Any, default: Any = None) -> Any:
         """Show a select popup with *options*; return the chosen option's
         value (see :func:`_option_pairs` for ``(label, value)`` support).
+        *default* pre-highlights the option with that value (compared like the
+        return value, so pass the value — not the label — for pairs).
         Esc aborts the pipeline like ``stop()``.  Exposed as ``select()``."""
         labels, values = _option_pairs(options)
         if not labels:
             raise ValueError('select(): options must not be empty')
-        choice = self.host.request_user_input(
-            {'kind': 'select', 'title': str(title), 'options': labels})
+        request = {'kind': 'select', 'title': str(title), 'options': labels}
+        if default is not None:
+            for label, value in zip(labels, values):
+                if value == default or label == str(default):
+                    request['default'] = label
+                    break
+        choice = self.host.request_user_input(request)
         if choice is None:
             self._stop()
         return self._label_map(labels, values).get(choice, choice)
 
-    def _user_mselect(self, title: Any, options: Any) -> List[Any]:
+    def _user_mselect(self, title: Any, options: Any, default: Any = None) -> List[Any]:
         """Multi-select variant of ``select()`` (Tab marks items, Enter
-        confirms); return the list of marked options' values.  Esc aborts the
-        pipeline like ``stop()``.  Exposed as ``mselect()``."""
+        confirms); return the list of marked options' values.  *default* is
+        the list of option values to pre-mark (a single value works too).
+        Esc aborts the pipeline like ``stop()``.  Exposed as ``mselect()``."""
         labels, values = _option_pairs(options)
         if not labels:
             raise ValueError('mselect(): options must not be empty')
-        marked = self.host.request_user_input(
-            {'kind': 'mselect', 'title': str(title), 'options': labels})
+        request = {'kind': 'mselect', 'title': str(title), 'options': labels}
+        if default is not None:
+            if not isinstance(default, (list, tuple, set)):
+                default = [default]
+            defaults = list(default)
+            default_labels = [
+                label for label, value in zip(labels, values)
+                if value in defaults or label in [str(d) for d in defaults]
+            ]
+            if default_labels:
+                request['default'] = default_labels
+        marked = self.host.request_user_input(request)
         if not marked:
             self._stop()
         mapping = self._label_map(labels, values)
         return [mapping.get(label, label) for label in marked]
 
-    def _user_input(self, title: Any) -> str:
+    def _user_input(self, title: Any, default: Any = None) -> str:
         """Ask the user to type a line of text; return the entered string.
+        *default* pre-fills the input line (the user can edit or clear it).
         Esc aborts the pipeline like ``stop()``.  Exposed as ``input()``
         (shadows the builtin, which cannot work under curses anyway)."""
-        text = self.host.request_user_input(
-            {'kind': 'input', 'title': str(title)})
+        request = {'kind': 'input', 'title': str(title)}
+        if default is not None:
+            request['default'] = str(default)
+        text = self.host.request_user_input(request)
         if text is None:
             self._stop()
         return text

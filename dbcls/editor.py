@@ -4,6 +4,7 @@
 from contextlib import contextmanager
 import curses
 import enum
+import functools
 import locale
 import os
 import re
@@ -87,6 +88,22 @@ def key_csi(*seq) -> int:
     return (packed << 2) | KEY_ESC_BIT
 
 
+# Word-jump key codes, shared by the editor bindings and LineInputBar:
+# Ctrl+Left/Right (443/444 and terminfo variants), Alt+b/f, and Alt+Left/Right
+# as ESC [D / ESC [1;3D (xterm) / ESC [1;9D (iTerm2).
+WORD_LEFT_KEYS = (
+    K(443), K(541), K(542), key_alt(ord('b')),
+    key_csi('[', 'D'),
+    key_csi('[', '1', ';', '3', 'D'),
+    key_csi('[', '1', ';', '9', 'D'),
+)
+WORD_RIGHT_KEYS = (
+    K(444), K(552), K(556), K(557), key_alt(ord('f')),
+    key_csi('[', 'C'),
+    key_csi('[', '1', ';', '3', 'C'),
+    key_csi('[', '1', ';', '9', 'C'),
+)
+
 # The key that starts a tmux-style prefix sequence.
 # After this key is pressed, the next key within 1 second is tagged with KEY_PREFIX_BIT.
 # If the timeout fires before the next key, the trigger key itself is dispatched normally.
@@ -137,6 +154,8 @@ Editing
       Delete word backward
   `Alt+Delete`
       Delete word forward
+  `Ctrl+U / Cmd+Backspace`
+      Clear current line (leaves it empty)
   `Tab`
       Insert 4 spaces
   `Enter`
@@ -159,6 +178,12 @@ Search
       Open search bar
   `Up / Down`
       Previous / next match
+  `Left / Right, Home / End`
+      Move within the query (also in input prompts)
+  `Alt+Left / Right`
+      Move by word within the query (also in input prompts)
+  `Alt+Backspace / Ctrl+U`
+      Delete word / whole query (also in input prompts)
   `Enter / Esc`
       Close search bar
 
@@ -170,6 +195,9 @@ Other
       combination (see the Key remapping help page)
   `Ctrl+K`
       Toggle line mark (highlight)
+  `Ctrl+P`
+      Toggle folding of `>>>` ... `<<<` blocks (a folded block
+      shows only its `>>>` line, marked with `-` in the gutter)
   `Ctrl+W`
       Toggle word wrap
   `Ctrl+D`
@@ -184,6 +212,37 @@ DEBUG_PARAMS = {
     "PAUSE_REQUESTED": threading.Event(),  # set by debug() to stop the UI loop
     "PAUSED": threading.Event(),           # set by the UI loop once drawing stopped
 }
+
+
+# ─── Fold blocks (>>> ... <<<) ────────────────────────────────────────────────
+FOLD_START_MARKER = '>>>'
+FOLD_END_MARKER = '<<<'
+
+
+def is_fold_start(line: str) -> bool:
+    return line.lstrip().startswith(FOLD_START_MARKER)
+
+
+def is_fold_end(line: str) -> bool:
+    return line.lstrip().startswith(FOLD_END_MARKER)
+
+
+def find_fold_blocks(lines: List[str]) -> List[Tuple[int, int]]:
+    """Return (start, end) line-index pairs of ``>>>`` ... ``<<<`` blocks.
+
+    ``start`` is the ``>>>`` line, ``end`` the matching ``<<<`` line. Blocks
+    do not nest: the first ``<<<`` closes the open block. An unclosed ``>>>``
+    (or a stray ``<<<``) produces no block."""
+    blocks = []
+    start = None
+    for i, line in enumerate(lines):
+        if start is None:
+            if is_fold_start(line):
+                start = i
+        elif is_fold_end(line):
+            blocks.append((start, i))
+            start = None
+    return blocks
 
 
 @contextmanager
@@ -614,8 +673,19 @@ class Lexer:
 
 
 # ─── TextBuffer ───────────────────────────────────────────────────────────────
+def _blocked_when_readonly(fn):
+    """Make a TextBuffer mutation a no-op while the buffer is read-only."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        if self.readonly:
+            return None
+        return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class TextBuffer:
     def __init__(self):
+        self.readonly = False  # when True every text mutation is ignored
         self.lines: List[str] = ['']
         self.cursor_row = 0
         self.cursor_col = 0
@@ -631,6 +701,9 @@ class TextBuffer:
         self._last_action_time: float = 0.0
         self.preferred_col = 0  # target column preserved across vertical moves
         self.marked_lines: set = set()  # persistent line highlights
+        # Rows hidden by fold mode (maintained by Editor._update_folds);
+        # cursor movement skips them, the renderer does not draw them.
+        self.hidden_rows: set = set()
 
     @property
     def dirty(self) -> bool:
@@ -676,6 +749,8 @@ class TextBuffer:
             return False
 
     def save(self, filepath: Optional[str] = None):
+        if self.readonly:
+            return False
         if filepath:
             self.filepath = filepath
         if not self.filepath:
@@ -719,6 +794,7 @@ class TextBuffer:
         self._last_action_tag = action_tag
         self._last_action_time = now
 
+    @_blocked_when_readonly
     def undo(self):
         if not self._undo_stack:
             return
@@ -727,6 +803,7 @@ class TextBuffer:
         self._restore_snapshot(snap)
         self._last_action_tag = None
 
+    @_blocked_when_readonly
     def redo(self):
         if not self._redo_stack:
             return
@@ -784,6 +861,7 @@ class TextBuffer:
         parts.append(self.lines[er][:ec])
         return '\n'.join(parts)
 
+    @_blocked_when_readonly
     def delete_selection(self):
         s, e = self._norm_sel()
         if s is None:
@@ -822,33 +900,67 @@ class TextBuffer:
         # Any explicit move resets preferred_col to actual position
         self.preferred_col = self.cursor_col
 
+    def prev_visible_row(self, row: int) -> int:
+        """Nearest non-hidden row at or above `row` (row 0 is never hidden)."""
+        while row > 0 and row in self.hidden_rows:
+            row -= 1
+        return row
+
+    def next_visible_row(self, row: int) -> Optional[int]:
+        """Nearest non-hidden row at or below `row`, or None if the rest of
+        the buffer is hidden."""
+        n = len(self.lines)
+        while row < n and row in self.hidden_rows:
+            row += 1
+        return row if row < n else None
+
+    def visible_row_offset(self, row: int, delta: int) -> int:
+        """The row `delta` visible rows away from `row` (clamped to the buffer)."""
+        r = row
+        for _ in range(abs(delta)):
+            if delta > 0:
+                nxt = self.next_visible_row(r + 1)
+                if nxt is None:
+                    break
+                r = nxt
+            else:
+                if r == 0:
+                    break
+                r = self.prev_visible_row(r - 1)
+        return r
+
     def move_up(self, extend=False):
         pc = self.preferred_col
-        self.move_cursor(self.cursor_row - 1, pc, extend)
+        self.move_cursor(self.prev_visible_row(self.cursor_row - 1), pc, extend)
         self.preferred_col = pc  # vertical move does not change preferred_col
 
     def move_down(self, extend=False):
         pc = self.preferred_col
-        self.move_cursor(self.cursor_row + 1, pc, extend)
+        row = self.next_visible_row(self.cursor_row + 1)
+        if row is None:
+            row = self.cursor_row  # everything below is folded away
+        self.move_cursor(row, pc, extend)
         self.preferred_col = pc  # vertical move does not change preferred_col
 
     def move_left(self, extend=False):
         if self.cursor_col > 0:
             self.move_cursor(self.cursor_row, self.cursor_col - 1, extend)
         elif self.cursor_row > 0:
-            nr = self.cursor_row - 1
+            nr = self.prev_visible_row(self.cursor_row - 1)
             self.move_cursor(nr, len(self.lines[nr]), extend)
 
     def move_right(self, extend=False):
         if self.cursor_col < len(self.lines[self.cursor_row]):
             self.move_cursor(self.cursor_row, self.cursor_col + 1, extend)
         elif self.cursor_row < len(self.lines) - 1:
-            self.move_cursor(self.cursor_row + 1, 0, extend)
+            nr = self.next_visible_row(self.cursor_row + 1)
+            if nr is not None:
+                self.move_cursor(nr, 0, extend)
 
     def move_word_left(self, extend=False):
         r, c = self.cursor_row, self.cursor_col
         if c == 0 and r > 0:
-            r -= 1
+            r = self.prev_visible_row(r - 1)
             c = len(self.lines[r])
         else:
             line = self.lines[r]
@@ -863,7 +975,9 @@ class TextBuffer:
         r, c = self.cursor_row, self.cursor_col
         line = self.lines[r]
         if c >= len(line) and r < len(self.lines) - 1:
-            r += 1
+            r = self.next_visible_row(r + 1)
+            if r is None:
+                return
             c = 0
         else:
             while c < len(line) and not (line[c].isalnum() or line[c] == '_'):
@@ -873,6 +987,7 @@ class TextBuffer:
         self.move_cursor(r, c, extend)
 
     # ── Text mutations ────────────────────────────────────────────────────────
+    @_blocked_when_readonly
     def insert_char(self, ch: str):
         self._push_undo('insert_char')
         if self.has_selection():
@@ -883,6 +998,7 @@ class TextBuffer:
         self.cursor_col = c + len(ch)
         self.dirty = True
 
+    @_blocked_when_readonly
     def insert_newline(self):
         self._push_undo('newline')
         if self.has_selection():
@@ -902,6 +1018,7 @@ class TextBuffer:
         self.cursor_col = len(indent)
         self.dirty = True
 
+    @_blocked_when_readonly
     def delete_char(self):
         """Backspace."""
         self._push_undo('delete')
@@ -914,6 +1031,8 @@ class TextBuffer:
             self.lines[r] = line[:c-1] + line[c:]
             self.cursor_col = c - 1
         elif r > 0:
+            if (r - 1) in self.hidden_rows:
+                return  # never join across a folded block
             prev = self.lines[r - 1]
             self.cursor_col = len(prev)
             self.lines[r-1] = prev + self.lines[r]
@@ -921,6 +1040,7 @@ class TextBuffer:
             self.cursor_row = r - 1
         self.dirty = True
 
+    @_blocked_when_readonly
     def delete_char_forward(self):
         """Delete key."""
         self._push_undo('delete')
@@ -932,10 +1052,13 @@ class TextBuffer:
         if c < len(line):
             self.lines[r] = line[:c] + line[c+1:]
         elif r < len(self.lines) - 1:
+            if (r + 1) in self.hidden_rows:
+                return  # never join across a folded block
             self.lines[r] = line + self.lines[r+1]
             self.lines.pop(r + 1)
         self.dirty = True
 
+    @_blocked_when_readonly
     def insert_text(self, text: str):
         self._push_undo('paste')
         if self.has_selection():
@@ -958,6 +1081,7 @@ class TextBuffer:
             self.cursor_col = len(parts[-1])
         self.dirty = True
 
+    @_blocked_when_readonly
     def delete_word_after_cursor(self):
         """Delete one token forward: word chars, or (if on non-word) non-word chars."""
         r, c = self.cursor_row, self.cursor_col
@@ -974,13 +1098,14 @@ class TextBuffer:
             self.lines[r] = line[:c] + line[end:]
             self.dirty = True
 
+    @_blocked_when_readonly
     def kill_word_backward(self):
         """Delete one token backward: word chars, or (if before non-word) non-word chars.
         At column 0 — join with previous line (delete the newline)."""
         r, c = self.cursor_row, self.cursor_col
         if c == 0:
-            if r == 0:
-                return
+            if r == 0 or (r - 1) in self.hidden_rows:
+                return  # never join across a folded block
             self._push_undo('delete_word')
             prev = self.lines[r - 1]
             self.lines[r - 1] = prev + self.lines[r]
@@ -1003,6 +1128,20 @@ class TextBuffer:
             self.cursor_col = start
             self.dirty = True
 
+    @_blocked_when_readonly
+    def delete_line(self):
+        """Clear the whole content of the current line, leaving it empty."""
+        r = self.cursor_row
+        if not self.lines[r]:
+            return
+        self._push_undo('delete_line')
+        if self.has_selection():
+            self.clear_selection()
+        self.lines[r] = ''
+        self.cursor_col = 0
+        self.dirty = True
+
+    @_blocked_when_readonly
     def delete_word_before_cursor(self):
         """Delete the word/prefix immediately before cursor (for autocomplete insertion)."""
         r, c = self.cursor_row, self.cursor_col
@@ -1136,25 +1275,91 @@ class LineInputBar:
         self.active = False
         self.query = ''
         self.prompt = ''
+        self.cursor = 0   # position within query
 
-    def open(self, prompt: str = ''):
+    def open(self, prompt: str = '', text: str = ''):
         self.active = True
-        self.query = ''
+        self.query = text
         self.prompt = prompt
+        self.cursor = len(text)
 
     def close(self):
         self.active = False
 
+    def _word_start_before_cursor(self) -> int:
+        """Start of the token before the cursor: word chars, or (if before
+        non-word) non-word chars — same rule as TextBuffer.kill_word_backward."""
+        q, start = self.query, self.cursor
+        if start > 0 and (q[start - 1].isalnum() or q[start - 1] == '_'):
+            while start > 0 and (q[start - 1].isalnum() or q[start - 1] == '_'):
+                start -= 1
+        else:
+            while start > 0 and not (q[start - 1].isalnum() or q[start - 1] == '_'):
+                start -= 1
+        return start
+
     def _edit_key(self, key) -> bool:
-        """Apply a text-editing key to the query; True if the query changed.
-        key is in the bitfield format produced by Editor._encode_key."""
+        """Apply a text-editing/movement key to the query; True if the query
+        text changed.  key is in the bitfield format produced by Editor._encode_key."""
+        c = self.cursor
+        if key == K(curses.KEY_LEFT):
+            self.cursor = max(0, c - 1)
+            return False
+        if key == K(curses.KEY_RIGHT):
+            self.cursor = min(len(self.query), c + 1)
+            return False
+        if key in (K(curses.KEY_HOME), K(604), K(ord('\x01'))):  # Home / Cmd+Left / ^A
+            self.cursor = 0
+            return False
+        if key in (K(curses.KEY_END), K(605), K(ord('\x05'))):   # End / Cmd+Right / ^E
+            self.cursor = len(self.query)
+            return False
+        if key in WORD_LEFT_KEYS:   # Alt+Left / Ctrl+Left / Alt+b
+            q = self.query
+            c -= 1
+            while c > 0 and not (q[c - 1].isalnum() or q[c - 1] == '_'):
+                c -= 1
+            while c > 0 and (q[c - 1].isalnum() or q[c - 1] == '_'):
+                c -= 1
+            self.cursor = max(0, c)
+            return False
+        if key in WORD_RIGHT_KEYS:  # Alt+Right / Ctrl+Right / Alt+f
+            q = self.query
+            while c < len(q) and not (q[c].isalnum() or q[c] == '_'):
+                c += 1
+            while c < len(q) and (q[c].isalnum() or q[c] == '_'):
+                c += 1
+            self.cursor = c
+            return False
         if key in (K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))):
-            self.query = self.query[:-1]
-            return True
+            if c > 0:
+                self.query = self.query[:c - 1] + self.query[c:]
+                self.cursor = c - 1
+                return True
+            return False
+        if key == K(curses.KEY_DC):  # Delete forward
+            if c < len(self.query):
+                self.query = self.query[:c] + self.query[c + 1:]
+                return True
+            return False
+        if key in (key_alt(127), key_alt(ord('\b')), key_alt(curses.KEY_BACKSPACE)):  # Alt+Backspace
+            start = self._word_start_before_cursor()
+            if start < c:
+                self.query = self.query[:start] + self.query[c:]
+                self.cursor = start
+                return True
+            return False
+        if key == K(ord('\x15')):  # Ctrl+U / Cmd+Backspace — clear the line
+            if self.query:
+                self.query = ''
+                self.cursor = 0
+                return True
+            return False
         if key_flags(key) == 0:
             base = key_base(key)
             if base >= 32 and chr(base).isprintable():
-                self.query += chr(base)
+                self.query = self.query[:c] + chr(base) + self.query[c:]
+                self.cursor = c + 1
                 return True
         return False
 
@@ -1164,8 +1369,12 @@ class InputBar(LineInputBar):
     Enter submits the typed text, Esc cancels."""
 
     def display(self) -> str:
-        """The bar text as drawn; the cursor sits right after it."""
+        """The bar text as drawn."""
         return f' {self.prompt}: {self.query}'
+
+    def cursor_x(self) -> int:
+        """Screen column of the cursor within the drawn bar."""
+        return len(f' {self.prompt}: ') + self.cursor
 
     def handle_key(self, key) -> Optional[str]:
         """Returns 'submit', 'cancel', or None.
@@ -1276,7 +1485,10 @@ class SelectPopup:
         self._match_cache: dict = {}
 
     def open(self, items: 'List[PopupItem]', filter_text: str = '',
-             on_select=None, title: str = '', multi: bool = False) -> None:
+             on_select=None, title: str = '', multi: bool = False,
+             default=None) -> None:
+        """*default*: pre-selection applied once at open — in multi mode a list
+        of insert texts to pre-mark, otherwise the insert text to highlight."""
         self.active = True
         self.items = list(items)
         self.filter_text = filter_text
@@ -1285,6 +1497,19 @@ class SelectPopup:
         self.multi = multi
         self.checked = set()
         self._refilter()
+        if default is not None:
+            if multi:
+                wanted = set(default)
+                self.checked = {
+                    id(item) for item in self.items if item.insert in wanted
+                }
+            else:
+                for i, item in enumerate(self.filtered):
+                    if item.insert == default:
+                        self.selected_idx = i
+                        if i >= self.MAX_VISIBLE:
+                            self.scroll_offset = i - self.MAX_VISIBLE + 1
+                        break
 
     def close(self):
         self.active = False
@@ -2214,6 +2439,7 @@ class Renderer:
         self.debug_text = ''
         self.status_name: Optional[str] = None
         self.status_notification: Optional[str] = None
+        self.input_pending = False  # a prompt is waiting for the user
         self.cursor_line_range: tuple = (0, 1)
         self.wrap: bool = False
         # Map token type -> color pair id (pair ids are stable across
@@ -2249,36 +2475,58 @@ class Renderer:
         tc = self.text_cols
         return (line_len + tc - 1) // tc
 
+    def _visible_rows_between(self, start: int, end: int) -> int:
+        """Number of non-hidden document rows in [start, end)."""
+        hidden = self.buf.hidden_rows
+        if not hidden:
+            return end - start
+        return sum(1 for i in range(start, end) if i not in hidden)
+
     def ensure_cursor_visible(self):
         cr, cc = self.buf.cursor_row, self.buf.cursor_col
+        hidden = self.buf.hidden_rows
+        # A fold created/removed above may leave scroll_row on a hidden line.
+        self.scroll_row = self.buf.prev_visible_row(min(self.scroll_row, len(self.buf.lines) - 1))
         if self.wrap:
             margin_v = 2
             tc = self.text_cols
             # Compute cursor visual row relative to scroll_row
             vrow = 0
             for i in range(self.scroll_row, cr):
+                if i in hidden:
+                    continue
                 vrow += self._visual_rows_count(len(self.buf.lines[i]))
             vrow += cc // tc
             # Scroll up if needed
             while vrow < margin_v and self.scroll_row > 0:
-                self.scroll_row -= 1
+                self.scroll_row = self.buf.prev_visible_row(self.scroll_row - 1)
                 vrow += self._visual_rows_count(len(self.buf.lines[self.scroll_row]))
             # Scroll down if needed
             while vrow >= self.text_rows - margin_v:
                 consumed = self._visual_rows_count(len(self.buf.lines[self.scroll_row]))
                 vrow -= consumed
-                if self.scroll_row < len(self.buf.lines) - 1:
-                    self.scroll_row += 1
+                nxt = self.buf.next_visible_row(self.scroll_row + 1)
+                if nxt is not None:
+                    self.scroll_row = nxt
                 else:
                     break
             self.scroll_col = 0
             return
-        # Vertical
+        # Vertical (in visible-row space so folded lines don't count)
         margin_v = 2
-        if cr < self.scroll_row + margin_v:
-            self.scroll_row = max(0, cr - margin_v)
-        if cr >= self.scroll_row + self.text_rows - margin_v:
-            self.scroll_row = cr - self.text_rows + margin_v + 1
+        above = self._visible_rows_between(self.scroll_row, cr) if cr > self.scroll_row \
+            else -self._visible_rows_between(cr, self.scroll_row)
+        if above < margin_v:
+            for _ in range(margin_v - above):
+                if self.scroll_row == 0:
+                    break
+                self.scroll_row = self.buf.prev_visible_row(self.scroll_row - 1)
+        if above >= self.text_rows - margin_v:
+            for _ in range(above - (self.text_rows - margin_v) + 1):
+                nxt = self.buf.next_visible_row(self.scroll_row + 1)
+                if nxt is None:
+                    break
+                self.scroll_row = nxt
         self.scroll_row = max(0, self.scroll_row)
         # Horizontal
         margin_h = 4
@@ -2330,14 +2578,14 @@ class Renderer:
         # Position physical cursor
         if search and search.active:
             prompt = ' Search: '
-            cx = min(len(prompt) + len(search.query), self._width - 1)
+            cx = min(len(prompt) + search.cursor, self._width - 1)
             cy = self._height - 2
             try:
                 self.stdscr.move(cy, cx)
             except curses.error:
                 pass
         elif input_bar and input_bar.active:
-            cx = min(len(input_bar.display()), self._width - 1)
+            cx = min(input_bar.cursor_x(), self._width - 1)
             cy = self._height - 2
             try:
                 self.stdscr.move(cy, cx)
@@ -2348,12 +2596,14 @@ class Renderer:
                 tc = self.text_cols
                 vrow = 0
                 for i in range(self.scroll_row, self.buf.cursor_row):
+                    if i in self.buf.hidden_rows:
+                        continue
                     vrow += self._visual_rows_count(len(self.buf.lines[i]))
                 vrow += self.buf.cursor_col // tc
                 cy = vrow
                 cx = self.GUTTER + self.buf.cursor_col % tc
             else:
-                cy = self.buf.cursor_row - self.scroll_row
+                cy = self._visible_rows_between(self.scroll_row, self.buf.cursor_row)
                 cx = self.GUTTER + self.buf.cursor_col - self.scroll_col
             cy = max(0, min(cy, self.text_rows - 1))
             cx = max(self.GUTTER, min(cx, self._width - 1))
@@ -2399,6 +2649,7 @@ class Renderer:
                 current_match_set.add((mr, c))
 
         gutter_str = '~    '[:self.GUTTER]
+        hidden = buf.hidden_rows
         if self.wrap:
             tc = self.text_cols
             screen_y = 0
@@ -2409,6 +2660,9 @@ class Renderer:
                         self._safe_addstr(screen_y, 0, gutter_str, curses.color_pair(colors.line_num))
                         screen_y += 1
                     break
+                if line_idx in hidden:
+                    line_idx += 1
+                    continue
                 line_len = len(buf.lines[line_idx])
                 num_vrows = max(1, (line_len + tc - 1) // tc) if line_len > 0 else 1
                 for vrow in range(num_vrows):
@@ -2419,13 +2673,16 @@ class Renderer:
                     screen_y += 1
                 line_idx += 1
         else:
+            line_idx = self.scroll_row
             for y in range(text_rows):
-                line_idx = self.scroll_row + y
+                while line_idx in hidden:
+                    line_idx += 1
                 if line_idx >= len(buf.lines):
                     self._safe_addstr(y, 0, gutter_str, curses.color_pair(colors.line_num))
                     continue
                 self._draw_visual_line(y, line_idx, self.scroll_col,
                                        True, match_set, current_match_set)
+                line_idx += 1
 
     def _draw_visual_line(self, y: int, line_idx: int, col_start: int, show_lineno: bool,
                           match_set: set, current_match_set: set):
@@ -2435,6 +2692,10 @@ class Renderer:
         # Gutter
         if show_lineno:
             line_no = str(line_idx + 1).rjust(self.GUTTER - 1) + ' '
+            # '-' before the number marks a folded-block header (its body,
+            # starting at the next row, is hidden).
+            if line_idx + 1 in buf.hidden_rows and line_no[0] == ' ':
+                line_no = '-' + line_no[1:]
         else:
             line_no = ' ' * self.GUTTER
         self._safe_addstr(y, 0, line_no, curses.color_pair(colors.line_num))
@@ -2551,7 +2812,8 @@ class Renderer:
         colors = self.colors
         filepath = os.path.basename(buf.filepath) if buf.filepath else '[No Name]'
         dirty = '*' if buf.dirty else ''
-        bar = f' {filepath}{dirty} '.ljust(W)[:W]
+        ro = ' [RO]' if buf.readonly else ''
+        bar = f' {filepath}{dirty}{ro} '.ljust(W)[:W]
         self._safe_addstr(y, 0, bar, curses.color_pair(colors.status_bar))
 
     def _draw_status_bar(self, search: Optional['SearchBar'] = None):
@@ -2579,7 +2841,10 @@ class Renderer:
         else:
             bar = (conn + mid + right)[:W]
             bar = bar.ljust(W)
-        self._safe_addstr(y, 0, bar, curses.color_pair(colors.status_bar))
+        # A pipeline prompt (select/input/warn/...) is waiting for the user —
+        # flag it with the warn color, same as the unsaved-changes quit prompt.
+        pair = colors.status_warn if self.input_pending else colors.status_bar
+        self._safe_addstr(y, 0, bar, curses.color_pair(pair))
 
 
 # ─── Function name enum ───────────────────────────────────────────────────────
@@ -2626,18 +2891,21 @@ class Fn(str, enum.Enum):
     DELETE           = 'delete'
     DELETE_WORD_FWD  = 'delete_word_fwd'
     KILL_WORD_BWD    = 'kill_word_bwd'
+    DELETE_LINE      = 'delete_line'
     NEWLINE          = 'newline'
     TAB              = 'tab'
     RESIZE           = 'resize'
     CLEAR_SELECTION  = 'clear_selection'
     COMMAND_PALETTE  = 'command_palette'
+    TOGGLE_FOLD      = 'toggle_fold'
 
 
 # ─── Editor ───────────────────────────────────────────────────────────────────
 class Editor:
     REMAPED_KEYS = {}
 
-    def __init__(self, stdscr: curses.window, filepath: Optional[str] = None, directory: Optional[str] = None):
+    def __init__(self, stdscr: curses.window, filepath: Optional[str] = None, directory: Optional[str] = None,
+                 readonly: bool = False):
         self.stdscr = stdscr
         stdscr.keypad(True)
         stdscr.timeout(50)
@@ -2648,6 +2916,7 @@ class Editor:
 
         self.colors = ColorManager()
         self.buf = TextBuffer()
+        self.buf.readonly = readonly
         self.lexer = Lexer()
         self.clipboard = Clipboard()
         self.search = SearchBar()
@@ -2673,6 +2942,10 @@ class Editor:
         self._running_done_cb = None
         self._file_change_dismissed: bool = False
         self._file_check_counter: int = 0
+        # >>> ... <<< block folding (Ctrl+P); _fold_key caches the buffer
+        # version the hidden-row set was computed for.
+        self.fold_enabled = False
+        self._fold_key = None
         self._init_ac_words([], [], [])
         self._editor_functions: dict = {}
 
@@ -2825,7 +3098,9 @@ class Editor:
 
         *request* needs ``kind`` (``'select'`` / ``'mselect'`` / ``'input'`` /
         ``'ask'`` / ``'warn'``), ``title`` and, for the select kinds,
-        ``options`` (list of strings).  Returns the chosen string (select),
+        ``options`` (list of strings).  Optional ``default`` pre-fills the
+        prompt: the option label to highlight (select), the labels to pre-mark
+        (mselect) or the initial text (input).  Returns the chosen string (select),
         the list of marked strings (mselect), the typed string (input), a bool
         (ask), or True once the popup is closed (warn).  Dismissing the prompt
         with Esc resolves as None (``[]`` for mselect) — the caller decides
@@ -2851,9 +3126,10 @@ class Editor:
         kind = req['kind']
         if kind in ('select', 'mselect'):
             items = [PopupItem(insert=o, label=o) for o in req.get('options') or []]
-            self.popup.open(items, title=req['title'], multi=(kind == 'mselect'))
+            self.popup.open(items, title=req['title'], multi=(kind == 'mselect'),
+                            default=req.get('default'))
         elif kind == 'input':
-            self.input_bar.open(req['title'])
+            self.input_bar.open(req['title'], req.get('default') or '')
         elif kind == 'warn':
             # warn(): an info popup the pipeline waits on.  Closing it resolves
             # the request in the info-popup dispatch branch (Esc → None).
@@ -2870,6 +3146,15 @@ class Editor:
                 self._resolve_ui_request(key in (ord('y'), ord('Y'), 'y', 'Y'))
         else:
             self._resolve_ui_request(None)
+
+    def _running_popup_to_draw(self) -> Optional['RunningPopup']:
+        """The running overlay to draw this frame.  Hidden while a worker-thread
+        prompt (select()/mselect()/input()/warn()) waits for the user, so the
+        prompt isn't obscured by the spinner box; it reappears once the request
+        is resolved (the pipeline keeps running)."""
+        if not self.running_popup.active or self._ui_request is not None:
+            return None
+        return self.running_popup
 
     def _resolve_ui_request(self, result: Any) -> None:
         """Deliver *result* to the waiting worker thread and clear the request."""
@@ -2971,11 +3256,13 @@ class Editor:
         add(Fn.DELETE,          self._cmd_delete_forward,       'Delete char forward',    'Del')
         add(Fn.DELETE_WORD_FWD, self._cmd_delete_word_forward,  'Delete word forward',    'Alt+Del')
         add(Fn.KILL_WORD_BWD,   self._cmd_kill_word_backward,   'Delete word backward',   'Alt+Backspace')
+        add(Fn.DELETE_LINE,     self._cmd_delete_line,          'Clear current line',     '^U / Cmd+Backspace')
         add(Fn.NEWLINE,         self._cmd_newline,              'New line',               'Enter')
         add(Fn.TAB,             self._cmd_tab,                  'Insert tab',             'Tab')
         add(Fn.RESIZE,          self._cmd_resize,               'Handle terminal resize')
         add(Fn.CLEAR_SELECTION, self.buf.clear_selection,       'Clear selection',        'Esc')
         add(Fn.COMMAND_PALETTE, self._cmd_command_palette,      'Command palette',        'Alt+P')
+        add(Fn.TOGGLE_FOLD,     self._cmd_toggle_fold,          'Toggle >>> <<< block folding', '^P')
 
     def _register_default_keybindings(self):
         add = self.add_keybinding
@@ -3000,8 +3287,8 @@ class Editor:
         add(Fn.SEL_PAGE_DOWN,   K(curses.KEY_SNEXT))
         add(Fn.FILE_START,      K(549))
         add(Fn.FILE_END,        K(544))
-        add(Fn.WORD_LEFT,       [K(443), K(541), K(542), key_alt(ord('b')), key_csi('[', 'D')])
-        add(Fn.WORD_RIGHT,      [K(444), K(552), K(556), K(557), key_alt(ord('f')), key_csi('[', 'C')])
+        add(Fn.WORD_LEFT,       list(WORD_LEFT_KEYS))
+        add(Fn.WORD_RIGHT,      list(WORD_RIGHT_KEYS))
         add(Fn.SEL_WORD_LEFT,   [K(553), K(559), K(558), K(600), K(602)])
         add(Fn.SEL_WORD_RIGHT,  [K(568), K(574), K(573), K(601), K(603)])
         # Ctrl shortcuts
@@ -3023,11 +3310,13 @@ class Editor:
         add(Fn.DELETE,          K(curses.KEY_DC))
         add(Fn.DELETE_WORD_FWD, K(608))
         add(Fn.KILL_WORD_BWD,   [key_alt(127), key_alt(ord('\b')), key_alt(curses.KEY_BACKSPACE)])  # Alt+Backspace (DEL or ^H)
+        add(Fn.DELETE_LINE,     K(ord('\x15')))  # Ctrl+U (Cmd+Backspace in terminals with natural text editing)
         add(Fn.NEWLINE,         [K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))])
         add(Fn.TAB,             K(ord('\t')))
         add(Fn.RESIZE,          K(curses.KEY_RESIZE))
         add(Fn.CLEAR_SELECTION, K(27))
         add(Fn.COMMAND_PALETTE, key_alt(ord('p')))   # Alt+P
+        add(Fn.TOGGLE_FOLD,     K(ord('\x10')))      # Ctrl+P
 
     def run(self):
         while self.running:
@@ -3095,14 +3384,16 @@ class Editor:
                 continue
             self._needs_redraw = False
 
+            self._update_folds()
             self.renderer.ensure_cursor_visible()
             self.renderer.search_matches = self.search.matches
             self.renderer.search_current = self.search.current_idx
             self.on_before_draw()
+            self.renderer.input_pending = self._ui_request is not None
             self.renderer.draw(
                 popup=self.popup if self.popup.active else None,
                 search=self.search if self.search.active else None,
-                running_popup=self.running_popup if self.running_popup.active else None,
+                running_popup=self._running_popup_to_draw(),
                 info_popup=self.info_popup if self.info_popup.active else None,
                 input_bar=self.input_bar if self.input_bar.active else None,
                 overlay=self._get_overlay(),
@@ -3281,11 +3572,15 @@ class Editor:
         gutter = self.renderer.GUTTER
         text_x = max(0, mx - gutter)  # clicks in the gutter go to start of that line
 
+        hidden = self.buf.hidden_rows
         if self.renderer.wrap:
             tc = self.renderer.text_cols
             screen_y = 0
             line_idx = self.renderer.scroll_row
             while line_idx < len(self.buf.lines):
+                if line_idx in hidden:
+                    line_idx += 1
+                    continue
                 line_len = len(self.buf.lines[line_idx])
                 num_vrows = max(1, (line_len + tc - 1) // tc) if line_len > 0 else 1
                 for vrow in range(num_vrows):
@@ -3296,11 +3591,17 @@ class Editor:
                     screen_y += 1
                 line_idx += 1
             # Clicked below last line — go to end of buffer
-            row = len(self.buf.lines) - 1
+            row = self.buf.prev_visible_row(len(self.buf.lines) - 1)
             self.buf.move_cursor(row, len(self.buf.lines[row]))
         else:
-            row = my + self.renderer.scroll_row
-            row = max(0, min(row, len(self.buf.lines) - 1))
+            # Walk down `my` visible rows from scroll_row
+            row = self.renderer.scroll_row
+            for _ in range(my):
+                nxt = self.buf.next_visible_row(row + 1)
+                if nxt is None:
+                    break
+                row = nxt
+            row = self.buf.prev_visible_row(max(0, min(row, len(self.buf.lines) - 1)))
             col = text_x + self.renderer.scroll_col
             col = max(0, min(col, len(self.buf.lines[row])))
             self.buf.move_cursor(row, col)
@@ -3334,13 +3635,13 @@ class Editor:
     def _cmd_page_up(self):
         rows = self.renderer.text_rows - 3
         pc = self.buf.preferred_col
-        self.buf.move_cursor(max(0, self.buf.cursor_row - rows), pc)
+        self.buf.move_cursor(self.buf.visible_row_offset(self.buf.cursor_row, -rows), pc)
         self.buf.preferred_col = pc
 
     def _cmd_page_down(self):
         rows = self.renderer.text_rows - 3
         pc = self.buf.preferred_col
-        self.buf.move_cursor(min(len(self.buf.lines) - 1, self.buf.cursor_row + rows), pc)
+        self.buf.move_cursor(self.buf.visible_row_offset(self.buf.cursor_row, rows), pc)
         self.buf.preferred_col = pc
 
     def _cmd_file_start(self):
@@ -3385,13 +3686,15 @@ class Editor:
     def _cmd_sel_page_up(self):
         rows = self.renderer.text_rows - 3
         pc = self.buf.preferred_col
-        self.buf.move_cursor(max(0, self.buf.cursor_row - rows), pc, extend_selection=True)
+        self.buf.move_cursor(self.buf.visible_row_offset(self.buf.cursor_row, -rows), pc,
+                             extend_selection=True)
         self.buf.preferred_col = pc
 
     def _cmd_sel_page_down(self):
         rows = self.renderer.text_rows - 3
         pc = self.buf.preferred_col
-        self.buf.move_cursor(min(len(self.buf.lines) - 1, self.buf.cursor_row + rows), pc, extend_selection=True)
+        self.buf.move_cursor(self.buf.visible_row_offset(self.buf.cursor_row, rows), pc,
+                             extend_selection=True)
         self.buf.preferred_col = pc
 
     def _cmd_sel_word_left(self):
@@ -3435,6 +3738,10 @@ class Editor:
         row_before = self.buf.cursor_row
         self.buf.kill_word_backward()
         self.lexer.invalidate(min(row_before, self.buf.cursor_row))
+
+    def _cmd_delete_line(self):
+        self.buf.delete_line()
+        self.lexer.invalidate(self.buf.cursor_row)
 
     def _cmd_newline(self):
         self.buf.insert_newline()
@@ -3484,6 +3791,36 @@ class Editor:
         self.renderer.wrap = not self.renderer.wrap
         self.renderer.scroll_col = 0
 
+    def _cmd_toggle_fold(self):
+        self.fold_enabled = not self.fold_enabled
+        self._fold_key = None
+        self._update_folds()
+        self.set_status_notification(
+            f'Block folding: {"on" if self.fold_enabled else "off"}')
+
+    def _update_folds(self):
+        """Recompute the hidden rows of ``>>>`` ... ``<<<`` fold blocks (a folded
+        block shows only its ``>>>`` line) and keep the cursor off hidden rows —
+        any jump into a fold (page move, click, search, undo) snaps to the
+        block's ``>>>`` line. Runs every tick before drawing."""
+        buf = self.buf
+        if not self.fold_enabled:
+            if buf.hidden_rows:
+                buf.hidden_rows = set()
+            return
+        if self._fold_key != buf.version:
+            self._fold_key = buf.version
+            hidden = set()
+            for start, end in find_fold_blocks(buf.lines):
+                hidden.update(range(start + 1, end + 1))
+            buf.hidden_rows = hidden
+        if buf.cursor_row in buf.hidden_rows:
+            old = (buf.cursor_row, buf.cursor_col)
+            buf.cursor_row = buf.prev_visible_row(buf.cursor_row)
+            buf.cursor_col = min(buf.cursor_col, len(buf.lines[buf.cursor_row]))
+            if buf.sel_end == old:  # keep an in-progress selection consistent
+                buf.sel_end = (buf.cursor_row, buf.cursor_col)
+
     def _cmd_toggle_mark(self):
         r = self.buf.cursor_row
         if r in self.buf.marked_lines:
@@ -3518,6 +3855,9 @@ class Editor:
         self._handle_printable(key)
 
     def _save_file(self):
+        if self.buf.readonly:
+            self.set_status_notification('Read-only mode — saving is disabled')
+            return
         if self.buf.filepath:
             if self.buf.file_changed_on_disk():
                 if not self._confirm('File changed on disk. Overwrite? (y/n): '):
@@ -3613,13 +3953,13 @@ class Editor:
     def move_up_5(self):
         buf = self.buf
         pc = buf.preferred_col
-        buf.move_cursor(max(0, buf.cursor_row - 5), pc)
+        buf.move_cursor(buf.visible_row_offset(buf.cursor_row, -5), pc)
         buf.preferred_col = pc
 
     def move_down_5(self):
         buf = self.buf
         pc = buf.preferred_col
-        buf.move_cursor(min(len(buf.lines) - 1, buf.cursor_row + 5), pc)
+        buf.move_cursor(buf.visible_row_offset(buf.cursor_row, 5), pc)
         buf.preferred_col = pc
 
     def _move_up_wrap(self, extend: bool = False):
@@ -3628,11 +3968,12 @@ class Editor:
         if buf.cursor_col >= tc:
             buf.move_cursor(buf.cursor_row, buf.cursor_col - tc, extend)
         elif buf.cursor_row > 0:
+            pr = buf.prev_visible_row(buf.cursor_row - 1)
             visual_col = buf.cursor_col % tc
-            prev_len = len(buf.lines[buf.cursor_row - 1])
+            prev_len = len(buf.lines[pr])
             last_vline_start = (prev_len // tc) * tc
             new_col = min(last_vline_start + visual_col, prev_len)
-            buf.move_cursor(buf.cursor_row - 1, new_col, extend)
+            buf.move_cursor(pr, new_col, extend)
 
     def _move_down_wrap(self, extend: bool = False):
         tc = self.renderer.text_cols
@@ -3643,9 +3984,12 @@ class Editor:
             new_col = min(buf.cursor_col + tc, line_len)
             buf.move_cursor(buf.cursor_row, new_col, extend)
         elif buf.cursor_row < len(buf.lines) - 1:
+            nr = buf.next_visible_row(buf.cursor_row + 1)
+            if nr is None:
+                return
             visual_col = buf.cursor_col % tc
-            new_col = min(visual_col, len(buf.lines[buf.cursor_row + 1]))
-            buf.move_cursor(buf.cursor_row + 1, new_col, extend)
+            new_col = min(visual_col, len(buf.lines[nr]))
+            buf.move_cursor(nr, new_col, extend)
 
     def _check_external_file_change(self):
         if (self._file_change_dismissed
