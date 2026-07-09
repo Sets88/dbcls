@@ -417,15 +417,16 @@ Available inside any Python-executing step (`.PY`, `.SLEEP`, `.SET_VAR`, the `.F
 | Helper | Effect |
 |--------|--------|
 | `info(msg)` | Show `msg` in a popup without halting execution; calling it again updates the text. `Esc` on the popup stops the pipeline; `Backspace` hides it until the next `info()` call. The popup stays after the pipeline finishes until dismissed. |
-| `warn(msg)` | Like `info()`, but pause the pipeline until the popup is closed: `Esc` stops the pipeline, any other closing key resumes it. |
+| `warn(msg)` | Like `info()`, but pause the pipeline until the popup is closed: `Esc` cancels the pipeline (no result is shown), any other closing key resumes it. |
 | `br()` | Break out of the current `.FOR` loop. A `result(...)` set just before `br()` becomes the loop's result. |
 | `stop()` | Abort the entire pipeline. The current step's data (a `result(...)` set before `stop()`, else the data flowing in) becomes the final result. |
 | `select(title, options, default=None)` | Pause the pipeline and open a select popup; returns the chosen option's value. `options` is a list of strings, rows from a previous step (the first column value is shown), or `(label, value)` pairs — the label is displayed, the value is returned. `default` pre-highlights the option with that value, e.g. `select('Limit', [('few', 10), ('many', 1000)], default=10)`. |
 | `mselect(title, options, default=None)` | Multi-select variant of `select()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms (with nothing marked it picks the highlighted item). Returns the list of marked options' values; `(label, value)` pairs work as in `select()`. `default` is a list of option values to pre-mark, e.g. `mselect('Params', [1, 2, 3, 4], default=[1, 2])`. |
+| `sselect(title, rows)` | Open `rows` (a list of row dicts, e.g. `data`) in VisiData. Mark rows with VisiData's selection (`s`/`t`/`gs`...); `Enter` confirms and returns only the marked rows (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
 | `input(title, default=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. |
 | `ask(title)` | Ask a yes/no question in the status bar; returns `True` on `y`, `False` on any other key. |
 
-Dismissing any of these prompts with `Esc` aborts the pipeline like `stop()`.
+Dismissing any of these prompts with `Esc` (`q` for `sselect`, since `Esc` is a regular key inside VisiData) cancels the pipeline: unlike `stop()`, no result is displayed — only a `Cancelled` notification in the status bar.
 
 ### Template Placeholders
 

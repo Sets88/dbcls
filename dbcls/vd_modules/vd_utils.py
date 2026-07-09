@@ -9,6 +9,29 @@ from visidata import ItemColumn
 from visidata import VisiData
 from visidata import ColumnItem
 from visidata import TypedExceptionWrapper
+from visidata import ListOfDictSheet
+from visidata import ReturnValue
+from visidata import vd
+
+
+class SselectSheet(ListOfDictSheet):
+    """Pipeline sselect() row picker: Enter confirms the selected rows
+    ([] when nothing is marked), q aborts the pipeline.  The commands are
+    bound to this class only (see vd_modules.__init__), so the regular result
+    viewer keeps VisiData's stock Enter/q behavior."""
+    precious = False
+
+    def confirm_selection(self):
+        raise ReturnValue(list(self.selectedRows))
+
+    def abort_selection(self):
+        # Sub-sheets of the picker (e.g. `"` dup-selected) stay sselect
+        # sheets: q on them just closes the sub-sheet like a normal quit;
+        # only q on the last one left aborts the pipeline.
+        if any(s is not self and isinstance(s, SselectSheet) for s in vd.sheets):
+            vd.quit(self)
+        else:
+            raise ReturnValue(None)
 
 
 @VisiData.api

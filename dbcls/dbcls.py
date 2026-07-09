@@ -20,7 +20,7 @@ import enum
 import visidata
 
 from .clients.base import Result
-from .vd_modules import DataBaseSheet, TablesSheet
+from .vd_modules import DataBaseSheet, TablesSheet, SselectSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
@@ -30,6 +30,7 @@ from .pipeline import is_pipeline
 from .pipeline import scan_line_code_and_triple
 from .pipeline import PipelineExecutor
 from .pipeline import PipelineStepError
+from .pipeline import PipelineCancelled
 from .pipeline import HELP_ENTRIES
 
 
@@ -745,6 +746,25 @@ class DbEditor(Editor):
         finally:
             self._fix_curses_after_visidata()
 
+    def run_sselect_sheet(self, title: str, rows: list) -> Optional[list]:
+        """Pipeline sselect(): hand the terminal to VisiData so the user can
+        mark rows; Enter returns the marked row dicts ([] when nothing is
+        marked), q or quitting VisiData returns None (pipeline abort)."""
+        sheet = SselectSheet(str(title) or 'sselect', source=rows)
+        with self._visidata_session():
+            try:
+                visidata.vd.run(sheet)  # returned normally = full quit (gq/Ctrl+Q)
+                return None
+            except visidata.ReturnValue as e:
+                return e.args[0] if e.args else None
+            finally:
+                # Drop every sselect sheet from the stack: a stale one reached
+                # from a later VisiData session (result viewer, Ctrl+Q) would
+                # raise ReturnValue with no handler and crash the app.
+                for vs in [s for s in visidata.vd.sheets
+                           if isinstance(s, SselectSheet)]:
+                    visidata.vd.remove(vs)
+
     def _open_result_in_visidata(self, result) -> None:
         """Open pipeline .SHEET results and/or the query result in VisiData."""
         if self._pipeline_sheets:
@@ -813,6 +833,10 @@ class DbEditor(Editor):
                 message = str(result)
                 self._open_result_in_visidata(result)
             except (asyncio.CancelledError, asyncio.InvalidStateError):
+                message = 'Cancelled'
+            except PipelineCancelled:
+                # A dismissed user prompt (Esc / q in sselect): abort with no
+                # result — just the status notification.
                 message = 'Cancelled'
             except Exception as exc:
                 message = self._format_query_error(exc)

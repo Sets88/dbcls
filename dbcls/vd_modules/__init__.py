@@ -9,6 +9,7 @@ from . import vd_plotter  # noqa: F401
 from . import vf_funcs  # noqa: F401
 from .vd_db_browser import DataBaseSheet, TablesSheet  # re-exported for dbcls.py
 from .vd_utils import SheetWithReference
+from .vd_utils import SselectSheet  # re-exported for dbcls.py
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 
 
@@ -20,6 +21,9 @@ TableSheet.addCommand('gp', 'alt-plot', 'vd.push(Plot(source=sheet))', 'Draw plo
 IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')
 SheetWithReference.addCommand('gz'+ENTER, 'dive-selected-cells', 'openRefCells(cursorCol, selectedRows)', 'open combined reference sheet for selected cells')
 TableSheet.addCommand('z'+ENTER, 'open-cell', 'vd.push(openCellAltered(sheet, cursorCol, cursorRow))', 'open sheet with copies of rows referenced in current cell')
+
+SselectSheet.addCommand('Enter', 'sselect-confirm', 'sheet.confirm_selection()', 'confirm the selected rows and return to dbcls')
+SselectSheet.addCommand('q', 'sselect-abort', 'sheet.abort_selection()', 'abort the pipeline')
 
 TableSheet.addCommand('gT', 'save-to-vars', 'save_rows_to_vars(sheet, selectedRows or [cursorRow])', 'Save selected rows (or current row) to _vars under a prompted name')
 TableSheet.addCommand('gzT', 'save-col-to-vars', 'save_col_values_to_vars(sheet, cursorCol, selectedRows or [cursorRow])', 'Save selected values of current column (or current cell) to _vars as a flat list')

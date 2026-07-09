@@ -127,12 +127,20 @@ mselect(title, options, default=None)
             multi-select variant of select(): Tab marks items, Enter confirms;
             returns the list of marked options' values.  default is a list of
             option values to pre-mark.
+sselect(title, rows)
+            open rows (a list of row dicts, e.g. data) in VisiData; mark rows
+            with VisiData's selection (s/t/gs...), Enter confirms and returns
+            only the marked rows ([] when nothing is marked).  q on the last
+            sselect sheet (sub-sheets like `"` just close) or quitting
+            VisiData aborts the pipeline without a result.
 input(title, default=None)
             ask the user to type a line of text; returns the string.  default
             pre-fills the input line.
 ask(title)  ask a yes/no question; returns True on 'y', else False.
 
-Dismissing any of these prompts with Esc aborts the pipeline like stop().
+Dismissing any of these prompts with Esc (q for sselect, since Esc is a
+regular key inside VisiData) aborts the pipeline without a result — unlike
+stop(), nothing is displayed, only a 'Cancelled' notification.
 """
 
 import time
@@ -371,8 +379,8 @@ info("Hello, world!")
 
 `warn(msg)`
   like `info()`, but *pauses* the pipeline until you close the popup:
-  `Esc` stops the pipeline, any other closing key (`Backspace`, Enter, …)
-  resumes it.
+  `Esc` cancels the pipeline (no result is shown), any other closing key
+  (`Backspace`, Enter, …) resumes it.
 
   Example:
 ```
@@ -431,8 +439,8 @@ set_var('some_var', 42)
   previous step (the first column value is shown), or `(label, value)` pairs —
   the label is displayed, the value is returned. `default` pre-highlights the
   option with that value, e.g. `select('Limit', [('few', 10), ('many', 1000)],
-  default=10)`. Dismissing the popup with `Esc` aborts the pipeline like
-  `stop()`.
+  default=10)`. Dismissing the popup with `Esc` cancels the pipeline — no
+  result is shown.
 
   Example (run a query against a table the user picks):
 ```
@@ -453,19 +461,31 @@ result(select('Pick a table', data))
   item, `Enter` confirms (with nothing marked it picks the highlighted item).
   Returns the list of marked options' values; `(label, value)` pairs work as
   in `select()`. `default` is a list of option values to pre-mark, e.g.
-  `mselect('Params', [1, 2, 3, 4], default=[1, 2])`. `Esc` aborts the
-  pipeline like `stop()`.
+  `mselect('Params', [1, 2, 3, 4], default=[1, 2])`. `Esc` cancels the
+  pipeline — no result is shown.
 
   Example:
 ```
 .RUN "SHOW TABLES" | .PY "result(mselect('Pick tables', data))"
 ```
 
+`sselect(title, rows)`
+  opens *rows* (a list of row dicts, e.g. `data`) in VisiData.  Mark rows with
+  VisiData's selection (`s`/`t`/`gs`...), `Enter` confirms and returns only
+  the marked rows (nothing marked returns `[]`).  `q` on a sub-sheet (e.g.
+  `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting
+  VisiData (`gq`, `Ctrl+Q`) cancels the pipeline — no result is shown.
+
+  Example:
+```
+.RUN "SELECT * FROM t" | .PY "result(sselect('Pick rows', data))"
+```
+
 `input(title, default=None)`
   asks the user to type a line of text in the bar at the bottom; returns the
   entered string. `default` pre-fills the line (the user can edit or clear
-  it), e.g. `input('Your age', default=18)`. `Esc` aborts the pipeline like
-  `stop()`.
+  it), e.g. `input('Your age', default=18)`. `Esc` cancels the pipeline — no
+  result is shown.
 
   Example:
 ```
@@ -475,7 +495,7 @@ result(select('Pick a table', data))
 
 `ask(title)`
   asks a yes/no question in the status bar; returns True on `y`, False on any
-  other key. `Esc` aborts the pipeline like `stop()`.
+  other key. `Esc` cancels the pipeline — no result is shown.
 
   Example:
 ```
@@ -701,9 +721,9 @@ def _render(template: str, context: dict) -> str:
             # The f'"""…"""' wrapper only clashes if *expr* itself contains the
             # literal sequence '"""', which is not a realistic case.
             return eval('f"""' + '{' + expr + '}' + '"""', context)  # noqa: S307
-        except (_PipelineBreak, _PipelineStop):
-            # Control flow from br()/stop() (directly or via an Esc-dismissed
-            # user prompt) inside a template — not an error, propagate as-is.
+        except (_PipelineBreak, _PipelineStop, PipelineCancelled):
+            # Control flow from br()/stop() or a cancelled user prompt inside
+            # a template — not an error, propagate as-is.
             raise
         except Exception as exc:
             raise ValueError(
@@ -1218,6 +1238,14 @@ class _PipelineStop(Exception):
         self.data = data
 
 
+class PipelineCancelled(Exception):
+    """Raised when the user dismisses an interactive prompt (Esc on
+    ``select()``/``mselect()``/``input()``/``ask()``/``warn()``, q in
+    ``sselect()``).  Unlike ``stop()`` it aborts the pipeline *without* a
+    result: the executor lets it propagate so the UI shows only a
+    'Cancelled' notification — no result popup, no VisiData."""
+
+
 class PipelineStepError(Exception):
     """Wraps a runtime error raised while executing a pipeline step, annotating it
     with the step's command and the current ``.FOR`` item (if any) so the UI can
@@ -1302,9 +1330,10 @@ class PipelineExecutor:
                 if flow.data is None:
                     flow.data = _as_rows(data)
                 raise
-            except (PipelineStepError, ValueError):
-                # An already-annotated inner error or a deliberate validation
-                # error (already clear) — propagate unchanged.
+            except (PipelineStepError, ValueError, PipelineCancelled):
+                # An already-annotated inner error, a deliberate validation
+                # error (already clear) or a cancelled prompt — propagate
+                # unchanged.
                 raise
             except Exception as exc:
                 raise self._step_error(node, exc) from exc
@@ -1508,11 +1537,11 @@ class PipelineExecutor:
 
     def _warn(self, msg: Any) -> None:
         """Show *msg* in the info popup and *block* until the user closes it;
-        Esc aborts the pipeline like ``stop()``.  Exposed as ``warn()``."""
+        Esc aborts the pipeline without a result.  Exposed as ``warn()``."""
         answer = self.host.request_user_input(
             {'kind': 'warn', 'title': str(msg)})
         if answer is None:
-            self._stop()
+            self._cancel()
 
     @staticmethod
     def _br() -> None:
@@ -1523,6 +1552,11 @@ class PipelineExecutor:
     def _stop() -> None:
         """Abort the entire pipeline.  Exposed as ``stop()``."""
         raise _PipelineStop()
+
+    @staticmethod
+    def _cancel() -> None:
+        """Abort the pipeline without a result (dismissed user prompt)."""
+        raise PipelineCancelled()
 
     def _set_var(self, name: str, value: Any) -> None:
         """Store *value* in the shared VARS under *name*.  Exposed as
@@ -1536,9 +1570,9 @@ class PipelineExecutor:
 
     # ── Interactive prompt helpers (block until the user answers in the UI) ──
     #
-    # Dismissing any prompt with Esc aborts the whole pipeline via stop() (the
-    # editor resolves an Esc as None — [] for mselect — and the helpers below
-    # translate that into _stop()).
+    # Dismissing any prompt with Esc aborts the whole pipeline without a
+    # result (the editor resolves an Esc as None — [] for mselect — and the
+    # helpers below translate that into _cancel()).
 
     @staticmethod
     def _label_map(labels: List[str], values: List[Any]) -> dict:
@@ -1553,7 +1587,7 @@ class PipelineExecutor:
         value (see :func:`_option_pairs` for ``(label, value)`` support).
         *default* pre-highlights the option with that value (compared like the
         return value, so pass the value — not the label — for pairs).
-        Esc aborts the pipeline like ``stop()``.  Exposed as ``select()``."""
+        Esc aborts the pipeline without a result.  Exposed as ``select()``."""
         labels, values = _option_pairs(options)
         if not labels:
             raise ValueError('select(): options must not be empty')
@@ -1565,14 +1599,14 @@ class PipelineExecutor:
                     break
         choice = self.host.request_user_input(request)
         if choice is None:
-            self._stop()
+            self._cancel()
         return self._label_map(labels, values).get(choice, choice)
 
     def _user_mselect(self, title: Any, options: Any, default: Any = None) -> List[Any]:
         """Multi-select variant of ``select()`` (Tab marks items, Enter
         confirms); return the list of marked options' values.  *default* is
         the list of option values to pre-mark (a single value works too).
-        Esc aborts the pipeline like ``stop()``.  Exposed as ``mselect()``."""
+        Esc aborts the pipeline without a result.  Exposed as ``mselect()``."""
         labels, values = _option_pairs(options)
         if not labels:
             raise ValueError('mselect(): options must not be empty')
@@ -1589,31 +1623,45 @@ class PipelineExecutor:
                 request['default'] = default_labels
         marked = self.host.request_user_input(request)
         if not marked:
-            self._stop()
+            self._cancel()
         mapping = self._label_map(labels, values)
         return [mapping.get(label, label) for label in marked]
+
+    def _user_sselect(self, title: Any, rows: Any) -> List[dict]:
+        """Open *rows* (a list of row dicts, e.g. ``data``) in VisiData; the
+        user marks rows with VisiData's selection (s/t/gs...), Enter confirms
+        and returns only the marked rows (nothing marked returns ``[]``).
+        ``q`` or quitting VisiData aborts the pipeline without a result.
+        Exposed as ``sselect()``."""
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise ValueError('sselect(): rows must be a list of dicts (e.g. data)')
+        selected = self.host.request_user_input(
+            {'kind': 'sselect', 'title': str(title), 'rows': rows})
+        if selected is None:
+            self._cancel()
+        return selected
 
     def _user_input(self, title: Any, default: Any = None) -> str:
         """Ask the user to type a line of text; return the entered string.
         *default* pre-fills the input line (the user can edit or clear it).
-        Esc aborts the pipeline like ``stop()``.  Exposed as ``input()``
+        Esc aborts the pipeline without a result.  Exposed as ``input()``
         (shadows the builtin, which cannot work under curses anyway)."""
         request = {'kind': 'input', 'title': str(title)}
         if default is not None:
             request['default'] = str(default)
         text = self.host.request_user_input(request)
         if text is None:
-            self._stop()
+            self._cancel()
         return text
 
     def _user_ask(self, title: Any) -> bool:
         """Ask a yes/no question; return ``True`` on 'y', ``False`` on any
-        other key.  Esc aborts the pipeline like ``stop()``.  Exposed as
+        other key.  Esc aborts the pipeline without a result.  Exposed as
         ``ask()``."""
         answer = self.host.request_user_input(
             {'kind': 'ask', 'title': str(title)})
         if answer is None:
-            self._stop()
+            self._cancel()
         return bool(answer)
 
     def _helper_context(self) -> dict:
@@ -1629,6 +1677,7 @@ class PipelineExecutor:
             'get_var': self._get_var,
             'select': self._user_select,
             'mselect': self._user_mselect,
+            'sselect': self._user_sselect,
             'input': self._user_input,
             'ask': self._user_ask,
         }

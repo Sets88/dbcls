@@ -2928,8 +2928,8 @@ class Editor:
         self._pipeline_info_live = False
         # Esc on a live info popup asks the pipeline to stop at its next step.
         self._pipeline_stop_requested = False
-        # Pending worker-thread prompt (pipeline select()/mselect()/input()/ask());
-        # see request_user_input().
+        # Pending worker-thread prompt (pipeline select()/mselect()/sselect()/
+        # input()/ask()); see request_user_input().
         self._ui_request: Optional[dict] = None
         self.renderer = Renderer(stdscr, self.colors, self.buf, self.lexer)
         self.running = True
@@ -3086,7 +3086,7 @@ class Editor:
         self._pipeline_info_live = True
         self.request_redraw()
 
-    # ── Worker-thread user prompts (pipeline select()/mselect()/input()/ask()) ──
+    # ── Worker-thread user prompts (pipeline select()/mselect()/sselect()/input()/ask()) ──
 
     def request_user_input(self, request: dict) -> Any:
         """Show an interactive prompt and block until the user answers.
@@ -3096,16 +3096,19 @@ class Editor:
         widget (SelectPopup / InputBar / y-n status prompt) and resolves the
         request with the user's answer.
 
-        *request* needs ``kind`` (``'select'`` / ``'mselect'`` / ``'input'`` /
-        ``'ask'`` / ``'warn'``), ``title`` and, for the select kinds,
-        ``options`` (list of strings).  Optional ``default`` pre-fills the
-        prompt: the option label to highlight (select), the labels to pre-mark
-        (mselect) or the initial text (input).  Returns the chosen string (select),
-        the list of marked strings (mselect), the typed string (input), a bool
-        (ask), or True once the popup is closed (warn).  Dismissing the prompt
-        with Esc resolves as None (``[]`` for mselect) — the caller decides
-        what cancellation means (the pipeline helpers abort the run via
-        ``stop()``)."""
+        *request* needs ``kind`` (``'select'`` / ``'mselect'`` / ``'sselect'`` /
+        ``'input'`` / ``'ask'`` / ``'warn'``), ``title`` and, for the select
+        kinds, ``options`` (list of strings) — except ``'sselect'``, which
+        takes ``rows`` (list of row dicts) instead.  Optional ``default``
+        pre-fills the prompt: the option label to highlight (select), the
+        labels to pre-mark (mselect) or the initial text (input).  Returns the
+        chosen string (select), the list of marked strings (mselect), the list
+        of marked row dicts (sselect), the typed string (input), a bool (ask),
+        or True once the popup is closed (warn).  Dismissing the prompt with
+        Esc resolves as None (``[]`` for mselect; for sselect, quitting the
+        viewer resolves as None while ``[]`` means "nothing marked") — the
+        caller decides what cancellation means (the pipeline helpers cancel
+        the run: it is aborted and no result is displayed)."""
         if threading.current_thread() is threading.main_thread():
             raise RuntimeError(
                 'request_user_input() must be called from a worker thread '
@@ -3144,8 +3147,20 @@ class Editor:
                 self._resolve_ui_request(None)
             else:
                 self._resolve_ui_request(key in (ord('y'), ord('Y'), 'y', 'Y'))
+        elif kind == 'sselect':
+            # Row picker in an external viewer (VisiData in DbEditor).
+            # Synchronous like 'ask': owns the terminal on the main loop while
+            # the worker waits; None aborts, [] is a valid empty selection.
+            self._resolve_ui_request(
+                self.run_sselect_sheet(req['title'], req.get('rows') or []))
         else:
             self._resolve_ui_request(None)
+
+    def run_sselect_sheet(self, title: str, rows: list) -> Optional[list]:
+        """Open *rows* in an external row picker and return the marked rows
+        ([] when nothing is marked) or None to abort.  The base editor has no
+        viewer — DbEditor overrides this with VisiData."""
+        return None
 
     def _running_popup_to_draw(self) -> Optional['RunningPopup']:
         """The running overlay to draw this frame.  Hidden while a worker-thread
