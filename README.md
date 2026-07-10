@@ -156,6 +156,20 @@ FROM User
 <<<
 ```
 
+which can become very useful for grouping scripts into sections, like:
+```sql
+>>> -- Terminate running queries (select and hit Enter)
+.RUN "SHOW PROCESSLIST" |
+.PY "sselect('queries_to_terminate', [x for x in data if x['Command'] == 'Query'])" |
+.FOR_RUN "KILL {{_0}}" | .PY "info('done')"
+<<<
+```
+
+collapses to:
+```sql
+>>> -- Terminate running queries (select and hit Enter)
+```
+
 `Ctrl+p` toggles folding on and off. While folding is on, each block collapses
 to its `>>>` line — the body and the `<<<` line are hidden (the text itself is
 not modified, and cursor movement skips the hidden lines). A collapsed header
@@ -440,9 +454,13 @@ Dismissing any of these prompts with `Esc` (`q` for `sselect`, since `Esc` is a 
 | `{{price:.2f}}` | Python format spec support |
 | `{{_vars['key']}}` | Value of a pipeline variable stored by `.SET_VAR` |
 
-### Helper Function
+### Helper Functions
 
 `sql_in_list(data)` — converts a list of scalars or list-of-dicts to a SQL `IN`-clause string, e.g. `('val1','val2')`. Available inside `.RUN` and `.PY` templates.
+
+`sql_values(data, chunk_size=None)` — converts data to a SQL `VALUES` string. A list of dicts (all column values, in order) or of lists/tuples gives one tuple per row, e.g. `(1,'a'),(2,'b')`; a flat list of scalars gives a *single* tuple: `[1, 2, 3]` → `(1,2,3)`. Strings are quoted, `None` becomes `NULL`. With `chunk_size` set, returns a *list* of such strings of at most `chunk_size` tuples each — feed it to `.FOR_RUN` for chunked inserts.
+
+> **Note:** build and format a list of lists in the *same* step. At every `|` boundary the step's output is normalised to a list of dicts (non-dict items are wrapped into a single `value` column), so `.PY "[[x, x+1] for x in range(3)]" | .PY "sql_values(data)"` yields `([0, 1]),([1, 2]),…` instead of `(0,1),(1,2),…` — use `.PY "sql_values([[x, x+1] for x in range(3)])"`. Query results (`.RUN`) are already lists of dicts and are unaffected.
 
 ### Examples
 
@@ -464,6 +482,13 @@ Dismissing any of these prompts with `Esc` (`q` for `sselect`, since `Esc` is a 
   | .RFILTER "{{_0}}" "^shard_"
   | .FOR_RUN "SELECT id FROM {{_0}}.events WHERE created_at > '2024-01-01'"
   | .RUN "SELECT * FROM archive WHERE id IN {{sql_in_list(data)}}"
+```
+
+**Copy rows between tables, inserting in chunks of 5000:**
+```sql
+.RUN "SELECT id, name FROM src"
+  | .PY "sql_values(data, 5000)"
+  | .FOR_RUN "INSERT INTO dst VALUES {{_0}}"
 ```
 
 **Post-process results with Python:**

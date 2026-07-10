@@ -100,6 +100,13 @@ sql_in_list(data)
     Convert data to a SQL IN-list string, e.g. ('val1','val2').
     data may be a list of scalars *or* a list of dicts (first column
     is used).
+sql_values(data, chunk_size=None)
+    Convert data to a SQL VALUES string: a list of dicts or of
+    lists/tuples gives one tuple per row, e.g. (1,'a'),(2,'b'); a flat
+    list of scalars gives a single tuple, e.g. (1,2,3).  With
+    chunk_size, return a list of such strings of at most chunk_size
+    tuples each — for chunked inserts: .PY "sql_values(data, 5000)" |
+    .FOR_RUN "INSERT INTO t VALUES {{_0}}".
 
 Helpers available inside Python-executing steps (.PY / .SLEEP / .SET_VAR /
 the .FOR expression) and inside {{expr}} template placeholders
@@ -337,6 +344,12 @@ and `_i` are in scope, along with datetime, timedelta, date, json, time.
 The output is, in priority: the last `result(val)` call; else a single
 expression's value (e.g. a list literal); else `data` passes through unchanged.
 
+Note: at the `|` step boundary the output is normalised to a list of dicts —
+each non-dict item (scalar, list, tuple) is wrapped into a single `value`
+column: [[0, 1], [1, 2]] → [{'value': [0, 1]}, {'value': [1, 2]}]. Nested
+lists therefore lose their shape for the next step — transform them (e.g.
+with `sql_values()`) in the same step that builds them.
+
 Examples:
 ```
 .RUN "SELECT * FROM t" |
@@ -511,6 +524,37 @@ if not ask('Continue with cleanup?'):
 ```
 .RUN "SELECT id FROM table" |
 .RUN "SELECT * FROM other WHERE table_id IN {{sql_in_list(data)}}"
+```
+
+`sql_values(data, chunk_size=None)`
+  converts data to a SQL VALUES string. A list of dicts (all column
+  values, in order) or of lists/tuples gives one tuple per row, e.g.
+  (1,'a'),(2,'b'); a flat list of scalars gives a *single* tuple:
+  [1, 2, 3] → (1,2,3). Strings are quoted, None becomes NULL. With
+  `chunk_size` set, returns a *list* of such strings of at most
+  `chunk_size` tuples each — one row per chunk.
+
+  Example (copy rows in one statement):
+```
+.RUN "SELECT id, name FROM src" |
+.RUN "INSERT INTO dst VALUES {{sql_values(data)}}"
+```
+
+  Example (insert in chunks of 5000):
+```
+.RUN "SELECT id, name FROM src" |
+.PY "sql_values(data, 5000)" |
+.FOR_RUN "INSERT INTO dst VALUES {{_0}}"
+```
+
+  Warning: build and format a list of lists in the *same* step. Passed
+  across a `|` boundary it is normalised to dicts with a single `value`
+  column, so each tuple becomes ([0, 1]) instead of (0,1):
+```
+.PY "sql_values([[x, x+1] for x in range(3)])"     -- (0,1),(1,2),(2,3)
+
+.PY "[[x, x+1] for x in range(3)]" |
+.PY "sql_values(data)"                             -- ([0, 1]),([1, 2]),…
 ```"""
 
 HELP_SET_VAR = _help_entry('set_var', """
@@ -678,6 +722,17 @@ DEFAULT_CONTEXT = {
 
 # ── Public helpers ────────────────────────────────────────────────────────────
 
+def _sql_literal(v: Any) -> str:
+    """Format *v* as a SQL literal: strings are quoted (``'`` doubled),
+    ``None`` becomes ``NULL``, everything else is ``str()``."""
+    if v is None:
+        return 'NULL'
+    if isinstance(v, str):
+        v = v.replace("'", "''")
+        return f"'{v}'"
+    return str(v)
+
+
 def sql_in_list(data: Any) -> str:
     """Return a SQL IN-list string ``('v1','v2',…)`` from *data*.
 
@@ -697,13 +752,52 @@ def sql_in_list(data: Any) -> str:
     else:
         items = [data]
 
-    def _fmt(v: Any) -> str:
-        if isinstance(v, str):
-            v = v.replace("'", "''")
-            return f"'{v}'"
-        return str(v)
+    return '(' + ','.join(_sql_literal(v) for v in items) + ')'
 
-    return '(' + ','.join(_fmt(v) for v in items) + ')'
+
+def sql_values(data: Any, chunk_size: Optional[int] = None) -> Any:
+    """Return a SQL VALUES string ``(v1,v2),(v3,v4),…`` from *data*.
+
+    The shape of *data* (decided by its first element, as in
+    :func:`sql_in_list`) determines the rows:
+    - a list of dicts        → one tuple per dict (all column values, in order)
+    - a list of lists/tuples → one tuple per item: [[1], [2]] → (1),(2)
+    - a list of scalars      → a *single* tuple: [1, 2, 3] → (1,2,3)
+    - a single scalar        → a single one-value tuple
+
+    With *chunk_size* omitted, one string with all tuples is returned::
+
+        .RUN "SELECT id, name FROM src" |
+        .RUN "INSERT INTO dst VALUES {{sql_values(data)}}"
+
+    With a positive *chunk_size*, a list of such strings is returned, each
+    holding at most *chunk_size* tuples — one row per chunk, ready for
+    chunked inserts via ``.FOR_RUN``::
+
+        .PY "sql_values(data, 5000)" |
+        .FOR_RUN "INSERT INTO dst VALUES {{_0}}"
+    """
+    if not data:
+        raise ValueError('sql_values: empty input is not allowed')
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError('sql_values: chunk_size must be a positive integer')
+    if isinstance(data, (list, tuple)):
+        if isinstance(data[0], (dict, list, tuple)):
+            rows = list(data)
+        else:
+            rows = [list(data)]     # list of scalars → one row
+    else:
+        rows = [[data]]
+
+    def _tuple(row: Any) -> str:
+        values = row.values() if isinstance(row, dict) else row
+        return '(' + ','.join(_sql_literal(v) for v in values) + ')'
+
+    tuples = [_tuple(row) for row in rows]
+    if chunk_size is None:
+        return ','.join(tuples)
+    return [','.join(tuples[i:i + chunk_size])
+            for i in range(0, len(tuples), chunk_size)]
 
 
 _TEMPLATE_RE = re.compile(r'\{\{([^}]*)\}\}')
@@ -755,6 +849,7 @@ def _build_context(row: Optional[dict], data: Optional[list], extra: Optional[di
         'row': row or {},
         'data': data if data is not None else [],
         'sql_in_list': sql_in_list,
+        'sql_values': sql_values,
         **(extra or {}),
     }
 
@@ -772,6 +867,7 @@ def render_template(template: str, row: dict = None, data: Optional[list] = None
                           hyphens, etc.: ``{{row['order-id']}}``)
     * ``data``          — the full input data list from the previous step
     * ``sql_in_list``   — helper that formats a list as a SQL ``IN (…)`` clause
+    * ``sql_values``    — helper that formats rows as SQL ``VALUES`` tuples
 
     When *row* is omitted (or ``None``) only ``data`` and ``sql_in_list`` are
     in scope — useful for SQL-level templates like ``.RUN``.
@@ -1692,6 +1788,7 @@ class PipelineExecutor:
             'data': list(data or []),
             '_vars': self.host.vars,
             'sql_in_list': sql_in_list,
+            'sql_values': sql_values,
             **self._helper_context(),
         }
         if extra:
