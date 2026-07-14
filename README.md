@@ -399,8 +399,8 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | `.FOR_RUN "SQL {{col}}"` | Execute SQL once per input row, substituting `{{column}}` placeholders. All result sets are merged. |
 | `.FOR "code" … .NOFOR` | Run the following steps once per item of the iterable produced by `code`; the item is exposed as `{{_i}}` / `_i`. See [Control flow](#control-flow). |
 | `.SLEEP "code"` | Evaluate `code` to a number of seconds, pause, then pass the input data through unchanged. Useful inside `.FOR` to pace work. |
-| `.PY "python_code"` | Execute Python. `data` (list of dicts), `_vars` and `_i` are in scope. Output is, in priority: the last `result(val)` call; else a single expression's value (e.g. a list literal); else `data` passes through unchanged. |
-| `.SET_VAR KEY [code]` | Store data (or the result of `code`) into a named variable. Data passes through unchanged, so `.SET_VAR` can appear mid-pipeline. |
+| `.PY "python_code"` | Execute Python. `data` (the previous step's output, passed between steps exactly as produced), `_vars` and `_i` are in scope. Output is, in priority: the last `result(val)` call; else a single expression's value (e.g. a list literal); else `data` passes through unchanged. |
+| `.SET_VAR KEY [code]` | Store data (or the result of `code`) into a named variable. Data passes through unchanged, so `.SET_VAR` can appear mid-pipeline. With no `code` and no input data, deletes `KEY`. |
 | `.GET_VAR KEY` | Inject a stored variable into the pipeline. If input data exists, the variable's rows are appended after it. A missing `KEY` contributes nothing (no error). |
 | `.VOID` | Discard input data. The next step starts fresh with no data (as if it were the first step). |
 | `.VARS` | Show all stored pipeline variables as a `key` / `value` list. |
@@ -417,7 +417,11 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 
 ### Control flow
 
-`.FOR "code"` evaluates `code` to an iterable and runs every following step once per item, exposing the current item as `{{_i}}` (templates) and `_i` (Python). `.NOFOR` closes the loop; nested `.FOR` loops are supported (innermost `_i` wins).
+`.FOR "code"` evaluates `code` to an iterable and runs every following step once per item, exposing the current item as `{{_i}}` (templates) and `_i` (Python). `.NOFOR` closes the loop; nested `.FOR` loops are supported — items are named by nesting depth: the outermost loop's item is `_i`, the second level's `_ii`, the third's `_iii`, and so on:
+
+```sql
+.FOR "range(2)" | .FOR "range(2)" | .RUN "SELECT '{{_i}}-{{_ii}}'"   -- 0-0, 0-1, 1-0, 1-1
+```
 
 - **With `.NOFOR`** — the loop's accumulated rows are *discarded* at the boundary, so steps after it start fresh (no input), and a pipeline ending in `.NOFOR` yields an empty result.
 - **Without `.NOFOR`** — the loop runs to the end of the pipeline and its merged rows become the result.
@@ -430,13 +434,16 @@ Available inside any Python-executing step (`.PY`, `.SLEEP`, `.SET_VAR`, the `.F
 
 | Helper | Effect |
 |--------|--------|
+| `result(val)` | Set the step's output value (the last call wins). Lets a multi-statement snippet return a value, e.g. `.SLEEP "from random import randint; result(randint(1, 10))"`. |
+| `set_var(name, value)` | Store `value` in the shared pipeline variables under `name` (same store as `.SET_VAR` / `gT` / `gzT`). |
+| `get_var(name, default=None)` | Return the pipeline variable `name` (`default` if absent). |
 | `info(msg)` | Show `msg` in a popup without halting execution; calling it again updates the text. `Esc` on the popup stops the pipeline; `Backspace` hides it until the next `info()` call. The popup stays after the pipeline finishes until dismissed. |
 | `warn(msg)` | Like `info()`, but pause the pipeline until the popup is closed: `Esc` cancels the pipeline (no result is shown), any other closing key resumes it. |
 | `br()` | Break out of the current `.FOR` loop. A `result(...)` set just before `br()` becomes the loop's result. |
 | `stop()` | Abort the entire pipeline. The current step's data (a `result(...)` set before `stop()`, else the data flowing in) becomes the final result. |
 | `select(title, options, default=None)` | Pause the pipeline and open a select popup; returns the chosen option's value. `options` is a list of strings, rows from a previous step (the first column value is shown), or `(label, value)` pairs — the label is displayed, the value is returned. `default` pre-highlights the option with that value, e.g. `select('Limit', [('few', 10), ('many', 1000)], default=10)`. |
 | `mselect(title, options, default=None)` | Multi-select variant of `select()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms (with nothing marked it picks the highlighted item). Returns the list of marked options' values; `(label, value)` pairs work as in `select()`. `default` is a list of option values to pre-mark, e.g. `mselect('Params', [1, 2, 3, 4], default=[1, 2])`. |
-| `sselect(title, rows)` | Open `rows` (a list of row dicts, e.g. `data`) in VisiData. Mark rows with VisiData's selection (`s`/`t`/`gs`...); `Enter` confirms and returns only the marked rows (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
+| `sselect(title, rows)` | Open `rows` (e.g. `data`; non-dict rows are shown as a `value` column, the selection returns the original items) in VisiData. Mark rows with VisiData's selection (`s`/`t`/`gs`...); `Enter` confirms and returns only the marked rows (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
 | `input(title, default=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. |
 | `ask(title)` | Ask a yes/no question in the status bar; returns `True` on `y`, `False` on any other key. |
 
@@ -446,21 +453,22 @@ Dismissing any of these prompts with `Esc` (`q` for `sselect`, since `Esc` is a 
 
 | Placeholder | Meaning |
 |-------------|---------|
-| `{{_0}}` | Value of the first column of the current row |
-| `{{_1}}` | Value of the second column |
+| `{{_0}}` | Value of the first column of the current row (for a list row — the first element, for a scalar row — the value itself) |
+| `{{_1}}` | Value of the second column (second element of a list row) |
 | `{{column_name}}` | Value of the column named `column_name` |
-| `{{_i}}` | Current `.FOR` loop item |
+| `{{_i}}` | Current `.FOR` loop item (outermost loop) |
+| `{{_ii}}`, `{{_iii}}` | Items of nested `.FOR` loops (second, third level, …) |
 | `{{row['any-name']}}` | Full row dict access — use for names with spaces or hyphens |
 | `{{price:.2f}}` | Python format spec support |
 | `{{_vars['key']}}` | Value of a pipeline variable stored by `.SET_VAR` |
 
 ### Helper Functions
 
-`sql_in_list(data)` — converts a list of scalars or list-of-dicts to a SQL `IN`-clause string, e.g. `('val1','val2')`. Available inside `.RUN` and `.PY` templates.
+`sql_in_list(data)` — converts a list of scalars, list-of-dicts (first column) or list-of-lists (first element) to a SQL `IN`-clause string, e.g. `('val1','val2')`. Available inside `.RUN` and `.PY` templates.
 
 `sql_values(data, chunk_size=None)` — converts data to a SQL `VALUES` string. A list of dicts (all column values, in order) or of lists/tuples gives one tuple per row, e.g. `(1,'a'),(2,'b')`; a flat list of scalars gives a *single* tuple: `[1, 2, 3]` → `(1,2,3)`. Strings are quoted, `None` becomes `NULL`. With `chunk_size` set, returns a *list* of such strings of at most `chunk_size` tuples each — feed it to `.FOR_RUN` for chunked inserts.
 
-> **Note:** build and format a list of lists in the *same* step. At every `|` boundary the step's output is normalised to a list of dicts (non-dict items are wrapped into a single `value` column), so `.PY "[[x, x+1] for x in range(3)]" | .PY "sql_values(data)"` yields `([0, 1]),([1, 2]),…` instead of `(0,1),(1,2),…` — use `.PY "sql_values([[x, x+1] for x in range(3)])"`. Query results (`.RUN`) are already lists of dicts and are unaffected.
+> **Note:** data crosses the `|` boundary exactly as produced — nested lists keep their shape, a scalar stays a scalar (`.PY "'test'"` → `data == 'test'` in the next step). So e.g. `.PY "[[x, x+1] for x in range(3)]" | .PY "sql_values(data)"` yields `(0,1),(1,2),(2,3)`. Only for display — the final result and `.SHEET` — non-dict rows are wrapped into a single `value` column.
 
 ### Examples
 

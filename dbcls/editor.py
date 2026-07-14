@@ -106,7 +106,8 @@ WORD_RIGHT_KEYS = (
 
 # The key that starts a tmux-style prefix sequence.
 # After this key is pressed, the next key within 1 second is tagged with KEY_PREFIX_BIT.
-# If the timeout fires before the next key, the trigger key itself is dispatched normally.
+# If the timeout fires before the next key, the prefix is simply cancelled
+# (nothing is bound to the bare trigger).
 KEY_PREFIX_TRIGGER = K(ord('\x18'))  # Ctrl+X
 
 

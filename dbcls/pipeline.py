@@ -54,8 +54,8 @@ Pipeline commands
     value may come from a `result(val)` call (e.g. .SLEEP "result(2)").
 
 .PY "python_code"
-    Execute arbitrary Python.  `data` (list of dicts from the previous
-    step), `_vars` and `_i` are in scope.  The step output is, in priority:
+    Execute arbitrary Python.  `data` (the previous step's rows, passed
+    between steps unchanged), `_vars` and `_i` are in scope.  The step output is, in priority:
     the last `result(val)` call; else a single expression's value
     (e.g. .PY "['a', 'b', 'c']"); else `data` passes through unchanged.
 
@@ -84,10 +84,12 @@ Pipeline commands
 
 Template placeholders
 ---------------------
-{{_0}}             first column value of the current row
-{{_1}}             second column value
+{{_0}}             first column value of the current row (for a list row —
+                   the first element, for a scalar row — the value itself)
+{{_1}}             second column value (second element of a list row)
 {{column_name}}    value of column named "column_name"
-{{_i}}             current .FOR loop item
+{{_i}}             current .FOR loop item (outermost loop)
+{{_ii}}, {{_iii}}  items of nested .FOR loops (second, third level, …)
 {{_vars['key']}}   value of a variable stored by .SET_VAR
 {{expr}}           any Python expression; the helper functions below are in
                    scope, so e.g. {{select('Pick', data)}} works inline.
@@ -98,8 +100,8 @@ Helper functions (available inside .RUN / .PY)
 -------------------------------------------------
 sql_in_list(data)
     Convert data to a SQL IN-list string, e.g. ('val1','val2').
-    data may be a list of scalars *or* a list of dicts (first column
-    is used).
+    data may be a list of scalars, a list of dicts (first column is
+    used) or a list of lists/tuples (first element is used).
 sql_values(data, chunk_size=None)
     Convert data to a SQL VALUES string: a list of dicts or of
     lists/tuples gives one tuple per row, e.g. (1,'a'),(2,'b'); a flat
@@ -135,7 +137,8 @@ mselect(title, options, default=None)
             returns the list of marked options' values.  default is a list of
             option values to pre-mark.
 sselect(title, rows)
-            open rows (a list of row dicts, e.g. data) in VisiData; mark rows
+            open rows (e.g. data; non-dict rows are shown as a 'value'
+            column, the selection returns the original items) in VisiData; mark rows
             with VisiData's selection (s/t/gs...), Enter confirms and returns
             only the marked rows ([] when nothing is marked).  q on the last
             sselect sheet (sub-sheets like `"` just close) or quitting
@@ -299,15 +302,21 @@ Example:
 HELP_FOR = _help_entry('for', """
 Evaluate PYTHON_CODE to an iterable and run every following step once per
 item, until a `.NOFOR` (or the end of the pipeline). The current item is
-exposed as `{{_i}}` in templates and as `_i` in Python code (innermost
-loop wins when `.FOR` is nested). `{{_0}}` / `_0` and named columns still
-refer to the previous step's result. Results from each iteration are merged
-into one flat list. PYTHON_CODE follows the usual rules: a single expression's
-value, or the last `result(val)` call (the value must be iterable).
+exposed as `{{_i}}` in templates and as `_i` in Python code. When `.FOR`
+loops are nested, items are named by depth: the outermost loop is `_i`,
+the second level `_ii`, the third `_iii`, and so on. `{{_0}}` / `_0` and
+named columns still refer to the previous step's result. Results from each
+iteration are merged into one flat list. PYTHON_CODE follows the usual rules:
+a single expression's value, or the last `result(val)` call (the value must
+be iterable).
 
-Example:
+Examples:
 ```
 .FOR "range(10)" | .RUN "SELECT '{{_i}}'"
+
+.FOR "range(2)" |
+.FOR "range(2)" |
+.RUN "SELECT '{{_i}}-{{_ii}}'"      -- 0-0, 0-1, 1-0, 1-1
 ```
 """)
 
@@ -339,16 +348,16 @@ Example:
 """)
 
 HELP_PY = _help_entry('py', """
-Execute Python code. `data` (list of dicts from the previous step), `_vars`
-and `_i` are in scope, along with datetime, timedelta, date, json, time.
-The output is, in priority: the last `result(val)` call; else a single
-expression's value (e.g. a list literal); else `data` passes through unchanged.
+Execute Python code. `data` (the previous step's output), `_vars` and `_i` are
+in scope, along with datetime, timedelta, date, json, time. The output is, in
+priority: the last `result(val)` call; else a single expression's value
+(e.g. a list literal); else `data` passes through unchanged.
 
-Note: at the `|` step boundary the output is normalised to a list of dicts —
-each non-dict item (scalar, list, tuple) is wrapped into a single `value`
-column: [[0, 1], [1, 2]] → [{'value': [0, 1]}, {'value': [1, 2]}]. Nested
-lists therefore lose their shape for the next step — transform them (e.g.
-with `sql_values()`) in the same step that builds them.
+Data crosses the `|` boundary exactly as produced: nested lists keep their
+shape (`.PY "[[0, 1], [1, 2]]" | .PY "sql_values(data)"` works), a scalar
+stays a scalar (`.PY "'test'"` → `data == 'test'` in the next step), even
+`None`/`0`/`''` pass as-is. Only for display (the final result, `.SHEET`)
+non-dict rows are wrapped into a `value` column.
 
 Examples:
 ```
@@ -483,7 +492,8 @@ result(select('Pick a table', data))
 ```
 
 `sselect(title, rows)`
-  opens *rows* (a list of row dicts, e.g. `data`) in VisiData.  Mark rows with
+  opens *rows* (e.g. `data`; non-dict rows are shown as a `value` column,
+  the selection returns the original items) in VisiData.  Mark rows with
   VisiData's selection (`s`/`t`/`gs`...), `Enter` confirms and returns only
   the marked rows (nothing marked returns `[]`).  `q` on a sub-sheet (e.g.
   `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting
@@ -517,8 +527,9 @@ if not ask('Continue with cleanup?'):
 ```
 
 `sql_in_list(data)`
-  converts a list of scalars or list-of-dicts to a SQL IN-list
-  string, e.g. ('val1','val2'). Use inside .RUN or .PY templates.
+  converts a list of scalars, list-of-dicts (first column) or
+  list-of-lists (first element) to a SQL IN-list string, e.g.
+  ('val1','val2'). Use inside .RUN or .PY templates.
 
   Example:
 ```
@@ -547,14 +558,11 @@ if not ask('Continue with cleanup?'):
 .FOR_RUN "INSERT INTO dst VALUES {{_0}}"
 ```
 
-  Warning: build and format a list of lists in the *same* step. Passed
-  across a `|` boundary it is normalised to dicts with a single `value`
-  column, so each tuple becomes ([0, 1]) instead of (0,1):
+  Data crosses the `|` boundary unchanged, so a list of lists built in a
+  previous step keeps its shape:
 ```
-.PY "sql_values([[x, x+1] for x in range(3)])"     -- (0,1),(1,2),(2,3)
-
 .PY "[[x, x+1] for x in range(3)]" |
-.PY "sql_values(data)"                             -- ([0, 1]),([1, 2]),…
+.PY "sql_values(data)"                             -- (0,1),(1,2),(2,3)
 ```"""
 
 HELP_SET_VAR = _help_entry('set_var', """
@@ -737,18 +745,24 @@ def sql_in_list(data: Any) -> str:
     """Return a SQL IN-list string ``('v1','v2',…)`` from *data*.
 
     *data* may be:
-    - a list of scalars  → each element is used directly
-    - a list of dicts    → the first column value of each dict is used
-    - a single scalar    → wrapped in parentheses
+    - a list of scalars      → each element is used directly
+    - a list of dicts        → the first column value of each dict is used
+    - a list of lists/tuples → the first element of each row is used
+    - a single scalar        → wrapped in parentheses
     """
     if not data:
         raise ValueError('sql_in_list: empty input is not allowed')
+
+    def _first_column(row: Any) -> Any:
+        if isinstance(row, dict):
+            return next(iter(row.values()))
+        if isinstance(row, (list, tuple)):
+            return row[0]
+        return row
+
     items: List[Any]
     if isinstance(data, (list, tuple)):
-        if data and isinstance(data[0], dict):
-            items = [next(iter(row.values())) for row in data]
-        else:
-            items = list(data)
+        items = [_first_column(row) for row in data]
     else:
         items = [data]
 
@@ -827,18 +841,27 @@ def _render(template: str, context: dict) -> str:
     return _TEMPLATE_RE.sub(_replacer, template)
 
 
-def _row_overlay(row: Optional[dict]) -> dict:
-    """Return the ``_0``/``_1``/named-column overlay for *row*: positional column
-    values plus every column whose name is a valid identifier.  Empty for a
-    falsy row.  Falling back to ``data[0]`` when no explicit row is given is the
-    caller's choice, so this helper never touches *data*."""
-    if not row:
+def _row_overlay(row: Any) -> dict:
+    """Return the ``_0``/``_1``/named-column overlay for *row*.
+
+    Rows flow between steps unchanged, so a row may be:
+    - a dict        → positional ``_0``/``_1`` from the column values plus every
+                      column whose name is a valid identifier;
+    - a list/tuple  → positional ``_0``/``_1`` from the elements;
+    - a scalar      → ``_0`` is the value itself.
+
+    Falling back to ``data[0]`` when no explicit row is given is the caller's
+    choice, so this helper never touches *data*."""
+    if row is None:
         return {}
-    values = list(row.values())
-    positional = {f'_{i}': v for i, v in enumerate(values)}
-    named = {k: v for k, v in row.items()
-             if isinstance(k, str) and k.isidentifier()}
-    return {**positional, **named}
+    if isinstance(row, dict):
+        positional = {f'_{i}': v for i, v in enumerate(row.values())}
+        named = {k: v for k, v in row.items()
+                 if isinstance(k, str) and k.isidentifier()}
+        return {**positional, **named}
+    if isinstance(row, (list, tuple)):
+        return {f'_{i}': v for i, v in enumerate(row)}
+    return {'_0': row}
 
 
 def _build_context(row: Optional[dict], data: Optional[list], extra: Optional[dict] = None) -> dict:
@@ -846,7 +869,7 @@ def _build_context(row: Optional[dict], data: Optional[list], extra: Optional[di
     return {
         **_row_overlay(row),
         **DEFAULT_CONTEXT,
-        'row': row or {},
+        'row': row if row is not None else {},
         'data': data if data is not None else [],
         'sql_in_list': sql_in_list,
         'sql_values': sql_values,
@@ -890,18 +913,17 @@ def render_template(template: str, row: dict = None, data: Optional[list] = None
 
 
 def normalize_to_dicts(value: Any) -> List[dict]:
-    """Convert *value* to a list of dicts suitable for display / chaining."""
-    if value is None:
+    """Convert *value* to a list of dicts for DISPLAY (the final pipeline
+    result, ``.SHEET`` sheets, ``sselect()``).  Between steps data flows
+    unchanged — do not call this at step boundaries.  Dict items are kept
+    as-is, every other item is wrapped into a single ``value`` column."""
+    if value is None or value is NO_DATA:
         return []
     if isinstance(value, dict):
         return [value]
     if isinstance(value, (list, tuple)):
-        if not value:
-            return []
-        if isinstance(value[0], dict):
-            return list(value)
-        # List of scalars → wrap each in {'value': …}
-        return [{'value': item} for item in value]
+        return [item if isinstance(item, dict) else {'value': item}
+                for item in value]
     # Scalar
     return [{'value': value}]
 
@@ -944,9 +966,35 @@ def _option_pairs(options: Any) -> 'tuple[List[str], List[Any]]':
 NO_DATA: Any = object()
 
 
-def _as_rows(data: Any) -> List[dict]:
-    """Coerce the inter-step value to a concrete row list (``[]`` for NO_DATA)."""
-    return [] if data is NO_DATA else (data or [])
+def _as_rows(data: Any) -> Any:
+    """Unwrap the inter-step value for consumers: ``[]`` for ``NO_DATA``,
+    otherwise the value exactly as the previous step produced it — a scalar,
+    dict, string, ``None``, ``0``, ``''`` — anything, unchanged."""
+    return [] if data is NO_DATA else data
+
+
+def _as_item_list(value: Any) -> list:
+    """View *value* as a list of rows *without touching the items*: a list
+    stays as-is, a tuple becomes a list, ``NO_DATA``/``None`` become ``[]``
+    and any other single value (scalar, dict) becomes a one-item list.
+    Used only by commands that genuinely need rows (per-row templates, row
+    concatenation, ``.FOR`` accumulation) — the step boundary itself passes
+    data through unchanged."""
+    if value is NO_DATA or value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _first_row(data: Any) -> Any:
+    """The row backing the ``_0``/``_1``/named overlay when no explicit row is
+    given: the first item of a list/tuple, or a non-list value itself."""
+    if isinstance(data, (list, tuple)):
+        return data[0] if data else None
+    return data
 
 
 # ── Pipeline parser ───────────────────────────────────────────────────────────
@@ -1315,7 +1363,7 @@ class _PipelineBreak(Exception):
     result, replacing the rows accumulated from earlier iterations.
     """
 
-    def __init__(self, data: Optional[List[dict]] = None) -> None:
+    def __init__(self, data: Optional[list] = None) -> None:
         super().__init__()
         self.data = data
 
@@ -1329,7 +1377,7 @@ class _PipelineStop(Exception):
     ``.FOR`` handler, so it propagates past every loop up to ``execute()``.
     """
 
-    def __init__(self, data: Optional[List[dict]] = None) -> None:
+    def __init__(self, data: Optional[list] = None) -> None:
         super().__init__()
         self.data = data
 
@@ -1392,7 +1440,9 @@ class PipelineExecutor:
             # stop() aborted the pipeline; its captured data is the final result.
             data = st.data if st.data is not None else NO_DATA
 
-        rows = _as_rows(data)
+        # The only normalisation point: rows are shaped into dicts for display,
+        # having flowed between steps unchanged.
+        rows = [] if data is NO_DATA else normalize_to_dicts(data)
         return Result(data=rows, rowcount=len(rows))
 
     # ── AST execution (walks PipelineStep / ForBlock nodes) ─────────────────────
@@ -1400,9 +1450,12 @@ class PipelineExecutor:
     async def _execute_nodes(self, nodes: List[Node], data: Any) -> Any:
         """Run a list of AST nodes sequentially, threading *data* through.
 
-        Each step's output is normalised to a list of dicts at the boundary, so
-        individual commands need not.  ``NO_DATA`` passes through un-normalised so
-        the first-step / post-``.VOID`` client fallback still works.
+        Data flows between steps exactly as produced — scalars, dicts,
+        ``None``, anything.  Commands that need rows view the value through
+        ``_as_item_list`` themselves; wrapping non-dict rows into a ``value``
+        column happens solely at display points (final result, ``.SHEET``,
+        ``sselect()``).  ``NO_DATA`` passes through as-is so the first-step /
+        post-``.VOID`` client fallback still works.
         """
         for node in nodes:
             # The user asked to stop (Esc on a live info() popup) — abort with
@@ -1424,7 +1477,7 @@ class PipelineExecutor:
                 # {{...}} template) carries no data yet: the step's input
                 # rows become the result, matching the stop() contract.
                 if flow.data is None:
-                    flow.data = _as_rows(data)
+                    flow.data = _as_item_list(data)
                 raise
             except (PipelineStepError, ValueError, PipelineCancelled):
                 # An already-annotated inner error, a deliberate validation
@@ -1433,30 +1486,30 @@ class PipelineExecutor:
                 raise
             except Exception as exc:
                 raise self._step_error(node, exc) from exc
-            data = result if result is NO_DATA else normalize_to_dicts(result)
+            data = result
         return data
 
-    async def _run_for(self, block: ForBlock, data: Any) -> List[dict]:
+    async def _run_for(self, block: ForBlock, data: Any) -> list:
         # The .FOR expression sees the upstream rows ([] when there are none).
         items = self._eval_for_items(block.expr, _as_rows(data))
 
-        accumulated: List[dict] = []
+        accumulated: list = []
         for item in items:
             self._loop_stack.append(item)
             try:
                 sub = await self._execute_nodes(block.body, NO_DATA)
-                accumulated.extend(_as_rows(sub))
+                accumulated.extend(_as_item_list(sub))
             except _PipelineBreak as brk:
                 # br() stops the loop; the breaking iteration's data becomes the
                 # loop result (replacing earlier iterations).
-                return list(brk.data or [])
+                return _as_item_list(brk.data)
             finally:
                 self._loop_stack.pop()
             # Yield control so Esc cancellation can be delivered.
             await asyncio.sleep(0)
         return accumulated
 
-    def _eval_for_items(self, code: str, data: Optional[List[dict]]) -> List[Any]:
+    def _eval_for_items(self, code: str, data: Optional[list]) -> List[Any]:
         """Evaluate the ``.FOR`` expression and coerce it to a list of items."""
         value = self._eval_user_code(code, data)
         if value is None:
@@ -1469,11 +1522,11 @@ class PipelineExecutor:
             return [value]
 
     def _loop_vars(self) -> dict:
-        """Expose the current ``.FOR`` item as ``_i`` (innermost loop wins), or an
-        empty dict outside any loop."""
-        if not self._loop_stack:
-            return {}
-        return {'_i': self._loop_stack[-1]}
+        """Expose the ``.FOR`` items by nesting depth: the outermost loop's item
+        as ``_i``, the second level's as ``_ii``, the third's as ``_iii`` and so
+        on.  Empty outside any loop."""
+        return {'_' + 'i' * (depth + 1): item
+                for depth, item in enumerate(self._loop_stack)}
 
     def _step_error(self, node: Node, exc: BaseException) -> 'PipelineStepError':
         """Annotate *exc* (raised by *node*) with the step command and loop item."""
@@ -1520,9 +1573,9 @@ class PipelineExecutor:
         ``.RUN "SELECT * FROM {{select('Pick', data)}}"``.  In per-row
         templates (``.RFILTER`` / ``.RGET`` / ``.FOR_RUN``) the expression is
         evaluated once per row — an interactive prompt there fires per row."""
-        overlay_row = row if row is not None else (data[0] if data else None)
+        overlay_row = row if row is not None else _first_row(data)
         context = _build_context(overlay_row, data, extra={
-            **self._loop_vars(),             # _i — current .FOR item
+            **self._loop_vars(),             # _i/_ii/… — .FOR items by depth
             '_vars': self.host.vars,
             **self._helper_context(),
         })
@@ -1531,7 +1584,7 @@ class PipelineExecutor:
     # ── Individual command implementations ────────────────────────────────────
 
     async def _cmd_run(
-        self, args: List[str], data: Optional[List[dict]]
+        self, args: List[str], data: Optional[list]
     ) -> List[dict]:
         if not args:
             raise ValueError('.RUN requires a SQL argument')
@@ -1542,8 +1595,8 @@ class PipelineExecutor:
         return (result.data or []) if result else []
 
     async def _cmd_urun(
-        self, args: List[str], data: Optional[List[dict]]
-    ) -> List[dict]:
+        self, args: List[str], data: Optional[list]
+    ) -> list:
         """UNION RUN: like .RUN, but append the query rows to the input data
         instead of replacing them (result = input rows + new rows)."""
         if not args:
@@ -1553,11 +1606,11 @@ class PipelineExecutor:
 
         result = await self.client.execute(sql)
         new_rows = (result.data or []) if result else []
-        return list(data or []) + new_rows
+        return _as_item_list(data) + new_rows
 
     async def _cmd_rfilter(
-        self, args: List[str], data: Optional[List[dict]]
-    ) -> List[dict]:
+        self, args: List[str], data: Optional[list]
+    ) -> list:
         if len(args) < 2:
             raise ValueError('.RFILTER requires a template and a regex argument')
         template, pattern_str = args[0], args[1]
@@ -1567,12 +1620,12 @@ class PipelineExecutor:
             raise ValueError(f'.RFILTER invalid regex {pattern_str!r}: {exc}') from exc
 
         return [
-            row for row in (data or [])
+            row for row in _as_item_list(data)
             if pattern.search(self._render_template(template, row, data))
         ]
 
     async def _cmd_rget(
-        self, args: List[str], data: Optional[List[dict]]
+        self, args: List[str], data: Optional[list]
     ) -> List[dict]:
         if len(args) < 2:
             raise ValueError('.RGET requires a template and a regex argument')
@@ -1583,7 +1636,7 @@ class PipelineExecutor:
             raise ValueError(f'.RGET invalid regex {pattern_str!r}: {exc}') from exc
 
         result: List[dict] = []
-        for row in (data or []):
+        for row in _as_item_list(data):
             m = pattern.search(self._render_template(template, row, data))
             if m:
                 groups = m.groups()
@@ -1595,13 +1648,13 @@ class PipelineExecutor:
         return result
 
     async def _cmd_for_run(
-        self, args: List[str], data: Optional[List[dict]]
+        self, args: List[str], data: Optional[list]
     ) -> List[dict]:
         if not args:
             raise ValueError('.FOR_RUN requires a SQL template argument')
         sql_template = args[0]
         result: List[dict] = []
-        for row in (data or []):
+        for row in _as_item_list(data):
             if self.host.pipeline_stop_requested():
                 raise _PipelineStop(result)   # rows collected so far
             sql = self._render_template(sql_template, row, data)
@@ -1613,13 +1666,13 @@ class PipelineExecutor:
         return result
 
     async def _cmd_sleep(
-        self, args: List[str], data: Optional[List[dict]]
-    ) -> List[dict]:
+        self, args: List[str], data: Optional[list]
+    ) -> list:
         if not args:
             raise ValueError('.SLEEP requires a seconds argument')
         seconds = self._eval_user_code(args[0], data)
         await asyncio.sleep(float(seconds))
-        return list(data or [])
+        return data
 
     def _info(self, msg: Any) -> None:
         """Show *msg* in the info popup (overlaying the running popup) without
@@ -1723,19 +1776,25 @@ class PipelineExecutor:
         mapping = self._label_map(labels, values)
         return [mapping.get(label, label) for label in marked]
 
-    def _user_sselect(self, title: Any, rows: Any) -> List[dict]:
-        """Open *rows* (a list of row dicts, e.g. ``data``) in VisiData; the
-        user marks rows with VisiData's selection (s/t/gs...), Enter confirms
-        and returns only the marked rows (nothing marked returns ``[]``).
-        ``q`` or quitting VisiData aborts the pipeline without a result.
-        Exposed as ``sselect()``."""
-        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
-            raise ValueError('sselect(): rows must be a list of dicts (e.g. data)')
+    def _user_sselect(self, title: Any, rows: Any) -> list:
+        """Open *rows* (e.g. ``data``) in VisiData; the user marks rows with
+        VisiData's selection (s/t/gs...), Enter confirms and returns only the
+        marked rows (nothing marked returns ``[]``).  ``q`` or quitting
+        VisiData aborts the pipeline without a result.  Exposed as
+        ``sselect()``.
+
+        Rows are shaped into dicts only for the sheet; the returned selection
+        contains the original (raw) rows."""
+        raw = _as_item_list(rows)
+        shaped = normalize_to_dicts(raw)
         selected = self.host.request_user_input(
-            {'kind': 'sselect', 'title': str(title), 'rows': rows})
+            {'kind': 'sselect', 'title': str(title), 'rows': shaped})
         if selected is None:
             self._cancel()
-        return selected
+        # Map the marked display rows back to the raw items (dict rows are
+        # passed to the sheet as-is, so they map to themselves).
+        raw_by_id = {id(shown): item for shown, item in zip(shaped, raw)}
+        return [raw_by_id.get(id(row), row) for row in selected]
 
     def _user_input(self, title: Any, default: Any = None) -> str:
         """Ask the user to type a line of text; return the entered string.
@@ -1778,14 +1837,15 @@ class PipelineExecutor:
             'ask': self._user_ask,
         }
 
-    def _python_context(self, data: Optional[List[dict]], extra: Optional[dict] = None) -> dict:
+    def _python_context(self, data: Any, extra: Optional[dict] = None) -> dict:
         """Build the global namespace shared by .PY / .SET_VAR / .SLEEP
-        and the .FOR expression."""
+        and the .FOR expression.  ``data`` is exposed exactly as the previous
+        step produced it (list, scalar, dict, None, …)."""
         context: dict = {
-            **_row_overlay(data[0] if data else None),  # _0/_1/named from previous step's data[0]
-            **self._loop_vars(),              # _i — current .FOR item
+            **_row_overlay(_first_row(data)),  # _0/_1/named from the first row
+            **self._loop_vars(),              # _i/_ii/… — .FOR items by depth
             **DEFAULT_CONTEXT,
-            'data': list(data or []),
+            'data': data,
             '_vars': self.host.vars,
             'sql_in_list': sql_in_list,
             'sql_values': sql_values,
@@ -1796,7 +1856,7 @@ class PipelineExecutor:
         return context
 
     def _run_user_code(
-        self, code: str, data: Optional[List[dict]], extra: Optional[dict] = None
+        self, code: str, data: Optional[list], extra: Optional[dict] = None
     ) -> Any:
         """Execute user Python for a pipeline step and return the step's value.
 
@@ -1804,7 +1864,7 @@ class PipelineExecutor:
 
         1. the argument of the last ``result(...)`` call, if any;
         2. else, for a single expression, that expression's value;
-        3. else ``data``, unchanged (the possibly-modified passthrough list).
+        3. else ``data``, unchanged (the possibly-modified passthrough value).
 
         ``result()`` is a callable injected here (backed by a local list), so it
         behaves identically in ``.PY`` and in ``.SLEEP`` / ``.SET_VAR`` / the
@@ -1820,14 +1880,12 @@ class PipelineExecutor:
         whatever the code produced (the last ``result(...)`` or the passthrough
         data) so the ``.FOR`` loop (br) or the executor (stop) can return it.
         """
-        data_list = list(data or [])
-
         _called: list = []
 
         def result(val: Any) -> None:
             _called.append(val)
 
-        context = self._python_context(data_list, {'result': result, **(extra or {})})
+        context = self._python_context(data, {'result': result, **(extra or {})})
 
         try:
             code_obj = compile(code, '<pipeline>', 'eval')
@@ -1843,12 +1901,12 @@ class PipelineExecutor:
             # Preserve any result()/passthrough produced before br()/stop() so the
             # loop (br) or the executor (stop) returns it instead of prior data.
             if flow.data is None:
-                flow.data = normalize_to_dicts(_called[-1] if _called else data_list)
+                flow.data = _as_item_list(_called[-1] if _called else data)
             raise
 
-        return _called[-1] if _called else data_list
+        return _called[-1] if _called else data
 
-    def _eval_user_code(self, code: str, data: Optional[List[dict]]) -> Any:
+    def _eval_user_code(self, code: str, data: Optional[list]) -> Any:
         """Run user Python and return its value (see :meth:`_run_user_code`).
 
         Used by ``.SLEEP``, ``.SET_VAR`` and the ``.FOR`` expression.  A single
@@ -1856,7 +1914,7 @@ class PipelineExecutor:
         falling back to the passthrough ``data``."""
         return self._run_user_code(code, data)
 
-    async def _cmd_py(self, args: List[str], data: Optional[List[dict]]) -> Any:
+    async def _cmd_py(self, args: List[str], data: Optional[list]) -> Any:
         """Run user Python.  The step's output is, in priority:
 
         1. the argument of the last ``result(...)`` call, if any;
@@ -1865,50 +1923,51 @@ class PipelineExecutor:
 
         ``data``, ``_vars``, ``_i``, ``info()``, ``br()``, ``set_var()``,
         ``get_var()``, ``select()``, ``mselect()``, ``input()``, ``ask()`` and
-        ``result()`` are in scope.  Output is normalised to dicts centrally in
-        ``_execute_nodes``.
+        ``result()`` are in scope.  The output crosses the step boundary
+        exactly as produced — even a scalar or ``None``; dict-wrapping happens
+        only at display points.
         """
         if not args:
             raise ValueError('.PY requires a Python code argument')
         return self._run_user_code(args[0], data)
 
     async def _cmd_set_var(
-        self, args: List[str], data: Optional[List[dict]]
-    ) -> List[dict]:
+        self, args: List[str], data: Optional[list]
+    ) -> list:
         if not args:
             raise ValueError('.SET_VAR requires a KEY argument')
         key = args[0]
         if len(args) >= 2:
             self.host.vars[key] = self._eval_user_code(args[1], data)
-        elif data:
+        elif _as_item_list(data):
             self.host.vars[key] = data
         else:
             self.host.vars.pop(key, None)
-        return list(data or [])
+        return data
 
-    async def _cmd_vars(self, args: List[str], data: Optional[List[dict]]) -> List[dict]:
+    async def _cmd_vars(self, args: List[str], data: Optional[list]) -> List[dict]:
         """Return the current variables as a list of dicts with 'key' and 'value'."""
         return [{'key': k, 'value': v} for k, v in self.host.vars.items()]
 
     async def _cmd_get_var(
-        self, args: List[str], data: Optional[List[dict]]
-    ) -> List[dict]:
+        self, args: List[str], data: Optional[list]
+    ) -> list:
         if not args:
             raise ValueError('.GET_VAR requires a KEY argument')
         key = args[0]
-        # A missing key contributes nothing (no exception): normalize_to_dicts([])
-        # is [], so the input data simply passes through unchanged.
-        var_list = normalize_to_dicts(self.host.vars.get(key, []))
-        if data:
-            return list(data) + var_list
-        return var_list
+        # A missing key contributes nothing (no exception): _as_item_list([])
+        # is [], so the input data simply passes through unchanged.  The value
+        # is appended raw — no dict-wrapping between steps.
+        var_list = _as_item_list(self.host.vars.get(key, []))
+        rows = _as_item_list(data)
+        return rows + var_list if rows else var_list
 
     async def _cmd_void(self, args: List[str], data: Any) -> Any:
         # Reset to "no data" so the next step behaves like a first step (its
         # template sees no rows, and an unknown command may fall back to the client).
         return NO_DATA
 
-    async def _cmd_sheet(self, args: List[str], data: Optional[List[dict]]) -> List[dict]:
+    async def _cmd_sheet(self, args: List[str], data: Optional[list]) -> list:
         """Open the input rows as a VisiData sheet named ``args[0]`` (rendered as a
         template), then pass the data through unchanged so the pipeline continues.
 
@@ -1917,10 +1976,11 @@ class PipelineExecutor:
         ``DbEditor.add_pipeline_sheet`` and ``_db_query``'s ``on_done``)."""
         if not args:
             raise ValueError('.SHEET requires a NAME argument')
-        rows = list(data or [])
-        name = self._render_template(args[0], data=rows)
-        self.host.add_pipeline_sheet(name, rows)
-        return rows
+        name = self._render_template(args[0], data=data)
+        # The sheet is a display point — shape rows into dicts for VisiData;
+        # the pipeline itself continues with the raw data.
+        self.host.add_pipeline_sheet(name, normalize_to_dicts(data))
+        return data
 
 
 # Fail fast at import time if the command table references a handler that does
