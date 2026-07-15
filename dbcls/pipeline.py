@@ -418,9 +418,9 @@ warn("About to rewrite the table!")
   Example (stop polling and return `['found']` as soon as a long query appears):
 ```
 .FOR "range(60)" |
-.SLEEP "1" |
-.RUN "SELECT max(TIME) AS mtime FROM ..." |
-.PY \"\"\"
+  .SLEEP "1" |
+  .RUN "SELECT max(TIME) AS mtime FROM ..." |
+  .PY \"\"\"
 info(mtime)
 if mtime > 1:
     result(['found'])
@@ -627,10 +627,11 @@ intermediate result sets as separate, named sheets (the pipeline's final
 result still opens too). NAME is a template, so `{{_i}}` / `{{_0}}` / column
 names can be substituted — handy inside `.FOR`.
 
-Example:
+Examples:
 ```
 .RUN "SELECT * FROM a" | .SHEET a |
 .RUN "SELECT * FROM b" | .SHEET b
+
 .FOR "range(3)" |
 .RUN "SELECT '{{_i}}' AS i" |
 .SHEET "data_{{_i}}" | .NOFOR

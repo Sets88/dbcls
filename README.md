@@ -411,8 +411,8 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 `#` or `-- ` (two dashes followed by a space) start a comment that runs to the end of the line. Comments are recognised only **outside** quoted strings, so a `#`/`--` inside the SQL of a `.RUN "…"` is left untouched. A `|` hidden behind a trailing comment still continues the pipeline onto the next line.
 
 ```sql
-.RUN "SELECT 1"   -- first step
-  | .URUN "SELECT 2"   # add another row
+.RUN "SELECT '1' AS col" |  -- first row
+.URUN "SELECT '2' AS col" -- second row
 ```
 
 ### Control flow
@@ -420,7 +420,9 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 `.FOR "code"` evaluates `code` to an iterable and runs every following step once per item, exposing the current item as `{{_i}}` (templates) and `_i` (Python). `.NOFOR` closes the loop; nested `.FOR` loops are supported — items are named by nesting depth: the outermost loop's item is `_i`, the second level's `_ii`, the third's `_iii`, and so on:
 
 ```sql
-.FOR "range(2)" | .FOR "range(2)" | .RUN "SELECT '{{_i}}-{{_ii}}'"   -- 0-0, 0-1, 1-0, 1-1
+.FOR "range(2)" |
+    .FOR "range(2)" |
+        .RUN "SELECT '{{_i}}-{{_ii}}' AS col"   -- 0-0, 0-1, 1-0, 1-1
 ```
 
 - **With `.NOFOR`** — the loop's accumulated rows are *discarded* at the boundary, so steps after it start fresh (no input), and a pipeline ending in `.NOFOR` yields an empty result.
@@ -479,49 +481,49 @@ Dismissing any of these prompts with `Esc` (`q` for `sselect`, since `Esc` is a 
 
 **Find IDs matching a pattern and fetch full records:**
 ```sql
-.RUN "SELECT id, name FROM users"
-  | .RFILTER "{{name}}" "^admin"
-  | .RUN "SELECT * FROM users WHERE id IN {{sql_in_list(data)}}"
+.RUN "SELECT id, name FROM users" |
+.RFILTER "{{name}}" "^admin" |
+.RUN "SELECT * FROM users WHERE id IN {{sql_in_list(data)}}"
 ```
 
 **Collect IDs across several databases and query them all at once:**
 ```sql
-.RUN "SHOW DATABASES"
-  | .RFILTER "{{_0}}" "^shard_"
-  | .FOR_RUN "SELECT id FROM {{_0}}.events WHERE created_at > '2024-01-01'"
-  | .RUN "SELECT * FROM archive WHERE id IN {{sql_in_list(data)}}"
+.RUN "SHOW DATABASES" |
+.RFILTER "{{_0}}" "^shard_" |
+.FOR_RUN "SELECT id FROM {{_0}}.events WHERE created_at > '2024-01-01'" |
+.RUN "SELECT * FROM archive WHERE id IN {{sql_in_list(data)}}"
 ```
 
 **Copy rows between tables, inserting in chunks of 5000:**
 ```sql
-.RUN "SELECT id, name FROM src"
-  | .PY "sql_values(data, 5000)"
-  | .FOR_RUN "INSERT INTO dst VALUES {{_0}}"
+.RUN "SELECT id, name FROM src" |
+.PY "sql_values(data, 5000)" |
+.FOR_RUN "INSERT INTO dst VALUES {{_0}}"
 ```
 
 **Post-process results with Python:**
 ```sql
-.RUN "SELECT name, score FROM results"
-  | .PY "sorted(data, key=lambda r: r['score'], reverse=True)[:10]"
+.RUN "SELECT name, score FROM results" |
+.PY "sorted(data, key=lambda r: r['score'], reverse=True)[:10]"
 ```
 
 **Append rows from another query (UNION):**
 ```sql
-.RUN "SELECT id, 'a' AS src FROM table_a"
-  | .URUN "SELECT id, 'b' AS src FROM table_b"
+.RUN "SELECT id, 'a' AS src FROM table_a" |
+.URUN "SELECT id, 'b' AS src FROM table_b"
 ```
 
 **Extract capture groups from a column:**
 ```sql
-.RUN "SELECT path FROM logs"
-  | .RGET "{{path}}" "/api/v\d+/([^/]+)"
+.RUN "SELECT path FROM logs" |
+.RGET "{{path}}" "/api/v\d+/([^/]+)"
 ```
 
 **Save IDs mid-pipeline and reuse them later:**
 ```sql
-.RUN "SELECT id FROM users WHERE active = 1"
-  | .SET_VAR user_ids "sql_in_list(data)"
-  | .RUN "SELECT * FROM orders WHERE user_id IN {{_vars['user_ids']}}"
+.RUN "SELECT id FROM users WHERE active = 1" |
+.SET_VAR user_ids "sql_in_list(data)" |
+.RUN "SELECT * FROM orders WHERE user_id IN {{_vars['user_ids']}}"
 ```
 
 **Run a query, then continue the pipeline with a fresh start:**
@@ -541,10 +543,10 @@ Dismissing any of these prompts with `Esc` (`q` for `sselect`, since `Esc` is a 
 
 **Poll until a condition, showing progress, then stop:**
 ```sql
-.FOR "range(60)"
-  | .SLEEP "1"
-  | .RUN "SELECT max(updated_at) AS mtime FROM jobs"
-  | .PY """
+.FOR "range(60)" |
+  .SLEEP "1" |
+  .RUN "SELECT max(updated_at) AS mtime FROM jobs" |
+  .PY """
 info(f'waiting… {mtime}')
 if mtime is not None:
     result(['done'])
