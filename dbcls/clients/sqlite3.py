@@ -11,6 +11,7 @@ from .base import (
 
 class Sqlite3Client(ClientClass):
     ENGINE = 'Sqlite3'
+    SUPPORTS_EDITING = True
 
     def __init__(self, filename):
         if not filename:
@@ -43,6 +44,17 @@ class Sqlite3Client(ClientClass):
             "SELECT name AS 'table', '%s' AS database FROM sqlite_master WHERE type='table';" % self.dbname
         )
 
+    def get_table_ref(self, table: str, database: Optional[str] = None) -> str:
+        # `database` is the filename here, never a name prefix
+        return self.quote_ident(table)
+
+    async def get_primary_key(self, table: str, database: Optional[str] = None) -> list:
+        result = await self.execute(f"PRAGMA table_info({self.quote_ident(table)})")
+        # pk is the 1-based position of the column in the primary key, 0 if not part of it;
+        # a table without a declared PK returns [] (implicit rowid is not in SELECT *)
+        rows = sorted((row for row in result.data if row['pk'] > 0), key=lambda x: x['pk'])
+        return [row['name'] for row in rows]
+
     def get_sample_data_sql(self,
         table: str,
         database: Optional[str] = None,
@@ -71,9 +83,8 @@ class Sqlite3Client(ClientClass):
         data = [dict(x) for x in cur.fetchall()]
         if rowcount <= 0:
             rowcount = len(data)
-        if self._conn is not None:
-            conn.commit()
-        else:
+        conn.commit()
+        if self._conn is None:
             conn.close()
 
         return Result(data, rowcount)

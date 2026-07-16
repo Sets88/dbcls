@@ -4,6 +4,8 @@ from time import time
 from typing import Optional
 from dataclasses import dataclass, field
 
+from ..utils import sql_literal
+
 
 COMMAND_RE = re.compile(r'\.([a-zA-Z_0-9]+)\s*(.*)', re.IGNORECASE)
 
@@ -38,6 +40,9 @@ class Result:
 class ClientClass(abc.ABC):
     ENGINE = ''
     SUPPORTS_SERVER_SIDE_PAGING = False
+    # Whether the engine supports editing data from the table browser
+    # ("Edit" option: pending cell edits / row adds committed as UPDATE/INSERT)
+    SUPPORTS_EDITING = False
 
     COMMANDS = [
         'tables', 'databases', 'schema', 'use'
@@ -158,6 +163,46 @@ class ClientClass(abc.ABC):
 
                 if tries == 1:
                     raise
+
+    def quote_ident(self, name: str) -> str:
+        name = name.replace('`', '``')
+        return f'`{name}`'
+
+    def get_table_ref(self, table: str, database: Optional[str] = None) -> str:
+        if database:
+            return f'{self.quote_ident(database)}.{self.quote_ident(table)}'
+        return self.quote_ident(table)
+
+    async def get_primary_key(self, table: str, database: Optional[str] = None) -> list:
+        """Return the ordered list of primary-key column names of *table*
+        (empty when the table has no primary key).  Required only when
+        SUPPORTS_EDITING is True."""
+        raise NotImplementedError
+
+    def get_update_sql(
+        self, table: str, changes: dict, pk: dict, database: Optional[str] = None
+    ) -> str:
+        set_sql = ', '.join(
+            f'{self.quote_ident(name)} = {sql_literal(value)}'
+            for name, value in changes.items()
+        )
+        where_sql = ' AND '.join(
+            f'{self.quote_ident(name)} = {sql_literal(value)}'
+            for name, value in pk.items()
+        )
+        return f'UPDATE {self.get_table_ref(table, database)} SET {set_sql} WHERE {where_sql}'
+
+    def get_insert_sql(self, table: str, values: dict, database: Optional[str] = None) -> str:
+        columns_sql = ', '.join(self.quote_ident(name) for name in values)
+        values_sql = ', '.join(sql_literal(value) for value in values.values())
+        return f'INSERT INTO {self.get_table_ref(table, database)} ({columns_sql}) VALUES ({values_sql})'
+
+    def get_delete_sql(self, table: str, pk: dict, database: Optional[str] = None) -> str:
+        where_sql = ' AND '.join(
+            f'{self.quote_ident(name)} = {sql_literal(value)}'
+            for name, value in pk.items()
+        )
+        return f'DELETE FROM {self.get_table_ref(table, database)} WHERE {where_sql}'
 
     def reset_pager(self) -> None:
         pass

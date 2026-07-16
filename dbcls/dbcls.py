@@ -369,6 +369,25 @@ DB-specific extensions
       Save current column values from selected rows to pipeline vars
       as a flat list
 
+Edit mode (table browser `Edit` option; MySQL/SQLite only)
+  `e`
+      Edit cell — kept pending (yellow) until committed
+  `a`
+      Add a new row — kept pending (green) until committed
+  `d / gd`
+      Mark current / selected rows for deletion — kept pending (red)
+      until committed (`U` undoes the mark)
+  `zd`
+      Set cell to NULL (pending)
+  `Ctrl+S`
+      Show the INSERT/UPDATE/DELETE statements for the pending
+      changes; on that sheet `Enter` executes them one by one (no
+      transaction), then the data is reloaded from the DB, `q` goes
+      back without executing.  On error execution stops, the failed
+      statement is marked ERROR and the pending changes are kept for
+      retry.  Editing or deleting existing rows requires a primary
+      key.
+
 Expression helpers
   Available in visidata expressions (`=` adds an expression column):
   `reference(sheet, field, value)`

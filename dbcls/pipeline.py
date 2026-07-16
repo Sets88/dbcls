@@ -731,15 +731,7 @@ DEFAULT_CONTEXT = {
 
 # ── Public helpers ────────────────────────────────────────────────────────────
 
-def _sql_literal(v: Any) -> str:
-    """Format *v* as a SQL literal: strings are quoted (``'`` doubled),
-    ``None`` becomes ``NULL``, everything else is ``str()``."""
-    if v is None:
-        return 'NULL'
-    if isinstance(v, str):
-        v = v.replace("'", "''")
-        return f"'{v}'"
-    return str(v)
+from .utils import sql_literal as _sql_literal
 
 
 def sql_in_list(data: Any) -> str:

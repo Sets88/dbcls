@@ -5,6 +5,17 @@ import json
 NUMBER_MATCHER = re.compile(r'^[-]?\d+(\.\d+)?$')
 
 
+def sql_literal(v) -> str:
+    """Format *v* as a SQL literal: strings are quoted (``'`` doubled),
+    ``None`` becomes ``NULL``, everything else is ``str()``."""
+    if v is None:
+        return 'NULL'
+    if isinstance(v, str):
+        v = v.replace("'", "''")
+        return f"'{v}'"
+    return str(v)
+
+
 def format_json(json_string, indent=2):
     """
     Formats JSON by adding indentation and line breaks

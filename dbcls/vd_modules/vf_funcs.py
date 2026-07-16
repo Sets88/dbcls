@@ -2,23 +2,55 @@ from datetime import datetime, timezone
 from typing import Union
 
 import visidata
-from visidata import VisiData, PyobjSheet, Progress, TypedExceptionWrapper
+from visidata import VisiData, Progress, TypedExceptionWrapper, Sheet, Column
 
 from ..utils import prettify
 from .vd_utils import reference_sheets
 
 
-@VisiData.api
-def make_formated_table(sheet, col, row):
-    if not row:
-        raise Exception('No data found')
+class LiveFormatSheet(Sheet):
+    """Follows the source sheet cursor: `rows` is recomputed from the cell
+    currently under the cursor, so when shown in the other split pane it
+    updates as the cursor moves or the cell is edited."""
+    precious = False
+    columns = [Column('formated', getter=lambda col, row: row)]
 
-    cell = col.getValue(row)
-    data = prettify(cell)
-    return PyobjSheet(
-        'formated',
-        source=data.split('\n'),
-    )
+    _cache_key = None
+    _cache_cell = None
+    _cache_lines = ['']
+
+    @property
+    def rows(self):
+        try:
+            row = self.source.cursorRow
+            col = self.source.cursorCol
+            cell = col.getValue(row) if row is not None else None
+        except Exception:
+            return self._cache_lines
+
+        key = (id(row), id(col))
+        try:
+            unchanged = key == self._cache_key and cell == self._cache_cell
+        except Exception:
+            unchanged = False
+
+        if not unchanged:
+            self._cache_key = key
+            self._cache_cell = cell
+            try:
+                self._cache_lines = prettify(cell).split('\n') if row is not None else ['']
+            except Exception as e:
+                self._cache_lines = [f'error: {e}']
+        return self._cache_lines
+
+    @rows.setter
+    def rows(self, _):
+        pass  # always derived from the source sheet cursor
+
+
+@VisiData.api
+def make_formated_table(_, sheet):
+    return LiveFormatSheet(sheet.name, 'formated', source=sheet)
 
 
 # NOTE: reference(), get_var() and the ts_*/dt_* helpers below have no callers

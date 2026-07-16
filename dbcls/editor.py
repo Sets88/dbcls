@@ -3367,12 +3367,20 @@ class Editor:
                 self._needs_redraw = True
 
             # A worker thread (pipeline select()/input()/ask()) asked for user
-            # input — open the matching widget on this tick.
-            if self._ui_request is not None and not self._ui_request['opened']:
+            # input — open the matching widget on this tick.  Deferred while a
+            # full-screen overlay (lock screen) is up: 'ask'/'sselect' grab the
+            # terminal synchronously, bypassing _dispatch_pre_hook.
+            if (self._ui_request is not None and not self._ui_request['opened']
+                    and self._get_overlay() is None):
                 self._open_ui_request(self._ui_request)
                 self._needs_redraw = True
 
-            if self.running_popup.active and self.running_popup.is_done():
+            # Deferred while a full-screen overlay (lock screen) is up: the
+            # done-callback may open the result viewer (VisiData), drawing
+            # query results over the lock.  Fires on the first tick after
+            # unlock instead.
+            if (self.running_popup.active and self.running_popup.is_done()
+                    and self._get_overlay() is None):
                 cb = self._running_done_cb
                 self._running_done_cb = None
                 self.running_popup.close()
@@ -3475,6 +3483,11 @@ class Editor:
                 _, mx, my, _, bstate = curses.getmouse()
             except curses.error as exc:
                 self.set_status_notification('KEY_MOUSE but getmouse() failed — ' + str(exc))
+                return
+            # Mouse events go through the pre-hook like keys: while the lock
+            # screen is active clicks/scrolls are swallowed here; while
+            # unlocked this counts as activity (resets the inactivity timer).
+            if self._dispatch_pre_hook(self._encode_key(key)):
                 return
             if bstate & curses.BUTTON1_PRESSED or bstate & curses.BUTTON1_CLICKED:
                 self._handle_mouse_click(mx, my)
@@ -4008,10 +4021,14 @@ class Editor:
             buf.move_cursor(nr, new_col, extend)
 
     def _check_external_file_change(self):
+        # Deferred while a full-screen overlay (lock screen) is up: the prompt
+        # reads keys directly, bypassing _dispatch_pre_hook, so it must never
+        # appear over the lock.
         if (self._file_change_dismissed
                 or not self.buf.filepath
                 or self.running_popup.active
-                or self.popup.active):
+                or self.popup.active
+                or self._get_overlay() is not None):
             return
         if self.buf.file_changed_on_disk():
             self._confirm_file_change()

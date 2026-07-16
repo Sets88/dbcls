@@ -15,7 +15,7 @@ from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper o
 
 IndexSheet.guide += '''- `^` to make new sheet with reference column between two sheets'''
 
-TableSheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(cursorCol, cursorRow))', 'Prettify current Cell on new sheet')
+TableSheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(sheet))', 'Prettify cell under cursor on new sheet, live-updating as the cursor moves when shown in a split pane')
 TableSheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
 TableSheet.addCommand('gp', 'alt-plot', 'vd.push(Plot(source=sheet))', 'Draw plotext chart from first 2 or 3 visible columns (datetime, [bucket,] value)')
 IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')

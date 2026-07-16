@@ -12,6 +12,7 @@ from .base import (
 
 class MysqlClient(ClientClass):
     ENGINE = 'MySQL'
+    SUPPORTS_EDITING = True
 
     SQL_COMMANDS = [
         'TABLES', 'DATABASES', 'USE', 'SHOW', 'PROCESSLIST', 'DEFAULT', 'KEY', 'PRIMARY', 'CHARACTER',
@@ -90,6 +91,18 @@ class MysqlClient(ClientClass):
         if result and result.data:
             result.data = [{'schema': list(x.values())[-1]} for x in result.data]
         return result
+
+    async def get_primary_key(self, table: str, database: Optional[str] = None) -> list:
+        if not database:
+            database = self.dbname
+
+        result = await self.execute(
+            f"SHOW KEYS FROM {self.get_table_ref(table, database)} WHERE Key_name = 'PRIMARY'"
+        )
+        if not result.data:
+            return []
+        rows = sorted(result.data, key=lambda x: x['Seq_in_index'])
+        return [row['Column_name'] for row in rows]
 
     def get_sample_data_sql(self,
         table: str,
