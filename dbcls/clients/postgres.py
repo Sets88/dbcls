@@ -17,6 +17,7 @@ from .base import (
 
 class PostgresClient(ClientClass):
     ENGINE = 'PostgreSQL'
+    SUPPORTS_EDITING = True
 
     def __init__(
         self, host: str, username: str, password: str, dbname: str,
@@ -78,6 +79,29 @@ class PostgresClient(ClientClass):
     async def get_databases(self) -> Result:
         sql = "SELECT datname AS database FROM pg_database;"
         return await self.execute(sql)
+
+    def quote_ident(self, name: str) -> str:
+        name = name.replace('"', '""')
+        return f'"{name}"'
+
+    def get_table_ref(self, table: str, database: Optional[str] = None) -> str:
+        # Cross-database references are not supported and "db"."table" would
+        # be parsed as schema.table, so `database` is ignored
+        return self.quote_ident(table)
+
+    async def get_primary_key(self, table: str, database: Optional[str] = None) -> list:
+        result = await self.execute(f"""
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON kcu.constraint_name = tc.constraint_name
+                AND kcu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+                AND tc.table_name = '{table}'
+                AND tc.table_schema = 'public'
+            ORDER BY kcu.ordinal_position
+        """)
+        return [row['column_name'] for row in result.data]
 
     def get_sample_data_sql(self,
         table: str,
@@ -243,7 +267,10 @@ class PostgresClient(ClientClass):
             async with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
                 await cur.execute(sql)
                 result = Result(rowcount=cur.rowcount)
-                result.data = await cur.fetchall()
+                # INSERT/UPDATE/DELETE produce no result set and fetchall()
+                # would raise "no results to fetch"
+                if cur.description is not None:
+                    result.data = await cur.fetchall()
 
                 return result
 

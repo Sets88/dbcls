@@ -19,6 +19,13 @@ class SselectSheet(ListOfDictSheet):
     ([] when nothing is marked), q aborts the pipeline.  The commands are
     bound to this class only (see vd_modules.__init__), so the regular result
     viewer keeps VisiData's stock Enter/q behavior."""
+    guide = '''# Pipeline row picker
+Select the rows to hand back to the sselect() pipeline step.
+
+- `s` / `t` / `u` to select / toggle / unselect rows (stock VisiData keys).
+- `Enter` to confirm: the selected rows are returned to the pipeline.
+- `q` to abort the pipeline.
+'''
     precious = False
 
     def confirm_selection(self):
@@ -36,6 +43,10 @@ class SselectSheet(ListOfDictSheet):
 
 @VisiData.api
 class ExpandVert(TableSheet):
+    guide = '''# Vertical expansion
+Copy of *{sheet.source}* with each element of the list in _{sheet.curcol.name}_ on its own row (rows whose cell is not a list are kept as-is).
+'''
+
     def __init__(self, source, curcol):
         super().__init__(source.name + "_expver", source=source)
         self.curcol = curcol
@@ -113,6 +124,13 @@ def openRefCells(vd, cursorCol, selectedRows):
 
 @VisiData.api
 class SheetWithReference(TableSheet):
+    guide = '''# Sheet with reference
+Rows of the first selected sheet plus a `__ref` column: each cell links to the rows of the second sheet whose key columns have the same values.
+
+- `Enter` on the ref column to dive into the matching rows.
+- `gz Enter` to open one combined sheet for the ref cells of all selected rows.
+'''
+
     def __init__(self, left_sheet, other_sheets):
         super().__init__('')
         if not left_sheet or not other_sheets:
@@ -152,6 +170,10 @@ class SheetWithReference(TableSheet):
 
 
 class ReferenceSheet(TableSheet):
+    guide = '''# Referenced rows
+Rows of *{sheet.source}* whose key columns match the originating reference cell.
+'''
+
     def __init__(self, name: str, source: TableSheet, fields: Tuple[str], values: List[Tuple[Any]]):
         super().__init__(name, source=source)
         self.fields = fields

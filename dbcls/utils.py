@@ -1,18 +1,27 @@
 import re
 import json
+import datetime
 
 
 NUMBER_MATCHER = re.compile(r'^[-]?\d+(\.\d+)?$')
 
 
 def sql_literal(v) -> str:
-    """Format *v* as a SQL literal: strings are quoted (``'`` doubled),
-    ``None`` becomes ``NULL``, everything else is ``str()``."""
+    """Format *v* as a SQL literal: strings and dates are quoted (``'``
+    doubled), ``None`` becomes ``NULL``, everything else is ``str()``."""
     if v is None:
         return 'NULL'
     if isinstance(v, str):
         v = v.replace("'", "''")
         return f"'{v}'"
+    if isinstance(v, datetime.datetime):
+        # midnight means a date-only value (visidata date parses '2016-02-15'
+        # as a datetime), so emit a plain date for DATE columns
+        if (v.hour, v.minute, v.second, v.microsecond) == (0, 0, 0, 0):
+            return f"'{v.strftime('%Y-%m-%d')}'"
+        return f"'{v.isoformat(sep=' ')}'"
+    if isinstance(v, datetime.date):
+        return f"'{v.isoformat()}'"
     return str(v)
 
 

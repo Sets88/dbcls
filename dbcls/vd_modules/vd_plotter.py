@@ -79,6 +79,13 @@ def _draw_ansi(scr, ansi_str, start_row=0, start_col=0):
 
 @VisiData.api
 class Plot(BaseSheet):
+    guide = '''# Chart
+plotext chart built from the source sheet key columns: (datetime, [bucket,] value).  Plots the selected rows when there is a selection, all rows otherwise.
+
+- `1`-`9` to toggle the visibility of the corresponding numbered bucket from the legend.
+- `q` to close the chart.
+'''
+
     def __init__(self, *names, **kwargs):
         self.source_sheet = kwargs['source']
         super().__init__(*names, **kwargs)

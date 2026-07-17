@@ -12,6 +12,9 @@ class LiveFormatSheet(Sheet):
     """Follows the source sheet cursor: `rows` is recomputed from the cell
     currently under the cursor, so when shown in the other split pane it
     updates as the cursor moves or the cell is edited."""
+    guide = '''# Formatted cell
+Prettified view of the cell under the cursor of *{sheet.source}*.  Shown in a split pane (`Z`) it live-updates as the cursor moves or the cell is edited.
+'''
     precious = False
     columns = [Column('formated', getter=lambda col, row: row)]
 

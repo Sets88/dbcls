@@ -15,6 +15,17 @@ from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper o
 
 IndexSheet.guide += '''- `^` to make new sheet with reference column between two sheets'''
 
+TableSheet.guide += '''
+## dbcls commands
+
+- `zf` to prettify the current cell on a live-updating sheet (best in a split pane).
+- `z Enter` to open the rows referenced in the current cell.
+- `g+` to expand a list cell vertically on a new sheet.
+- `gp` to draw a plotext chart from the key columns (datetime, [bucket,] value).
+- `gT` / `gzT` to save the selected rows / column values to pipeline _vars.
+- `Alt+Up` / `Alt+Down` to move the cursor 5 rows, `Alt+b` / `Alt+f` 3 columns.
+'''
+
 TableSheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(sheet))', 'Prettify cell under cursor on new sheet, live-updating as the cursor moves when shown in a split pane')
 TableSheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
 TableSheet.addCommand('gp', 'alt-plot', 'vd.push(Plot(source=sheet))', 'Draw plotext chart from first 2 or 3 visible columns (datetime, [bucket,] value)')
