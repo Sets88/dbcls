@@ -169,8 +169,12 @@ Editing
 File
   `Ctrl+S`
       Save
+  `Save As` (command palette only)
+      Save to a different path
   `Ctrl+G`
       Open file / browse directory files
+  `Toggle read-only mode` (command palette only)
+      Block/allow editing and saving (shows `[RO]` next to the file name)
   `Ctrl+Q`
       Quit
 
@@ -2881,6 +2885,8 @@ class Fn(str, enum.Enum):
     UNDO             = 'undo'
     REDO             = 'redo'
     SAVE             = 'save'
+    SAVE_AS          = 'save_as'
+    TOGGLE_READONLY  = 'toggle_readonly'
     SEARCH           = 'search'
     AUTOCOMPLETE     = 'autocomplete'
     QUIT             = 'quit'
@@ -3261,6 +3267,8 @@ class Editor:
         add(Fn.UNDO,            self._cmd_undo,                 'Undo',                   '^Z')
         add(Fn.REDO,            self._cmd_redo,                 'Redo',                   '^Y')
         add(Fn.SAVE,            self._save_file,                'Save',                   '^S')
+        add(Fn.SAVE_AS,         self._save_file_as,             'Save As')
+        add(Fn.TOGGLE_READONLY, self._toggle_readonly,          'Toggle read-only mode')
         add(Fn.SEARCH,          self._cmd_search,               'Search',                 '^F')
         add(Fn.AUTOCOMPLETE,    self._cmd_autocomplete,         'Base autocomplete',      '^N')
         add(Fn.QUIT,            self._quit,                     'Quit',                   '^Q')
@@ -3900,6 +3908,21 @@ class Editor:
                 self.buf.save(path)
                 self._file_change_dismissed = False
                 self.set_status_notification(f'Saved {path}')
+
+    def _save_file_as(self):
+        if self.buf.readonly:
+            self.set_status_notification('Read-only mode — saving is disabled')
+            return
+        path = self._prompt('Save as: ', default=self.buf.filepath or '')
+        if path:
+            self.buf.save(path)
+            self._file_change_dismissed = False
+            self.set_status_notification(f'Saved {path}')
+
+    def _toggle_readonly(self):
+        self.buf.readonly = not self.buf.readonly
+        self.set_status_notification(
+            'Read-only mode enabled' if self.buf.readonly else 'Read-only mode disabled')
 
     def show_help(self) -> None:
         self.info_popup.open('Help', self._help_pages())

@@ -8,19 +8,30 @@ from ..utils import prettify
 from .vd_utils import reference_sheets
 
 
+def _set_edited_line(col, row, val):
+    col.sheet.editLine(col.sheet.cursorRowIndex, val)
+
+
 class LiveFormatSheet(Sheet):
     """Follows the source sheet cursor: `rows` is recomputed from the cell
     currently under the cursor, so when shown in the other split pane it
-    updates as the cursor moves or the cell is edited."""
+    updates as the cursor moves or the cell is edited.
+
+    Lines can be edited (`e`) to tweak text before yanking it — edits are
+    kept in `_edits` and overlaid on `_cache_lines`, never written back to
+    the source cell. They're dropped whenever the underlying cell changes."""
     guide = '''# Formatted cell
 Prettified view of the cell under the cursor of *{sheet.source}*.  Shown in a split pane (`Z`) it live-updates as the cursor moves or the cell is edited.
+
+- `e` to tweak the current line locally (e.g. before yanking it) — not written back to the source cell.
 '''
     precious = False
-    columns = [Column('formated', getter=lambda col, row: row)]
+    columns = [Column('formated', getter=lambda col, row: row, setter=_set_edited_line)]
 
     _cache_key = None
     _cache_cell = None
     _cache_lines = ['']
+    _edits = None  # {line index: edited text}, reset whenever the source cell changes
 
     @property
     def rows(self):
@@ -29,7 +40,7 @@ Prettified view of the cell under the cursor of *{sheet.source}*.  Shown in a sp
             col = self.source.cursorCol
             cell = col.getValue(row) if row is not None else None
         except Exception:
-            return self._cache_lines
+            return self._display_rows()
 
         key = (id(row), id(col))
         try:
@@ -40,15 +51,26 @@ Prettified view of the cell under the cursor of *{sheet.source}*.  Shown in a sp
         if not unchanged:
             self._cache_key = key
             self._cache_cell = cell
+            self._edits = {}
             try:
                 self._cache_lines = prettify(cell).split('\n') if row is not None else ['']
             except Exception as e:
                 self._cache_lines = [f'error: {e}']
-        return self._cache_lines
+        return self._display_rows()
+
+    def _display_rows(self):
+        if not self._edits:
+            return self._cache_lines
+        return [self._edits.get(i, line) for i, line in enumerate(self._cache_lines)]
 
     @rows.setter
     def rows(self, _):
         pass  # always derived from the source sheet cursor
+
+    def editLine(self, index, value):
+        if self._edits is None:
+            self._edits = {}
+        self._edits[index] = value
 
 
 @VisiData.api

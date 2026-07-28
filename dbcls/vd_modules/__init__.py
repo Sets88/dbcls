@@ -6,10 +6,10 @@ from visidata import ENTER
 # inside addCommand execstrings below resolve through the VisiData API at
 # runtime, not through imports in this module.
 from . import vd_plotter  # noqa: F401
-from . import vf_funcs  # noqa: F401
 from .vd_db_browser import DataBaseSheet, TablesSheet  # re-exported for dbcls.py
 from .vd_utils import SheetWithReference
 from .vd_utils import SselectSheet  # re-exported for dbcls.py
+from .vf_funcs import LiveFormatSheet
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 
 
@@ -32,6 +32,13 @@ TableSheet.addCommand('gp', 'alt-plot', 'vd.push(Plot(source=sheet))', 'Draw plo
 IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')
 SheetWithReference.addCommand('gz'+ENTER, 'dive-selected-cells', 'openRefCells(cursorCol, selectedRows)', 'open combined reference sheet for selected cells')
 TableSheet.addCommand('z'+ENTER, 'open-cell', 'vd.push(openCellAltered(sheet, cursorCol, cursorRow))', 'open sheet with copies of rows referenced in current cell')
+
+# Override visidata's generic '"' (dup-selected): it defers to sheet.reload(),
+# which only runs when sheet.rows is still the UNLOADED sentinel. On
+# LiveFormatSheet, `rows` is a property that's never UNLOADED, so that reload
+# never fires and the pushed sheet keeps following the live source instead of
+# freezing on the rows that were selected.
+LiveFormatSheet.addCommand('"', 'dup-selected', 'vd.push(Sheet(sheet.name + "_selectedref", columns=[Column("formated", getter=lambda col, row: row)], rows=list(selectedRows) or fail("no rows selected")))', 'open a duplicate sheet with only the selected rows')
 
 SselectSheet.addCommand('Enter', 'sselect-confirm', 'sheet.confirm_selection()', 'confirm the selected rows and return to dbcls')
 SselectSheet.addCommand('q', 'sselect-abort', 'sheet.abort_selection()', 'abort the pipeline')

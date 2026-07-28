@@ -6,11 +6,19 @@ import datetime
 NUMBER_MATCHER = re.compile(r'^[-]?\d+(\.\d+)?$')
 
 
+class SqlExpr(str):
+    """A raw SQL expression (e.g. ``NOW()``) entered by the user via the
+    edit-sheet `z=`/`g=` commands.  sql_literal() emits it verbatim instead
+    of quoting it as a string literal."""
+
+
 def sql_literal(v) -> str:
     """Format *v* as a SQL literal: strings and dates are quoted (``'``
     doubled), ``None`` becomes ``NULL``, everything else is ``str()``."""
     if v is None:
         return 'NULL'
+    if isinstance(v, SqlExpr):
+        return str(v)
     if isinstance(v, str):
         v = v.replace("'", "''")
         return f"'{v}'"

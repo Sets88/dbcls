@@ -12,6 +12,13 @@ Each step is either a pipeline command or an existing client command
 Comments: `#` or `-- ` start a comment to the end of the line, recognised
 only outside quoted strings (so SQL inside .RUN "…" keeps its own --/#).
 
+Soft steps (`?` suffix): appending `?` directly to any command name (e.g.
+.FOR_RUN?, .RUN?) makes its failure non-fatal — the failure is reported via
+an info popup instead of aborting the pipeline. For .FOR_RUN? this applies
+per row: a failing row is skipped and the rest keep running, merging
+whatever rows succeeded. For every other command the whole step is skipped
+on failure and the previous step's data flows through unchanged.
+
 Pipeline commands
 -----------------
 .RUN "SQL"
@@ -39,7 +46,8 @@ Pipeline commands
 .FOR_RUN "SQL {{col}}"
     Execute SQL for each input row, substituting {{column_name}} or
     {{_N}} (positional) placeholders.  All results are merged into one
-    flat list.
+    flat list.  With the `?` suffix (.FOR_RUN?), a row whose SQL fails is
+    skipped (reported via an info popup) instead of aborting the pipeline.
 
 .FOR "python_code" … .NOFOR
     Run the following steps once per item of the iterable produced by
@@ -239,7 +247,10 @@ Triple quotes are supported for multi-line parameters:
 ```
 
 Comments: `#` or `-- ` start a comment that runs to the end of the line
-(outside quoted SQL). See `Comments` below."""
+(outside quoted SQL). See `Comments` below.
+
+Append `?` to any command (e.g. `.FOR_RUN?`) to make its failure non-fatal
+instead of aborting the pipeline. See `Soft steps` below."""
 
 HELP_RUN = _help_entry('run', """
 Execute SQL query. `{{expr}}` placeholders in the SQL are evaluated as
@@ -293,9 +304,15 @@ HELP_FOR_RUN = _help_entry('for_run', """
 Execute SQL once per input row, substituting {{column}} placeholders.
 All result sets are merged into one flat list.
 
+With the `?` suffix, `.FOR_RUN?` skips a row whose SQL fails (reporting it
+via an info popup) instead of aborting the pipeline, and keeps the rows
+from every other row.
+
 Example:
 ```
 .RUN "SHOW TABLES" | .FOR_RUN "SELECT * FROM {{_0}} LIMIT 1"
+
+.RUN "SHOW TABLES" | .FOR_RUN? "SELECT * FROM {{_0}} LIMIT 1"
 ```
 """)
 
@@ -685,11 +702,29 @@ Example:
 ```
 """
 
+HELP_SOFT_STEPS = """
+`Soft steps: ?`
+Append `?` directly to a command name (no space) to make its failure
+non-fatal instead of aborting the whole pipeline. The failure is reported
+via an info popup.
+
+For `.FOR_RUN?` this applies per row: a row whose SQL fails is skipped and
+the rest keep running, merging whatever rows succeeded. For every other
+command (`.RUN?`, `.PY?`, …) the whole step is skipped on failure and the
+previous step's data flows through unchanged.
+
+Example:
+```
+.RUN "SHOW TABLES" | .FOR_RUN? "SELECT * FROM {{_0}} LIMIT 1"
+```
+"""
+
 #: Help text shown on the "Pipelines" page of the in-app help (F1 / Alt+H).
 HELP_ENTRIES: List[str] = [
     HELP_HEADER,
     HELP_PIPE_SYNTAX,
     HELP_COMMENTS,
+    HELP_SOFT_STEPS,
     HELP_TEMPLATE_POS,
     HELP_TEMPLATE_NAMED,
     HELP_RUN,
@@ -997,6 +1032,8 @@ class PipelineStep:
     command: str          # lowercase command name, e.g. 'run', 'rfilter', 'tables'
     args: List[str]       # parsed (unquoted) arguments
     original_text: str    # the raw step text, including the leading dot
+    soft: bool = False    # True for a `?`-suffixed command (e.g. .FOR_RUN?):
+                           # a failure is reported, not fatal — see PipelineExecutor
 
 
 @dataclass
@@ -1242,7 +1279,14 @@ def _parse_step(raw: str) -> PipelineStep:
         raise ValueError(f'Pipeline step does not start with a dot-command: {raw!r}')
 
     command = m.group(1).lower()
-    rest = raw[m.end():].strip()
+    pos = m.end()
+    # `?` directly after the command name (no space) marks it "soft": a
+    # failure is reported but does not abort the pipeline — see
+    # PipelineExecutor._execute_nodes / _cmd_for_run.
+    soft = raw[pos:pos + 1] == '?'
+    if soft:
+        pos += 1
+    rest = raw[pos:].strip()
 
     try:
         args = _parse_args(rest) if rest else []
@@ -1251,7 +1295,7 @@ def _parse_step(raw: str) -> PipelineStep:
             f'Cannot parse arguments for .{command.upper()}: {exc}'
         ) from exc
 
-    return PipelineStep(command=command, args=args, original_text=raw)
+    return PipelineStep(command=command, args=args, original_text=raw, soft=soft)
 
 
 def parse_pipeline(sql: str) -> List[Node]:
@@ -1415,6 +1459,10 @@ class PipelineExecutor:
         self.client = host.client
         # Stack of raw loop items pushed by nested .FOR loops (innermost last).
         self._loop_stack: List[Any] = []
+        # Whether the step currently being dispatched was `?`-suffixed (soft);
+        # set by _execute_step just before calling the handler so handlers that
+        # do their own per-item looping (e.g. .FOR_RUN) can honour it.
+        self._current_soft: bool = False
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -1478,7 +1526,14 @@ class PipelineExecutor:
                 # unchanged.
                 raise
             except Exception as exc:
-                raise self._step_error(node, exc) from exc
+                if isinstance(node, PipelineStep) and node.soft:
+                    # `?`-suffixed step: report the failure without aborting
+                    # the pipeline — the step is skipped, previous data flows
+                    # through unchanged to the next step.
+                    self.host.show_pipeline_info(self._soft_error_message(node, exc))
+                    result = data
+                else:
+                    raise self._step_error(node, exc) from exc
             data = result
         return data
 
@@ -1535,11 +1590,20 @@ class PipelineExecutor:
             command=command, cause=exc,
         )
 
+    def _soft_error_message(self, step: 'PipelineStep', exc: BaseException) -> str:
+        """Build the info-popup text for a `?`-suffixed step whose failure was
+        swallowed instead of aborting the pipeline."""
+        if self._loop_stack:
+            item = self._loop_stack[-1]
+            return f'.{step.command.upper()}? skipped (loop item {item!r}): {exc}'
+        return f'.{step.command.upper()}? skipped: {exc}'
+
     # ── Step dispatcher ───────────────────────────────────────────────────────
 
     async def _execute_step(self, step: PipelineStep, data: Any) -> Any:
         handler_name = _COMMAND_HANDLERS.get(step.command)
         if handler_name is not None:
+            self._current_soft = step.soft
             # Handlers work with a concrete row list ([] when there is no data).
             return await getattr(self, handler_name)(step.args, _as_rows(data))
 
@@ -1646,12 +1710,24 @@ class PipelineExecutor:
         if not args:
             raise ValueError('.FOR_RUN requires a SQL template argument')
         sql_template = args[0]
+        soft = self._current_soft
         result: List[dict] = []
         for row in _as_item_list(data):
             if self.host.pipeline_stop_requested():
                 raise _PipelineStop(result)   # rows collected so far
-            sql = self._render_template(sql_template, row, data)
-            res = await self.client.execute(sql)
+            try:
+                sql = self._render_template(sql_template, row, data)
+                res = await self.client.execute(sql)
+            except (_PipelineBreak, _PipelineStop, PipelineCancelled):
+                raise
+            except Exception as exc:
+                if not soft:
+                    raise
+                # `.FOR_RUN?`: this row's failure is reported but does not
+                # abort the loop — rows from other iterations are kept.
+                self.host.show_pipeline_info(f'.FOR_RUN? skipped row {row!r}: {exc}')
+                await asyncio.sleep(0)
+                continue
             if res and res.data:
                 result.extend(res.data)
             # Yield control so Esc cancellation can be delivered

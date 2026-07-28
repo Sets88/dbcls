@@ -4,6 +4,8 @@ import threading
 from visidata import VisiData, TableSheet, Column, ColumnItem
 from visidata import vd, asyncthread, ENTER, AttrDict, deduceType, Progress
 
+from ..utils import SqlExpr
+
 
 @VisiData.api
 class DataBaseSheet(TableSheet):
@@ -181,14 +183,17 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
 
 class EditTableSheet(TableSampleDataSheet):
     """Sample-data browsing with pending edits: `e`/`zd` mark cell changes
-    (yellow), `a` adds pending rows (green), `d` marks rows for deletion
-    (red); Ctrl+S shows the INSERT/UPDATE/DELETE statements on a
-    PendingSqlSheet for confirmation."""
+    (yellow), `z=`/`g=` set cell(s) to a raw (unquoted) SQL expression,
+    `a` adds pending rows (green), `d` marks rows for deletion (red);
+    Ctrl+S shows the INSERT/UPDATE/DELETE statements on a PendingSqlSheet
+    for confirmation."""
     guide = '''# Edit table
 Changes are collected locally and only executed after confirmation.
 
 - `e` to edit the current cell (yellow until committed).
 - `zd` or `Bksp` to set the current cell to NULL.
+- `z=` to set the current cell to a raw SQL expression (e.g. `NOW()`), emitted unquoted in the generated SQL.
+- `g=` to do the same for all selected rows in the current column.
 - `a` to add a new row (green until committed).
 - `d` / `gd` to mark the current / selected rows for deletion (red until committed).
 - `E` to edit the underlying SQL (add WHERE / ORDER BY, ...).
@@ -278,10 +283,32 @@ Editing and deleting existing rows requires the table to have a primary key; wit
         # numeric literals render unquoted (fall back to the raw value)
         if value is None:
             return None
+        if isinstance(value, SqlExpr):
+            # entered via z=/g=: a raw SQL expression, not a column-typed
+            # literal -- col.type() would coerce/strip it (e.g. str(value)
+            # drops the SqlExpr subclass), so pass it through untouched
+            return value
         try:
             return col.type(value)
         except Exception:
             return value
+
+    def edit_cell_sql_expr(self, col, row):
+        self.ensure_editable(row)
+        self.ensure_not_deleted(row)
+        expr = vd.input('set sql expr= ')
+        if not expr:
+            return
+        col.setValues([row], SqlExpr(expr))
+
+    def edit_selected_sql_expr(self, col, rows):
+        self.ensure_rows_editable(rows)
+        for row in rows:
+            self.ensure_not_deleted(row)
+        expr = vd.input('set sql expr for selected= ')
+        if not expr:
+            return
+        col.setValues(rows, SqlExpr(expr))
 
     def _pk_values(self, row) -> dict:
         cols_by_name = {col.name: col for col in self.columns}
@@ -424,12 +451,22 @@ The CREATE TABLE statement for _{sheet.table}_ (reconstructed from the system ca
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(f\'table_options__{cursorRow["database"]}__{cursorRow["table"]}\', client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
 TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.update_current_sql(input("current sql: ", value=sheet.get_sample_base_sql(sheet.table, sheet.db)))', 'Edit current sql')
+# iterload's chunked loader is designed to idle forever (see the comment in
+# iterload), so leaving the sheet via `q` must explicitly stop it -- otherwise
+# it keeps calling the shared client in the background and starves/blocks
+# queries made from sibling sheets (schema, other tables, ...) opened afterwards.
+TableSampleDataSheet.addCommand('q', 'quit-sheet', 'cancelThread(*sheet.currentThreads); vd.quit(sheet)', 'quit current sheet, canceling the chunked loader')
 
 # EditTableSheet: pending edits + SQL confirmation.  Guards are prepended to
 # the stock visidata execstrs.
 EditTableSheet.addCommand('e', 'edit-cell', 'ensure_editable(cursorRow); ensure_not_deleted(cursorRow); cursorCol.setValues([cursorRow], editCell(cursorVisibleColIndex))', 'edit cell (pending until Ctrl+S)')
 EditTableSheet.addCommand('zd', 'delete-cell', 'ensure_editable(cursorRow); ensure_not_deleted(cursorRow); cursorCol.setValues([cursorRow], options.null_value)', 'set cell to NULL (pending until Ctrl+S)')
 EditTableSheet.bindkey('Bksp', 'delete-cell')  # shadow the stock menu-help
+# Shadow stock visidata's Python-expression commands ('=' evaluates the input
+# as Python): here the input is a raw SQL expression stored verbatim and
+# emitted unquoted (see SqlExpr / _typed), e.g. z= "NOW()" -> SET col=NOW().
+EditTableSheet.addCommand('z=', 'edit-cell-sql-expr', 'sheet.edit_cell_sql_expr(cursorCol, cursorRow)', 'set current cell to a raw SQL expression, e.g. NOW() (pending until Ctrl+S)')
+EditTableSheet.addCommand('g=', 'edit-selected-sql-expr', 'sheet.edit_selected_sql_expr(cursorCol, someSelectedRows)', 'set current column for selected rows to a raw SQL expression (pending until Ctrl+S)')
 EditTableSheet.addCommand('d', 'delete-row', 'ensure_editable(cursorRow); delete_row(cursorRowIndex); cursorDown(1)', 'mark row for deletion (pending until Ctrl+S)')
 EditTableSheet.addCommand('gd', 'delete-selected', 'ensure_rows_editable(onlySelectedRows); deleteSelected()', 'mark selected rows for deletion (pending until Ctrl+S)')
 EditTableSheet.addCommand('Ctrl+S', 'show-pending-sql', 'sheet.show_pending_sql()', 'show SQL for pending changes')

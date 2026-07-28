@@ -144,6 +144,11 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 The full list of editor keybindings (navigation, selection, editing) is available on the
 `Editor` page of the in-app help (`F1` / `Alt+h`).
 
+`Save As` and `Toggle read-only mode` have no default hotkey — run them from the command
+palette (`Alt+p`). Toggling read-only mode at runtime has the same effect as starting with
+`--readonly` (see [Command Line Options](#command-line-options) below): the document cannot
+be modified or saved until it's toggled off again.
+
 ### Fold Blocks
 
 Lines starting with `>>>` and `<<<` mark a foldable block (anything after the
@@ -255,6 +260,29 @@ When using `Alt+e` (database list) or `Alt+t` (table list), use the arrow keys t
 - Select a table and press `Enter` to access options:
   - View table schema
   - Show sample data
+  - Edit (engines with `SUPPORTS_EDITING`, currently MySQL, PostgreSQL, SQLite)
+
+### Editing Table Data
+
+The `Edit` table option opens the table's sample data with pending, locally-collected
+edits — nothing is sent to the database until you confirm.
+
+| Hotkey | Action |
+|--------|--------|
+| `e` | Edit the current cell (pending, shown in yellow, until committed) |
+| `zd` / `Bksp` | Set the current cell to `NULL` |
+| `z=` | Set the current cell to a **raw SQL expression** (e.g. `NOW()`), emitted unquoted in the generated SQL — unlike stock VisiData's `z=`, this is not evaluated as Python |
+| `g=` | Same as `z=`, applied to all selected rows in the current column |
+| `a` | Add a new row (pending, shown in green) |
+| `d` / `gd` | Mark the current / selected rows for deletion (pending, shown in red) |
+| `E` | Edit the underlying SQL (add `WHERE` / `ORDER BY`, ...); the sheet reloads with the new query |
+| `Ctrl+S` | Review the generated `INSERT`/`UPDATE`/`DELETE` statements on a confirmation sheet; `Enter` there executes them sequentially, `q` goes back without executing |
+
+For example, on a `DATE`/`DATETIME` column, pressing `z=` and typing `NOW()` produces
+`UPDATE table SET col=NOW() WHERE id=1` rather than quoting `NOW()` as a string.
+
+Editing and deleting existing rows requires the table to have a primary key; without one
+only `a` (adding rows) works.
 
 ## VisiData Sheets
 
@@ -272,7 +300,7 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 
 | Hotkey | Action |
 |--------|--------|
-| `zf` | Format current cell (JSON indentation, number prettification) |
+| `zf` | Format current cell (JSON indentation, number prettification); shown in a split pane (`Z`) it live-updates as the cursor moves. `e` on that pane tweaks the current line locally (e.g. before yanking it) — never written back to the source cell |
 | `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
 | `gp` | Draw a time-series chart from the current sheet's key columns (see [Plotting](#plotting) below) |
 | `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only) |
@@ -396,7 +424,7 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | `.URUN "SQL"` | UNION RUN: like `.RUN`, but **appends** the query's rows to the input data instead of replacing them (result = input + new rows). With no input it behaves like `.RUN`. |
 | `.RFILTER "{{tmpl}}" "regex"` | Keep rows where the rendered template matches the regex. Returns the original rows unchanged. |
 | `.RGET "{{tmpl}}" "regex"` | Extract regex capture groups from the template. Returns one dict per matching row, keyed `"0"`, `"1"`, … |
-| `.FOR_RUN "SQL {{col}}"` | Execute SQL once per input row, substituting `{{column}}` placeholders. All result sets are merged. |
+| `.FOR_RUN "SQL {{col}}"` | Execute SQL once per input row, substituting `{{column}}` placeholders. All result sets are merged. With the `?` suffix (`.FOR_RUN?`), a row whose SQL fails is skipped (reported via an info popup) instead of aborting the pipeline. |
 | `.FOR "code" … .NOFOR` | Run the following steps once per item of the iterable produced by `code`; the item is exposed as `{{_i}}` / `_i`. See [Control flow](#control-flow). |
 | `.SLEEP "code"` | Evaluate `code` to a number of seconds, pause, then pass the input data through unchanged. Useful inside `.FOR` to pace work. |
 | `.PY "python_code"` | Execute Python. `data` (the previous step's output, passed between steps exactly as produced), `_vars` and `_i` are in scope. Output is, in priority: the last `result(val)` call; else a single expression's value (e.g. a list literal); else `data` passes through unchanged. |
@@ -413,6 +441,17 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 ```sql
 .RUN "SELECT '1' AS col" |  -- first row
 .URUN "SELECT '2' AS col" -- second row
+```
+
+### Soft Steps (`?`)
+
+Appending `?` directly to any command name (no space, e.g. `.RUN?`, `.FOR_RUN?`) makes its failure non-fatal: the failure is reported via an info popup instead of aborting the pipeline.
+
+- For `.FOR_RUN?` this applies **per row**: a row whose SQL fails is skipped and the rest keep running, merging whatever rows succeeded.
+- For every other command, the whole step is skipped on failure and the previous step's data flows through unchanged.
+
+```sql
+.RUN "SHOW TABLES" | .FOR_RUN? "SELECT * FROM {{_0}} LIMIT 1"
 ```
 
 ### Control flow
