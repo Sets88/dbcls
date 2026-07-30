@@ -24,7 +24,7 @@ from .vd_modules import DataBaseSheet, TablesSheet, SselectSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
-from .editor import Editor, K, key_alt, PopupItem, draw_box
+from .editor import Editor, Fn, K, key_alt, PopupItem, draw_box
 from .editor import find_fold_blocks, is_fold_end, is_fold_start
 from .pipeline import is_pipeline
 from .pipeline import scan_line_code_and_triple
@@ -664,6 +664,12 @@ class DbEditor(Editor):
         except Exception:
             print('Invalid key remap string in DBCLS_KEY_REMAP')
 
+    def _toggle_readonly(self):
+        super()._toggle_readonly()
+        # Enter runs the query in read-only mode (no editing to do instead);
+        # otherwise it must fall back to inserting a newline.
+        self.add_keybinding(DbFn.RUN_QUERY if self.buf.readonly else Fn.NEWLINE, K(ord('\n')))
+
     # ── Screen lock ───────────────────────────────────────────────────────────
 
     def _dispatch_pre_hook(self, key) -> bool:
@@ -841,6 +847,7 @@ class DbEditor(Editor):
         def on_done():
             end = time.time()
             message = ''
+            is_error = False
             # A live pipeline info() popup is intentionally left open after the
             # run finishes — it stays until the user dismisses it (Esc/any key).
             # The error branch below reuses the same popup via info_popup.open().
@@ -859,10 +866,11 @@ class DbEditor(Editor):
                 message = 'Cancelled'
             except Exception as exc:
                 message = self._format_query_error(exc)
+                is_error = True
                 self.info_popup.open('Error', {'main': message})
             finally:
                 self.set_status_name(self.client.get_title())
-                self.set_status_notification(f'{round(end - start, 2)}s  {message}')
+                self.set_status_notification(f'{round(end - start, 2)}s  {message}', error=is_error)
 
         self.open_running_popup(task, start, on_done)
 

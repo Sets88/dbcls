@@ -2444,6 +2444,7 @@ class Renderer:
         self.debug_text = ''
         self.status_name: Optional[str] = None
         self.status_notification: Optional[str] = None
+        self.status_notification_error = False  # show status_notification in the error color
         self.input_pending = False  # a prompt is waiting for the user
         self.cursor_line_range: tuple = (0, 1)
         self.wrap: bool = False
@@ -2846,9 +2847,11 @@ class Renderer:
         else:
             bar = (conn + mid + right)[:W]
             bar = bar.ljust(W)
-        # A pipeline prompt (select/input/warn/...) is waiting for the user —
-        # flag it with the warn color, same as the unsaved-changes quit prompt.
-        pair = colors.status_warn if self.input_pending else colors.status_bar
+        # A pipeline prompt (select/input/warn/...) is waiting for the user, or the
+        # last query/pipeline run failed — flag it with the warn color, same as the
+        # unsaved-changes quit prompt.
+        warn = self.input_pending or (self.status_notification and self.status_notification_error)
+        pair = colors.status_warn if warn else colors.status_bar
         self._safe_addstr(y, 0, bar, curses.color_pair(pair))
 
 
@@ -3044,8 +3047,9 @@ class Editor:
         self.renderer.status_name = name
         self.request_redraw()
 
-    def set_status_notification(self, text: str) -> None:
-        """Show a transient message in the status bar.
+    def set_status_notification(self, text: str, error: bool = False) -> None:
+        """Show a transient message in the status bar, in the error (red) color
+        if *error* is set.
         If the message is wider than the terminal, show it in a popup instead.
         The message is replaced by the normal status bar after the next keypress."""
         W = self.stdscr.getmaxyx()[1]
@@ -3054,6 +3058,7 @@ class Editor:
         else:
             self._status_notification = text
             self.renderer.status_notification = text
+            self.renderer.status_notification_error = error
         self.request_redraw()
 
     def set_words(self, keywords=None, types=None, functions=None) -> None:
@@ -3528,6 +3533,7 @@ class Editor:
         if self._status_notification is not None:
             self._status_notification = None
             self.renderer.status_notification = None
+            self.renderer.status_notification_error = False
         if self._debug_mode:
             flags = ('ALT ' if key_is_alt(key) else '') + ('PFX ' if key_is_pfx(key) else '')
             self.renderer.debug_text = f'key={key} raw={flags}{key_base(key)}'

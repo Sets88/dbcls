@@ -90,16 +90,18 @@ class PostgresClient(ClientClass):
         return self.quote_ident(table)
 
     async def get_primary_key(self, table: str, database: Optional[str] = None) -> list:
+        # information_schema.table_constraints only lists constraints for
+        # tables the current user owns or has a privilege other than SELECT
+        # on, so a read-only role would never see the primary key there.
+        # pg_catalog isn't subject to that restriction.
         result = await self.execute(f"""
-            SELECT kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-                ON kcu.constraint_name = tc.constraint_name
-                AND kcu.table_schema = tc.table_schema
-            WHERE tc.constraint_type = 'PRIMARY KEY'
-                AND tc.table_name = '{table}'
-                AND tc.table_schema = 'public'
-            ORDER BY kcu.ordinal_position
+            SELECT a.attname AS column_name
+            FROM pg_catalog.pg_index i
+            JOIN pg_catalog.pg_attribute a
+                ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid = '{table}'::regclass
+                AND i.indisprimary
+            ORDER BY array_position(i.indkey, a.attnum)
         """)
         return [row['column_name'] for row in result.data]
 
