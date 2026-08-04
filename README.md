@@ -426,13 +426,17 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | `.RGET "{{tmpl}}" "regex"` | Extract regex capture groups from the template. Returns one dict per matching row, keyed `"0"`, `"1"`, … |
 | `.FOR_RUN "SQL {{col}}"` | Execute SQL once per input row, substituting `{{column}}` placeholders. All result sets are merged. With the `?` suffix (`.FOR_RUN?`), a row whose SQL fails is skipped (reported via an info popup) instead of aborting the pipeline. |
 | `.FOR "code" … .NOFOR` | Run the following steps once per item of the iterable produced by `code`; the item is exposed as `{{_i}}` / `_i`. See [Control flow](#control-flow). |
+| `.WHILE "code" … .ENDWHILE` | Run the following steps while `code` stays truthy. The condition sees the data that entered the loop (frozen) and its value becomes the body's input. See [Control flow](#control-flow). |
+| `.FN "NAME" … .ENDFN` | Define a named function — the body runs on `.CALL`, not in the main flow. Top level only, `.ENDFN` mandatory, definitions are hoisted. |
+| `.CALL "NAME"` | Run the `.FN` block `NAME` with the current data and continue with its output. `NAME` is a template, so it can be chosen at run time. |
 | `.SLEEP "code"` | Evaluate `code` to a number of seconds, pause, then pass the input data through unchanged. Useful inside `.FOR` to pace work. |
 | `.PY "python_code"` | Execute Python. `data` (the previous step's output, passed between steps exactly as produced), `_vars` and `_i` are in scope. Output is, in priority: the last `result(val)` call; else a single expression's value (e.g. a list literal); else `data` passes through unchanged. |
 | `.SET_VAR KEY [code]` | Store data (or the result of `code`) into a named variable. Data passes through unchanged, so `.SET_VAR` can appear mid-pipeline. With no `code` and no input data, deletes `KEY`. |
 | `.GET_VAR KEY` | Inject a stored variable into the pipeline. If input data exists, the variable's rows are appended after it. A missing `KEY` contributes nothing (no error). |
 | `.VOID` | Discard input data. The next step starts fresh with no data (as if it were the first step). |
 | `.VARS` | Show all stored pipeline variables as a `key` / `value` list. |
-| `.SHEET NAME` | Open the input rows as a VisiData sheet named `NAME` (a template), then pass the data through unchanged. |
+| `.SHEET NAME` | Create a VisiData sheet named `NAME` (a template) from the input rows and pass the data through unchanged. The sheet is built in the background as the step runs — it never blocks the pipeline and it survives a cancelled run; reach it mid-run with VisiData's `Shift+S` from a picker sheet, or with `Alt+S` afterwards. The whole stack opens when the pipeline finishes. |
+| `.VIEW NAME` | Like `.SHEET`, but **blocking**: the sheet is shown immediately and the pipeline waits until it is closed with `q`. Use it inside a `.WHILE` loop or a `.FN` function to see rows at the point they are produced. Closing the sheet is not an answer — it never cancels the pipeline. |
 
 ### Comments
 
@@ -469,26 +473,65 @@ Appending `?` directly to any command name (no space, e.g. `.RUN?`, `.FOR_RUN?`)
 
 To carry loop rows forward past a `.NOFOR`, stash them with `.SET_VAR` inside the loop.
 
+`.WHILE "code"` runs every following step (until `.ENDWHILE`, or the end of the pipeline) while `code` stays truthy — `0`, `''`, `None`, `[]` and `{}` end the loop, exactly as in Python:
+
+```sql
+.RUN "SELECT * FROM users" |
+.WHILE "sselect('Users', data)" |
+    .CALL "{{choose('Action', ['articles', 'orders'])}}" |
+.ENDWHILE
+```
+
+- The condition is re-evaluated every iteration against the data that entered the loop — **frozen**, so the steps before it never run again and `sselect()` keeps offering the same rows.
+- The condition's value (the marked rows, the next page, …) becomes the input of the body's first step and is exposed as `{{_i}}` / `_i`.
+- The body's output is **not** accumulated: the loop hands its own input data to the step after `.ENDWHILE`, so carry results out with `.SET_VAR` / `set_var()`.
+- `br()` ends the loop with that iteration's data, `stop()` aborts the whole pipeline, `Esc` cancels it. A condition that never turns falsy aborts the pipeline after 100000 iterations.
+
+### Functions (`.FN` / `.ENDFN` / `.CALL`)
+
+`.FN "NAME" … .ENDFN` names a piece of pipeline. Its body does **not** run in the main flow (data passes the definition by unchanged) — only `.CALL "NAME"` runs it, with the caller's data as input, and the function's last step's data flows back into the step after the `.CALL`. It is a call, not a jump.
+
+```sql
+.FN "articles" |
+    .RUN "SELECT * FROM articles WHERE user_id IN {{sql_in_list([x['id'] for x in data])}}" |
+    .SHEET "articles" |
+.ENDFN |
+.RUN "SELECT * FROM users" | .CALL "articles"
+```
+
+- Definitions are collected before the pipeline runs, so a function may be defined before or after the `.CALL` that uses it. `.FN` is allowed only at the top level (not inside `.FOR` / `.WHILE` / another `.FN`) and `.ENDFN` is mandatory.
+- `.CALL`'s argument is a template, so the function can be picked at run time: `.CALL "{{choose('Action', ['articles', 'orders'])}}"`.
+- `br()` inside a function (with no `.FOR` of its own) is an early return and cannot break the caller's loop; `stop()` still aborts everything. `.CALL?` reports a failure inside the function instead of aborting.
+- In a multi-line pipeline, keep the trailing `|` on the `.ENDFN` line — otherwise the statement ends there.
+
 ### Helpers in Python steps and templates
 
-Available inside any Python-executing step (`.PY`, `.SLEEP`, `.SET_VAR`, the `.FOR` expression) **and** inside `{{expr}}` template placeholders — so `.RUN "SELECT * FROM {{select('Pick a table', data)}} LIMIT 1"` prompts inline. Note that per-row templates (`.RFILTER`, `.RGET`, `.FOR_RUN`) evaluate their expression once per row.
+Available inside any Python-executing step (`.PY`, `.SLEEP`, `.SET_VAR`, the `.FOR` expression) **and** inside `{{expr}}` template placeholders — so `.RUN "SELECT * FROM {{choose('Pick a table', data)}} LIMIT 1"` prompts inline. Note that per-row templates (`.RFILTER`, `.RGET`, `.FOR_RUN`) evaluate their expression once per row.
+
+The four row prompts come as two pairs — `choose`/`select` as a popup over the editor, `schoose`/`sselect` as a sheet in VisiData — where the s-less name picks one item and the plural one marks any number:
+
+|            | popup       | VisiData sheet |
+|------------|-------------|----------------|
+| pick one   | `choose()`  | `schoose()`    |
+| mark any   | `select()`  | `sselect()`    |
 
 | Helper | Effect |
 |--------|--------|
-| `result(val)` | Set the step's output value (the last call wins). Lets a multi-statement snippet return a value, e.g. `.SLEEP "from random import randint; result(randint(1, 10))"`. |
+| `result(val)` | Set the step's output value (the last call wins). Lets a multi-statement snippet return a value, e.g. `.SLEEP "from random import randint; result(randint(1, 10))"`. Inside a `{{expr}}` placeholder it sets what the placeholder renders to — and since `result(val)` returns `val`, it chains with other calls: `.RUN "SHOW TABLES" \| .FOR_RUN "SELECT * FROM {{result(_0) and info(_0)}}"` substitutes `_0` and shows it in a popup. |
 | `set_var(name, value)` | Store `value` in the shared pipeline variables under `name` (same store as `.SET_VAR` / `gT` / `gzT`). |
 | `get_var(name, default=None)` | Return the pipeline variable `name` (`default` if absent). |
 | `info(msg)` | Show `msg` in a popup without halting execution; calling it again updates the text. `Esc` on the popup stops the pipeline; `Backspace` hides it until the next `info()` call. The popup stays after the pipeline finishes until dismissed. |
 | `warn(msg)` | Like `info()`, but pause the pipeline until the popup is closed: `Esc` cancels the pipeline (no result is shown), any other closing key resumes it. |
-| `br()` | Break out of the current `.FOR` loop. A `result(...)` set just before `br()` becomes the loop's result. |
+| `br()` | Break out of the current `.FOR` / `.WHILE` loop. A `result(...)` set just before `br()` becomes the loop's result. Inside a `.FN` function with no loop of its own it returns from the function. |
 | `stop()` | Abort the entire pipeline. The current step's data (a `result(...)` set before `stop()`, else the data flowing in) becomes the final result. |
-| `select(title, options, default=None)` | Pause the pipeline and open a select popup; returns the chosen option's value. `options` is a list of strings, rows from a previous step (the first column value is shown), or `(label, value)` pairs — the label is displayed, the value is returned. `default` pre-highlights the option with that value, e.g. `select('Limit', [('few', 10), ('many', 1000)], default=10)`. |
-| `mselect(title, options, default=None)` | Multi-select variant of `select()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms (with nothing marked it picks the highlighted item). Returns the list of marked options' values; `(label, value)` pairs work as in `select()`. `default` is a list of option values to pre-mark, e.g. `mselect('Params', [1, 2, 3, 4], default=[1, 2])`. |
-| `sselect(title, rows)` | Open `rows` (e.g. `data`; non-dict rows are shown as a `value` column, the selection returns the original items) in VisiData. Mark rows with VisiData's selection (`s`/`t`/`gs`...); `Enter` confirms and returns only the marked rows (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
+| `choose(title, options, default=None)` | Pause the pipeline and open a popup; returns the chosen option's value. `options` is a list of strings, rows from a previous step (the first column value is shown), or `(label, value)` pairs — the label is displayed, the value is returned. `default` pre-highlights the option with that value, e.g. `choose('Limit', [('few', 10), ('many', 1000)], default=10)`. |
+| `select(title, options, default=None)` | Multi-choice variant of `choose()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms. Returns the list of marked options' values — `[]` when nothing is marked, which is a normal answer the pipeline continues with. `(label, value)` pairs work as in `choose()`. `default` is a list of option values to pre-mark, e.g. `select('Params', [1, 2, 3, 4], default=[1, 2])`. |
+| `schoose(title, rows)` | Open `rows` (e.g. `data`; non-dict rows are shown as a `value` column, the answer holds the original items) in VisiData. `Enter` picks the row under the cursor (VisiData's selection is ignored) and returns *that item itself*, not a list — so it can be compared to a value directly. `q` or quitting VisiData cancels the pipeline. |
+| `sselect(title, rows)` | Multi-row variant of `schoose()`: mark rows with VisiData's selection (`s`/`t`/`gs`...); `Enter` confirms and returns only the marked rows (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
 | `input(title, default=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. |
 | `ask(title)` | Ask a yes/no question in the status bar; returns `True` on `y`, `False` on any other key. |
 
-Dismissing any of these prompts with `Esc` (`q` for `sselect`, since `Esc` is a regular key inside VisiData) cancels the pipeline: unlike `stop()`, no result is displayed — only a `Cancelled` notification in the status bar.
+Dismissing any of these prompts with `Esc` (`q` for the VisiData sheets, since `Esc` is a regular key inside VisiData) cancels the pipeline: unlike `stop()`, no result is displayed — only a `Cancelled` notification in the status bar. An empty selection is *not* a dismissal: `select()` / `sselect()` return `[]` and the pipeline keeps running.
 
 ### Template Placeholders
 
@@ -502,6 +545,7 @@ Dismissing any of these prompts with `Esc` (`q` for `sselect`, since `Esc` is a 
 | `{{row['any-name']}}` | Full row dict access — use for names with spaces or hyphens |
 | `{{price:.2f}}` | Python format spec support |
 | `{{_vars['key']}}` | Value of a pipeline variable stored by `.SET_VAR` |
+| `{{result(val)}}` | Renders `val` — a placeholder runs the same Python a `.PY` step does, so `result()` sets what it substitutes to. Useful when the expression also does something else: `{{result(_0) and info(_0)}}`. Statements work too (`{{x = _0.strip(); result(x)}}`); code that never calls `result()` renders as an empty string. |
 
 ### Helper Functions
 
@@ -592,6 +636,24 @@ if mtime is not None:
     stop()
 """
 ```
+
+**Interactive browser — pick users, drill into what they wrote, come back:**
+```sql
+.FN "articles" |
+  .RUN "SELECT * FROM articles WHERE user_id IN {{sql_in_list([x['id'] for x in data])}}" |
+  .SHEET "articles" |
+.ENDFN |
+.FN "orders" |
+  .RUN "SELECT * FROM orders WHERE user_id IN {{sql_in_list([x['id'] for x in data])}}" |
+  .SHEET "orders" |
+.ENDFN |
+.RUN "SELECT * FROM users" |
+.WHILE "sselect('Users', data)" |
+  .CALL "{{choose('Action', ['articles', 'orders'])}}" |
+.ENDWHILE
+```
+
+Mark users and press `Enter` to run the chosen action for them; the same list opens again afterwards. `Enter` with nothing marked leaves the loop, `q` cancels the pipeline.
 
 ## Supported Database Engines
 

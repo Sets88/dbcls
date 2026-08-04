@@ -8,7 +8,7 @@ from visidata import ENTER
 from . import vd_plotter  # noqa: F401
 from .vd_db_browser import DataBaseSheet, TablesSheet  # re-exported for dbcls.py
 from .vd_utils import SheetWithReference
-from .vd_utils import SselectSheet  # re-exported for dbcls.py
+from .vd_utils import SselectSheet, SchooseSheet, ViewSheet  # re-exported for dbcls.py
 from .vf_funcs import LiveFormatSheet
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 
@@ -42,6 +42,8 @@ LiveFormatSheet.addCommand('"', 'dup-selected', 'vd.push(Sheet(sheet.name + "_se
 
 SselectSheet.addCommand('Enter', 'sselect-confirm', 'sheet.confirm_selection()', 'confirm the selected rows and return to dbcls')
 SselectSheet.addCommand('q', 'sselect-abort', 'sheet.abort_selection()', 'abort the pipeline')
+# SchooseSheet inherits both commands; only what they do differs (see the class).
+ViewSheet.addCommand('q', 'view-close', 'sheet.close_view()', 'close the view and resume the pipeline')
 
 TableSheet.addCommand('gT', 'save-to-vars', 'save_rows_to_vars(sheet, selectedRows or [cursorRow])', 'Save selected rows (or current row) to _vars under a prompted name')
 TableSheet.addCommand('gzT', 'save-col-to-vars', 'save_col_values_to_vars(sheet, cursorCol, selectedRows or [cursorRow])', 'Save selected values of current column (or current cell) to _vars as a flat list')

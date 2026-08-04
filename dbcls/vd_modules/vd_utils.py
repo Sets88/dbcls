@@ -41,6 +41,42 @@ Select the rows to hand back to the sselect() pipeline step.
             raise ReturnValue(None)
 
 
+class ViewSheet(ListOfDictSheet):
+    """Pipeline .VIEW sheet: rows shown in the middle of a running pipeline,
+    with no answer to give back — q closes it and the pipeline resumes.  Like
+    the pickers, the command is bound to this class only (see
+    vd_modules.__init__), so the regular result viewer keeps stock q."""
+    guide = '''# Pipeline view
+Rows handed over by a .VIEW pipeline step. The pipeline is paused meanwhile.
+
+- `q` to close the sheet and let the pipeline continue.
+'''
+    precious = False
+
+    def close_view(self):
+        # Sub-sheets opened from the view (e.g. `"` dup-selected) are view
+        # sheets too: q on them just closes the sub-sheet, and only q on the
+        # last one left hands control back to the pipeline.
+        if any(s is not self and isinstance(s, ViewSheet) for s in vd.sheets):
+            vd.quit(self)
+        else:
+            raise ReturnValue(None)
+
+
+class SchooseSheet(SselectSheet):
+    """Pipeline schoose() row chooser: Enter picks the single row under the
+    cursor (VisiData's selection is ignored), q aborts the pipeline."""
+    guide = '''# Pipeline row chooser
+Pick one row to hand back to the schoose() pipeline step.
+
+- `Enter` to choose the row under the cursor.
+- `q` to abort the pipeline.
+'''
+
+    def confirm_selection(self):
+        raise ReturnValue([self.cursorRow])
+
+
 @VisiData.api
 class ExpandVert(TableSheet):
     guide = '''# Vertical expansion

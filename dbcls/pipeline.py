@@ -26,7 +26,7 @@ Pipeline commands
     (double braces) that are evaluated as Python expressions with `data`
     (rows from the previous step) and every helper function in scope —
     sql_in_list, get_var/set_var, info, and the user prompts
-    (e.g. .RUN "SELECT * FROM {{select('Pick a table', data)}}").
+    (e.g. .RUN "SELECT * FROM {{choose('Pick a table', data)}}").
 
 .URUN "SQL"
     UNION RUN: like .RUN, but append the query rows to the input data
@@ -55,6 +55,34 @@ Pipeline commands
     loop and *discards* its accumulated rows (steps after it start fresh).
     Without a .NOFOR the loop runs to the end of the pipeline and its
     merged rows become the result.
+
+.WHILE "python_code" … .ENDWHILE
+    Run the following steps while python_code stays truthy (0, '', None,
+    [], {} end the loop, exactly as in Python).  The condition is
+    re-evaluated every iteration against the data that entered the block —
+    frozen, so the steps before the loop never re-run — and its value
+    becomes the input of the body's first step (and the loop item _i).
+    The body's output is not accumulated: the loop passes its own input
+    data on to the next step, so carry results out with .SET_VAR /
+    set_var().  br() inside the body ends the loop with that iteration's
+    data, stop() aborts the whole pipeline, Esc cancels it; a condition
+    that never turns falsy aborts after MAX_WHILE_ITERATIONS iterations.
+
+.FN "NAME" … .ENDFN
+    Define a named function: the steps up to .ENDFN are not run in the
+    main flow (data passes the definition by unchanged) but on .CALL.
+    Definitions are collected before the pipeline runs, so they may sit
+    before or after the call, and are only allowed at the top level
+    (not inside .FOR / .WHILE / another .FN).  .ENDFN is mandatory.
+
+.CALL "NAME"
+    Run the .FN block named NAME — a call, not a jump: the current data
+    flows into the function's first step and the data of its last step
+    flows back into the next step of the caller.  NAME is a template, so
+    it can be picked at run time:
+    .CALL "{{choose('Action', ['articles', 'orders'])}}".
+    br() inside the function (with no .FOR of its own) is an early return
+    and cannot break the caller's loop; stop() still aborts everything.
 
 .SLEEP "python_code"
     Evaluate python_code to a number of seconds, pause, then pass the
@@ -87,8 +115,15 @@ Pipeline commands
     Return all stored pipeline variables as a list of {key, value} dicts.
 
 .SHEET NAME
-    Open the input rows as a VisiData sheet named NAME (a template), then
-    pass the data through unchanged.
+    Create a VisiData sheet named NAME (a template) from the input rows and
+    pass the data through unchanged.  The sheet is built in the background
+    as the step runs and the whole stack opens when the pipeline finishes.
+
+.VIEW NAME
+    Like .SHEET, but blocking: the sheet is shown right away and the
+    pipeline waits until it is closed with q.  Use it inside a .WHILE loop
+    or a .FN function to look at rows at the point they are produced.
+    Closing the sheet is not an answer — it never cancels the pipeline.
 
 Template placeholders
 ---------------------
@@ -96,13 +131,20 @@ Template placeholders
                    the first element, for a scalar row — the value itself)
 {{_1}}             second column value (second element of a list row)
 {{column_name}}    value of column named "column_name"
-{{_i}}             current .FOR loop item (outermost loop)
-{{_ii}}, {{_iii}}  items of nested .FOR loops (second, third level, …)
+{{_i}}             current loop item (outermost loop): the .FOR item, or the
+                   value of the .WHILE condition
+{{_ii}}, {{_iii}}  items of nested loops (second, third level, …)
 {{_vars['key']}}   value of a variable stored by .SET_VAR
 {{expr}}           any Python expression; the helper functions below are in
-                   scope, so e.g. {{select('Pick', data)}} works inline.
+                   scope, so e.g. {{choose('Pick', data)}} works inline.
                    In per-row templates (.RFILTER / .RGET / .FOR_RUN) the
                    expression is evaluated once per row.
+{{result(val)}}    a placeholder runs the same Python a .PY step does, so
+                   result(val) sets what it renders to — handy when the
+                   expression does something else too, e.g.
+                   .FOR_RUN "SELECT * FROM {{result(_0) and info(_0)}}".
+                   Statements work as well; without a result() call they
+                   render as an empty string.
 
 Helper functions (available inside .RUN / .PY)
 -------------------------------------------------
@@ -124,33 +166,43 @@ the .FOR expression) and inside {{expr}} template placeholders
 result(val) set the step's output value (the last call wins).  Lets a
             multi-statement snippet return a value, e.g.
             .SLEEP "from random import randint; result(randint(1, 10))".
+            Inside a {{expr}} placeholder it sets what the placeholder
+            renders to; it returns val, so it chains: {{result(_0) and info(_0)}}.
 info(msg)   show msg in a popup without halting.  Esc on the popup stops the
             pipeline; Backspace hides it until the next info() call.
 warn(msg)   like info(), but pause the pipeline until the popup is closed
             (Esc stops the pipeline, any other closing key resumes it).
-br()        break out of the current .FOR loop.
+br()        break out of the current .FOR / .WHILE loop (inside a .FN
+            function with no loop of its own it returns from the function).
 stop()      abort the entire pipeline (current step's data is the result).
 set_var(name, value)
             store value in the shared VARS under name (same store as .SET_VAR).
 get_var(name, default=None)
             return the VARS value for name (default if absent).
-select(title, options, default=None)
-            open a select popup; pauses the pipeline and returns the chosen
+The four row prompts come as two pairs — choose/select as a popup over the
+editor, schoose/sselect as a sheet in VisiData — where the s-less name picks
+one item and the plural one marks any number:
+
+choose(title, options, default=None)
+            open a popup; pauses the pipeline and returns the chosen
             option's value.  options may be a list of strings, rows from a
             previous step (first column is shown), or (label, value) pairs —
             label is displayed, value is returned.  default pre-highlights
             the option with that value.
-mselect(title, options, default=None)
-            multi-select variant of select(): Tab marks items, Enter confirms;
-            returns the list of marked options' values.  default is a list of
-            option values to pre-mark.
+select(title, options, default=None)
+            multi-choice popup: Tab marks items, Enter confirms; returns the
+            list of marked options' values, or [] when nothing is marked.
+            default is a list of option values to pre-mark.
+schoose(title, rows)
+            open rows (e.g. data; non-dict rows are shown as a 'value' column,
+            the answer holds the original items) in VisiData; Enter picks the
+            row under the cursor and returns that one item itself, not a list.
+            q aborts the pipeline without a result.
 sselect(title, rows)
-            open rows (e.g. data; non-dict rows are shown as a 'value'
-            column, the selection returns the original items) in VisiData; mark rows
-            with VisiData's selection (s/t/gs...), Enter confirms and returns
-            only the marked rows ([] when nothing is marked).  q on the last
-            sselect sheet (sub-sheets like `"` just close) or quitting
-            VisiData aborts the pipeline without a result.
+            multi-row variant of schoose(): mark rows with VisiData's selection
+            (s/t/gs...), Enter confirms and returns only the marked rows ([]
+            when nothing is marked).  q on the last sselect sheet (sub-sheets
+            like `"` just close) or quitting VisiData aborts the pipeline.
 input(title, default=None)
             ask the user to type a line of text; returns the string.  default
             pre-fills the input line.
@@ -190,16 +242,46 @@ _COMMAND_TABLE: List[tuple] = [
     ('get_var', '.GET_VAR <KEY>',                  '_cmd_get_var'),
     ('void',    '.VOID',                           '_cmd_void'),
     ('sheet',   '.SHEET <NAME>',                   '_cmd_sheet'),
+    ('view',    '.VIEW <NAME>',                    '_cmd_view'),
+    ('call',    '.CALL <FN_NAME>',                 '_cmd_call'),
 ]
 
 #: Control-flow keywords are part of the grammar (handled by the parser/executor
-#: as ``.FOR … .NOFOR`` blocks), NOT dispatchable commands — they have no handler
-#: and can never reach the command dispatcher.  Listed here only so autocomplete
-#: and the pipeline-detection regex still recognise them.
+#: as ``.FOR … .NOFOR`` / ``.WHILE … .ENDWHILE`` / ``.FN … .ENDFN`` blocks), NOT
+#: dispatchable commands — they have no handler and can never reach the command
+#: dispatcher.  Listed here only so autocomplete and the pipeline-detection regex
+#: still recognise them.
 CONTROL_KEYWORDS: List[tuple] = [
-    ('for',   '.FOR <PYTHON_CODE>'),
-    ('nofor', '.NOFOR'),
+    ('for',      '.FOR <PYTHON_CODE>'),
+    ('nofor',    '.NOFOR'),
+    ('while',    '.WHILE <PYTHON_CODE>'),
+    ('endwhile', '.ENDWHILE'),
+    ('fn',       '.FN <NAME>'),
+    ('endfn',    '.ENDFN'),
 ]
+
+#: Closing keyword of each block-opening control keyword.
+_BLOCK_CLOSERS: dict = {'for': 'nofor', 'while': 'endwhile', 'fn': 'endfn'}
+
+#: Every closing keyword — a step whose command is one of these never reaches
+#: the dispatcher; the parser consumes it (or ignores a stray one).
+_BLOCK_END_KEYWORDS: frozenset = frozenset(_BLOCK_CLOSERS.values())
+
+#: Safety net for a ``.WHILE`` whose condition never becomes falsy: the loop
+#: aborts with an error instead of hanging the pipeline forever.  Esc (which
+#: cancels the running task at the per-iteration ``await``) remains the normal
+#: way out.
+MAX_WHILE_ITERATIONS: int = 100_000
+
+#: How deeply ``.CALL`` may nest before the pipeline is aborted — a runaway
+#: recursion (a function calling itself) would otherwise blow the Python stack.
+MAX_CALL_DEPTH: int = 20
+
+#: Commands whose handler wants the inter-step value *raw* (``NO_DATA``
+#: included) instead of the ``_as_rows()`` view every other handler gets:
+#: ``.CALL`` only forwards the value into the function body, so a function
+#: starting with a client dot-command (``.TABLES``) must still see ``NO_DATA``.
+_RAW_DATA_COMMANDS: frozenset = frozenset({'call'})
 
 #: name → handler-method name, used for dispatch (control keywords excluded).
 _COMMAND_HANDLERS: dict = {name: handler for name, _hint, handler in _COMMAND_TABLE}
@@ -264,7 +346,7 @@ Examples:
 .RUN "SELECT id FROM t" |
 .RUN "SELECT * FROM other WHERE id IN {{sql_in_list(data)}}"
 
-.RUN "SELECT * FROM {{select('Pick a table', ['t1', 't2'])}} LIMIT 1"
+.RUN "SELECT * FROM {{choose('Pick a table', ['t1', 't2'])}} LIMIT 1"
 ```
 """)
 
@@ -351,6 +433,90 @@ Example:
 ```
 """)
 
+HELP_WHILE = _help_entry('while', """
+Run every following step, until an `.ENDWHILE` (or the end of the pipeline),
+while PYTHON_CODE stays truthy — `0`, `''`, `None`, `[]` and `{}` end the
+loop, exactly as in Python.
+
+The condition is re-evaluated on every iteration against the data that
+entered the block: it is **frozen**, so the steps before the loop never run
+again (`.WHILE "sselect('Users', data)"` keeps offering the same rows). The
+condition's value — the marked rows, the next page, … — becomes the input of
+the body's first step and is exposed as `{{_i}}` / `_i`.
+
+The body's output is **not** accumulated: each iteration starts afresh from
+the condition's value and the loop hands its own input data to the step after
+`.ENDWHILE`, so carry results out with `.SET_VAR` / `set_var()`. `br()` ends
+the loop with that iteration's data, `stop()` aborts the whole pipeline, Esc
+cancels it, and a condition that never turns falsy aborts the pipeline after
+100000 iterations.
+
+Example:
+```
+.RUN "SELECT * FROM users" |
+.WHILE "sselect('Users', data)" |
+  .CALL "{{choose('Action', ['articles', 'orders'])}}" |
+.ENDWHILE
+```
+""")
+
+HELP_ENDWHILE = _help_entry('endwhile', """
+End the scope of the preceding `.WHILE`. Steps after it run once, with the
+data that entered the loop (the loop body's rows are not carried out — stash
+them with `.SET_VAR` inside the loop if they are needed). Without an
+`.ENDWHILE` the loop body extends to the end of the pipeline.
+
+Example:
+```
+.PY "[1, 2]" | .WHILE "cond()" | .RUN "..." | .ENDWHILE | .SHEET "input rows"
+```
+""")
+
+HELP_FN = _help_entry('fn', """
+Define a named function: the steps up to `.ENDFN` are **not** run in the main
+flow (data passes the definition by unchanged) but only when `.CALL "NAME"`
+runs them.
+
+Definitions are collected before the pipeline starts, so a function may be
+defined before or after the `.CALL` that uses it. `.FN` is allowed only at the
+top level (not inside `.FOR` / `.WHILE` / another `.FN`) and `.ENDFN` is
+mandatory. In a multi-line pipeline remember the trailing `|` on the `.ENDFN`
+line, otherwise the statement ends there.
+
+Example:
+```
+.FN "articles" |
+  .RUN "SELECT * FROM articles WHERE user_id IN {{sql_in_list([x['id'] for x in data])}}" |
+  .SHEET "articles" |
+.ENDFN |
+.RUN "SELECT * FROM users" | .CALL "articles"
+```
+""")
+
+HELP_ENDFN = _help_entry('endfn', """
+End a `.FN` definition. Mandatory: a `.FN` without a matching `.ENDFN` is a
+parse error.
+""")
+
+HELP_CALL = _help_entry('call', """
+Run the `.FN` block named FN_NAME and continue with its output — a call, not
+a jump: the current data flows into the function's first step, and the data of
+the function's last step flows back into the next step of the caller.
+
+FN_NAME is a template, so the function can be picked at run time. Inside the
+function `br()` (with no `.FOR` of its own) is an early return and cannot
+break the caller's loop; `stop()` still aborts the whole pipeline. A `.CALL?`
+reports a failure inside the function instead of aborting. Calls may nest 20
+levels deep before a runaway recursion is aborted.
+
+Examples:
+```
+.RUN "SELECT * FROM users" | .CALL "articles"
+
+.CALL "{{choose('Action', ['articles', 'orders'])}}"
+```
+""")
+
 HELP_SLEEP = _help_entry('sleep', """
 Evaluate PYTHON_CODE to a number of seconds and pause for that long, then
 pass the input data through unchanged. Useful inside `.FOR` to pace work
@@ -400,6 +566,15 @@ HELP_PY_FUNCTIONS = """
 ```
 from random import randint
 result(randint(1, 10))
+```
+
+  A `{{expr}}` placeholder runs the same Python, so there `result(val)` sets
+  what the placeholder renders to (statements are allowed too — without a
+  `result()` call they render as an empty string). `result(val)` returns `val`,
+  so it chains with other calls in one expression:
+```
+.RUN "SELECT {{result('test')}} AS test"
+.RUN "SHOW TABLES" | .FOR_RUN "SELECT * FROM {{result(_0) and info(_0)}}"
 ```
 
 `info(msg)`
@@ -455,7 +630,7 @@ if mtime > 1:
 result(['done'])
 stop()
 ```
-  
+
 `get_var(name, default=None)`
   returns the value of a variable stored by `.SET_VAR` (or `default` if not set).
 
@@ -472,49 +647,75 @@ stop()
 set_var('some_var', 42)
 ```
 
-`select(title, options, default=None)`
-  pauses the pipeline and opens a select popup titled `title`; returns the
-  chosen option's value. `options` may be a list of strings, rows from a
-  previous step (the first column value is shown), or `(label, value)` pairs —
-  the label is displayed, the value is returned. `default` pre-highlights the
-  option with that value, e.g. `select('Limit', [('few', 10), ('many', 1000)],
+`The four row prompts`
+  come as two pairs — `choose`/`select` as a popup over the editor,
+  `schoose`/`sselect` as a sheet in VisiData — where the s-less name picks one
+  item and the plural one marks any number:
+
+```
+                 popup        VisiData sheet
+  pick one       choose()     schoose()
+  mark any       select()     sselect()
+```
+
+`choose(title, options, default=None)`
+  pauses the pipeline and opens a popup titled `title`; returns the chosen
+  option's value. `options` may be a list of strings, rows from a previous
+  step (the first column value is shown), or `(label, value)` pairs — the
+  label is displayed, the value is returned. `default` pre-highlights the
+  option with that value, e.g. `choose('Limit', [('few', 10), ('many', 1000)],
   default=10)`. Dismissing the popup with `Esc` cancels the pipeline — no
   result is shown.
 
   Example (run a query against a table the user picks):
 ```
 .RUN "SHOW TABLES" | .PY \"\"\"
-result(select('Pick a table', data))
+result(choose('Pick a table', data))
 \"\"\" |
 .RUN "SELECT * FROM {{_0}} LIMIT 10"
 ```
 
   Example with (label, value) pairs:
 ```
-.PY "result([select('Row limit', [('few', 10), ('many', 1000)])])" |
+.PY "result([choose('Row limit', [('few', 10), ('many', 1000)])])" |
 .RUN "SELECT * FROM t LIMIT {{_0}}"
 ```
 
-`mselect(title, options, default=None)`
-  multi-select variant of `select()`: `Tab` marks/unmarks the highlighted
-  item, `Enter` confirms (with nothing marked it picks the highlighted item).
-  Returns the list of marked options' values; `(label, value)` pairs work as
-  in `select()`. `default` is a list of option values to pre-mark, e.g.
-  `mselect('Params', [1, 2, 3, 4], default=[1, 2])`. `Esc` cancels the
-  pipeline — no result is shown.
+`select(title, options, default=None)`
+  multi-choice variant of `choose()`: `Tab` marks/unmarks the highlighted
+  item, `Enter` confirms. Returns the list of marked options' values — an
+  empty list when nothing is marked, which is a normal answer the pipeline
+  continues with. `(label, value)` pairs work as in `choose()`. `default` is a
+  list of option values to pre-mark, e.g. `select('Params', [1, 2, 3, 4],
+  default=[1, 2])`. `Esc` cancels the pipeline — no result is shown.
 
   Example:
 ```
-.RUN "SHOW TABLES" | .PY "result(mselect('Pick tables', data))"
+.RUN "SHOW TABLES" | .PY "result(select('Pick tables', data))"
+```
+
+`schoose(title, rows)`
+  opens *rows* (e.g. `data`; non-dict rows are shown as a `value` column, the
+  answer holds the original items) in VisiData. `Enter` picks the row under
+  the cursor (VisiData's selection is ignored) and returns *that item itself*,
+  not a list — so it can be compared to a value directly. `q` or quitting
+  VisiData cancels the pipeline. Use it for menus and for drilling into one
+  row; `choose()` is the lighter popup for a short list of plain strings.
+
+  Example (pick one row, then query it):
+```
+.RUN "SELECT id, name FROM users" |
+.PY "result([schoose('Pick a user', data)])" |
+.RUN "SELECT * FROM articles WHERE user_id = {{id}}"
 ```
 
 `sselect(title, rows)`
-  opens *rows* (e.g. `data`; non-dict rows are shown as a `value` column,
-  the selection returns the original items) in VisiData.  Mark rows with
-  VisiData's selection (`s`/`t`/`gs`...), `Enter` confirms and returns only
-  the marked rows (nothing marked returns `[]`).  `q` on a sub-sheet (e.g.
-  `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting
-  VisiData (`gq`, `Ctrl+Q`) cancels the pipeline — no result is shown.
+  multi-row variant of `schoose()`: the rows open the same way, but you mark
+  them with VisiData's selection (`s`/`t`/`gs`...) and `Enter` returns only the
+  marked ones — an empty list when nothing is marked, which the pipeline
+  continues with. `q` on a sub-sheet (e.g. `"` dup-selected) just closes it;
+  `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels
+  the pipeline — no result is shown.
 
   Example:
 ```
@@ -642,7 +843,16 @@ Open the input rows as a new VisiData sheet named NAME, then pass the data
 through unchanged. Use it several times in one pipeline to inspect multiple
 intermediate result sets as separate, named sheets (the pipeline's final
 result still opens too). NAME is a template, so `{{_i}}` / `{{_0}}` / column
-names can be substituted — handy inside `.FOR`.
+names can be substituted — handy inside `.FOR` / `.WHILE`.
+
+The sheet is created in the background the moment the step runs: it never
+interrupts the pipeline, and it survives a cancelled run (`q` in a picker, Esc).
+While the pipeline is running the editor takes no keys but Esc — reach an
+already-created sheet with VisiData's own `Shift+S` sheet browser while a
+`sselect()`/`schoose()` sheet is open, or with `Alt+S` once the run has ended.
+The whole stack opens when the pipeline finishes. Inside a `.WHILE` loop that
+means one sheet per iteration — give it a distinct name
+(e.g. `.SHEET "articles {{_i}}"`) to tell them apart.
 
 Examples:
 ```
@@ -652,6 +862,27 @@ Examples:
 .FOR "range(3)" |
 .RUN "SELECT '{{_i}}' AS i" |
 .SHEET "data_{{_i}}" | .NOFOR
+```
+""")
+
+HELP_VIEW = _help_entry('view', """
+Show the input rows as a VisiData sheet named NAME and **wait**: the pipeline
+resumes when the sheet is closed with `q`. The blocking counterpart of
+`.SHEET`, which only queues its sheet for the end of the run.
+
+Use it wherever the rows must be seen at the point they are produced —
+typically inside a `.WHILE` browser loop or a `.FN` function. Closing the
+sheet is not an answer, so unlike a dismissed `sselect()` it never cancels the
+pipeline. NAME is a template.
+
+Example:
+```
+.FN "articles" |
+.RUN "SELECT * FROM articles WHERE user_id IN {{sql_in_list([x['id'] for x in data])}}" |
+.VIEW "articles" |
+.ENDFN |
+.RUN "SELECT * FROM users" |
+.WHILE "sselect('Users', data)" | .CALL "articles" | .ENDWHILE
 ```
 """)
 
@@ -734,6 +965,11 @@ HELP_ENTRIES: List[str] = [
     HELP_FOR_RUN,
     HELP_FOR,
     HELP_NOFOR,
+    HELP_WHILE,
+    HELP_ENDWHILE,
+    HELP_FN,
+    HELP_ENDFN,
+    HELP_CALL,
     HELP_SLEEP,
     HELP_PY,
     HELP_SET_VAR,
@@ -741,6 +977,7 @@ HELP_ENTRIES: List[str] = [
     HELP_VOID,
     HELP_VARS,
     HELP_SHEET,
+    HELP_VIEW,
     HELP_PY_FUNCTIONS,
 ]
 
@@ -845,26 +1082,90 @@ def sql_values(data: Any, chunk_size: Optional[int] = None) -> Any:
 _TEMPLATE_RE = re.compile(r'\{\{([^}]*)\}\}')
 
 
+def _inject_result(context: dict) -> list:
+    """Put a fresh ``result(val)`` collector into *context* and return the list
+    it appends to (the last call wins).  ``result()`` returns *val*, so it can be
+    chained with other calls in one expression: ``result(_0) and info(_0)``."""
+    called: list = []
+
+    def result(val: Any) -> Any:
+        called.append(val)
+        return val
+
+    context['result'] = result
+    return called
+
+
+def run_user_code(code: str, context: dict, data: Any) -> Any:
+    """Execute a user Python snippet for a pipeline step and return its value.
+
+    Output precedence: the last ``result(...)`` argument; else, for a single
+    expression, that expression's value; else *data* unchanged (passthrough).
+    Classification is done up front with :func:`compile`, so a genuine
+    ``SyntaxError`` surfaces as-is instead of being masked by a second
+    eval-then-exec attempt.  ``br()``/``stop()`` raised inside the code carry
+    whatever the code produced so the caller can return it."""
+    called = _inject_result(context)
+
+    try:
+        code_obj = compile(code, '<pipeline>', 'eval')
+    except SyntaxError:
+        code_obj = None     # not a single expression — run as statements
+
+    try:
+        if code_obj is not None:
+            value = eval(code_obj, context)  # noqa: S307 — intentional scripting feature
+            return called[-1] if called else value
+        exec(compile(code, '<pipeline>', 'exec'), context)  # noqa: S102
+    except (_PipelineBreak, _PipelineStop) as flow:
+        # Preserve any result()/passthrough produced before br()/stop() so the
+        # loop (br) or the executor (stop) returns it instead of prior data.
+        if flow.data is None:
+            flow.data = _as_item_list(called[-1] if called else data)
+        raise
+
+    return called[-1] if called else data
+
+
 def _render(template: str, context: dict) -> str:
     """Substitute every ``{{expr}}`` in *template* by evaluating *expr* against
     *context*.  Single place that performs the substitution, shared by
-    :func:`render_template` and :meth:`PipelineExecutor._render_template`."""
+    :func:`render_template` and :meth:`PipelineExecutor._render_template`.
+
+    A placeholder runs the same Python as a ``.PY`` step, ``result(val)``
+    included: when the expression calls it, the placeholder renders the last
+    ``result(...)`` argument instead of the expression's own value.  That lets
+    one placeholder both produce a value and run side effects, e.g.
+    ``{{result(_0) and info(_0)}}``.  Snippets that are not a single expression
+    are executed as statements — they render as the last ``result(...)`` value,
+    or as an empty string when they never call it."""
     def _replacer(m: 're.Match') -> str:
         expr = m.group(1)
+        called = _inject_result(context)
         try:
             # Evaluate as an f-string so Python format specs are supported:
             #   {{price:.2f}}  →  eval('f"""{price:.2f}"""')  →  '9.50'
             # The f'"""…"""' wrapper only clashes if *expr* itself contains the
             # literal sequence '"""', which is not a realistic case.
-            return eval('f"""' + '{' + expr + '}' + '"""', context)  # noqa: S307
+            code_obj = compile('f"""' + '{' + expr + '}' + '"""',
+                               '<pipeline>', 'eval')
+        except SyntaxError:
+            code_obj = None     # not an expression — run as statements
+        try:
+            if code_obj is not None:
+                rendered = eval(code_obj, context)  # noqa: S307
+            else:
+                exec(compile(expr, '<pipeline>', 'exec'), context)  # noqa: S102
+                rendered = ''
         except (_PipelineBreak, _PipelineStop, PipelineCancelled):
-            # Control flow from br()/stop() or a cancelled user prompt inside
-            # a template — not an error, propagate as-is.
+            # Control flow from br()/stop() or a cancelled user prompt
+            # inside a template — not an error, propagate as-is.
             raise
         except Exception as exc:
             raise ValueError(
                 f'Error in template expression {{{expr!r}}}: {exc}'
             ) from exc
+        return str(called[-1]) if called else rendered
 
     return _TEMPLATE_RE.sub(_replacer, template)
 
@@ -957,8 +1258,8 @@ def normalize_to_dicts(value: Any) -> List[dict]:
 
 
 def _option_pairs(options: Any) -> 'tuple[List[str], List[Any]]':
-    """Coerce *options* to the ``(labels, values)`` lists used by ``select()`` /
-    ``mselect()``: *labels* are the strings shown in the popup, *values* what
+    """Coerce *options* to the ``(labels, values)`` lists used by ``choose()`` /
+    ``select()``: *labels* are the strings shown in the popup, *values* what
     the helper returns for each of them.  Each option may be:
 
     - a tuple/list ``(label, value)`` — display ``str(label)``, return *value*
@@ -1046,8 +1347,34 @@ class ForBlock:
                               # (the loop's data is then discarded at the boundary)
 
 
+@dataclass
+class WhileBlock:
+    """A ``.WHILE … .ENDWHILE`` block: run *body* while *expr* stays truthy.
+
+    Unlike :class:`ForBlock` the condition is re-evaluated every iteration
+    against the data that entered the block (frozen — the steps before the loop
+    never re-run), and its value becomes the input of the body's first step.
+    """
+    expr: str                 # the .WHILE Python expression (the condition)
+    body: List['Node']        # nodes executed once per iteration
+    original_text: str        # the raw '.WHILE …' text (used for error context)
+
+
+@dataclass
+class FnBlock:
+    """A ``.FN "NAME" … .ENDFN`` block: a named piece of pipeline invoked by
+    ``.CALL``.  Definitions are hoisted before execution, so the block itself is
+    a no-op in the main flow (data passes through it unchanged)."""
+    name: str                 # the function name given to .CALL
+    body: List['Node']        # nodes executed on .CALL
+    original_text: str        # the raw '.FN …' text (used for error context)
+
+
 #: A node in the pipeline AST.
-Node = Union[PipelineStep, ForBlock]
+Node = Union[PipelineStep, ForBlock, WhileBlock, FnBlock]
+
+#: Block node type → the keyword that opened it (used in error messages).
+_BLOCK_COMMANDS: dict = {ForBlock: 'for', WhileBlock: 'while', FnBlock: 'fn'}
 
 
 def _triple_at(s: str, i: int) -> Optional[str]:
@@ -1303,43 +1630,91 @@ def parse_pipeline(sql: str) -> List[Node]:
 
     The AST is a flat list of nodes where each node is either a
     :class:`PipelineStep` (an ordinary ``.RUN`` / ``.RFILTER`` / … step) or a
-    :class:`ForBlock` (a ``.FOR … .NOFOR`` loop, with nested loops as nested
-    ``ForBlock`` nodes inside its body).
+    block — :class:`ForBlock` (``.FOR … .NOFOR``), :class:`WhileBlock`
+    (``.WHILE … .ENDWHILE``) or :class:`FnBlock` (``.FN … .ENDFN``) — whose body
+    is itself a list of nodes, so blocks nest.
     """
     raw_steps = _split_pipeline(sql)
     steps = [_parse_step(raw) for raw in raw_steps]
-    nodes, _, _ = _parse_block(steps, 0, top_level=True)
+    nodes, _, _ = _parse_block(steps, 0, closer=None)
     return nodes
 
 
-def _parse_block(steps: List[PipelineStep], i: int, top_level: bool) -> 'tuple[List[Node], int, bool]':
+def _parse_block(steps: List[PipelineStep], i: int,
+                 closer: Optional[str]) -> 'tuple[List[Node], int, Optional[str]]':
     """Build the AST for *steps* starting at index *i*; return
-    ``(nodes, next, closed)`` where *closed* is ``True`` when the block was
-    terminated by a matching ``.NOFOR`` (rather than the end of the pipeline).
+    ``(nodes, next, closed_by)`` where *closed_by* is the closing keyword that
+    terminated the block (``'nofor'`` / ``'endwhile'`` / ``'endfn'``) or ``None``
+    when the pipeline simply ended.
 
-    A ``.FOR`` recurses to collect its body up to the matching ``.NOFOR`` (which
-    is consumed) or the end of the pipeline.  An unclosed ``.FOR`` runs to the
-    end — the documented short form (``.FOR … | .RUN …``).  A ``.NOFOR`` with no
-    enclosing ``.FOR`` is ignored (a harmless no-op, as before).
+    *closer* is the closing keyword this block expects (``None`` at the top
+    level).  A block-opening keyword recurses to collect its body up to its own
+    closer (which is consumed) or the end of the pipeline — an unclosed ``.FOR``
+    / ``.WHILE`` runs to the end, the documented short form
+    (``.FOR … | .RUN …``).  A closing keyword belonging to an *outer* block is
+    left unconsumed so that outer level sees it (it implicitly closes this one);
+    a stray one at the top level is ignored, as before.
     """
     nodes: List[Node] = []
     n = len(steps)
     while i < n:
         step = steps[i]
-        if step.command == 'for':
+        command = step.command
+        if command in _BLOCK_CLOSERS:
             if not step.args:
-                raise ValueError('.FOR requires a Python code argument')
-            body, i, closed = _parse_block(steps, i + 1, top_level=False)
-            nodes.append(ForBlock(expr=step.args[0], body=body,
-                                  original_text=step.original_text, closed=closed))
-        elif step.command == 'nofor':
-            if not top_level:
-                return nodes, i + 1, True   # matching .NOFOR closes this loop body
-            i += 1                          # stray top-level .NOFOR — ignored, as before
+                what = 'a NAME' if command == 'fn' else 'a Python code'
+                raise ValueError(f'.{command.upper()} requires {what} argument')
+            if command == 'fn' and closer is not None:
+                raise ValueError(
+                    '.FN is only allowed at the top level of a pipeline '
+                    '(not inside .FOR / .WHILE / .FN)'
+                )
+            body, i, closed_by = _parse_block(steps, i + 1, closer=_BLOCK_CLOSERS[command])
+            nodes.append(_make_block(step, body, closed_by))
+        elif command in _BLOCK_END_KEYWORDS:
+            if command == closer:
+                return nodes, i + 1, command   # our own closer — consume it
+            if closer is not None:
+                return nodes, i, None          # an outer block's closer — leave it
+            i += 1                             # stray closer at top level — ignored
         else:
             nodes.append(step)
             i += 1
-    return nodes, i, False
+    return nodes, i, None
+
+
+def _is_soft(node: Node) -> bool:
+    """``True`` for a `?`-suffixed step — a failure is reported, not fatal.
+    Blocks (``.FOR`` / ``.WHILE`` / ``.FN``) can never be soft."""
+    return isinstance(node, PipelineStep) and node.soft
+
+
+def _collect_functions(nodes: List[Node]) -> dict:
+    """Return the ``{name: FnBlock}`` table of the pipeline's ``.FN``
+    definitions.  Only the top level is scanned — the parser already rejects a
+    ``.FN`` nested in another block — and the table is built before execution,
+    which is what lets a ``.CALL`` name a function defined further down."""
+    functions: dict = {}
+    for node in nodes:
+        if isinstance(node, FnBlock):
+            if node.name in functions:
+                raise ValueError(f'Duplicate .FN definition {node.name!r}')
+            functions[node.name] = node
+    return functions
+
+
+def _make_block(step: PipelineStep, body: List[Node], closed_by: Optional[str]) -> Node:
+    """Build the AST node for a block opened by *step* and closed by *closed_by*."""
+    if step.command == 'for':
+        return ForBlock(expr=step.args[0], body=body,
+                        original_text=step.original_text,
+                        closed=closed_by == 'nofor')
+    if step.command == 'while':
+        return WhileBlock(expr=step.args[0], body=body,
+                          original_text=step.original_text)
+    if closed_by != 'endfn':
+        raise ValueError(f'.FN {step.args[0]!r} is not closed by .ENDFN')
+    return FnBlock(name=step.args[0], body=body, original_text=step.original_text)
 
 
 def is_pipeline(sql: str) -> bool:
@@ -1421,8 +1796,8 @@ class _PipelineStop(Exception):
 
 class PipelineCancelled(Exception):
     """Raised when the user dismisses an interactive prompt (Esc on
-    ``select()``/``mselect()``/``input()``/``ask()``/``warn()``, q in
-    ``sselect()``).  Unlike ``stop()`` it aborts the pipeline *without* a
+    ``choose()``/``select()``/``input()``/``ask()``/``warn()``, q in
+    ``sselect()``/``schoose()``).  Unlike ``stop()`` it aborts the pipeline *without* a
     result: the executor lets it propagate so the UI shows only a
     'Cancelled' notification — no result popup, no VisiData."""
 
@@ -1457,12 +1832,19 @@ class PipelineExecutor:
     def __init__(self, host: PipelineHost) -> None:
         self.host = host
         self.client = host.client
-        # Stack of raw loop items pushed by nested .FOR loops (innermost last).
+        # Stack of raw loop items pushed by nested .FOR / .WHILE loops
+        # (innermost last) — exposed to user code as _i / _ii / _iii …
         self._loop_stack: List[Any] = []
         # Whether the step currently being dispatched was `?`-suffixed (soft);
         # set by _execute_step just before calling the handler so handlers that
         # do their own per-item looping (e.g. .FOR_RUN) can honour it.
         self._current_soft: bool = False
+        # name → .FN block, collected from the parsed pipeline before execution
+        # so a .CALL may name a function defined further down the pipeline.
+        self._functions: dict = {}
+        # Names of the .FN blocks currently executing (innermost last), used to
+        # bound recursion — see MAX_CALL_DEPTH.
+        self._call_stack: List[str] = []
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -1472,9 +1854,13 @@ class PipelineExecutor:
         from .clients.base import Result  # noqa: PLC0415
 
         self._loop_stack = []
+        self._call_stack = []
         self.host.reset_pipeline_info()
 
         nodes = parse_pipeline(sql)
+        # Hoist the .FN definitions before running anything, so .CALL works no
+        # matter whether the function is defined before or after the call site.
+        self._functions = _collect_functions(nodes)
         try:
             data = await self._execute_nodes(nodes, NO_DATA)
         except _PipelineStop as st:
@@ -1486,7 +1872,7 @@ class PipelineExecutor:
         rows = [] if data is NO_DATA else normalize_to_dicts(data)
         return Result(data=rows, rowcount=len(rows))
 
-    # ── AST execution (walks PipelineStep / ForBlock nodes) ─────────────────────
+    # ── AST execution (walks PipelineStep / ForBlock / WhileBlock / FnBlock) ────
 
     async def _execute_nodes(self, nodes: List[Node], data: Any) -> Any:
         """Run a list of AST nodes sequentially, threading *data* through.
@@ -1510,6 +1896,12 @@ class PipelineExecutor:
                         # A loop explicitly closed by .NOFOR discards its data at
                         # the boundary: following steps start fresh (NO_DATA).
                         result = NO_DATA
+                elif isinstance(node, WhileBlock):
+                    result = await self._run_while(node, data)
+                elif isinstance(node, FnBlock):
+                    # A definition, not a call: hoisted by execute(), so here it
+                    # is a no-op and the data flows past it unchanged.
+                    result = data
                 else:
                     result = await self._execute_step(node, data)
             except (_PipelineBreak, _PipelineStop) as flow:
@@ -1520,13 +1912,18 @@ class PipelineExecutor:
                 if flow.data is None:
                     flow.data = _as_item_list(data)
                 raise
-            except (PipelineStepError, ValueError, PipelineCancelled):
+            except (PipelineStepError, ValueError, PipelineCancelled) as exc:
                 # An already-annotated inner error, a deliberate validation
                 # error (already clear) or a cancelled prompt — propagate
-                # unchanged.
-                raise
+                # unchanged.  The one exception is a `?`-suffixed .CALL: the
+                # failure was already annotated inside the function body, so
+                # only the soft marker on the call itself can still absorb it.
+                if not (isinstance(exc, PipelineStepError) and _is_soft(node)):
+                    raise
+                self.host.show_pipeline_info(self._soft_error_message(node, exc))
+                result = data
             except Exception as exc:
-                if isinstance(node, PipelineStep) and node.soft:
+                if _is_soft(node):
                     # `?`-suffixed step: report the failure without aborting
                     # the pipeline — the step is skipped, previous data flows
                     # through unchanged to the next step.
@@ -1557,6 +1954,49 @@ class PipelineExecutor:
             await asyncio.sleep(0)
         return accumulated
 
+    async def _run_while(self, block: WhileBlock, data: Any) -> Any:
+        """Run *block*'s body while its condition stays truthy.
+
+        The condition is re-evaluated every iteration against the data that
+        entered the block — frozen, so the steps before the loop never re-run
+        and e.g. ``.WHILE "sselect(data)"`` keeps offering the same rows.  Its
+        value (the selection, the next page, …) becomes the input of the body's
+        first step and is pushed on the loop stack as ``_i``.
+
+        The body's output is *not* accumulated: every iteration starts afresh
+        from the condition's value, and the loop passes its own input data
+        through to the next step (use ``.SET_VAR`` / ``set_var()`` to carry
+        something out).  ``br()`` in the body ends the loop with the breaking
+        iteration's data, ``stop()`` aborts the whole pipeline.
+        """
+        # The condition always sees the data that entered the block.
+        frozen = _as_rows(data)
+
+        for _ in range(MAX_WHILE_ITERATIONS):
+            # Esc on a live info() popup — abort with stop() semantics.
+            if self.host.pipeline_stop_requested():
+                raise _PipelineStop(_as_item_list(frozen))
+            value = self._eval_user_code(block.expr, frozen)
+            if not value:
+                return data           # falsy condition — normal end of the loop
+            self._loop_stack.append(value)
+            try:
+                await self._execute_nodes(block.body, value)
+            except _PipelineBreak as brk:
+                # br() leaves the loop; the breaking iteration's data becomes
+                # the loop's result (as in .FOR).
+                return _as_item_list(brk.data)
+            finally:
+                self._loop_stack.pop()
+            # Yield control so Esc cancellation can be delivered even when the
+            # body never awaits anything (a tight loop with no I/O).
+            await asyncio.sleep(0)
+
+        raise ValueError(
+            f'.WHILE exceeded {MAX_WHILE_ITERATIONS} iterations — the condition '
+            f'{block.expr!r} never became falsy (possible infinite loop)'
+        )
+
     def _eval_for_items(self, code: str, data: Optional[list]) -> List[Any]:
         """Evaluate the ``.FOR`` expression and coerce it to a list of items."""
         value = self._eval_user_code(code, data)
@@ -1570,15 +2010,16 @@ class PipelineExecutor:
             return [value]
 
     def _loop_vars(self) -> dict:
-        """Expose the ``.FOR`` items by nesting depth: the outermost loop's item
-        as ``_i``, the second level's as ``_ii``, the third's as ``_iii`` and so
-        on.  Empty outside any loop."""
+        """Expose the enclosing loop items by nesting depth: the outermost
+        loop's item as ``_i``, the second level's as ``_ii``, the third's as
+        ``_iii`` and so on.  A ``.FOR`` pushes the current item, a ``.WHILE``
+        the value of its condition.  Empty outside any loop."""
         return {'_' + 'i' * (depth + 1): item
                 for depth, item in enumerate(self._loop_stack)}
 
     def _step_error(self, node: Node, exc: BaseException) -> 'PipelineStepError':
         """Annotate *exc* (raised by *node*) with the step command and loop item."""
-        command = node.command if isinstance(node, PipelineStep) else 'for'
+        command = node.command if isinstance(node, PipelineStep) else _BLOCK_COMMANDS[type(node)]
         if self._loop_stack:
             item = self._loop_stack[-1]
             return PipelineStepError(
@@ -1604,8 +2045,11 @@ class PipelineExecutor:
         handler_name = _COMMAND_HANDLERS.get(step.command)
         if handler_name is not None:
             self._current_soft = step.soft
-            # Handlers work with a concrete row list ([] when there is no data).
-            return await getattr(self, handler_name)(step.args, _as_rows(data))
+            # Handlers work with a concrete row list ([] when there is no data)
+            # — except the few that only forward the value on (see
+            # _RAW_DATA_COMMANDS) and must be able to pass NO_DATA along.
+            rows = data if step.command in _RAW_DATA_COMMANDS else _as_rows(data)
+            return await getattr(self, handler_name)(step.args, rows)
 
         if data is not NO_DATA:
             known = ', '.join(f'.{c.upper()}' for c in PIPELINE_COMMANDS)
@@ -1627,7 +2071,7 @@ class PipelineExecutor:
         """Render a ``{{expr}}`` template with the full pipeline context: row /
         ``data`` overlays plus ``_i``, ``_vars`` and every helper function, so
         templates can run the same Python as ``.PY`` — e.g.
-        ``.RUN "SELECT * FROM {{select('Pick', data)}}"``.  In per-row
+        ``.RUN "SELECT * FROM {{choose('Pick', data)}}"``.  In per-row
         templates (``.RFILTER`` / ``.RGET`` / ``.FOR_RUN``) the expression is
         evaluated once per row — an interactive prompt there fires per row."""
         overlay_row = row if row is not None else _first_row(data)
@@ -1788,9 +2232,17 @@ class PipelineExecutor:
 
     # ── Interactive prompt helpers (block until the user answers in the UI) ──
     #
-    # Dismissing any prompt with Esc aborts the whole pipeline without a
-    # result (the editor resolves an Esc as None — [] for mselect — and the
-    # helpers below translate that into _cancel()).
+    # They come in two pairs — one for the popup over the editor, one for a
+    # sheet in the external viewer — differing only in how many rows the user
+    # may pick:
+    #
+    #     single choice   choose()    schoose()
+    #     any number      select()    sselect()
+    #
+    # Each pair shares its plumbing (_ask_options / _prompt_rows below).
+    # Dismissing any prompt (Esc in the popup, q in the viewer) resolves the
+    # request as None, which the helpers turn into _cancel(): the pipeline is
+    # aborted without a result.
 
     @staticmethod
     def _label_map(labels: List[str], values: List[Any]) -> dict:
@@ -1800,50 +2252,67 @@ class PipelineExecutor:
             mapping.setdefault(label, value)
         return mapping
 
-    def _user_select(self, title: Any, options: Any, default: Any = None) -> Any:
-        """Show a select popup with *options*; return the chosen option's
-        value (see :func:`_option_pairs` for ``(label, value)`` support).
-        *default* pre-highlights the option with that value (compared like the
-        return value, so pass the value — not the label — for pairs).
-        Esc aborts the pipeline without a result.  Exposed as ``select()``."""
-        labels, values = _option_pairs(options)
-        if not labels:
-            raise ValueError('select(): options must not be empty')
-        request = {'kind': 'select', 'title': str(title), 'options': labels}
-        if default is not None:
-            for label, value in zip(labels, values):
-                if value == default or label == str(default):
-                    request['default'] = label
-                    break
-        choice = self.host.request_user_input(request)
-        if choice is None:
-            self._cancel()
-        return self._label_map(labels, values).get(choice, choice)
+    @staticmethod
+    def _default_labels(labels: List[str], values: List[Any],
+                        default: Any, *, multi: bool) -> List[str]:
+        """The labels to pre-select for *default*, which holds option *values*
+        (or, for convenience, labels): a single one for ``choose()``, any
+        number — passed as a list — for ``select()``."""
+        if default is None:
+            return []
+        wanted = list(default) if (multi and isinstance(default, (list, tuple, set))) \
+            else [default]
+        as_text = [str(d) for d in wanted]
+        matched = [label for label, value in zip(labels, values)
+                   if value in wanted or label in as_text]
+        return matched if multi else matched[:1]
 
-    def _user_mselect(self, title: Any, options: Any, default: Any = None) -> List[Any]:
-        """Multi-select variant of ``select()`` (Tab marks items, Enter
-        confirms); return the list of marked options' values.  *default* is
-        the list of option values to pre-mark (a single value works too).
-        Esc aborts the pipeline without a result.  Exposed as ``mselect()``."""
+    def _ask_options(self, kind: str, title: Any, options: Any,
+                     default: Any, *, multi: bool) -> Any:
+        """Run a popup prompt over *options* and return the picked option's
+        value — a list of them when *multi*.  Shared by ``choose()`` and
+        ``select()``; see :func:`_option_pairs` for ``(label, value)`` support.
+        Esc aborts the pipeline."""
         labels, values = _option_pairs(options)
         if not labels:
-            raise ValueError('mselect(): options must not be empty')
-        request = {'kind': 'mselect', 'title': str(title), 'options': labels}
-        if default is not None:
-            if not isinstance(default, (list, tuple, set)):
-                default = [default]
-            defaults = list(default)
-            default_labels = [
-                label for label, value in zip(labels, values)
-                if value in defaults or label in [str(d) for d in defaults]
-            ]
-            if default_labels:
-                request['default'] = default_labels
-        marked = self.host.request_user_input(request)
-        if not marked:
+            raise ValueError(f'{kind}(): options must not be empty')
+        request = {'kind': kind, 'title': str(title), 'options': labels}
+        if (pre := self._default_labels(labels, values, default, multi=multi)):
+            request['default'] = pre if multi else pre[0]
+        answer = self.host.request_user_input(request)
+        if answer is None:
             self._cancel()
         mapping = self._label_map(labels, values)
-        return [mapping.get(label, label) for label in marked]
+        if not multi:
+            return mapping.get(answer, answer)
+        return [mapping.get(label, label) for label in answer]
+
+    def _user_choose(self, title: Any, options: Any, default: Any = None) -> Any:
+        """Show a popup with *options* and return the chosen option's value.
+        *default* pre-highlights the option with that value (compared like the
+        return value, so pass the value — not the label — for pairs).
+        Esc aborts the pipeline without a result.  Exposed as ``choose()``."""
+        return self._ask_options('choose', title, options, default, multi=False)
+
+    def _user_select(self, title: Any, options: Any, default: Any = None) -> List[Any]:
+        """Multi-choice popup (Tab marks items, Enter confirms); return the
+        list of marked options' values — ``[]`` when nothing is marked.
+        *default* is the list of option values to pre-mark (a single value
+        works too).  Esc aborts the pipeline without a result.  Exposed as
+        ``select()``."""
+        return self._ask_options('select', title, options, default, multi=True)
+
+    def _prompt_rows(self, kind: str, title: Any, raw: list,
+                     shaped: List[dict]) -> Optional[list]:
+        """Ask the UI to pick rows out of *shaped* (the dict-shaped view of
+        *raw*, built by the caller) and map the answer back to the *raw* items
+        behind them.  ``None`` means the user dismissed the sheet, which both
+        ``sselect()`` and ``schoose()`` treat as cancelling the pipeline."""
+        request = {'kind': kind, 'title': str(title), 'rows': shaped}
+        picked = self.host.request_user_input(request)
+        if picked is None:
+            return None
+        return self._map_selection(raw, shaped, picked)
 
     def _user_sselect(self, title: Any, rows: Any) -> list:
         """Open *rows* (e.g. ``data``) in VisiData; the user marks rows with
@@ -1855,13 +2324,30 @@ class PipelineExecutor:
         Rows are shaped into dicts only for the sheet; the returned selection
         contains the original (raw) rows."""
         raw = _as_item_list(rows)
-        shaped = normalize_to_dicts(raw)
-        selected = self.host.request_user_input(
-            {'kind': 'sselect', 'title': str(title), 'rows': shaped})
+        selected = self._prompt_rows('sselect', title, raw, normalize_to_dicts(raw))
         if selected is None:
             self._cancel()
-        # Map the marked display rows back to the raw items (dict rows are
-        # passed to the sheet as-is, so they map to themselves).
+        return selected
+
+    def _user_schoose(self, title: Any, rows: Any) -> Any:
+        """Open *rows* in VisiData and let the user pick exactly one of them
+        with Enter (the row under the cursor); return that single item — the
+        raw one, not a list.  This is the single-choice counterpart of
+        ``sselect()``, which marks any number of rows.  ``q`` or quitting
+        VisiData aborts the pipeline without a result.  Exposed as
+        ``schoose()``."""
+        raw = _as_item_list(rows)
+        if not raw:
+            raise ValueError('schoose(): rows must not be empty')
+        chosen = self._prompt_rows('schoose', title, raw, normalize_to_dicts(raw))
+        if not chosen:
+            self._cancel()
+        return chosen[0]
+
+    @staticmethod
+    def _map_selection(raw: list, shaped: List[dict], selected: list) -> list:
+        """Map the rows picked on a sheet back to the raw items (dict rows are
+        passed to the sheet as-is, so they map to themselves)."""
         raw_by_id = {id(shown): item for shown, item in zip(shaped, raw)}
         return [raw_by_id.get(id(row), row) for row in selected]
 
@@ -1899,8 +2385,9 @@ class PipelineExecutor:
             'stop': self._stop,
             'set_var': self._set_var,
             'get_var': self._get_var,
+            'choose': self._user_choose,
             'select': self._user_select,
-            'mselect': self._user_mselect,
+            'schoose': self._user_schoose,
             'sselect': self._user_sselect,
             'input': self._user_input,
             'ask': self._user_ask,
@@ -1939,7 +2426,7 @@ class PipelineExecutor:
         behaves identically in ``.PY`` and in ``.SLEEP`` / ``.SET_VAR`` / the
         ``.FOR`` expression — they all run through this one core.  ``data``,
         ``_vars``, ``_i``, ``info()``, ``br()``, ``stop()``, ``set_var()``,
-        ``get_var()``, the user prompts (``select()`` / ``mselect()`` /
+        ``get_var()``, the user prompts (``choose()`` / ``select()`` /
         ``input()`` / ``ask()``) and ``sql_in_list`` come from
         :meth:`_python_context`.
 
@@ -1948,32 +2435,12 @@ class PipelineExecutor:
         eval-then-exec attempt.  ``br()``/``stop()`` raised inside the code carry
         whatever the code produced (the last ``result(...)`` or the passthrough
         data) so the ``.FOR`` loop (br) or the executor (stop) can return it.
+
+        The execution itself is :func:`run_user_code` — the very same core that
+        evaluates ``{{expr}}`` template placeholders, so a placeholder runs the
+        Python a ``.PY`` step would.
         """
-        _called: list = []
-
-        def result(val: Any) -> None:
-            _called.append(val)
-
-        context = self._python_context(data, {'result': result, **(extra or {})})
-
-        try:
-            code_obj = compile(code, '<pipeline>', 'eval')
-        except SyntaxError:
-            code_obj = None     # not a single expression — run as statements
-
-        try:
-            if code_obj is not None:
-                value = eval(code_obj, context)  # noqa: S307 — intentional scripting feature
-                return _called[-1] if _called else value
-            exec(compile(code, '<pipeline>', 'exec'), context)  # noqa: S102
-        except (_PipelineBreak, _PipelineStop) as flow:
-            # Preserve any result()/passthrough produced before br()/stop() so the
-            # loop (br) or the executor (stop) returns it instead of prior data.
-            if flow.data is None:
-                flow.data = _as_item_list(_called[-1] if _called else data)
-            raise
-
-        return _called[-1] if _called else data
+        return run_user_code(code, self._python_context(data, extra), data)
 
     def _eval_user_code(self, code: str, data: Optional[list]) -> Any:
         """Run user Python and return its value (see :meth:`_run_user_code`).
@@ -1991,7 +2458,7 @@ class PipelineExecutor:
         3. else ``data``, unchanged (passthrough).
 
         ``data``, ``_vars``, ``_i``, ``info()``, ``br()``, ``set_var()``,
-        ``get_var()``, ``select()``, ``mselect()``, ``input()``, ``ask()`` and
+        ``get_var()``, ``choose()``, ``select()``, ``input()``, ``ask()`` and
         ``result()`` are in scope.  The output crosses the step boundary
         exactly as produced — even a scalar or ``None``; dict-wrapping happens
         only at display points.
@@ -2040,9 +2507,13 @@ class PipelineExecutor:
         """Open the input rows as a VisiData sheet named ``args[0]`` (rendered as a
         template), then pass the data through unchanged so the pipeline continues.
 
-        The host only stashes the ``(name, rows)`` pair; the VisiData sheet itself
-        is built on the UI thread once the pipeline finishes (see
-        ``DbEditor.add_pipeline_sheet`` and ``_db_query``'s ``on_done``)."""
+        The host creates the sheet in the background as this step runs — it does
+        not block and nothing is drawn — so it is already on VisiData's sheet
+        stack (reachable with ``Shift+S`` from a picker sheet mid-run, and with
+        Alt+S afterwards) and survives a cancelled run; the whole stack is handed
+        to VisiData when the pipeline finishes (see
+        ``DbEditor.add_pipeline_sheet`` and ``_db_query``'s ``on_done``).  In a
+        ``.WHILE`` loop that means one sheet per iteration."""
         if not args:
             raise ValueError('.SHEET requires a NAME argument')
         name = self._render_template(args[0], data=data)
@@ -2050,6 +2521,61 @@ class PipelineExecutor:
         # the pipeline itself continues with the raw data.
         self.host.add_pipeline_sheet(name, normalize_to_dicts(data))
         return data
+
+    async def _cmd_view(self, args: List[str], data: Optional[list]) -> list:
+        """Show the input rows as a VisiData sheet named ``args[0]`` (a
+        template) and *block* until the user closes it with ``q``, then pass the
+        data through unchanged.
+
+        The blocking counterpart of ``.SHEET``: it uses the same handover as the
+        ``sselect()`` / ``schoose()`` prompts, so it works in the middle of a
+        run — inside a ``.WHILE`` loop or a ``.FN`` function the rows are on
+        screen at the point they are produced, not only when the pipeline ends.
+        Closing the sheet is not an answer, so (unlike a dismissed prompt) it
+        never cancels the pipeline."""
+        if not args:
+            raise ValueError('.VIEW requires a NAME argument')
+        name = self._render_template(args[0], data=data)
+        # A display point — shape rows into dicts for VisiData; the pipeline
+        # itself continues with the raw data.
+        self.host.request_user_input(
+            {'kind': 'view', 'title': name, 'rows': normalize_to_dicts(data)})
+        return data
+
+    async def _cmd_call(self, args: List[str], data: Any) -> Any:
+        """Run the ``.FN`` block named by ``args[0]`` and return its output.
+
+        The name is a template, so it can be computed at run time
+        (``.CALL "{{choose('Action', ['articles', 'orders'])}}"``).  The current
+        data flows into the function's first step and the data of its last step
+        flows back out into the next step of the caller — a call, not a jump.
+        ``br()`` inside the function (with no ``.FOR`` of its own to catch it)
+        is an early return, so it cannot break the caller's loop; ``stop()``
+        still aborts the whole pipeline.
+        """
+        if not args:
+            raise ValueError('.CALL requires a function NAME argument')
+        name = self._render_template(args[0], data=_as_rows(data)).strip()
+        block = self._functions.get(name)
+        if block is None:
+            known = ', '.join(repr(n) for n in self._functions) or 'none defined'
+            raise ValueError(
+                f'Unknown pipeline function {name!r}. Known .FN functions: {known}'
+            )
+        if len(self._call_stack) >= MAX_CALL_DEPTH:
+            chain = ' → '.join(self._call_stack + [name])
+            raise ValueError(
+                f'.CALL nested deeper than {MAX_CALL_DEPTH} levels '
+                f'(possible runaway recursion): {chain}'
+            )
+        self._call_stack.append(name)
+        try:
+            return await self._execute_nodes(block.body, data)
+        except _PipelineBreak as brk:
+            # br() reaching the function boundary — an early return.
+            return _as_item_list(brk.data)
+        finally:
+            self._call_stack.pop()
 
 
 # Fail fast at import time if the command table references a handler that does

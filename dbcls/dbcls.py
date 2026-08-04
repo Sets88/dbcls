@@ -20,7 +20,7 @@ import enum
 import visidata
 
 from .clients.base import Result
-from .vd_modules import DataBaseSheet, TablesSheet, SselectSheet
+from .vd_modules import DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
@@ -35,6 +35,12 @@ from .pipeline import HELP_ENTRIES
 
 
 warnings.filterwarnings("ignore")
+
+
+class StaleSheetError(Exception):
+    """Raised when VisiData resurrects a sselect sheet whose pipeline step
+    already returned (via a stale ReturnValue reaching an unrelated
+    vd.run() session, e.g. through gU/gS)."""
 
 
 class DbFn(str, enum.Enum):
@@ -771,11 +777,20 @@ class DbEditor(Editor):
         finally:
             self._fix_curses_after_visidata()
 
-    def run_sselect_sheet(self, title: str, rows: list) -> Optional[list]:
-        """Pipeline sselect(): hand the terminal to VisiData so the user can
-        mark rows; Enter returns the marked row dicts ([] when nothing is
-        marked), q or quitting VisiData returns None (pipeline abort)."""
-        sheet = SselectSheet(str(title) or 'sselect', source=rows)
+    #: Pipeline sheet-handover kind → the VisiData sheet class that implements
+    #: it; they all share run_sheet_prompt's handover and differ only in what
+    #: their Enter/q commands do (see vd_modules.vd_utils).  'view' is the
+    #: odd one out: it only shows rows (.VIEW) and gives no answer back.
+    _PICKER_SHEETS = {
+        'sselect': SselectSheet,
+        'schoose': SchooseSheet,
+        'view': ViewSheet,
+    }
+
+    def _run_picker_sheet(self, sheet) -> Optional[list]:
+        """Hand the terminal to VisiData for a pipeline row picker and return
+        what the sheet raised: the picked rows, or None when the user quit it
+        (q on the last picker sheet, gq/Ctrl+Q)."""
         with self._visidata_session():
             try:
                 visidata.vd.run(sheet)  # returned normally = full quit (gq/Ctrl+Q)
@@ -783,30 +798,50 @@ class DbEditor(Editor):
             except visidata.ReturnValue as e:
                 return e.args[0] if e.args else None
             finally:
-                # Drop every sselect sheet from the stack: a stale one reached
+                # Drop every handover sheet from the stack: a stale one reached
                 # from a later VisiData session (result viewer, Ctrl+Q) would
                 # raise ReturnValue with no handler and crash the app.
                 for vs in [s for s in visidata.vd.sheets
-                           if isinstance(s, SselectSheet)]:
+                           if isinstance(s, tuple(self._PICKER_SHEETS.values()))]:
                     visidata.vd.remove(vs)
+
+    def run_sheet_prompt(self, kind: str, title: str, rows: list) -> Optional[list]:
+        """Show a pipeline row prompt in VisiData (see Editor.run_sheet_prompt).
+
+        Every picker kind is the same handover — only the sheet class differs
+        (:data:`_PICKER_SHEETS`), and each class decides what Enter and q do."""
+        return self._run_picker_sheet(
+            self._PICKER_SHEETS[kind](str(title) or kind, source=rows))
+
+    def _vd_run(self, sheet) -> None:
+        """Run a VisiData mainloop starting at `sheet`, guarding against a
+        stray ReturnValue: a stale sselect sheet (see SselectSheet) can be
+        resurrected into an unrelated session via VisiData's own gU/gS
+        commands, and pressing Enter on it raises ReturnValue (a BaseException,
+        not caught by `except Exception`) with nothing left to catch it, which
+        would otherwise crash the app. Re-raise as a normal Exception so
+        regular error handling (status bar, popups) picks it up instead."""
+        try:
+            visidata.vd.run(sheet)
+        except visidata.ReturnValue:
+            raise StaleSheetError('This pipeline has already finished') from None
 
     def _open_result_in_visidata(self, result) -> None:
         """Open pipeline .SHEET results and/or the query result in VisiData."""
         if self._pipeline_sheets:
-            # .SHEET was used: open each requested sheet (named), plus the
-            # pipeline's final result on top, then hand control to VisiData.
+            # .SHEET was used: its sheets are already on the stack (pushed as
+            # the steps ran, see add_pipeline_sheet) — put the pipeline's final
+            # result on top and hand control to VisiData.
             with self._visidata_session():
-                for name, rows in self._pipeline_sheets:
-                    visidata.vd.push(visidata.PyobjSheet(name, source=rows))
                 if result and result.data:
                     visidata.vd.push(visidata.PyobjSheet('result', source=result.data))
-                visidata.vd.run(visidata.vd.sheets[0])
+                self._vd_run(visidata.vd.sheets[0])
         elif result and result.data:
             with self._visidata_session():
                 visidata.vd.view(result.data)
 
     def _format_query_error(self, exc: Exception) -> str:
-        if isinstance(exc, PipelineStepError) or self.client.is_db_error_exception(exc):
+        if isinstance(exc, (PipelineStepError, StaleSheetError)) or self.client.is_db_error_exception(exc):
             return str(exc)
         return ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
@@ -913,23 +948,35 @@ class DbEditor(Editor):
         """Open VisiData on the given sheet. Override to provide actual behaviour."""
         try:
             with self._visidata_session():
-                visidata.vd.run(visidata.vd.sheets[sheet_index])
+                self._vd_run(visidata.vd.sheets[sheet_index])
         except Exception as exc:
             self.info_popup.open('Error', {'main': str(exc)})
+            self.set_status_notification(str(exc), error=True)
 
     def create_new_sheet(self) -> None:
         """Open a new empty VisiData sheet. Override to provide actual behaviour."""
         try:
             with self._visidata_session():
-                visidata.vd.run(visidata.vd.newSheet('unnamed', 1))
+                self._vd_run(visidata.vd.newSheet('unnamed', 1))
         except Exception as exc:
             self.info_popup.open('Error', {'main': str(exc)})
+            self.set_status_notification(str(exc), error=True)
 
     def add_pipeline_sheet(self, name, rows) -> None:
-        """Pipeline host hook for the .SHEET command: remember a named result set.
-        The actual VisiData sheet is built later, on the UI thread (see _db_query's
-        on_done), since the pipeline runs on the async loop thread."""
-        self._pipeline_sheets.append((name, list(rows)))
+        """Pipeline host hook for the .SHEET command: build the VisiData sheet
+        straight away and put it on the sheet stack, without interrupting the
+        pipeline.
+
+        Only the sheet stack is touched (``load=False`` keeps the rows lazy and
+        starts no loader thread), so this is safe from the async loop thread:
+        nothing is drawn and the pipeline is not blocked.  The sheet exists from
+        that moment on — reachable with Alt+S even while the pipeline is still
+        running, and still there if the run is later cancelled — and the whole
+        stack is handed to VisiData when the pipeline finishes (see
+        _open_result_in_visidata)."""
+        sheet = visidata.PyobjSheet(str(name), source=list(rows))
+        visidata.vd.push(sheet, load=False)
+        self._pipeline_sheets.append(sheet)
 
     def _db_show_vd_sheets(self):
         sheets = self.get_sheets()
@@ -945,15 +992,23 @@ class DbEditor(Editor):
         self.popup.open(items, filter_text='', on_select=on_select, title='Open VisiData sheet')
 
     def _db_show_tables(self):
-        with self._visidata_session():
-            visidata.vd.run(TablesSheet(
-                client=SyncClient(self.asyncloop_thread, self.client),
-                db=getattr(self.client, 'dbname', None),
-            ))
+        try:
+            with self._visidata_session():
+                self._vd_run(TablesSheet(
+                    client=SyncClient(self.asyncloop_thread, self.client),
+                    db=getattr(self.client, 'dbname', None),
+                ))
+        except Exception as exc:
+            self.info_popup.open('Error', {'main': str(exc)})
+            self.set_status_notification(str(exc), error=True)
 
     def _db_show_databases(self):
-        with self._visidata_session():
-            visidata.vd.run(DataBaseSheet(client=SyncClient(self.asyncloop_thread, self.client)))
+        try:
+            with self._visidata_session():
+                self._vd_run(DataBaseSheet(client=SyncClient(self.asyncloop_thread, self.client)))
+        except Exception as exc:
+            self.info_popup.open('Error', {'main': str(exc)})
+            self.set_status_notification(str(exc), error=True)
 
 
 def _cassandra_available() -> bool:

@@ -29,6 +29,12 @@ class PopupItem:
 MAX_UNDO = 200
 TAB_SIZE = 4
 
+#: request_user_input() kinds that are answered in an external viewer rather
+#: than by an editor widget — see Editor.run_sheet_prompt().  'view' (.VIEW)
+#: only shows rows and has no answer to give back; it is handled here because
+#: it needs the very same terminal handover as the row pickers.
+SHEET_PROMPT_KINDS = ('sselect', 'schoose', 'view')
+
 # ─── Key code bitfield ────────────────────────────────────────────────────────
 # Layout (LSB-first):
 #   bit 0  KEY_ESC_BIT    — ESC/Alt prefix was used (e.g. Alt+P)
@@ -2938,7 +2944,7 @@ class Editor:
         self._pipeline_info_live = False
         # Esc on a live info popup asks the pipeline to stop at its next step.
         self._pipeline_stop_requested = False
-        # Pending worker-thread prompt (pipeline select()/mselect()/sselect()/
+        # Pending worker-thread prompt (pipeline choose()/select()/sselect()/
         # input()/ask()); see request_user_input().
         self._ui_request: Optional[dict] = None
         self.renderer = Renderer(stdscr, self.colors, self.buf, self.lexer)
@@ -3098,7 +3104,7 @@ class Editor:
         self._pipeline_info_live = True
         self.request_redraw()
 
-    # ── Worker-thread user prompts (pipeline select()/mselect()/sselect()/input()/ask()) ──
+    # ── Worker-thread user prompts (pipeline choose()/select()/sselect()/input()/ask()) ──
 
     def request_user_input(self, request: dict) -> Any:
         """Show an interactive prompt and block until the user answers.
@@ -3108,19 +3114,21 @@ class Editor:
         widget (SelectPopup / InputBar / y-n status prompt) and resolves the
         request with the user's answer.
 
-        *request* needs ``kind`` (``'select'`` / ``'mselect'`` / ``'sselect'`` /
-        ``'input'`` / ``'ask'`` / ``'warn'``), ``title`` and, for the select
-        kinds, ``options`` (list of strings) — except ``'sselect'``, which
-        takes ``rows`` (list of row dicts) instead.  Optional ``default``
-        pre-fills the prompt: the option label to highlight (select), the
-        labels to pre-mark (mselect) or the initial text (input).  Returns the
-        chosen string (select), the list of marked strings (mselect), the list
-        of marked row dicts (sselect), the typed string (input), a bool (ask),
-        or True once the popup is closed (warn).  Dismissing the prompt with
-        Esc resolves as None (``[]`` for mselect; for sselect, quitting the
-        viewer resolves as None while ``[]`` means "nothing marked") — the
-        caller decides what cancellation means (the pipeline helpers cancel
-        the run: it is aborted and no result is displayed)."""
+        *request* needs ``kind`` and ``title``.  Popup kinds — ``'choose'``
+        (pick one) and ``'select'`` (mark any number) — take ``options`` (list
+        of strings); the viewer kinds in :data:`SHEET_PROMPT_KINDS` take
+        ``rows`` (list of row dicts) instead.  ``'input'`` / ``'ask'`` /
+        ``'warn'`` need only the title.  Optional ``default`` pre-fills the
+        prompt: the option label to highlight (choose), the labels to pre-mark
+        (select) or the initial text (input).
+
+        Returns the chosen string (choose), the list of marked strings
+        (select), the list of picked row dicts (sselect/schoose), the typed
+        string (input), a bool (ask), or True once the popup is closed (warn).
+        An empty list is a real answer ("nothing marked"); dismissing the
+        prompt (Esc, or q in the viewer) always resolves as None — the caller
+        decides what that means (the pipeline helpers abort the run with no
+        result displayed)."""
         if threading.current_thread() is threading.main_thread():
             raise RuntimeError(
                 'request_user_input() must be called from a worker thread '
@@ -3139,9 +3147,9 @@ class Editor:
         """Open the widget for a pending worker-thread prompt (main loop tick)."""
         req['opened'] = True
         kind = req['kind']
-        if kind in ('select', 'mselect'):
+        if kind in ('choose', 'select'):
             items = [PopupItem(insert=o, label=o) for o in req.get('options') or []]
-            self.popup.open(items, title=req['title'], multi=(kind == 'mselect'),
+            self.popup.open(items, title=req['title'], multi=(kind == 'select'),
                             default=req.get('default'))
         elif kind == 'input':
             self.input_bar.open(req['title'], req.get('default') or '')
@@ -3159,24 +3167,30 @@ class Editor:
                 self._resolve_ui_request(None)
             else:
                 self._resolve_ui_request(key in (ord('y'), ord('Y'), 'y', 'Y'))
-        elif kind == 'sselect':
-            # Row picker in an external viewer (VisiData in DbEditor).
-            # Synchronous like 'ask': owns the terminal on the main loop while
-            # the worker waits; None aborts, [] is a valid empty selection.
-            self._resolve_ui_request(
-                self.run_sselect_sheet(req['title'], req.get('rows') or []))
+        elif kind in SHEET_PROMPT_KINDS:
+            # Row prompts shown in an external viewer (VisiData in DbEditor).
+            # Synchronous like 'ask': the viewer owns the terminal on the main
+            # loop while the worker thread waits for the answer.
+            self._resolve_ui_request(self.run_sheet_prompt(
+                kind, req['title'], req.get('rows') or []))
         else:
             self._resolve_ui_request(None)
 
-    def run_sselect_sheet(self, title: str, rows: list) -> Optional[list]:
-        """Open *rows* in an external row picker and return the marked rows
-        ([] when nothing is marked) or None to abort.  The base editor has no
-        viewer — DbEditor overrides this with VisiData."""
+    def run_sheet_prompt(self, kind: str, title: str, rows: list) -> Optional[list]:
+        """Show *rows* in an external viewer and block until the user answers.
+
+        *kind* is one of :data:`SHEET_PROMPT_KINDS`: ``'sselect'`` (mark any
+        number of rows), ``'schoose'`` (pick the row under the cursor) or
+        ``'view'`` (just show the rows).  It returns the picked rows ([] when
+        nothing is marked), or None when the user quit the viewer — which is
+        the only possible outcome of ``'view'``, and the caller ignores it.
+
+        The base editor has no viewer — DbEditor overrides this with VisiData."""
         return None
 
     def _running_popup_to_draw(self) -> Optional['RunningPopup']:
         """The running overlay to draw this frame.  Hidden while a worker-thread
-        prompt (select()/mselect()/input()/warn()) waits for the user, so the
+        prompt (choose()/select()/input()/warn()) waits for the user, so the
         prompt isn't obscured by the spinner box; it reappears once the request
         is resolved (the pipeline keeps running)."""
         if not self.running_popup.active or self._ui_request is not None:
@@ -3195,23 +3209,21 @@ class Editor:
         """Route *key* to the active prompt widget; resolve when it finishes."""
         req = self._ui_request
         kind = req['kind']
-        if kind in ('select', 'mselect'):
+        if kind in ('choose', 'select'):
             action = self.popup.handle_key(key)
             if action == 'insert':
-                if kind == 'mselect':
-                    # Enter confirms the marked items; with nothing marked it
-                    # selects just the highlighted one (single-choice shortcut).
-                    result = self.popup.checked_values()
-                    if not result:
-                        word = self.popup.selected_word()
-                        result = [word] if word is not None else []
-                else:
-                    result = self.popup.selected_word()
+                # Enter confirms: the marked items for the multi-choice
+                # 'select' (an empty list when nothing is marked is a valid
+                # answer), the highlighted one for 'choose'.
+                result = (self.popup.checked_values() if kind == 'select'
+                          else self.popup.selected_word())
                 self.popup.close()
                 self._resolve_ui_request(result)
             elif action == 'cancel':
+                # Esc means "cancelled" for both kinds — distinct from the
+                # empty selection that 'select' can legitimately return.
                 self.popup.close()
-                self._resolve_ui_request([] if kind == 'mselect' else None)
+                self._resolve_ui_request(None)
         elif kind == 'input':
             action = self.input_bar.handle_key(key)
             if action == 'submit':
@@ -3379,7 +3391,7 @@ class Editor:
                 self.lexer.invalidate(self.buf.cursor_row)
                 self._needs_redraw = True
 
-            # A worker thread (pipeline select()/input()/ask()) asked for user
+            # A worker thread (pipeline choose()/input()/ask()) asked for user
             # input — open the matching widget on this tick.  Deferred while a
             # full-screen overlay (lock screen) is up: 'ask'/'sselect' grab the
             # terminal synchronously, bypassing _dispatch_pre_hook.
@@ -3561,7 +3573,7 @@ class Editor:
             return
 
         # Worker-thread prompt mode — checked before the running popup so that
-        # pipeline select()/mselect()/input() prompts receive keys while a
+        # pipeline choose()/select()/input() prompts receive keys while a
         # task is running.
         if self._ui_request is not None and self._ui_request['opened']:
             self._handle_ui_request_key(key)
