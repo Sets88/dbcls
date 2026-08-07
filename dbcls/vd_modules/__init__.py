@@ -8,7 +8,7 @@ from visidata import ENTER
 from . import vd_plotter  # noqa: F401
 from .vd_db_browser import DataBaseSheet, TablesSheet  # re-exported for dbcls.py
 from .vd_utils import SheetWithReference
-from .vd_utils import SselectSheet, SchooseSheet, ViewSheet  # re-exported for dbcls.py
+from .vd_utils import SselectSheet, SchooseSheet, ViewSheet, VarsSheet  # re-exported for dbcls.py
 from .vf_funcs import LiveFormatSheet
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 

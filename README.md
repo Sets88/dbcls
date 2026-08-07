@@ -7,6 +7,7 @@ DbCls is a terminal-based database client that pairs a built-in SQL editor with 
 - Built-in SQL editor with syntax highlighting and customizable keybindings
 - LM-ranked autocomplete for tables, columns, keywords, and functions
 - Direct query execution from the editor, results opened straight in visidata
+- Pipelines — chain queries, Python, loops, functions and user prompts with `|` to automate multi-step work right in the editor
 - Powerful interactive data exploration via visidata (filter, sort, pivot, frequency tables, cross-sheet references)
 - Support for multiple database engines (MySQL, PostgreSQL, ClickHouse, SQLite, Cassandra / ScyllaDB)
 - Unix socket connections with optional auto-SSH tunneling
@@ -406,7 +407,40 @@ Pipeline variables tie the editor and VisiData together: rows saved with `gT` / 
 
 ## Pipelines
 
-Pipelines let you chain SQL queries and data-transformation steps with `|`. Each step receives the output of the previous step as input, so you can filter, extract, iterate, or post-process results without leaving the editor.
+A pipeline is a **mini-program written in the SQL editor instead of a single query**. You type it where you would type SQL and run it with the same key, but instead of one statement it is a chain of steps joined by `|`, each receiving the previous step's output as its input.
+
+The steps are not limited to SQL. Next to `.RUN "…"` there are steps that transform data in Python, filter it with a regex, loop over it, store it in variables, call named sub-routines, sleep, ask the user a question, or open a sheet in VisiData. Together they form a small scripting language whose native data type is a query result — enough to automate the multi-step chores that would otherwise become a throwaway Python script or a long series of hand-copied queries:
+
+- **Feed one query into the next.** Take IDs from one result straight into the `IN (…)` of another — across databases, shards, or a whole list of tables — without copy-pasting values.
+- **Fan out over rows.** `.FOR_RUN` runs a statement once per row of the previous result: the same migration on every matching table, the same check on every shard.
+- **Do batch work.** Copy a table in chunks of 5000 rows, generate and insert data, back-fill a column.
+- **Wait for something.** Poll a jobs table every second, show progress in a popup, stop when it is done.
+- **Ask the user.** Prompt for a value, a table, or a set of rows in the middle of a run and branch on the answer — the pipeline becomes a small tool a colleague can use without knowing the schema.
+- **Build interactive tools.** `.WHILE` + `.CALL` + VisiData sheets make a menu-driven browser: pick rows, drill into related data, come back, repeat.
+- **Keep it.** A pipeline is just text in your `.sql` file, so it can be saved, versioned and re-run like any other query.
+
+### The language in one example
+
+```sql
+-- ask which shards to look at, then collect failed jobs from each of them
+.FOR "select('Shards', ['shard_1', 'shard_2', 'shard_3'])" |   -- prompt once, loop over the answer
+    .RUN? """
+        SELECT '{{_i}}' AS shard, id, error
+        FROM {{_i}}.jobs
+        WHERE status = 'failed'
+    """ |                                                      -- `?`: an unreachable shard is skipped
+    .PY "info(f'{_i}: {len(data)} failed')"                    -- progress popup, rows pass through
+```
+
+Every loop iteration's rows are merged, so the pipeline ends with one result set covering all the chosen shards — opened in VisiData as usual.
+
+### How a pipeline runs
+
+- Steps run left to right; each one gets the previous step's output as `data`.
+- **Data crosses `|` exactly as produced.** A scalar stays a scalar, a nested list keeps its shape, `None` / `0` / `''` pass through. Rows are only wrapped into `{'value': …}` dicts at display points (the final result, `.SHEET`, `.VIEW`, `sselect()`), so only `.RUN` / `.URUN` / `.FOR_RUN` guarantee a list of dicts.
+- Anything in `{{…}}` is Python, evaluated with the current row's columns, `data`, `_vars`, the loop items and all the [helpers](#helpers-in-python-steps-and-templates) in scope.
+- A step that fails aborts the run — unless it is marked as a [soft step](#soft-steps-) with `?`.
+- `Esc` cancels a running pipeline at any point (`q` inside a VisiData prompt sheet).
 
 ### Syntax
 
@@ -414,7 +448,18 @@ Pipelines let you chain SQL queries and data-transformation steps with `|`. Each
 <step1> | <step2> | <step3> ...
 ```
 
-Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-specific commands can appear anywhere in the chain.
+Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step — or the step right after `.VOID`. Pipeline-specific commands can appear anywhere in the chain.
+
+A pipeline may span several lines: keep a trailing `|` on every line except the last, otherwise the statement ends there. Arguments can be quoted with `"…"`, `'…'` or triple quotes `"""…"""` / `'''…'''`; prefer triple quotes for multi-line SQL or Python and for anything containing quotes — their content is taken verbatim (no backslash escaping), and a `|` inside them does not split the pipeline.
+
+```sql
+.RUN """
+    SELECT id, name
+    FROM users
+    WHERE name LIKE 'a%' AND note != 'x|y'
+""" |
+.PY "sorted(data, key=lambda r: r['name'])"
+```
 
 ### Pipeline Commands
 
@@ -434,9 +479,9 @@ Any dot-command (`.TABLES`, `.DATABASES`, …) can be the first step. Pipeline-s
 | `.SET_VAR KEY [code]` | Store data (or the result of `code`) into a named variable. Data passes through unchanged, so `.SET_VAR` can appear mid-pipeline. With no `code` and no input data, deletes `KEY`. |
 | `.GET_VAR KEY` | Inject a stored variable into the pipeline. If input data exists, the variable's rows are appended after it. A missing `KEY` contributes nothing (no error). |
 | `.VOID` | Discard input data. The next step starts fresh with no data (as if it were the first step). |
-| `.VARS` | Show all stored pipeline variables as a `key` / `value` list. |
+| `.VARS` | Open all stored pipeline variables as an **editable** `key` / `value` sheet, then return them as rows. Blocking like `.VIEW`, and it opens even when there are no variables yet; as the last step the rows are not opened a second time. Edits hit the store immediately: `e` renames the key or sets the value (as a string), `z=` / `g=` set the value to the result of a Python expression, `a` adds a variable once its key is filled in, `d` / `gd` delete, `U` undoes. |
 | `.SHEET NAME` | Create a VisiData sheet named `NAME` (a template) from the input rows and pass the data through unchanged. The sheet is built in the background as the step runs — it never blocks the pipeline and it survives a cancelled run; reach it mid-run with VisiData's `Shift+S` from a picker sheet, or with `Alt+S` afterwards. The whole stack opens when the pipeline finishes. |
-| `.VIEW NAME` | Like `.SHEET`, but **blocking**: the sheet is shown immediately and the pipeline waits until it is closed with `q`. Use it inside a `.WHILE` loop or a `.FN` function to see rows at the point they are produced. Closing the sheet is not an answer — it never cancels the pipeline. |
+| `.VIEW NAME` | Like `.SHEET`, but **blocking**: the sheet is shown immediately and the pipeline waits until it is closed with `q`. Use it inside a `.WHILE` loop or a `.FN` function to see rows at the point they are produced. Closing the sheet is not an answer — it never cancels the pipeline. As the last step the rows are not opened a second time. |
 
 ### Comments
 

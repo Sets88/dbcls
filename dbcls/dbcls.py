@@ -20,7 +20,8 @@ import enum
 import visidata
 
 from .clients.base import Result
-from .vd_modules import DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet
+from .vd_modules import (
+    DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet, VarsSheet)
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
@@ -779,12 +780,14 @@ class DbEditor(Editor):
 
     #: Pipeline sheet-handover kind → the VisiData sheet class that implements
     #: it; they all share run_sheet_prompt's handover and differ only in what
-    #: their Enter/q commands do (see vd_modules.vd_utils).  'view' is the
-    #: odd one out: it only shows rows (.VIEW) and gives no answer back.
+    #: their Enter/q commands do (see vd_modules.vd_utils).  'view' and 'vars'
+    #: are the odd ones out: they give no answer back — 'view' only shows rows
+    #: (.VIEW), and 'vars' (.VARS) edits self.vars in place.
     _PICKER_SHEETS = {
         'sselect': SselectSheet,
         'schoose': SchooseSheet,
         'view': ViewSheet,
+        'vars': VarsSheet,
     }
 
     def _run_picker_sheet(self, sheet) -> Optional[list]:
@@ -809,9 +812,13 @@ class DbEditor(Editor):
         """Show a pipeline row prompt in VisiData (see Editor.run_sheet_prompt).
 
         Every picker kind is the same handover — only the sheet class differs
-        (:data:`_PICKER_SHEETS`), and each class decides what Enter and q do."""
+        (:data:`_PICKER_SHEETS`), and each class decides what Enter and q do.
+
+        The editor is handed to the sheet as ``host`` (VisiData assigns unknown
+        kwargs as attributes); only VarsSheet uses it, to write the edited
+        variables straight into self.vars."""
         return self._run_picker_sheet(
-            self._PICKER_SHEETS[kind](str(title) or kind, source=rows))
+            self._PICKER_SHEETS[kind](str(title) or kind, source=rows, host=self))
 
     def _vd_run(self, sheet) -> None:
         """Run a VisiData mainloop starting at `sheet`, guarding against a
@@ -828,17 +835,24 @@ class DbEditor(Editor):
 
     def _open_result_in_visidata(self, result) -> None:
         """Open pipeline .SHEET results and/or the query result in VisiData."""
+        # `shown` marks a result the pipeline already had on screen (.VIEW or
+        # .VARS as the last step): reopening it would just stack an identical
+        # read-only copy on top of the sheet the user has only now closed.
+        has_result = bool(result and result.data and not result.shown)
         if self._pipeline_sheets:
             # .SHEET was used: its sheets are already on the stack (pushed as
             # the steps ran, see add_pipeline_sheet) — put the pipeline's final
             # result on top and hand control to VisiData.
             with self._visidata_session():
-                if result and result.data:
+                if has_result:
                     visidata.vd.push(visidata.PyobjSheet('result', source=result.data))
                 self._vd_run(visidata.vd.sheets[0])
-        elif result and result.data:
+        elif has_result:
             with self._visidata_session():
-                visidata.vd.view(result.data)
+                # not visidata.vd.view(): that calls vd.run() unguarded, and a
+                # stale handover sheet left on the stack (see _vd_run) raises
+                # ReturnValue right through it and kills the app.
+                self._vd_run(visidata.PyobjSheet('result', source=result.data))
 
     def _format_query_error(self, exc: Exception) -> str:
         if isinstance(exc, (PipelineStepError, StaleSheetError)) or self.client.is_db_error_exception(exc):
@@ -905,7 +919,10 @@ class DbEditor(Editor):
                 self.info_popup.open('Error', {'main': message})
             finally:
                 self.set_status_name(self.client.get_title())
-                self.set_status_notification(f'{round(end - start, 2)}s  {message}', error=is_error)
+                # popup=False: the error branch above already opened the popup
+                # with the full text — the bar only carries the short version.
+                self.set_status_notification(
+                    f'{round(end - start, 2)}s  {message}', error=is_error, popup=not is_error)
 
         self.open_running_popup(task, start, on_done)
 
@@ -951,7 +968,7 @@ class DbEditor(Editor):
                 self._vd_run(visidata.vd.sheets[sheet_index])
         except Exception as exc:
             self.info_popup.open('Error', {'main': str(exc)})
-            self.set_status_notification(str(exc), error=True)
+            self.set_status_notification(str(exc), error=True, popup=False)
 
     def create_new_sheet(self) -> None:
         """Open a new empty VisiData sheet. Override to provide actual behaviour."""
@@ -960,7 +977,7 @@ class DbEditor(Editor):
                 self._vd_run(visidata.vd.newSheet('unnamed', 1))
         except Exception as exc:
             self.info_popup.open('Error', {'main': str(exc)})
-            self.set_status_notification(str(exc), error=True)
+            self.set_status_notification(str(exc), error=True, popup=False)
 
     def add_pipeline_sheet(self, name, rows) -> None:
         """Pipeline host hook for the .SHEET command: build the VisiData sheet
@@ -1000,7 +1017,7 @@ class DbEditor(Editor):
                 ))
         except Exception as exc:
             self.info_popup.open('Error', {'main': str(exc)})
-            self.set_status_notification(str(exc), error=True)
+            self.set_status_notification(str(exc), error=True, popup=False)
 
     def _db_show_databases(self):
         try:
@@ -1008,7 +1025,7 @@ class DbEditor(Editor):
                 self._vd_run(DataBaseSheet(client=SyncClient(self.asyncloop_thread, self.client)))
         except Exception as exc:
             self.info_popup.open('Error', {'main': str(exc)})
-            self.set_status_notification(str(exc), error=True)
+            self.set_status_notification(str(exc), error=True, popup=False)
 
 
 def _cassandra_available() -> bool:

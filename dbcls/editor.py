@@ -31,9 +31,10 @@ TAB_SIZE = 4
 
 #: request_user_input() kinds that are answered in an external viewer rather
 #: than by an editor widget — see Editor.run_sheet_prompt().  'view' (.VIEW)
-#: only shows rows and has no answer to give back; it is handled here because
-#: it needs the very same terminal handover as the row pickers.
-SHEET_PROMPT_KINDS = ('sselect', 'schoose', 'view')
+#: only shows rows and has no answer to give back, and 'vars' (.VARS) writes
+#: the edited variables back itself; both are handled here because they need
+#: the very same terminal handover as the row pickers.
+SHEET_PROMPT_KINDS = ('sselect', 'schoose', 'view', 'vars')
 
 # ─── Key code bitfield ────────────────────────────────────────────────────────
 # Layout (LSB-first):
@@ -704,6 +705,9 @@ class TextBuffer:
         self.sel_end: Optional[Tuple[int, int]] = None
         self._dirty = False
         self.version = 0  # bumped on every text modification (cache invalidation key)
+        # Hash of the text as last loaded/saved: undo/redo landing back on it
+        # clears the dirty flag.
+        self._clean_hash: int = hash('')
         self.filepath: Optional[str] = None
         self._file_mtime: Optional[float] = None
         self._undo_stack: List[Snapshot] = []
@@ -745,6 +749,7 @@ class TextBuffer:
         self.sel_start = self.sel_end = None
         self.dirty = False
         self.version += 1  # text changed even though dirty is reset
+        self._clean_hash = self._content_hash()
         self.filepath = filepath
         self.marked_lines.clear()
         self._undo_stack.clear()
@@ -769,10 +774,14 @@ class TextBuffer:
         with open(self.filepath, 'w', encoding='utf-8') as f:
             f.write('\n'.join(self.lines))
         self.dirty = False
+        self._clean_hash = self._content_hash()
         self._file_mtime = os.path.getmtime(self.filepath)
         return True
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
+    def _content_hash(self) -> int:
+        return hash('\n'.join(self.lines))
+
     def _make_snapshot(self) -> Snapshot:
         return Snapshot(
             lines=self.lines[:],
@@ -788,7 +797,12 @@ class TextBuffer:
         self.cursor_col = snap.cursor_col
         self.sel_start = snap.sel_start
         self.sel_end = snap.sel_end
-        self.dirty = True
+        if self._content_hash() == self._clean_hash:
+            # Undo/redo walked back onto the on-disk text: nothing to save.
+            self.dirty = False
+            self.version += 1  # text changed even though dirty is reset
+        else:
+            self.dirty = True
 
     def _push_undo(self, action_tag: str):
         now = time.monotonic()
@@ -3053,18 +3067,29 @@ class Editor:
         self.renderer.status_name = name
         self.request_redraw()
 
-    def set_status_notification(self, text: str, error: bool = False) -> None:
+    @staticmethod
+    def _fit_status_text(text: str, width: int) -> str:
+        """Squeeze *text* into a single status bar line of *width* columns."""
+        line = text.split('\n', 1)[0]
+        limit = max(width - 3, 1)
+        return line if len(line) <= limit else line[:limit - 1] + '…'
+
+    def set_status_notification(self, text: str, error: bool = False, popup: bool = True) -> None:
         """Show a transient message in the status bar, in the error (red) color
         if *error* is set.
-        If the message is wider than the terminal, show it in a popup instead.
+        A message that does not fit on one line is additionally shown in a popup
+        (unless *popup* is False, for callers that opened their own), while the
+        bar keeps a truncated one-line version — the error color has to be
+        visible even when the full text lives in the popup.
         The message is replaced by the normal status bar after the next keypress."""
         W = self.stdscr.getmaxyx()[1]
         if len(text) + 2 > W or '\n' in text:
-            self.info_popup.open('Info', {'main': text})
-        else:
-            self._status_notification = text
-            self.renderer.status_notification = text
-            self.renderer.status_notification_error = error
+            if popup:
+                self.info_popup.open('Error' if error else 'Info', {'main': text})
+            text = self._fit_status_text(text, W)
+        self._status_notification = text
+        self.renderer.status_notification = text
+        self.renderer.status_notification_error = error
         self.request_redraw()
 
     def set_words(self, keywords=None, types=None, functions=None) -> None:
@@ -3542,7 +3567,10 @@ class Editor:
             self.stdscr.timeout(1000)
             return
 
-        if self._status_notification is not None:
+        # An active info popup swallows this key (it is the key that closes it),
+        # so it must not also wipe the notification underneath — otherwise the
+        # error message/color is gone before it was ever seen.
+        if self._status_notification is not None and not self.info_popup.active:
             self._status_notification = None
             self.renderer.status_notification = None
             self.renderer.status_notification_error = False
@@ -4100,17 +4128,26 @@ class Editor:
                 return key
 
     def _confirm_file_change(self):
-        """Prompt user when the file was modified externally."""
-        key = self._read_answer('File changed on disk. (r)eload / (w)rite / other=dismiss: ')
-        if key in (ord('r'), ord('R'), 'r', 'R'):
-            self.buf.load(self.buf.filepath)
-            self.lexer.invalidate(0)
-            self._file_change_dismissed = False
-        elif key in (ord('w'), ord('W'), 'w', 'W'):
-            self.buf.save()
-            self._file_change_dismissed = False
-        else:
-            self._file_change_dismissed = True
+        """Prompt user when the file was modified externally.  Unlike the other
+        status-bar questions this one loops until a real answer is given: it can
+        pop up in the middle of typing, and a stray keystroke must not dismiss
+        it."""
+        write = '' if self.buf.readonly else ' / (w)rite'
+        message = f'File changed on disk. (r)eload{write} / Esc=dismiss: '
+        while True:
+            key = self._read_answer(message)
+            if key in (ord('r'), ord('R'), 'r', 'R'):
+                self.buf.load(self.buf.filepath)
+                self.lexer.invalidate(0)
+                self._file_change_dismissed = False
+                return
+            if key in (ord('w'), ord('W'), 'w', 'W') and not self.buf.readonly:
+                self.buf.save()
+                self._file_change_dismissed = False
+                return
+            if key == 27:
+                self._file_change_dismissed = True
+                return
 
     def _confirm_3way(self, message: str) -> str:
         """Show a y/n/c question; return 'yes', 'no', or 'cancel' on first keypress."""

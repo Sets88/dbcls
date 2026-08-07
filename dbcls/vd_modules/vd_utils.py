@@ -77,6 +77,110 @@ Pick one row to hand back to the schoose() pipeline step.
         raise ReturnValue([self.cursorRow])
 
 
+# ── .VARS: the pipeline variables as an editable sheet ────────────────────────
+# The three functions below hold the whole write-back rule set.  They touch
+# nothing but the plain dict they are given (no vd calls), so the sheet layer
+# stays a thin wrapper and the rules can be tested without VisiData.
+
+def store_var(variables: dict, key, value) -> None:
+    """Set *key* to *value* in the pipeline variables."""
+    variables[key] = value
+
+
+def drop_var(variables: dict, key):
+    """Remove *key* from the pipeline variables and return its old value
+    (which the caller registers as the undo)."""
+    return variables.pop(key, None)
+
+
+def rename_var(variables: dict, old, new, value) -> None:
+    """Rename variable *old* to *new*, keeping *value*.
+
+    *old* is empty for a row added with `a` that has no key yet — then this is
+    simply the creation of *new*.  Renaming onto an existing name is refused
+    rather than silently overwriting the other variable.
+    """
+    if not new:
+        raise ValueError('variable name cannot be empty; press d to delete the variable')
+    if new == old:
+        return
+    if new in variables:
+        raise ValueError(f'variable {new} already exists')
+    if old:
+        variables.pop(old, None)
+    variables[new] = value
+
+
+class VarKeyColumn(ColumnItem):
+    """The `key` column of VarsSheet: setting it renames the variable.
+
+    At putValue time the row still carries the *old* key, so no separate
+    bookkeeping of the committed name is needed."""
+
+    def putValue(self, row, value):
+        new = '' if value is None else str(value).strip()
+        try:
+            rename_var(self.sheet.host.vars, row.get('key'), new, row.get('value'))
+        except ValueError as exc:
+            vd.fail(str(exc))
+        super().putValue(row, new)
+
+
+class VarValueColumn(ColumnItem):
+    """The `value` column of VarsSheet: setting it updates the variable.
+
+    `e` stores what was typed (a string); `z=` / `g=` store the result of a
+    Python expression, so lists/dicts/numbers are set with those."""
+
+    def putValue(self, row, value):
+        super().putValue(row, value)
+        key = row.get('key')
+        if key:
+            store_var(self.sheet.host.vars, key, value)
+        else:
+            vd.status('row has no key yet: set the key to store the variable')
+
+
+class VarsSheet(ViewSheet):
+    """Pipeline .VARS sheet: the shared pipeline variables as editable
+    key/value rows.  Every edit is applied to the variables immediately (there
+    is nothing to commit), and q hands control back to the pipeline the same
+    way .VIEW does."""
+    guide = '''# Pipeline variables
+Edits are applied to the pipeline variables immediately.
+
+- `e` to set the key / value (the value is stored as a string).
+- `z=` / `g=` to set the value to the result of a Python expression (number, list, dict).
+- `a` to add a row; the variable is created as soon as the key is filled in.
+- `d` / `gd` to delete the variable.
+- `U` to undo the last change.
+- `q` to close the sheet and let the pipeline continue.
+'''
+    rowtype = 'variables'
+    #: the DbEditor owning the variables, passed in by run_sheet_prompt
+    host = None
+    columns = [VarKeyColumn('key'), VarValueColumn('value')]
+
+    def reload(self):
+        # deliberately not ListOfDictSheet.reload: that one resets the columns
+        # and derives them from the rows, which leaves an empty VARS with no
+        # columns at all and `a` (add-row) nowhere to put values.
+        self.rows = list(self.source)
+
+    def newRow(self):
+        return {'key': '', 'value': None}
+
+    def commitDeleteRow(self, row):
+        # The sheet is not deferred, so both d (delete_row) and gd
+        # (deleteSelected -> deleteBy) drop the row through here.
+        key = row.get('key')
+        if not key or key not in self.host.vars:
+            return
+        old = drop_var(self.host.vars, key)
+        # the stock undo only puts the row back into sheet.rows
+        vd.addUndo(store_var, self.host.vars, key, old)
+
+
 @VisiData.api
 class ExpandVert(TableSheet):
     guide = '''# Vertical expansion

@@ -112,7 +112,9 @@ Pipeline commands
     the first step in the pipeline).
 
 .VARS
-    Return all stored pipeline variables as a list of {key, value} dicts.
+    Open all stored pipeline variables as an editable {key, value} sheet
+    (blocking, like .VIEW; it opens even when there are none yet), then
+    return them as a list of {key, value} dicts.
 
 .SHEET NAME
     Create a VisiData sheet named NAME (a template) from the input rows and
@@ -124,6 +126,7 @@ Pipeline commands
     pipeline waits until it is closed with q.  Use it inside a .WHILE loop
     or a .FN function to look at rows at the point they are produced.
     Closing the sheet is not an answer — it never cancels the pipeline.
+    As the last step the rows are not opened a second time.
 
 Template placeholders
 ---------------------
@@ -826,9 +829,21 @@ Example:
 """)
 
 HELP_VARS = _help_entry('vars', """
-Show all pipeline variables stored with .SET_VAR.
-Returns a list of dicts with `key` and `value` columns.
-Can be used as a standalone command or as the last step in a pipeline.
+Open all pipeline variables (the store shared with .SET_VAR / set_var()) as an
+editable `key` / `value` sheet.  Like .VIEW it blocks until the sheet is closed
+with `q`, so the edits are already in effect for the steps after it, and it
+opens even when there are no variables yet — the place to add the first one.
+
+Every edit is applied to the store immediately:
+- `e` sets the key (renaming the variable) or the value (as a string).
+- `z=` / `g=` set the value to the result of a Python expression, e.g. `[1, 2]`.
+- `a` adds a row; the variable appears as soon as its key is filled in.
+- `d` / `gd` delete the variable, `U` undoes the last change.
+
+Returns a list of dicts with `key` and `value` columns, rebuilt after the sheet
+is closed.  Can be used as a standalone command, in the middle of a pipeline or
+as its last step — as the last step the rows are not opened a second time, the
+sheet you have just closed was them.
 
 Examples:
 ```
@@ -874,6 +889,9 @@ Use it wherever the rows must be seen at the point they are produced —
 typically inside a `.WHILE` browser loop or a `.FN` function. Closing the
 sheet is not an answer, so unlike a dismissed `sselect()` it never cancels the
 pipeline. NAME is a template.
+
+As the last step the rows are not opened a second time: the sheet you have just
+closed was them.
 
 Example:
 ```
@@ -1293,6 +1311,11 @@ def _option_pairs(options: Any) -> 'tuple[List[str], List[Any]]':
 #: client's own command handling (``.TABLES`` …); an unknown command that
 #: receives real rows (even ``[]``) is an error.
 NO_DATA: Any = object()
+
+#: Sentinel for "no step has shown its output on screen yet" — see
+#: ``PipelineExecutor._shown_data``.  Distinct from ``None`` and ``NO_DATA``,
+#: both of which are values a step may legitimately have shown.
+NOTHING_SHOWN: Any = object()
 
 
 def _as_rows(data: Any) -> Any:
@@ -1845,6 +1868,10 @@ class PipelineExecutor:
         # Names of the .FN blocks currently executing (innermost last), used to
         # bound recursion — see MAX_CALL_DEPTH.
         self._call_stack: List[str] = []
+        # The value a blocking display step (.VIEW, .VARS) has just put on
+        # screen.  If the pipeline ends up returning that very object, the host
+        # is told not to open a second sheet showing the same rows again.
+        self._shown_data: Any = NOTHING_SHOWN
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -1855,6 +1882,7 @@ class PipelineExecutor:
 
         self._loop_stack = []
         self._call_stack = []
+        self._shown_data = NOTHING_SHOWN
         self.host.reset_pipeline_info()
 
         nodes = parse_pipeline(sql)
@@ -1867,10 +1895,14 @@ class PipelineExecutor:
             # stop() aborted the pipeline; its captured data is the final result.
             data = st.data if st.data is not None else NO_DATA
 
+        # Identity, not equality: the result is worth showing again unless it is
+        # the very object the last step executed had on screen (see _mark_shown).
+        shown = data is self._shown_data
+
         # The only normalisation point: rows are shaped into dicts for display,
         # having flowed between steps unchanged.
         rows = [] if data is NO_DATA else normalize_to_dicts(data)
-        return Result(data=rows, rowcount=len(rows))
+        return Result(data=rows, rowcount=len(rows), shown=shown)
 
     # ── AST execution (walks PipelineStep / ForBlock / WhileBlock / FnBlock) ────
 
@@ -2042,6 +2074,10 @@ class PipelineExecutor:
     # ── Step dispatcher ───────────────────────────────────────────────────────
 
     async def _execute_step(self, step: PipelineStep, data: Any) -> Any:
+        # Only a display step that is still the last one executed may claim its
+        # output is on screen; every other step invalidates the claim before it
+        # runs (see _mark_shown).  Steps nested in .CALL/.FOR set it themselves.
+        self._shown_data = NOTHING_SHOWN
         handler_name = _COMMAND_HANDLERS.get(step.command)
         if handler_name is not None:
             self._current_soft = step.soft
@@ -2481,9 +2517,48 @@ class PipelineExecutor:
             self.host.vars.pop(key, None)
         return data
 
-    async def _cmd_vars(self, args: List[str], data: Optional[list]) -> List[dict]:
-        """Return the current variables as a list of dicts with 'key' and 'value'."""
+    def _var_rows(self) -> List[dict]:
+        """The variables as display rows, in insertion order."""
         return [{'key': k, 'value': v} for k, v in self.host.vars.items()]
+
+    def _show_blocking_sheet(self, kind: str, title: str, rows: list) -> None:
+        """Show *rows* on a blocking VisiData sheet and wait for it to close.
+
+        Shared by the display steps that own the screen while they run
+        (``.VIEW``, ``.VARS``); it uses the same handover as the
+        ``sselect()`` / ``schoose()`` prompts, so it works in the middle of a
+        run.  Closing the sheet is not an answer, so (unlike a dismissed
+        prompt) it never cancels the pipeline."""
+        self.host.request_user_input({'kind': kind, 'title': title, 'rows': rows})
+
+    def _mark_shown(self, data: Any) -> Any:
+        """Record *data* as the value a display step has just had on screen and
+        return it unchanged.
+
+        A pipeline that *ends* on such a step returns the very object that was
+        displayed; ``execute`` then flags the ``Result`` so the host does not
+        stack a second, identical sheet on top of the one just closed.
+
+        Two conditions guard it, because either alone is too loose: any later
+        step clears the mark (``_execute_step``), and the returned value must
+        still be the displayed object — a loop accumulating its iterations
+        marks the last one but hands back a different list."""
+        self._shown_data = data
+        return data
+
+    async def _cmd_vars(self, args: List[str], data: Optional[list]) -> List[dict]:
+        """Open the variables as an *editable* ``key``/``value`` sheet and return
+        them as a list of dicts.
+
+        It blocks like ``.VIEW`` (same handover), so the sheet is on screen at
+        the point the step runs and the edits are visible to the steps after it.
+        The sheet edits the variables in place — renaming a key renames the
+        variable, ``a`` adds one, ``d`` deletes one — so the rows are rebuilt
+        from the store once it is closed.  The sheet opens even when there are
+        no variables yet, as the place to add the first one."""
+        self._show_blocking_sheet('vars', 'vars', self._var_rows())
+        # rebuilt: the sheet may have added, renamed or dropped variables
+        return self._mark_shown(self._var_rows())
 
     async def _cmd_get_var(
         self, args: List[str], data: Optional[list]
@@ -2527,20 +2602,18 @@ class PipelineExecutor:
         template) and *block* until the user closes it with ``q``, then pass the
         data through unchanged.
 
-        The blocking counterpart of ``.SHEET``: it uses the same handover as the
-        ``sselect()`` / ``schoose()`` prompts, so it works in the middle of a
-        run — inside a ``.WHILE`` loop or a ``.FN`` function the rows are on
-        screen at the point they are produced, not only when the pipeline ends.
-        Closing the sheet is not an answer, so (unlike a dismissed prompt) it
-        never cancels the pipeline."""
+        The blocking counterpart of ``.SHEET``: inside a ``.WHILE`` loop or a
+        ``.FN`` function the rows are on screen at the point they are produced,
+        not only when the pipeline ends."""
         if not args:
             raise ValueError('.VIEW requires a NAME argument')
         name = self._render_template(args[0], data=data)
         # A display point — shape rows into dicts for VisiData; the pipeline
         # itself continues with the raw data.
-        self.host.request_user_input(
-            {'kind': 'view', 'title': name, 'rows': normalize_to_dicts(data)})
-        return data
+        self._show_blocking_sheet('view', name, normalize_to_dicts(data))
+        # the data itself, not the shaped copy: that is what a following step
+        # would pass on and what the final result would be normalised from
+        return self._mark_shown(data)
 
     async def _cmd_call(self, args: List[str], data: Any) -> Any:
         """Run the ``.FN`` block named by ``args[0]`` and return its output.

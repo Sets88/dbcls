@@ -23,6 +23,10 @@ class Result:
     # Used only for Cassandra server-side paging; False for all other engines
     has_more: bool = False
     message: str = ''
+    # Set by the pipeline when `data` is exactly what its last step already put
+    # on screen (.VIEW, .VARS), so the caller does not open a second, identical
+    # sheet on top of the one the user has just closed.
+    shown: bool = False
 
     def __str__(self) -> str:
         if self.message:
