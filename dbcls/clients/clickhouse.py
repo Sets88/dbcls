@@ -16,7 +16,9 @@ logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 class ClickhouseClient(ClientClass):
     ENGINE = 'Clickhouse'
 
-    SQL_COMMANDS = ['TABLES', 'DATABASES', 'USE', 'SHOW', 'CLUSTERS']
+    SUPPORTS_COMPRESSION = True
+
+    SQL_COMMANDS =['TABLES', 'DATABASES', 'USE', 'SHOW', 'CLUSTERS']
 
     SQL_FUNCTIONS = [
         'today', 'yesterday', 'toStartOfDay', 'toStartOfMonth', 'toStartOfQuarter', 'toStartOfYear',
@@ -85,6 +87,14 @@ class ClickhouseClient(ClientClass):
             database=self.dbname,
             compress=self.compress
         )
+
+    def toggle_compression(self) -> bool:
+        """Switch connection compression on/off and return the new state.
+        Compression is fixed per connection — drop it so the next query
+        reconnects with the new setting."""
+        self.compress = not self.compress
+        self.connection = None
+        return self.compress
 
     async def change_database(self, database: str):
         # The database is fixed per connection — reconnect with the new one.

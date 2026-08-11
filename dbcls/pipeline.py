@@ -209,7 +209,8 @@ sselect(title, rows)
 input(title, default=None)
             ask the user to type a line of text; returns the string.  default
             pre-fills the input line.
-ask(title)  ask a yes/no question; returns True on 'y', else False.
+ask(title)  ask a yes/no question; y/Enter returns True, n returns False.
+            Any other key is ignored and the question keeps waiting.
 
 Dismissing any of these prompts with Esc (q for sselect, since Esc is a
 regular key inside VisiData) aborts the pipeline without a result — unlike
@@ -725,11 +726,19 @@ result(choose('Pick a table', data))
 .RUN "SELECT * FROM t" | .PY "result(sselect('Pick rows', data))"
 ```
 
-`input(title, default=None)`
+`input(title, default=None, items=None)`
   asks the user to type a line of text in the bar at the bottom; returns the
   entered string. `default` pre-fills the line (the user can edit or clear
-  it), e.g. `input('Your age', default=18)`. `Esc` cancels the pipeline — no
-  result is shown.
+  it), e.g. `input('Your age', default=18)`. `↑`/`↓` walk what was entered at
+  the same title before and list the matches in a popup above the bar — each
+  title keeps its own history (up to 500 lines, for as long as dbcls runs).
+  What is typed filters that list, live: only entries containing every
+  space-separated part are offered, e.g. `te st` matches `my test string`.
+  `items` offers values the user never typed — a list of strings or rows of a
+  previous step (the first column is taken) — as entries older than the ones
+  actually entered at this title; they stay in the history afterwards. `Esc`
+  closes the list, and cancels the pipeline when no list is up — no result is
+  shown.
 
   Example:
 ```
@@ -737,9 +746,15 @@ result(choose('Pick a table', data))
 .RUN "SELECT * FROM customers WHERE id = '{{_0}}'"
 ```
 
+```
+.RUN "SELECT path FROM files" |
+.PY "result([input('path', items=data)])"
+```
+
 `ask(title)`
-  asks a yes/no question in the status bar; returns True on `y`, False on any
-  other key. `Esc` cancels the pipeline — no result is shown.
+  asks a yes/no question in the status bar; `y` or `Enter` returns True, `n`
+  returns False. `Esc` cancels the pipeline — no result is shown. Any other
+  key is ignored: the question stays up until one of these is pressed.
 
   Example:
 ```
@@ -2387,23 +2402,32 @@ class PipelineExecutor:
         raw_by_id = {id(shown): item for shown, item in zip(shaped, raw)}
         return [raw_by_id.get(id(row), row) for row in selected]
 
-    def _user_input(self, title: Any, default: Any = None) -> str:
+    def _user_input(self, title: Any, default: Any = None,
+                    items: Any = None) -> str:
         """Ask the user to type a line of text; return the entered string.
-        *default* pre-fills the input line (the user can edit or clear it).
-        Esc aborts the pipeline without a result.  Exposed as ``input()``
-        (shadows the builtin, which cannot work under curses anyway)."""
+        *default* pre-fills the input line (the user can edit or clear it);
+        the arrow keys recall earlier answers to the same *title*, filtered by
+        what is typed (the bar keeps a per-title history for the app's
+        lifetime and lists the matches in a popup).  *items* offers values the
+        user never typed — rows of a previous step, or plain strings — as
+        entries older than the ones actually entered at this title.
+        Esc closes that list; with no list up it aborts the pipeline without a
+        result.  Exposed as ``input()`` (shadows the builtin, which cannot work
+        under curses anyway)."""
         request = {'kind': 'input', 'title': str(title)}
         if default is not None:
             request['default'] = str(default)
+        if (offered := _option_pairs(items)[0]):
+            request['items'] = offered
         text = self.host.request_user_input(request)
         if text is None:
             self._cancel()
         return text
 
     def _user_ask(self, title: Any) -> bool:
-        """Ask a yes/no question; return ``True`` on 'y', ``False`` on any
-        other key.  Esc aborts the pipeline without a result.  Exposed as
-        ``ask()``."""
+        """Ask a yes/no question; return ``True`` on 'y'/Enter, ``False`` on
+        'n'.  Esc aborts the pipeline without a result; any other key is
+        ignored and the question keeps waiting.  Exposed as ``ask()``."""
         answer = self.host.request_user_input(
             {'kind': 'ask', 'title': str(title)})
         if answer is None:

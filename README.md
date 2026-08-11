@@ -70,7 +70,7 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-P, --port` | Port number (optional) |
 | `-S, --unix-socket` | Path to Unix socket file (optional, overrides host/port) |
 | `-c, --config` | Path to configuration file |
-| `--no-compress` | Disable compression for ClickHouse connections |
+| `--no-compress` | Disable compression for ClickHouse connections (can also be switched at runtime via the `Toggle connection compression` command in the command palette) |
 | `--key-remap` | Remap key codes, e.g. `"36:1412,1412:36"` to swap Tab and Shift+Tab |
 | `--fold` | Start with `>>>` ... `<<<` block folding enabled (see [Fold Blocks](#fold-blocks)) |
 | `-R, --readonly` | Open the editor in read-only mode: the document cannot be modified or saved (`[RO]` is shown next to the file name). Also `DBCLS_READONLY=1` or `"readonly": true` in the config file |
@@ -573,8 +573,8 @@ The four row prompts come as two pairs — `choose`/`select` as a popup over the
 | `select(title, options, default=None)` | Multi-choice variant of `choose()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms. Returns the list of marked options' values — `[]` when nothing is marked, which is a normal answer the pipeline continues with. `(label, value)` pairs work as in `choose()`. `default` is a list of option values to pre-mark, e.g. `select('Params', [1, 2, 3, 4], default=[1, 2])`. |
 | `schoose(title, rows)` | Open `rows` (e.g. `data`; non-dict rows are shown as a `value` column, the answer holds the original items) in VisiData. `Enter` picks the row under the cursor (VisiData's selection is ignored) and returns *that item itself*, not a list — so it can be compared to a value directly. `q` or quitting VisiData cancels the pipeline. |
 | `sselect(title, rows)` | Multi-row variant of `schoose()`: mark rows with VisiData's selection (`s`/`t`/`gs`...); `Enter` confirms and returns only the marked rows (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
-| `input(title, default=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. |
-| `ask(title)` | Ask a yes/no question in the status bar; returns `True` on `y`, `False` on any other key. |
+| `input(title, default=None, items=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. `↑`/`↓` walk what was entered at the same `title` earlier and list the matches in a popup above the bar — every title keeps its own history (up to 500 lines, for as long as dbcls runs). Whatever is typed filters that list live, the way the autocomplete popup filters: only the entries containing every space-separated part are offered, e.g. `te st` matches `my test string`. `items` adds values the user never typed (strings, or rows of a previous step — the first column) as older entries, e.g. `input('path', items=data)`. `Esc` closes the list first and cancels the pipeline only when no list is up. |
+| `ask(title)` | Ask a yes/no question in the status bar; `y`/`Enter` return `True`, `n` returns `False`, `Esc` cancels the pipeline. Any other key is ignored and the question keeps waiting. |
 
 Dismissing any of these prompts with `Esc` (`q` for the VisiData sheets, since `Esc` is a regular key inside VisiData) cancels the pipeline: unlike `stop()`, no result is displayed — only a `Cancelled` notification in the status bar. An empty selection is *not* a dismissal: `select()` / `sselect()` return `[]` and the pipeline keeps running.
 

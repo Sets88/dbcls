@@ -51,6 +51,7 @@ class DbFn(str, enum.Enum):
     SHOW_DATABASES  = 'show_databases'
     SHOW_PREDICTION = 'show_prediction'
     SHOW_VD_SHEETS  = 'show_vd_sheets'
+    TOGGLE_COMPRESSION = 'toggle_compression'
 
 
 logging.basicConfig(level=logging.ERROR)
@@ -283,6 +284,9 @@ DB_HELP_DATABASE = """\
       Open files within the current directory
   `Alt+P`
       Open command palette
+  `Toggle connection compression` (command palette only)
+      ClickHouse only: switch compression on/off (as `--no-compress`),
+      applied when the connection is re-established by the next query
   `Esc`
       Cancel running query"""
 
@@ -661,6 +665,11 @@ class DbEditor(Editor):
             self.set_status_name(self.client.get_title())
             self.set_words(keywords=self.client.all_commands, functions=self.client.all_functions)
 
+            if self.client.SUPPORTS_COMPRESSION:
+                self.add_editor_function(
+                    DbFn.TOGGLE_COMPRESSION, self._db_toggle_compression,
+                    'Toggle connection compression')
+
     def apply_keys_remap(self, remap_str: str):
         if not remap_str:
             return
@@ -676,6 +685,11 @@ class DbEditor(Editor):
         # Enter runs the query in read-only mode (no editing to do instead);
         # otherwise it must fall back to inserting a newline.
         self.add_keybinding(DbFn.RUN_QUERY if self.buf.readonly else Fn.NEWLINE, K(ord('\n')))
+
+    def _db_toggle_compression(self):
+        enabled = self.client.toggle_compression()
+        self.set_status_notification(
+            'Connection compression %s (applied on next query)' % ('enabled' if enabled else 'disabled'))
 
     # ── Screen lock ───────────────────────────────────────────────────────────
 

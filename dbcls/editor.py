@@ -1389,9 +1389,154 @@ class LineInputBar:
         return False
 
 
+class InputHistory:
+    """Previously entered lines, kept per prompt title for the app's lifetime.
+
+    Each title gets its own bucket, so ``input('path')`` never shows what was
+    typed at ``input('test')``.  Buckets are an LRU (the least recently used
+    title is dropped first — dicts keep insertion order, so re-inserting a
+    bucket moves it to the young end) and each keeps the newest entries last.
+    Nothing is written to disk: the history lives only as long as the process."""
+
+    MAX_ENTRIES = 500   # remembered lines per title
+    MAX_TITLES = 500    # remembered titles
+
+    def __init__(self):
+        self._buckets: dict = {}
+
+    def entries(self, title: str) -> List[str]:
+        """The lines entered for *title*, oldest first.  The returned list is
+        the live bucket — read it, don't mutate it."""
+        if title not in self._buckets:
+            return []
+        bucket = self._buckets.pop(title)   # re-insert: youngest in the LRU
+        self._buckets[title] = bucket
+        return bucket
+
+    def add(self, title: str, text: str) -> None:
+        """Record *text* as the newest entry for *title* (empty text is
+        ignored; an entry typed again moves to the end instead of piling up)."""
+        if not text:
+            return
+        bucket = self._buckets.pop(title, [])
+        if text in bucket:
+            bucket.remove(text)
+        bucket.append(text)
+        self._store(title, bucket)
+
+    def extend(self, title: str, texts) -> None:
+        """Offer *texts* at *title* as entries older than everything already
+        recorded there, keeping their own order.  What the user actually typed
+        stays the freshest, and entries already known keep their place."""
+        known = set(self._buckets.get(title, ()))
+        older = []
+        for text in texts:
+            text = str(text)
+            if text and text not in known:
+                known.add(text)
+                older.append(text)
+        if not older:
+            return
+        self._store(title, older + self._buckets.pop(title, []))
+
+    def _store(self, title: str, bucket: List[str]) -> None:
+        """Put *bucket* back as the youngest in the LRU, trimmed to the caps."""
+        del bucket[:-self.MAX_ENTRIES]
+        self._buckets.pop(title, None)
+        self._buckets[title] = bucket
+        while len(self._buckets) > self.MAX_TITLES:
+            del self._buckets[next(iter(self._buckets))]
+
+
 class InputBar(LineInputBar):
     """Free-text prompt bar (drawn in place of the filename bar).
-    Enter submits the typed text, Esc cancels."""
+    Enter submits the typed text, Esc cancels.
+
+    ↑ walks the history of what was entered at this prompt title before (see
+    :class:`InputHistory`) and opens :attr:`history_popup` — a SelectPopup
+    listing the matches, drawn just above the bar.  What is typed acts as the
+    popup's filter, so it narrows both the list and the walk to the entries
+    containing every space-separated part of it; ↓ past the newest entry brings
+    that typed text back.  Esc closes the list first and only cancels the
+    prompt once it is gone."""
+
+    #: keys that walk the history instead of editing the line
+    HISTORY_KEYS = (K(curses.KEY_UP), K(curses.KEY_DOWN),
+                    K(curses.KEY_PPAGE), K(curses.KEY_NPAGE))
+
+    def __init__(self):
+        super().__init__()
+        self.history = InputHistory()
+        self.history_popup = SelectPopup()
+        self._draft = ''      # the typed line — also the popup's filter
+        self._picked = False  # the line currently holds an entry off the list
+
+    def open(self, prompt: str = '', text: str = '', items=()):
+        """*items* are merged into the prompt's history bucket as older
+        entries, so the caller can offer values the user never typed."""
+        if items:
+            self.history.extend(prompt, items)
+        super().open(prompt, text)
+        self.history_popup.close()
+        self._draft = text
+        self._picked = False
+
+    def close(self):
+        super().close()
+        self.history_popup.close()
+        self._picked = False
+
+    def _set_text(self, text: str) -> None:
+        self.query = text
+        self.cursor = len(text)
+
+    def _fill_history(self) -> bool:
+        """(Re)fill the history popup, filtered by the typed line and with the
+        newest match highlighted; False when nothing matches (the popup is left
+        open — the caller decides whether it should be up at all).  The oldest
+        entry goes on top, so the newest sits closest to the bar."""
+        items = [PopupItem(insert=entry, label=entry, weight=i)
+                 for i, entry in enumerate(self.history.entries(self.prompt))]
+        self.history_popup.open(items, filter_text=self._draft, title='History')
+        if not self.history_popup.filtered:
+            return False
+        self.history_popup._nav_end()
+        return True
+
+    def _text_edited(self) -> None:
+        """The line was just edited: it is the user's own text again, and the
+        popup's filter.  An open list stays up — narrowed, possibly to nothing
+        until the text is cut back; a closed one is not opened by typing."""
+        self._draft = self.query
+        self._picked = False
+        if self.history_popup.active:
+            self._fill_history()
+
+    def _history_nav(self, key) -> None:
+        """Walk the history popup: ↑ opens it (or takes the highlighted entry
+        when it is already up), ↓ past the newest entry puts the typed line
+        back without closing the list."""
+        popup = self.history_popup
+        older = key in (K(curses.KEY_UP), K(curses.KEY_PPAGE))
+        if not popup.active:
+            if not older:
+                return
+            if not self._fill_history():   # nothing to show — stay closed
+                popup.close()
+                return
+        elif not self._picked:
+            if not older:
+                return          # on the typed line already, nothing newer
+        elif not older and popup.selected_idx >= len(popup.filtered) - 1:
+            self._picked = False
+            self._set_text(self._draft)
+            return
+        else:
+            popup.handle_key(key)
+        word = popup.selected_word()
+        if word is not None:
+            self._picked = True
+            self._set_text(word)
 
     def display(self) -> str:
         """The bar text as drawn."""
@@ -1404,11 +1549,20 @@ class InputBar(LineInputBar):
     def handle_key(self, key) -> Optional[str]:
         """Returns 'submit', 'cancel', or None.
         key is in the bitfield format produced by Editor._encode_key."""
-        if key == K(27):  # Escape
+        if key == K(27):  # Escape — closes the history list first
+            if self.history_popup.active:
+                self.history_popup.close()
+                return None
             return 'cancel'
         if key in (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))):
+            self.history.add(self.prompt, self.query)
+            self.history_popup.close()
             return 'submit'
-        self._edit_key(key)
+        if key in self.HISTORY_KEYS:
+            self._history_nav(key)
+            return None
+        if self._edit_key(key):
+            self._text_edited()
         return None
 
 
@@ -1673,18 +1827,25 @@ class SelectPopup:
             self._filter_char(key)
         return None
 
-    def draw(self, stdscr: curses.window, colors, H: int, W: int):
-        total = len(self.filtered)
-        visible_count = min(self.MAX_VISIBLE, total)
-        # Height: top border + filter + separator + items + indicator + bottom border
+    def geometry(self, H: int, W: int) -> Tuple[int, int, int, int]:
+        """Box placement for a screen of *H* x *W*: (top row, width, height,
+        visible items).  The box ends one row above the status bar, so the bar
+        below it (the filename bar, or the input bar the history popup belongs
+        to) stays visible; rows py+3 .. py+ph-2 hold the visible items."""
+        visible_count = min(self.MAX_VISIBLE, len(self.filtered))
+        # top border + filter + separator + items + indicator + bottom border
         ph = visible_count + 4
-        max_label_len = max((len(item.label) for item in self.filtered), default=0) if self.filtered else 0
+        max_label_len = max((len(item.label) for item in self.filtered), default=0)
         # inner content = prefix + label; borders add 2 more.  The prefix is
         # "  " (2) normally, "> [x] " (6) in multi mode.
         prefix_w = 6 if self.multi else 2
         min_pw = max(20, len(self._title) + 6 if self._title else 0)
         pw = min(max(max_label_len + prefix_w + 2, min_pw), W - 3)
-        py = max(0, H - 1 - ph)
+        return max(0, H - 2 - ph), pw, ph, visible_count
+
+    def draw(self, stdscr: curses.window, colors, H: int, W: int):
+        total = len(self.filtered)
+        py, pw, ph, visible_count = self.geometry(H, W)
         px = 0
 
         ba = curses.color_pair(colors.popup_border)
@@ -1761,7 +1922,7 @@ class SelectPopup:
 
         # Items
         ma = curses.color_pair(colors.popup_match)
-        for i in range(self.MAX_VISIBLE):
+        for i in range(visible_count):
             row_y = py + 3 + i
             abs_i = i + self.scroll_offset
             ach(row_y, px, ACS_VL, ba)
@@ -1793,7 +1954,7 @@ class SelectPopup:
         if self.multi:
             indicator = f'Tab marks ({len(self.checked)}) {indicator}'
         indicator = indicator[:pw - 2]
-        ind_row = py + 3 + self.MAX_VISIBLE
+        ind_row = py + 3 + visible_count
         ach (ind_row, px,                            ACS_VL, ba)
         astr(ind_row, px + 1,                        ' ' * (pw - 2), ia)
         astr(ind_row, max(px + 1, px + pw - len(indicator) - 1), indicator, ia)
@@ -3145,7 +3306,8 @@ class Editor:
         ``rows`` (list of row dicts) instead.  ``'input'`` / ``'ask'`` /
         ``'warn'`` need only the title.  Optional ``default`` pre-fills the
         prompt: the option label to highlight (choose), the labels to pre-mark
-        (select) or the initial text (input).
+        (select) or the initial text (input).  ``'input'`` also takes optional
+        ``items`` — strings offered in its history list.
 
         Returns the chosen string (choose), the list of marked strings
         (select), the list of picked row dicts (sselect/schoose), the typed
@@ -3177,21 +3339,19 @@ class Editor:
             self.popup.open(items, title=req['title'], multi=(kind == 'select'),
                             default=req.get('default'))
         elif kind == 'input':
-            self.input_bar.open(req['title'], req.get('default') or '')
+            self.input_bar.open(req['title'], req.get('default') or '',
+                                req.get('items') or [])
         elif kind == 'warn':
             # warn(): an info popup the pipeline waits on.  Closing it resolves
             # the request in the info-popup dispatch branch (Esc → None).
             self.info_popup.open('Warning', {'main': req['title']})
             self._pipeline_info_live = False
         elif kind == 'ask':
-            # Single-keypress y/n prompt — blocks the loop for one key, like
-            # every other _read_answer() prompt.  Esc means "cancelled" (None),
-            # distinct from a plain "no".
-            key = self._read_answer(f"{req['title']} (y/n): ")
-            if key in (27, '\x1b'):
-                self._resolve_ui_request(None)
-            else:
-                self._resolve_ui_request(key in (ord('y'), ord('Y'), 'y', 'Y'))
+            # Single-keypress y/n prompt — blocks the loop until the user gives
+            # a real answer, so a stray keystroke can neither answer "no" nor
+            # dismiss it.  Esc means "cancelled" (None), distinct from "no".
+            self._resolve_ui_request(
+                self._read_pipeline_ask(f"{req['title']} (y/Enter = yes, n = no, Esc = cancel): "))
         elif kind in SHEET_PROMPT_KINDS:
             # Row prompts shown in an external viewer (VisiData in DbEditor).
             # Synchronous like 'ask': the viewer owns the terminal on the main
@@ -3221,6 +3381,13 @@ class Editor:
         if not self.running_popup.active or self._ui_request is not None:
             return None
         return self.running_popup
+
+    def _popup_to_draw(self) -> Optional['SelectPopup']:
+        """The list popup to draw this frame — the input bar's history popup
+        while it is up, otherwise the editor's own popup."""
+        if self.input_bar.active and self.input_bar.history_popup.active:
+            return self.input_bar.history_popup
+        return self.popup if self.popup.active else None
 
     def _resolve_ui_request(self, result: Any) -> None:
         """Deliver *result* to the waiting worker thread and clear the request."""
@@ -3465,7 +3632,7 @@ class Editor:
             self.on_before_draw()
             self.renderer.input_pending = self._ui_request is not None
             self.renderer.draw(
-                popup=self.popup if self.popup.active else None,
+                popup=self._popup_to_draw(),
                 search=self.search if self.search.active else None,
                 running_popup=self._running_popup_to_draw(),
                 info_popup=self.info_popup if self.info_popup.active else None,
@@ -4161,6 +4328,21 @@ class Editor:
     def _confirm(self, message: str) -> bool:
         """Show a y/n question; return True immediately on 'y'/'Y', False on anything else."""
         return self._read_answer(message) in (ord('y'), ord('Y'), 'y', 'Y')
+
+    def _read_pipeline_ask(self, message: str) -> Optional[bool]:
+        """Show the pipeline ask() question and loop until a real answer.
+
+        'y'/Enter → True, 'n' → False, Esc → None (cancel the pipeline); any
+        other key redraws the question and keeps waiting.  Escape sequences
+        (arrows, Alt combos) are resolved so they don't read as a bare Esc."""
+        while True:
+            key = self._resolve_key(self._read_answer(message))
+            if key in (ord('y'), ord('Y'), curses.KEY_ENTER, ord('\n'), ord('\r')):
+                return True
+            if key in (ord('n'), ord('N')):
+                return False
+            if key == 27:
+                return None
 
     def _prompt(self, message: str) -> str:
         """Show a prompt in the status bar and read a line of input."""

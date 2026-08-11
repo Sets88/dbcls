@@ -47,6 +47,9 @@ class ClientClass(abc.ABC):
     # Whether the engine supports editing data from the table browser
     # ("Edit" option: pending cell edits / row adds committed as UPDATE/INSERT)
     SUPPORTS_EDITING = False
+    # Whether connection compression can be switched at runtime
+    # (the client must then implement toggle_compression())
+    SUPPORTS_COMPRESSION = False
 
     COMMANDS = [
         'tables', 'databases', 'schema', 'use'
