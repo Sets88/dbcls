@@ -33,6 +33,7 @@ from .pipeline import PipelineExecutor
 from .pipeline import PipelineStepError
 from .pipeline import PipelineCancelled
 from .pipeline import HELP_ENTRIES
+from .plugins import HookBus, PluginManager, resolve_plugin_names, resolve_plugin_paths
 
 
 warnings.filterwarnings("ignore")
@@ -618,6 +619,7 @@ class DbEditor(Editor):
         lock_check_command: Optional[str] = None,
         fold: bool = False,
         readonly: bool = False,
+        plugins: Optional[PluginManager] = None,
     ):
         visidata.vd.addGlobals(dbeditor=self)
         self.client = client
@@ -625,6 +627,8 @@ class DbEditor(Editor):
         self.asyncloop_thread = AsyncLoopThread(daemon=True)
         self.asyncloop_thread.start()
         self.vars = {}
+        # Filter chains plugins hook into (before_query / after_query).
+        self.hooks = HookBus(on_error=lambda text: self.set_status_notification(text, error=True))
         # (name, rows) sheets requested by the pipeline's .SHEET command during the
         # current run; built into VisiData sheets in _db_query's on_done.
         self._pipeline_sheets = []
@@ -651,7 +655,8 @@ class DbEditor(Editor):
         self.add_editor_function(DbFn.SHOW_TABLES,     self._db_show_tables,    'Browse tables',  'Alt+T')
         self.add_editor_function(DbFn.SHOW_DATABASES,  self._db_show_databases, 'Browse databases', 'Alt+E')
         self.add_editor_function(DbFn.SHOW_PREDICTION, self._db_show_prediction,'Autocomplete','Shift+Tab / Alt+1')
-        self.add_keybinding(DbFn.RUN_QUERY,       key_alt(ord('r')))              # Alt+R
+        self.add_keybinding(DbFn.RUN_QUERY,       key_alt(ord('r')))              # Alt+R  deprecated, to be removed in future releases
+        self.add_keybinding(DbFn.RUN_QUERY,       key_alt(ord('\n')))             # Alt+Enter
         self.add_keybinding(DbFn.SHOW_TABLES,     key_alt(ord('t')))              # Alt+T
         if (readonly):
             self.add_keybinding(DbFn.RUN_QUERY,        K(ord('\n')))              # Enter(for readonly mode)
@@ -669,6 +674,13 @@ class DbEditor(Editor):
                 self.add_editor_function(
                     DbFn.TOGGLE_COMPRESSION, self._db_toggle_compression,
                     'Toggle connection compression')
+
+        # Plugins go last: everything they may want to override or build on
+        # (commands, keybindings, the client) is in place by now.  Their
+        # options were declared and resolved back in main(), before the command
+        # line was parsed — see PluginManager.
+        self.plugins = plugins if plugins is not None else PluginManager(enabled=False)
+        self.plugins.register(self)
 
     def apply_keys_remap(self, remap_str: str):
         if not remap_str:
@@ -695,7 +707,7 @@ class DbEditor(Editor):
 
     def _dispatch_pre_hook(self, key) -> bool:
         if self.lock_screen is None:
-            return False
+            return super()._dispatch_pre_hook(key)
         if self.lock_screen.should_lock():
             self.lock_screen.open()
         if self.lock_screen.active:
@@ -713,10 +725,13 @@ class DbEditor(Editor):
             return True
         if key != -1:
             self.lock_screen.reset_timer()
-        return False
+        return super()._dispatch_pre_hook(key)
 
     def _get_overlay(self):
-        return self.lock_screen if self.lock_screen and self.lock_screen.active else None
+        # The lock screen outranks everything: it must cover a chat window too.
+        if self.lock_screen and self.lock_screen.active:
+            return self.lock_screen
+        return super()._get_overlay()
 
     # ── Help pages ────────────────────────────────────────────────────────────
 
@@ -736,6 +751,16 @@ class DbEditor(Editor):
         pages['Pipelines']     = "\n".join(HELP_ENTRIES)
         pages['VisiData']      = DB_HELP_VISIDATA
         return pages
+
+    def statement_rows(self) -> list:
+        """Row indices of the statement under the cursor ([] on a blank line
+        between statements) — what Alt+R would run, for plugins that want to
+        read or replace it."""
+        return get_sql_rows(self.buf)
+
+    def show_rows(self, name: str, rows) -> None:
+        """Put rows on the VisiData sheet stack (reachable with Alt+S)."""
+        self.add_pipeline_sheet(name, rows)
 
     def on_before_draw(self):
         # get_sql_rows() rescans the whole buffer; only recompute when the
@@ -883,7 +908,8 @@ class DbEditor(Editor):
         start = time.time()
 
         async def fetch_all():
-            sql = sel.strip()
+            # before_query: a plugin may rewrite what actually runs.
+            sql = self.hooks.filter('before_query', sel.strip())
             if is_pipeline(sql):
                 executor = PipelineExecutor(self)
                 return await executor.execute(sql)
@@ -919,6 +945,9 @@ class DbEditor(Editor):
                     message = 'Cancelled'
                     return
                 result = task.result()
+                # after_query: a plugin may transform the rows before they are
+                # shown (add columns, filter, annotate).
+                result = self.hooks.filter('after_query', result)
                 message = str(result)
                 self._open_result_in_visidata(result)
             except (asyncio.CancelledError, asyncio.InvalidStateError):
@@ -1062,7 +1091,42 @@ def env_override(args: argparse.Namespace):
         print('Error processing environment variable overrides')
 
 
+def plugin_arguments(parser: argparse.ArgumentParser) -> None:
+    """The options that decide which plugins load.  They are parsed twice: once
+    on their own (so the plugins are known before the real parser is built, and
+    can add options of their own), then again as part of it."""
+    parser.add_argument('--plugin-dir', dest='plugin_dir', default='',
+        help='directory of plugin .py files or plugin packages to load'
+             ' (several separated like PATH)')
+    parser.add_argument('--plugin', dest='plugin', default='',
+        help='comma-separated plugin names to load; the default loads every one found')
+    parser.add_argument('--no-plugins', dest='plugins', action='store_false', default=True,
+        help='do not load any plugin')
+
+
+def discover_plugins() -> PluginManager:
+    """Work out which plugins to load from the command line and the
+    environment, and import them — before the real parser exists, so they can
+    declare their own options into it."""
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    plugin_arguments(pre_parser)
+    pre_args, _unknown = pre_parser.parse_known_args()
+    env_override(pre_args)
+    enabled = pre_args.plugins
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() not in ('0', 'false', 'no', 'off')
+    manager = PluginManager(
+        paths=resolve_plugin_paths(pre_args.plugin_dir),
+        only=resolve_plugin_names(pre_args.plugin),
+        enabled=enabled,
+    )
+    manager.discover()
+    return manager
+
+
 def main():
+    plugins = discover_plugins()
+
     parser = argparse.ArgumentParser(description='DB connection tool')
     parser.add_argument('filepath', nargs='?', default=None, help='SQL file to edit')
     parser.add_argument('--config', '-c', dest='config', help='specify config path', default='')
@@ -1090,6 +1154,9 @@ def main():
         help='seconds of inactivity before the screen locks')
     parser.add_argument('--lock-check-command', dest='lock_check_command', default=None,
         help='shell command to verify a lock session (receives same secret via stdin, must output same code)')
+    plugin_arguments(parser)
+    # Every plugin declares its own options here — the core knows none of them.
+    plugins.add_arguments(parser)
 
     args = parser.parse_args()
     env_override(args)
@@ -1114,6 +1181,7 @@ def main():
     readonly = args.readonly
     if isinstance(readonly, str):
         readonly = readonly.strip().lower() in ('1', 'true', 'yes', 'on')
+    config = {}
 
     if args.config:
         with open(args.config) as f:
@@ -1136,6 +1204,10 @@ def main():
         args.lock_check_command = args.lock_check_command or config.get('lock_check_command', None)
         if args.lock_timeout is None:
             args.lock_timeout = config.get('lock_timeout', None)
+
+    # Each plugin's own options, resolved from the command line, the
+    # environment and its section of the config file.
+    plugins.configure(args, config)
 
     # lock_timeout may arrive as a string (env var / JSON string) — coerce once
     # so every downstream consumer gets a float.
@@ -1202,6 +1274,7 @@ def main():
                 lock_check_command=args.lock_check_command,
                 fold=fold,
                 readonly=readonly,
+                plugins=plugins,
             ).run()
         )
     except RuntimeError as e:

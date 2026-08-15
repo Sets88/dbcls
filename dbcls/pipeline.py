@@ -220,10 +220,12 @@ stop(), nothing is displayed, only a 'Cancelled' notification.
 import time
 import json
 import asyncio
+import inspect
+import keyword
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
-from typing import Any, List, Optional, Protocol, Union
+from typing import Any, List, Optional, Protocol, Tuple, Union
 
 # ── Public constants ──────────────────────────────────────────────────────────
 
@@ -285,9 +287,12 @@ MAX_CALL_DEPTH: int = 20
 #: included) instead of the ``_as_rows()`` view every other handler gets:
 #: ``.CALL`` only forwards the value into the function body, so a function
 #: starting with a client dot-command (``.TABLES``) must still see ``NO_DATA``.
-_RAW_DATA_COMMANDS: frozenset = frozenset({'call'})
+#: Plugins may add to it via ``register_command(raw_data=True)``.
+_RAW_DATA_COMMANDS: set = {'call'}
 
-#: name → handler-method name, used for dispatch (control keywords excluded).
+#: name → handler: the name of a ``PipelineExecutor`` method for the built-in
+#: commands, or (for plugin commands, see :func:`register_command`) a coroutine
+#: function taking ``(executor, args, data)``.  Control keywords are excluded.
 _COMMAND_HANDLERS: dict = {name: handler for name, _hint, handler in _COMMAND_TABLE}
 
 #: All recognised pipeline tokens (commands + control keywords), lowercase.
@@ -1019,11 +1024,65 @@ _DOT_CMD_RE = re.compile(r'^\s*\.([a-zA-Z_][a-zA-Z_0-9]*)', re.IGNORECASE)
 #: Derived from the registry — longest names first so e.g. ``for_run`` is matched
 #: before ``for`` (the trailing ``\b`` already prevents a partial match, but the
 #: ordering keeps the alternation unambiguous).
-_PIPELINE_CMD_RE = re.compile(
-    r'^\s*\.(' + '|'.join(re.escape(c) for c in sorted(PIPELINE_COMMANDS, key=len, reverse=True)) + r')\b',
-    re.IGNORECASE,
-)
+def _build_pipeline_cmd_re() -> 're.Pattern':
+    return re.compile(
+        r'^\s*\.(' + '|'.join(re.escape(c) for c in sorted(PIPELINE_COMMANDS, key=len, reverse=True)) + r')\b',
+        re.IGNORECASE,
+    )
+
+
+_PIPELINE_CMD_RE = _build_pipeline_cmd_re()
 _ANY_DOT_CMD_RE = re.compile(r'^\s*\.[a-zA-Z_]', re.IGNORECASE)
+
+
+#: name → help text passed to :func:`register_command`, kept per command as
+#: well as folded into :data:`HELP_ENTRIES`: the help page wants one flat list,
+#: while the LLM reference needs to tell a plugin's command from a built-in and
+#: quote its own text (see :mod:`dbcls.llm.reference`).
+PLUGIN_COMMAND_HELP: dict = {}
+
+
+def register_command(name: str, hint: str, handler, help_text: str = '',
+                     raw_data: bool = False) -> None:
+    """Add a pipeline command at runtime — the seam plugins extend the language
+    through (see :mod:`dbcls.plugins`).
+
+    *name* is the command without its dot, lowercase (``'hello'`` for
+    ``.HELLO``); *hint* is the one-line syntax shown by autocomplete
+    (``'.HELLO <NAME>'``); *handler* is a coroutine function
+
+        ``async def handler(executor, args: List[str], data) -> Any``
+
+    where *executor* is the running :class:`PipelineExecutor` — through it the
+    handler reaches ``executor.client``, ``executor.host.vars``, the user
+    prompts and ``executor._render_template()``.  It returns the rows the next
+    step receives.  With *raw_data* the handler is given the inter-step value
+    untouched (``NO_DATA`` included) instead of a row list.
+
+    *help_text*, when given, is appended to the in-app Pipelines help page.
+    Re-registering a name replaces the previous handler; a built-in name is
+    refused, so a plugin cannot quietly redefine ``.RUN``.
+    """
+    global _PIPELINE_CMD_RE
+    name = name.lower()
+    if name in _BUILTIN_COMMANDS:
+        raise ValueError(f'.{name.upper()} is a built-in pipeline command and cannot be replaced')
+    if not callable(handler):
+        raise TypeError('handler must be a coroutine function taking (executor, args, data)')
+    _COMMAND_HANDLERS[name] = handler
+    PIPELINE_COMMAND_HINTS[name] = hint
+    if name not in PIPELINE_COMMANDS:
+        PIPELINE_COMMANDS.append(name)
+    if raw_data:
+        _RAW_DATA_COMMANDS.add(name)
+    PLUGIN_COMMAND_HELP[name] = help_text
+    if help_text:
+        HELP_ENTRIES.append(_help_entry(name, help_text))
+    _PIPELINE_CMD_RE = _build_pipeline_cmd_re()
+
+
+#: The commands shipped with dbcls — registering over one of these is refused.
+_BUILTIN_COMMANDS: frozenset = frozenset(PIPELINE_COMMANDS)
 
 
 DEFAULT_CONTEXT = {
@@ -1033,6 +1092,95 @@ DEFAULT_CONTEXT = {
     'json': json,
     'time': time,
 }
+
+#: name → value added by plugins (see :func:`register_function`), merged into
+#: the namespace of every ``{{expr}}`` placeholder and Python-executing step
+#: just after :data:`DEFAULT_CONTEXT`.
+PLUGIN_FUNCTIONS: dict = {}
+
+#: name → help text passed to :func:`register_function`, kept per name for the
+#: same reason as :data:`PLUGIN_COMMAND_HELP`.
+PLUGIN_FUNCTION_HELP: dict = {}
+
+#: Names the executor itself puts in that namespace — a plugin function may not
+#: take one of them, or user code would lose a helper it relies on.  Kept in
+#: step with :meth:`PipelineExecutor._helper_context` by a test.
+HELPER_NAMES: frozenset = frozenset({
+    'result', 'info', 'warn', 'br', 'stop', 'set_var', 'get_var',
+    'choose', 'select', 'schoose', 'sselect', 'input', 'ask',
+    'data', 'row', '_vars', 'sql_in_list', 'sql_values',
+})
+
+
+def register_function(name: str, value, help_text: str = '') -> None:
+    """Add a function (or any value) to the Python namespace pipelines run in —
+    the seam plugins extend ``{{expr}}`` and ``.PY`` through (see
+    :mod:`dbcls.plugins`).
+
+    It becomes visible to every ``{{expr}}`` placeholder and every
+    Python-executing step (``.PY`` / ``.SET_VAR`` / ``.SLEEP`` / the ``.FOR``
+    and ``.WHILE`` expressions), exactly like the built-in ``datetime`` or
+    ``json``::
+
+        register_function('slugify', slugify)
+        # .TABLES | .PY "[slugify(r['name']) for r in data]"
+
+    The value is used as-is, so it need not be callable — a module or a
+    constant is registered the same way.  Calls are made from inside ``eval``,
+    which is synchronous: something that has to await belongs in a pipeline
+    command (:func:`register_command`), where the handler is a coroutine.
+
+    *name* must be a plain identifier that does not start with ``_`` (those are
+    the positional ``_0`` / loop ``_i`` overlays) and is neither a helper name
+    (``info``, ``get_var``, ``data``, …) nor one of the built-in context values
+    (``datetime``, ``json``, …).  Re-registering the same name replaces the
+    previous value.  *help_text*, when given, is appended to the in-app
+    Pipelines help page.
+
+    A registered name shadows a same-named column of the incoming row inside
+    ``{{…}}``, just as the built-in context values do — so prefer a name no
+    result column is likely to have.
+    """
+    if not name.isidentifier() or keyword.iskeyword(name):
+        raise ValueError(f'{name!r} is not a valid Python identifier')
+    if name.startswith('_'):
+        raise ValueError(
+            f'{name!r} may not start with "_" — those names are the positional '
+            '(_0, _1, …) and loop (_i, _ii, …) overlays')
+    if name in HELPER_NAMES or name in DEFAULT_CONTEXT:
+        raise ValueError(
+            f'{name!r} is part of the pipeline context and cannot be replaced')
+    PLUGIN_FUNCTIONS[name] = value
+    PLUGIN_FUNCTION_HELP[name] = help_text
+    if help_text:
+        HELP_ENTRIES.append(f'\n`{function_hint(name, value)}`{help_text}')
+
+
+def function_hint(name: str, value) -> str:
+    """``name(args)`` for a callable whose signature can be read, else *name*."""
+    try:
+        return f'{name}{inspect.signature(value)}'
+    except (TypeError, ValueError):
+        return name
+
+
+def plugin_commands() -> List[Tuple[str, str, str]]:
+    """``(name, hint, help text)`` for every command a plugin added, in
+    registration order — the language beyond what dbcls itself ships.
+
+    Anything that has to describe the pipeline language as it stands in *this*
+    installation reads it from here (the LLM reference does)."""
+    return [(name, PIPELINE_COMMAND_HINTS.get(name, f'.{name.upper()}'),
+             PLUGIN_COMMAND_HELP.get(name, ''))
+            for name in PIPELINE_COMMANDS if name not in _BUILTIN_COMMANDS]
+
+
+def plugin_functions() -> List[Tuple[str, str, str]]:
+    """``(name, hint, help text)`` for every function a plugin added, in
+    registration order.  The companion of :func:`plugin_commands`."""
+    return [(name, function_hint(name, value), PLUGIN_FUNCTION_HELP.get(name, ''))
+            for name, value in PLUGIN_FUNCTIONS.items()]
+
 
 # ── Public helpers ────────────────────────────────────────────────────────────
 
@@ -1231,6 +1379,7 @@ def _build_context(row: Optional[dict], data: Optional[list], extra: Optional[di
     return {
         **_row_overlay(row),
         **DEFAULT_CONTEXT,
+        **PLUGIN_FUNCTIONS,
         'row': row if row is not None else {},
         'data': data if data is not None else [],
         'sql_in_list': sql_in_list,
@@ -1253,6 +1402,8 @@ def render_template(template: str, row: dict = None, data: Optional[list] = None
     * ``data``          — the full input data list from the previous step
     * ``sql_in_list``   — helper that formats a list as a SQL ``IN (…)`` clause
     * ``sql_values``    — helper that formats rows as SQL ``VALUES`` tuples
+    * ``datetime``, ``json``, … — :data:`DEFAULT_CONTEXT`, plus whatever
+                          plugins added with :func:`register_function`
 
     When *row* is omitted (or ``None``) only ``data`` and ``sql_in_list`` are
     in scope — useful for SQL-level templates like ``.RUN``.
@@ -2093,14 +2244,18 @@ class PipelineExecutor:
         # output is on screen; every other step invalidates the claim before it
         # runs (see _mark_shown).  Steps nested in .CALL/.FOR set it themselves.
         self._shown_data = NOTHING_SHOWN
-        handler_name = _COMMAND_HANDLERS.get(step.command)
-        if handler_name is not None:
+        handler = _COMMAND_HANDLERS.get(step.command)
+        if handler is not None:
             self._current_soft = step.soft
             # Handlers work with a concrete row list ([] when there is no data)
             # — except the few that only forward the value on (see
             # _RAW_DATA_COMMANDS) and must be able to pass NO_DATA along.
             rows = data if step.command in _RAW_DATA_COMMANDS else _as_rows(data)
-            return await getattr(self, handler_name)(step.args, rows)
+            if isinstance(handler, str):
+                return await getattr(self, handler)(step.args, rows)
+            # A plugin command (see register_command): a plain coroutine
+            # function, so it takes the executor explicitly.
+            return await handler(self, step.args, rows)
 
         if data is not NO_DATA:
             known = ', '.join(f'.{c.upper()}' for c in PIPELINE_COMMANDS)
@@ -2461,6 +2616,7 @@ class PipelineExecutor:
             **_row_overlay(_first_row(data)),  # _0/_1/named from the first row
             **self._loop_vars(),              # _i/_ii/… — .FOR items by depth
             **DEFAULT_CONTEXT,
+            **PLUGIN_FUNCTIONS,               # register_function() — plugins
             'data': data,
             '_vars': self.host.vars,
             'sql_in_list': sql_in_list,

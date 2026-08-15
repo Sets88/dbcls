@@ -62,6 +62,17 @@ def key_alt(k: int) -> int:
     return (k << 2) | KEY_ESC_BIT
 
 
+def key_ctrl(k) -> int:
+    """Encode Ctrl + a letter, given as the letter itself (``key_ctrl('l')``).
+
+    Prefer this over Alt for a binding that must work everywhere: the terminal
+    sends the same control code whatever the keyboard layout, while Alt+L on a
+    Cyrillic layout arrives as Alt+д and matches nothing."""
+    if isinstance(k, str):
+        k = ord(k.lower())
+    return K(k & 0x1f)
+
+
 def key_pfx(k: int) -> int:
     """Encode a prefix + key combination (triggered by KEY_PREFIX_TRIGGER)."""
     return (k << 2) | KEY_PREFIX_BIT
@@ -116,6 +127,64 @@ WORD_RIGHT_KEYS = (
 # If the timeout fires before the next key, the prefix is simply cancelled
 # (nothing is bound to the bare trigger).
 KEY_PREFIX_TRIGGER = K(ord('\x18'))  # Ctrl+X
+
+
+# ─── Function name enum ───────────────────────────────────────────────────────
+class Fn(str, enum.Enum):
+    """Named editor functions. Values are the string keys used in the function registry.
+
+    The value of every function listed in :data:`TEXT_EDIT_BINDINGS` is also the
+    name of the :class:`TextArea` method implementing it."""
+    MOVE_UP          = 'move_up'
+    MOVE_DOWN        = 'move_down'
+    MOVE_LEFT        = 'move_left'
+    MOVE_RIGHT       = 'move_right'
+    SEL_MOVE_UP      = 'sel_move_up'
+    SEL_MOVE_DOWN    = 'sel_move_down'
+    SEL_MOVE_LEFT    = 'sel_move_left'
+    SEL_MOVE_RIGHT   = 'sel_move_right'
+    MOVE_UP_5        = 'move_up_5'
+    MOVE_DOWN_5      = 'move_down_5'
+    MOVE_HOME        = 'move_home'
+    MOVE_END         = 'move_end'
+    SEL_MOVE_HOME    = 'sel_move_home'
+    SEL_MOVE_END     = 'sel_move_end'
+    PAGE_UP          = 'page_up'
+    PAGE_DOWN        = 'page_down'
+    SEL_PAGE_UP      = 'sel_page_up'
+    SEL_PAGE_DOWN    = 'sel_page_down'
+    FILE_START       = 'file_start'
+    FILE_END         = 'file_end'
+    WORD_LEFT        = 'word_left'
+    WORD_RIGHT       = 'word_right'
+    SEL_WORD_LEFT    = 'sel_word_left'
+    SEL_WORD_RIGHT   = 'sel_word_right'
+    OPEN_FILE        = 'open_file'
+    COPY             = 'copy'
+    PASTE            = 'paste'
+    UNDO             = 'undo'
+    REDO             = 'redo'
+    SAVE             = 'save'
+    SAVE_AS          = 'save_as'
+    TOGGLE_READONLY  = 'toggle_readonly'
+    SEARCH           = 'search'
+    AUTOCOMPLETE     = 'autocomplete'
+    QUIT             = 'quit'
+    HELP             = 'help'
+    TOGGLE_WRAP      = 'toggle_wrap'
+    TOGGLE_MARK      = 'toggle_mark'
+    SELECT_ALL       = 'select_all'
+    BACKSPACE        = 'backspace'
+    DELETE           = 'delete'
+    DELETE_WORD_FWD  = 'delete_word_fwd'
+    KILL_WORD_BWD    = 'kill_word_bwd'
+    DELETE_LINE      = 'delete_line'
+    NEWLINE          = 'newline'
+    TAB              = 'tab'
+    RESIZE           = 'resize'
+    CLEAR_SELECTION  = 'clear_selection'
+    COMMAND_PALETTE  = 'command_palette'
+    TOGGLE_FOLD      = 'toggle_fold'
 
 
 EDITOR_HELP = """\
@@ -2200,10 +2269,13 @@ class InfoPopup:
     Navigation (no links — scrollable text page):
       ↑ / ↓ / PgUp / PgDn / Home / End   scroll
       Esc / ←       go back (or close if on the first page)
+      c             copy the current page's text to the clipboard
       any other key close
     """
 
-    def __init__(self):
+    def __init__(self, clipboard: Optional['Clipboard'] = None):
+        self.clipboard = clipboard
+        self._copied_msg: str = ''       # transient 'copied' note on the border
         self.active   = False
         self._title   = ''
         self._pages: dict = {}
@@ -2231,6 +2303,7 @@ class InfoPopup:
         self._scroll   = 0
         self._lines    = []
         self._inner_w  = 0
+        self._copied_msg = ''
         self._reset_search()
         self._rebuild_links()
 
@@ -2239,6 +2312,7 @@ class InfoPopup:
         self._pages   = {}
         self._history = []
         self._lines   = []
+        self._copied_msg = ''
         self._reset_search()
 
     # ── internal helpers ─────────────────────────────────────────────────────
@@ -2274,6 +2348,31 @@ class InfoPopup:
             self._rebuild_links()
             return None
         return 'close'
+
+    # ── copy to clipboard ────────────────────────────────────────────────────
+
+    def _plain_page_text(self) -> str:
+        """The current page as plain text: fences dropped, inline markup
+        stripped, original (unwrapped) line breaks kept — so a copied error
+        message pastes exactly as it was produced."""
+        out: List[str] = []
+        for raw in self._current_text().splitlines():
+            sraw = raw.strip()
+            if sraw.startswith('```') and sraw.endswith('```') and len(sraw) > 6:
+                out.append(sraw[3:-3].strip())
+            elif sraw == '```':
+                continue                       # fence marker — not content
+            else:
+                out.append(self._display_text(('normal', raw)))
+        return '\n'.join(out)
+
+    def _copy_page(self) -> None:
+        text = self._plain_page_text()
+        if self.clipboard is None:
+            self._copied_msg = ' no clipboard '
+            return
+        self.clipboard.copy(text)
+        self._copied_msg = f' copied {len(text)} chars '
 
     # ── search (less-like /, n, N) ───────────────────────────────────────────
 
@@ -2394,6 +2493,9 @@ class InfoPopup:
         has_links  = bool(self._links)
         can_scroll = self._total() > self._visible
 
+        if not self._search_input:
+            self._copied_msg = ''      # any key clears the previous copy note
+
         back_keys = (K(27), K(curses.KEY_LEFT),
                      K(curses.KEY_BACKSPACE), K(ord('\x7f')))
         enter_keys = (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r')),
@@ -2415,6 +2517,11 @@ class InfoPopup:
                     self._search_query += chr(base)
                     self._compile_search()
             return None                               # never closes while typing
+
+        # ── Copy the page text; checked before every "any key closes" branch ─
+        if key == K(ord('c')):
+            self._copy_page()
+            return None
 
         # ── Start a search (scrollable text pages only; link menus keep ↑↓) ──
         if key == K(ord('/')) and not has_links:
@@ -2543,15 +2650,15 @@ class InfoPopup:
         multi_page = len(self._pages) > 1
 
         if has_links:
-            hint = ' ↑↓ select · Enter open · Esc back · any key close '
+            hint = ' ↑↓ select · Enter open · c copy · Esc back · any key close '
         elif can_scroll and multi_page:
-            hint = ' ↑↓/PgUp/PgDn scroll · / find · Esc back · any key close '
+            hint = ' ↑↓/PgUp/PgDn scroll · / find · c copy · Esc back · any key close '
         elif can_scroll:
-            hint = ' ↑↓/PgUp/PgDn scroll · / find · any key close '
+            hint = ' ↑↓/PgUp/PgDn scroll · / find · c copy · any key close '
         elif multi_page:
-            hint = ' / find · Esc back · any key close '
+            hint = ' / find · c copy · Esc back · any key close '
         else:
-            hint = ' / find · any key to close '
+            hint = ' / find · c copy · any key to close '
 
         page_key  = self._current_key()
         page_part = f' — {page_key}' if page_key != 'main' else ''
@@ -2599,6 +2706,8 @@ class InfoPopup:
         if self._search_input:
             prompt = f' /{self._search_query} '[:win_w - 4]
             astr(win_h - 1, 2, prompt, ba | curses.A_BOLD)
+        elif self._copied_msg:
+            astr(win_h - 1, 2, self._copied_msg[:win_w - 4], ba | curses.A_BOLD)
         elif self._search_re is not None:
             if self._search_matches:
                 tag = f' {self._search_idx + 1}/{len(self._search_matches)} matches '
@@ -2607,26 +2716,45 @@ class InfoPopup:
             astr(win_h - 1, 2, tag[:win_w - 4], ba | curses.A_BOLD)
 
 
-# ─── Renderer ─────────────────────────────────────────────────────────────────
-class Renderer:
-    GUTTER = 5  # line number width + space
+# ─── TextView ─────────────────────────────────────────────────────────────────
+class TextView:
+    """Draws a :class:`TextBuffer` inside a rectangle of the screen.
 
-    def __init__(self, stdscr: curses.window, colors: ColorManager, buf: TextBuffer, lexer: Lexer):
+    Everything that depends on *where* the text sits and *how much of it fits*
+    lives here: scrolling, word wrap, hidden (folded) rows, syntax colouring,
+    search highlighting, and the mapping between screen cells and buffer
+    positions.  The main editor uses one view covering the whole screen minus
+    its two bars; a :class:`TextArea` uses a small one inside a box — so a
+    field in a dialog scrolls and wraps exactly like the editor itself.
+
+    Coordinates passed to and returned by the drawing helpers are relative to
+    the rectangle; :meth:`cursor_screen_pos` and :meth:`click_to_cursor` speak
+    absolute screen coordinates, since their callers do.
+    """
+
+    GUTTER = 5  # line-number column width; 0 draws no line numbers
+
+    def __init__(self, stdscr: curses.window, colors: ColorManager, buf: 'TextBuffer',
+                 lexer: Optional['Lexer'] = None, *, gutter: int = GUTTER):
         self.stdscr = stdscr
         self.colors = colors
         self.buf = buf
         self.lexer = lexer
+        self.gutter = gutter
+        # Rectangle, in absolute screen coordinates.
+        self.top = 0
+        self.left = 0
+        self._height = 1
+        self._width = 1
         self.scroll_row = 0
         self.scroll_col = 0
-        self._height = 0
-        self._width = 0
+        #: Wrap mode only: how many visual rows of scroll_row are hidden above
+        #: the top of the view.  Without it the view could only start at a line
+        #: boundary, and a line taller than the pane — one long chat message,
+        #: say — could be neither scrolled into nor scrolled past.
+        self.scroll_vrow = 0
         self.search_matches: List[Tuple[int, int, int]] = []
         self.search_current = -1
-        self.debug_text = ''
-        self.status_name: Optional[str] = None
-        self.status_notification: Optional[str] = None
-        self.status_notification_error = False  # show status_notification in the error color
-        self.input_pending = False  # a prompt is waiting for the user
         self.cursor_line_range: tuple = (0, 1)
         self.wrap: bool = False
         # Map token type -> color pair id (pair ids are stable across
@@ -2641,19 +2769,25 @@ class Renderer:
             'number':   colors.number,
             'operator': colors.operator,
         }
-        self.resize()
 
-    def resize(self):
-        self._height, self._width = self.stdscr.getmaxyx()
+    def set_rect(self, top: int, left: int, height: int, width: int) -> None:
+        self.top = top
+        self.left = left
+        self._height = max(1, height)
+        self._width = max(1, width)
 
     @property
     def text_rows(self) -> int:
-        # Reserve 2 rows: status bar + filename/search bar
-        return max(1, self._height - 2)
+        return self._height
 
     @property
     def text_cols(self) -> int:
-        return max(1, self._width - self.GUTTER)
+        return max(1, self._width - self.gutter)
+
+    @property
+    def page_rows(self) -> int:
+        """Rows a PgUp/PgDn moves by — a screenful minus a little overlap."""
+        return max(1, self._height - 3)
 
     def _visual_rows_count(self, line_len: int) -> int:
         """Number of screen rows a document line of given length occupies in wrap mode."""
@@ -2669,38 +2803,107 @@ class Renderer:
             return end - start
         return sum(1 for i in range(start, end) if i not in hidden)
 
+    def _line_vrows(self, row: int) -> int:
+        """Visual rows one document line occupies at the current width."""
+        return self._visual_rows_count(len(self.buf.lines[row]))
+
+    def _visual_rows_between(self, start: int, end: int) -> int:
+        """Visual rows the non-hidden document rows in [start, end) occupy."""
+        hidden = self.buf.hidden_rows
+        return sum(self._line_vrows(i) for i in range(start, end) if i not in hidden)
+
+    def cursor_vrow_in_line(self) -> int:
+        """Which visual row of its own line the cursor is on.
+
+        A line filling its last row exactly has no row after it, so the
+        end-of-line position belongs to the last row drawn rather than to a
+        phantom one below it — scrolling to which would leave a blank row on
+        screen and hide the text the cursor is supposed to be in.
+        """
+        return min(self.buf.cursor_col // self.text_cols,
+                   self._line_vrows(self.buf.cursor_row) - 1)
+
+    def cursor_vrow(self) -> int:
+        """The cursor's row on screen, counted from the top of the view.
+
+        Negative when the cursor is above what is drawn and >= text_rows when
+        it is below — the scrolling in :meth:`ensure_cursor_visible` needs the
+        sign, so this must not be clamped.
+        """
+        cr = self.buf.cursor_row
+        if cr >= self.scroll_row:
+            distance = self._visual_rows_between(self.scroll_row, cr)
+        else:
+            distance = -self._visual_rows_between(cr, self.scroll_row)
+        return distance + self.cursor_vrow_in_line() - self.scroll_vrow
+
+    def _vrows_after_cursor(self, limit: int) -> int:
+        """Visual rows following the cursor's own, counted no further than
+        *limit*: enough to tell whether the bottom margin has text to show,
+        and cheap — it walks at most *limit* lines."""
+        buf = self.buf
+        cr = buf.cursor_row
+        found = self._line_vrows(cr) - 1 - self.cursor_vrow_in_line()
+        row = cr + 1
+        while found < limit and row < len(buf.lines):
+            if row not in buf.hidden_rows:
+                found += self._line_vrows(row)
+            row += 1
+        return min(found, limit)
+
+    def _scroll_up_one_vrow(self) -> bool:
+        """Move the top of the view up by one visual row; False at the top."""
+        if self.scroll_vrow > 0:
+            self.scroll_vrow -= 1
+            return True
+        if self.scroll_row <= 0:
+            return False
+        self.scroll_row = self.buf.prev_visible_row(self.scroll_row - 1)
+        self.scroll_vrow = self._line_vrows(self.scroll_row) - 1
+        return True
+
+    def _scroll_down_one_vrow(self) -> bool:
+        """Move the top of the view down by one visual row; False at the end."""
+        if self.scroll_vrow + 1 < self._line_vrows(self.scroll_row):
+            self.scroll_vrow += 1
+            return True
+        nxt = self.buf.next_visible_row(self.scroll_row + 1)
+        if nxt is None:
+            return False
+        self.scroll_row = nxt
+        self.scroll_vrow = 0
+        return True
+
     def ensure_cursor_visible(self):
         cr, cc = self.buf.cursor_row, self.buf.cursor_col
-        hidden = self.buf.hidden_rows
         # A fold created/removed above may leave scroll_row on a hidden line.
         self.scroll_row = self.buf.prev_visible_row(min(self.scroll_row, len(self.buf.lines) - 1))
         if self.wrap:
-            margin_v = 2
-            tc = self.text_cols
-            # Compute cursor visual row relative to scroll_row
-            vrow = 0
-            for i in range(self.scroll_row, cr):
-                if i in hidden:
-                    continue
-                vrow += self._visual_rows_count(len(self.buf.lines[i]))
-            vrow += cc // tc
-            # Scroll up if needed
-            while vrow < margin_v and self.scroll_row > 0:
-                self.scroll_row = self.buf.prev_visible_row(self.scroll_row - 1)
-                vrow += self._visual_rows_count(len(self.buf.lines[self.scroll_row]))
-            # Scroll down if needed
-            while vrow >= self.text_rows - margin_v:
-                consumed = self._visual_rows_count(len(self.buf.lines[self.scroll_row]))
-                vrow -= consumed
-                nxt = self.buf.next_visible_row(self.scroll_row + 1)
-                if nxt is not None:
-                    self.scroll_row = nxt
-                else:
-                    break
+            # Room for the margin and a row of text; a two-row pane keeps none.
+            margin_v = max(0, min(2, (self.text_rows - 1) // 2))
+            self.scroll_vrow = min(self.scroll_vrow, self._line_vrows(self.scroll_row) - 1)
+            # One visual row at a time, in both directions: a line taller than
+            # the view is scrolled *through* rather than jumped over, which is
+            # what makes a long message readable at all.  Scrolling by a row
+            # moves the cursor a row the other way, so the position is carried
+            # along rather than recomputed on every step.
+            vrow = self.cursor_vrow()
+            while vrow < margin_v and self._scroll_up_one_vrow():
+                vrow += 1
+            # The bottom margin is only worth keeping while there is text below
+            # to fill it: at the end of the buffer the last row goes on the last
+            # screen row rather than leaving blank rows under it.
+            bottom = self.text_rows - self._vrows_after_cursor(margin_v)
+            while vrow >= bottom and self._scroll_down_one_vrow():
+                vrow -= 1
             self.scroll_col = 0
             return
-        # Vertical (in visible-row space so folded lines don't count)
-        margin_v = 2
+        self.scroll_vrow = 0
+        # Vertical (in visible-row space so folded lines don't count).  Room
+        # for both margins and a row of text between them, as in wrap mode: a
+        # view four rows or shorter cannot hold two, and asking for them makes
+        # the two loops below undo each other on every draw.
+        margin_v = max(0, min(2, (self.text_rows - 1) // 2))
         above = self._visible_rows_between(self.scroll_row, cr) if cr > self.scroll_row \
             else -self._visible_rows_between(cr, self.scroll_row)
         if above < margin_v:
@@ -2723,103 +2926,19 @@ class Renderer:
             self.scroll_col = cc - self.text_cols + margin_h + 1
         self.scroll_col = max(0, self.scroll_col)
 
-    def draw(
-        self,
-        popup: Optional['SelectPopup'] = None,
-        search: Optional['SearchBar'] = None,
-        running_popup: Optional['RunningPopup'] = None,
-        info_popup: Optional['InfoPopup'] = None,
-        input_bar: Optional['InputBar'] = None,
-        overlay=None,
-    ):
-        self.stdscr.erase()
-
-        # A full-screen overlay (e.g. the lock screen) hides everything else.
-        if overlay is not None:
-            overlay.draw(self.stdscr, self._height, self._width)
-            try:
-                curses.curs_set(0)
-            except curses.error:
-                pass
-            self.stdscr.refresh()
-            return
-
-        self._draw_text_area()
-        if search and search.active:
-            self._draw_search_bar(search)
-        elif input_bar and input_bar.active:
-            self._draw_input_bar(input_bar)
-        else:
-            self._draw_filename_bar()
-        if popup and popup.active:
-            popup.draw(self.stdscr, self.colors, self._height, self._width)
-        if running_popup and running_popup.active:
-            running_popup.draw(self.stdscr, self._height, self._width)
-        if info_popup and info_popup.active:
-            info_popup.draw(self.stdscr, self.colors, self._height, self._width)
-        self._draw_status_bar(search)
-        try:
-            curses.curs_set(1)
-        except curses.error:
-            pass
-        # Position physical cursor
-        if search and search.active:
-            prompt = ' Search: '
-            cx = min(len(prompt) + search.cursor, self._width - 1)
-            cy = self._height - 2
-            try:
-                self.stdscr.move(cy, cx)
-            except curses.error:
-                pass
-        elif input_bar and input_bar.active:
-            cx = min(input_bar.cursor_x(), self._width - 1)
-            cy = self._height - 2
-            try:
-                self.stdscr.move(cy, cx)
-            except curses.error:
-                pass
-        else:
-            if self.wrap:
-                tc = self.text_cols
-                vrow = 0
-                for i in range(self.scroll_row, self.buf.cursor_row):
-                    if i in self.buf.hidden_rows:
-                        continue
-                    vrow += self._visual_rows_count(len(self.buf.lines[i]))
-                vrow += self.buf.cursor_col // tc
-                cy = vrow
-                cx = self.GUTTER + self.buf.cursor_col % tc
-            else:
-                cy = self._visible_rows_between(self.scroll_row, self.buf.cursor_row)
-                cx = self.GUTTER + self.buf.cursor_col - self.scroll_col
-            cy = max(0, min(cy, self.text_rows - 1))
-            cx = max(self.GUTTER, min(cx, self._width - 1))
-            try:
-                self.stdscr.move(cy, cx)
-            except curses.error:
-                pass
-        self.stdscr.refresh()
-
     def _safe_addstr(self, y: int, x: int, s: str, attr: int = 0):
+        """Draw at (y, x) *relative to the rectangle*, clipped to its bounds."""
         if y < 0 or y >= self._height or x < 0 or x >= self._width:
             return
         s = s[:max(0, self._width - x)]
         if not s:
             return
         try:
-            self.stdscr.addstr(y, x, s, attr)
+            self.stdscr.addstr(self.top + y, self.left + x, s, attr)
         except curses.error:
             pass
 
-    def _safe_addch(self, y: int, x: int, ch: str, attr: int = 0):
-        if y < 0 or y >= self._height or x < 0 or x >= self._width:
-            return
-        try:
-            self.stdscr.addch(y, x, ch, attr)
-        except curses.error:
-            pass
-
-    def _draw_text_area(self):
+    def draw(self):
         buf = self.buf
         colors = self.colors
         text_rows = self.text_rows
@@ -2835,12 +2954,15 @@ class Renderer:
             for c in range(mcs, mce):
                 current_match_set.add((mr, c))
 
-        gutter_str = '~    '[:self.GUTTER]
+        gutter_str = '~    '[:self.gutter]
         hidden = buf.hidden_rows
         if self.wrap:
             tc = self.text_cols
             screen_y = 0
             line_idx = self.scroll_row
+            # The first line may start part-way down: scroll_vrow of its visual
+            # rows are above the top of the view.
+            skip = self.scroll_vrow
             while screen_y < text_rows:
                 if line_idx >= len(buf.lines):
                     while screen_y < text_rows:
@@ -2852,12 +2974,13 @@ class Renderer:
                     continue
                 line_len = len(buf.lines[line_idx])
                 num_vrows = max(1, (line_len + tc - 1) // tc) if line_len > 0 else 1
-                for vrow in range(num_vrows):
+                for vrow in range(skip, num_vrows):
                     if screen_y >= text_rows:
                         break
                     self._draw_visual_line(screen_y, line_idx, vrow * tc,
                                            vrow == 0, match_set, current_match_set)
                     screen_y += 1
+                skip = 0
                 line_idx += 1
         else:
             line_idx = self.scroll_row
@@ -2877,18 +3000,22 @@ class Renderer:
         colors = self.colors
 
         # Gutter
-        if show_lineno:
-            line_no = str(line_idx + 1).rjust(self.GUTTER - 1) + ' '
-            # '-' before the number marks a folded-block header (its body,
-            # starting at the next row, is hidden).
-            if line_idx + 1 in buf.hidden_rows and line_no[0] == ' ':
-                line_no = '-' + line_no[1:]
-        else:
-            line_no = ' ' * self.GUTTER
-        self._safe_addstr(y, 0, line_no, curses.color_pair(colors.line_num))
+        if self.gutter:
+            if show_lineno:
+                line_no = str(line_idx + 1).rjust(self.gutter - 1) + ' '
+                # '-' before the number marks a folded-block header (its body,
+                # starting at the next row, is hidden).
+                if line_idx + 1 in buf.hidden_rows and line_no[0] == ' ':
+                    line_no = '-' + line_no[1:]
+            else:
+                line_no = ' ' * self.gutter
+            self._safe_addstr(y, 0, line_no, curses.color_pair(colors.line_num))
 
         line = buf.lines[line_idx]
-        tokens = self.lexer.get_tokens(line_idx, buf.lines)
+        if self.lexer is not None:
+            tokens = self.lexer.get_tokens(line_idx, buf.lines)
+        else:
+            tokens = []
         type_to_pair = self.type_to_pair
 
         # Ensure we cover the full line (fill gaps between tokens)
@@ -2909,7 +3036,7 @@ class Renderer:
         is_cursor_line = cl_start != cl_end and cl_start <= (line_idx - buf.cursor_row) < cl_end
 
         if is_cursor_line:
-            self._safe_addstr(y, self.GUTTER, ' ' * self.text_cols,
+            self._safe_addstr(y, self.gutter, ' ' * self.text_cols,
                               curses.color_pair(colors.cursor_normal))
 
         # Precompute same-row selection boundaries for fast-path correctness.
@@ -2928,7 +3055,7 @@ class Renderer:
             vis_e = min(te, ec)
             if vis_s >= vis_e:
                 continue
-            screen_x = self.GUTTER + vis_s - sc
+            screen_x = self.gutter + vis_s - sc
             segment = line[vis_s:vis_e]
             pair_id = type_to_pair.get(tt, colors.normal)
 
@@ -2973,6 +3100,629 @@ class Renderer:
                     else:
                         attr = curses.color_pair(pair_id)
                     self._safe_addstr(y, sx, ch, attr)
+
+    def cursor_screen_pos(self) -> Tuple[int, int]:
+        """Absolute screen position of the buffer cursor, clamped to the rectangle."""
+        buf = self.buf
+        if self.wrap:
+            cy = self.cursor_vrow()
+            cx = self.gutter + buf.cursor_col - self.cursor_vrow_in_line() * self.text_cols
+        else:
+            cy = self._visible_rows_between(self.scroll_row, buf.cursor_row)
+            cx = self.gutter + buf.cursor_col - self.scroll_col
+        cy = max(0, min(cy, self.text_rows - 1))
+        cx = max(self.gutter, min(cx, self._width - 1))
+        return self.top + cy, self.left + cx
+
+    def contains(self, mx: int, my: int) -> bool:
+        """True when the absolute screen cell (mx, my) is inside the rectangle."""
+        return (self.left <= mx < self.left + self._width
+                and self.top <= my < self.top + self._height)
+
+    def click_to_cursor(self, mx: int, my: int) -> bool:
+        """Move the buffer cursor to the absolute screen cell (mx, my).
+        Returns False (and does nothing) when the cell is outside the view."""
+        if not self.contains(mx, my):
+            return False
+        my -= self.top
+        # Clicks in the gutter go to the start of that line.
+        text_x = max(0, mx - self.left - self.gutter)
+
+        buf = self.buf
+        hidden = buf.hidden_rows
+        if self.wrap:
+            tc = self.text_cols
+            screen_y = 0
+            line_idx = self.scroll_row
+            skip = self.scroll_vrow          # as draw() starts it (see there)
+            while line_idx < len(buf.lines):
+                if line_idx in hidden:
+                    line_idx += 1
+                    continue
+                line_len = len(buf.lines[line_idx])
+                num_vrows = max(1, (line_len + tc - 1) // tc) if line_len > 0 else 1
+                for vrow in range(skip, num_vrows):
+                    if screen_y == my:
+                        col = min(vrow * tc + text_x, len(buf.lines[line_idx]))
+                        buf.move_cursor(line_idx, col)
+                        return True
+                    screen_y += 1
+                skip = 0
+                line_idx += 1
+            # Clicked below last line — go to end of buffer
+            row = buf.prev_visible_row(len(buf.lines) - 1)
+            buf.move_cursor(row, len(buf.lines[row]))
+        else:
+            # Walk down `my` visible rows from scroll_row
+            row = self.scroll_row
+            for _ in range(my):
+                nxt = buf.next_visible_row(row + 1)
+                if nxt is None:
+                    break
+                row = nxt
+            row = buf.prev_visible_row(max(0, min(row, len(buf.lines) - 1)))
+            col = text_x + self.scroll_col
+            col = max(0, min(col, len(buf.lines[row])))
+            buf.move_cursor(row, col)
+        return True
+
+    # ── Wrap-aware vertical movement (a screen row, not a document line) ──────
+
+    def move_up_wrap(self, extend: bool = False):
+        tc = self.text_cols
+        buf = self.buf
+        if buf.cursor_col >= tc:
+            buf.move_cursor(buf.cursor_row, buf.cursor_col - tc, extend)
+        elif buf.cursor_row > 0:
+            pr = buf.prev_visible_row(buf.cursor_row - 1)
+            visual_col = buf.cursor_col % tc
+            prev_len = len(buf.lines[pr])
+            last_vline_start = (prev_len // tc) * tc
+            new_col = min(last_vline_start + visual_col, prev_len)
+            buf.move_cursor(pr, new_col, extend)
+
+    def move_down_wrap(self, extend: bool = False):
+        tc = self.text_cols
+        buf = self.buf
+        line_len = len(buf.lines[buf.cursor_row])
+        next_vline_start = (buf.cursor_col // tc + 1) * tc
+        if next_vline_start <= line_len:
+            new_col = min(buf.cursor_col + tc, line_len)
+            buf.move_cursor(buf.cursor_row, new_col, extend)
+        elif buf.cursor_row < len(buf.lines) - 1:
+            nr = buf.next_visible_row(buf.cursor_row + 1)
+            if nr is None:
+                return
+            visual_col = buf.cursor_col % tc
+            new_col = min(visual_col, len(buf.lines[nr]))
+            buf.move_cursor(nr, new_col, extend)
+
+
+# ─── TextArea ─────────────────────────────────────────────────────────────────
+#: The editing and movement commands shared by the main editor and every
+#: :class:`TextArea`.  One table so a text field in a dialog can never drift
+#: away from the editor's own keys: :class:`TextArea` builds its key map from
+#: it, and Editor._register_default_* register the very same functions (adding
+#: only the commands that belong to a whole editor — save, search, folding …).
+#:
+#: Columns: (Fn, [key codes], description, keybinding shown in the palette).
+#: The Fn value doubles as the name of the TextArea method to call.
+TEXT_EDIT_BINDINGS = (
+    (Fn.MOVE_UP,         [K(curses.KEY_UP)],                     'Move cursor up',        ''),
+    (Fn.MOVE_DOWN,       [K(curses.KEY_DOWN)],                   'Move cursor down',      ''),
+    (Fn.MOVE_LEFT,       [K(curses.KEY_LEFT)],                   'Move cursor left',      ''),
+    (Fn.MOVE_RIGHT,      [K(curses.KEY_RIGHT)],                  'Move cursor right',     ''),
+    (Fn.SEL_MOVE_UP,     [K(curses.KEY_SR)],                     'Extend selection up',   ''),
+    (Fn.SEL_MOVE_DOWN,   [K(curses.KEY_SF)],                     'Extend selection down', ''),
+    (Fn.SEL_MOVE_LEFT,   [K(curses.KEY_SLEFT)],                  'Extend selection left', ''),
+    (Fn.SEL_MOVE_RIGHT,  [K(curses.KEY_SRIGHT)],                 'Extend selection right', ''),
+    (Fn.MOVE_UP_5,       [K(578)],                               'Move 5 lines up',       'Alt+Up'),
+    (Fn.MOVE_DOWN_5,     [K(537)],                               'Move 5 lines down',     'Alt+Down'),
+    (Fn.MOVE_HOME,       [K(curses.KEY_HOME), K(604), K(ord('\x01'))],
+                                                                 'Move to line start',    '^A / Cmd+Left'),
+    (Fn.MOVE_END,        [K(curses.KEY_END), K(605), K(ord('\x05'))],
+                                                                 'Move to line end',      '^E / Cmd+Right'),
+    (Fn.SEL_MOVE_HOME,   [K(curses.KEY_SHOME), key_csi('[', '1', ';', '1', '0', 'D')],
+                                                                 'Select to line start',  'Shift+Home'),
+    (Fn.SEL_MOVE_END,    [K(curses.KEY_SEND), key_csi('[', '1', ';', '1', '0', 'C')],
+                                                                 'Select to line end',    'Shift+End'),
+    (Fn.PAGE_UP,         [K(curses.KEY_PPAGE)],                  'Page up',               ''),
+    (Fn.PAGE_DOWN,       [K(curses.KEY_NPAGE)],                  'Page down',             ''),
+    (Fn.SEL_PAGE_UP,     [K(curses.KEY_SPREVIOUS)],              'Select page up',        ''),
+    (Fn.SEL_PAGE_DOWN,   [K(curses.KEY_SNEXT)],                  'Select page down',      ''),
+    (Fn.FILE_START,      [K(549)],                               'Go to file start',      '^Home'),
+    (Fn.FILE_END,        [K(544)],                               'Go to file end',        '^End'),
+    (Fn.WORD_LEFT,       list(WORD_LEFT_KEYS),                   'Move word left',        '^Left / Alt+b'),
+    (Fn.WORD_RIGHT,      list(WORD_RIGHT_KEYS),                  'Move word right',       '^Right / Alt+f'),
+    (Fn.SEL_WORD_LEFT,   [K(553), K(559), K(558), K(600), K(602)],
+                                                                 'Select word left',      ''),
+    (Fn.SEL_WORD_RIGHT,  [K(568), K(574), K(573), K(601), K(603)],
+                                                                 'Select word right',     ''),
+    (Fn.COPY,            [K(ord('\x03'))],                       'Copy',                  '^C'),
+    (Fn.PASTE,           [K(ord('\x16'))],                       'Paste',                 '^V'),
+    (Fn.UNDO,            [K(ord('\x1a'))],                       'Undo',                  '^Z'),
+    (Fn.REDO,            [K(ord('\x19'))],                       'Redo',                  '^Y'),
+    (Fn.TOGGLE_WRAP,     [K(ord('\x17'))],                       'Toggle word wrap',      '^W'),
+    (Fn.TOGGLE_MARK,     [K(ord('\x0b'))],                       'Toggle line mark',      '^K'),
+    (Fn.SELECT_ALL,      [key_alt(ord('\x01'))],                 'Select all',            'Esc+^A'),
+    (Fn.BACKSPACE,       [K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))],
+                                                                 'Delete char backward',  'Backspace'),
+    (Fn.DELETE,          [K(curses.KEY_DC)],                     'Delete char forward',   'Del'),
+    (Fn.DELETE_WORD_FWD, [K(608)],                               'Delete word forward',   'Alt+Del'),
+    (Fn.KILL_WORD_BWD,   [key_alt(127), key_alt(ord('\b')), key_alt(curses.KEY_BACKSPACE)],
+                                                                 'Delete word backward',  'Alt+Backspace'),
+    (Fn.DELETE_LINE,     [K(ord('\x15'))],                       'Clear current line',    '^U / Cmd+Backspace'),
+    (Fn.NEWLINE,         [K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))],
+                                                                 'New line',              'Enter'),
+    (Fn.TAB,             [K(ord('\t'))],                         'Insert tab',            'Tab'),
+    (Fn.CLEAR_SELECTION, [K(27)],                                'Clear selection',       'Esc'),
+)
+
+
+class TextArea:
+    """An editable multi-line text field.
+
+    Holds the text (:class:`TextBuffer`), draws it (:class:`TextView`) and
+    applies the editor's own editing keys to it (:data:`TEXT_EDIT_BINDINGS`) —
+    selection, word jumps, undo/redo, clipboard, wrap.  The main editor is
+    built on one of these; dialogs (the LLM chat) put several small ones on
+    screen, optionally boxed with a title.
+    """
+
+    def __init__(self, stdscr: curses.window, colors: ColorManager,
+                 lexer: Optional['Lexer'] = None, *, buf: Optional['TextBuffer'] = None,
+                 clipboard: Optional['Clipboard'] = None, gutter: int = TextView.GUTTER,
+                 readonly: bool = False, border: bool = False, title: str = ''):
+        self.buf = buf if buf is not None else TextBuffer()
+        self.buf.readonly = readonly
+        self.lexer = lexer
+        self.clipboard = clipboard if clipboard is not None else Clipboard()
+        self.view = TextView(stdscr, colors, self.buf, lexer, gutter=gutter)
+        self.colors = colors
+        self.stdscr = stdscr
+        self.border = border
+        #: The border is only drawn when the slot is big enough to hold it —
+        #: see :meth:`set_rect`.
+        self._bordered = border
+        self.title = title
+        self.focused = False
+        #: key code -> Fn (the name of the method implementing it)
+        self.keymap: dict = {}
+        for fn, keys, _description, _keybinding in TEXT_EDIT_BINDINGS:
+            for key in keys:
+                self.keymap[key] = fn
+
+    # ── Text ─────────────────────────────────────────────────────────────────
+
+    @property
+    def text(self) -> str:
+        return '\n'.join(self.buf.lines)
+
+    @text.setter
+    def text(self, value: str) -> None:
+        self.set_text(value)
+
+    def set_text(self, value: str, *, keep_undo: bool = False) -> None:
+        """Replace the whole content.
+
+        With *keep_undo* the replacement goes through the buffer as an ordinary
+        edit, so Ctrl+Z takes the previous text back; without it the field
+        starts over — no undo history, cursor at the top, nothing selected."""
+        buf = self.buf
+        if keep_undo:
+            readonly, buf.readonly = buf.readonly, False
+            try:
+                buf.select_all()
+                buf.insert_text(value)   # pushes undo, then replaces the selection
+            finally:
+                buf.readonly = readonly
+        else:
+            buf.lines = value.split('\n') or ['']
+            buf._undo_stack.clear()
+            buf._redo_stack.clear()
+            buf.marked_lines.clear()
+            buf.clear_selection()
+            buf.cursor_row = 0
+            buf.cursor_col = 0
+            buf.preferred_col = 0
+            buf.dirty = True   # bumps buf.version — invalidates the caches keyed on it
+        self._invalidate(0)
+
+    # ── Geometry and drawing ─────────────────────────────────────────────────
+
+    def set_rect(self, top: int, left: int, height: int, width: int) -> None:
+        """Place the field.  With a border, one row/column on each side is
+        spent on it and the text gets what is left — unless the slot is too
+        small to hold a border around a row of text, when the border is
+        dropped: drawing it anyway would spill over whatever sits below."""
+        self._bordered = self.border and height >= 3 and width >= 3
+        if self._bordered:
+            self.view.set_rect(top + 1, left + 1, height - 2, width - 2)
+        else:
+            self.view.set_rect(top, left, max(1, height), max(1, width))
+
+    def draw(self) -> None:
+        if self._bordered:
+            self._draw_border()
+        self.view.ensure_cursor_visible()
+        self.view.draw()
+
+    def _draw_border(self) -> None:
+        view = self.view
+        top, left = view.top - 1, view.left - 1
+        height, width = view._height + 2, view._width + 2
+        attr = curses.color_pair(self.colors.status_bar if self.focused else self.colors.line_num)
+        try:
+            self.stdscr.attron(attr)
+            self.stdscr.addch(top, left, curses.ACS_ULCORNER)
+            self.stdscr.hline(top, left + 1, curses.ACS_HLINE, width - 2)
+            self.stdscr.addch(top, left + width - 1, curses.ACS_URCORNER)
+            for row in range(top + 1, top + height - 1):
+                self.stdscr.addch(row, left, curses.ACS_VLINE)
+                self.stdscr.addch(row, left + width - 1, curses.ACS_VLINE)
+            bot = top + height - 1
+            self.stdscr.addch(bot, left, curses.ACS_LLCORNER)
+            self.stdscr.hline(bot, left + 1, curses.ACS_HLINE, width - 2)
+            self.stdscr.addch(bot, left + width - 1, curses.ACS_LRCORNER)
+            if self.title:
+                self.stdscr.addstr(top, left + 2, f' {self.title} '[:max(0, width - 4)])
+            self.stdscr.attroff(attr)
+        except curses.error:
+            pass
+
+    def cursor_screen_pos(self) -> Tuple[int, int]:
+        return self.view.cursor_screen_pos()
+
+    # ── Key handling ─────────────────────────────────────────────────────────
+
+    def handle_key(self, key, is_text: bool = True) -> bool:
+        """Apply *key* to the field; True when it was consumed.
+
+        *key* is in the bitfield format produced by Editor._encode_key.
+        *is_text* says whether it came from a character the user typed rather
+        than a special key — pass False for anything read as a curses constant,
+        or it may be inserted as text (see :meth:`insert_printable`)."""
+        fn = self.keymap.get(key)
+        if fn is not None:
+            getattr(self, fn.value)()
+            return True
+        return self.insert_printable(key, is_text)
+
+    def insert_printable(self, key, is_text: bool = True) -> bool:
+        """Insert *key* as a character, if that is what it is.
+
+        Looking printable is not enough to go on: curses key constants live in
+        the printable Unicode range too (KEY_MOUSE is 409, ``'ƙ'``; F5 is 269,
+        ``'č'``), and they cannot be told apart by value — typed ``'ā'`` is 257,
+        the same as KEY_MIN.  Only the caller knows, hence *is_text*."""
+        if not is_text:
+            return False
+        # After encoding, printable chars have no flags and base >= 32
+        if isinstance(key, int) and key_flags(key) == 0:
+            base = key_base(key)
+            if base >= 32 and chr(base).isprintable():
+                self.buf.insert_char(chr(base))
+                return True
+        return False
+
+    def _invalidate(self, from_row: int = 0) -> None:
+        if self.lexer is not None:
+            self.lexer.invalidate(max(0, from_row))
+
+    # ── Movement commands ────────────────────────────────────────────────────
+
+    def move_up(self):
+        if self.view.wrap:
+            self.view.move_up_wrap()
+        else:
+            self.buf.move_up()
+
+    def move_down(self):
+        if self.view.wrap:
+            self.view.move_down_wrap()
+        else:
+            self.buf.move_down()
+
+    def move_left(self):
+        self.buf.move_left()
+
+    def move_right(self):
+        self.buf.move_right()
+
+    def move_home(self):
+        self.buf.move_cursor(self.buf.cursor_row, 0)
+
+    def move_end(self):
+        self.buf.move_cursor(self.buf.cursor_row, len(self.buf.lines[self.buf.cursor_row]))
+
+    def move_up_5(self):
+        self._move_rows(-5)
+
+    def move_down_5(self):
+        self._move_rows(5)
+
+    def page_up(self):
+        self._move_rows(-self.view.page_rows)
+
+    def page_down(self):
+        self._move_rows(self.view.page_rows)
+
+    def file_start(self):
+        self.buf.move_cursor(0, 0)
+
+    def file_end(self):
+        last = len(self.buf.lines) - 1
+        self.buf.move_cursor(last, len(self.buf.lines[last]))
+
+    def word_left(self):
+        self.buf.move_word_left()
+
+    def word_right(self):
+        self.buf.move_word_right()
+
+    def _move_rows(self, delta: int, extend: bool = False):
+        """Move *delta* visible rows, keeping the preferred column.
+
+        With wrap on the rows counted are the ones on screen, not document
+        lines: a page of a wrapped document is a screenful, and paging through
+        a single long line has to work at all."""
+        buf = self.buf
+        if self.view.wrap:
+            step = self.view.move_up_wrap if delta < 0 else self.view.move_down_wrap
+            for _ in range(abs(delta)):
+                step(extend)
+            return
+        pc = buf.preferred_col
+        buf.move_cursor(buf.visible_row_offset(buf.cursor_row, delta), pc,
+                        extend_selection=extend)
+        buf.preferred_col = pc
+
+    # ── Selection movement commands ──────────────────────────────────────────
+
+    def sel_move_up(self):
+        if self.view.wrap:
+            self.view.move_up_wrap(extend=True)
+        else:
+            self.buf.move_up(extend=True)
+
+    def sel_move_down(self):
+        if self.view.wrap:
+            self.view.move_down_wrap(extend=True)
+        else:
+            self.buf.move_down(extend=True)
+
+    def sel_move_left(self):
+        self.buf.move_left(extend=True)
+
+    def sel_move_right(self):
+        self.buf.move_right(extend=True)
+
+    def sel_move_home(self):
+        self.buf.move_cursor(self.buf.cursor_row, 0, extend_selection=True)
+
+    def sel_move_end(self):
+        self.buf.move_cursor(self.buf.cursor_row,
+                             len(self.buf.lines[self.buf.cursor_row]), extend_selection=True)
+
+    def sel_page_up(self):
+        self._move_rows(-self.view.page_rows, extend=True)
+
+    def sel_page_down(self):
+        self._move_rows(self.view.page_rows, extend=True)
+
+    def sel_word_left(self):
+        self.buf.move_word_left(extend=True)
+
+    def sel_word_right(self):
+        self.buf.move_word_right(extend=True)
+
+    def select_all(self):
+        self.buf.select_all()
+
+    def clear_selection(self):
+        self.buf.clear_selection()
+
+    # ── Editing commands ─────────────────────────────────────────────────────
+
+    def copy(self):
+        if self.buf.has_selection():
+            self.clipboard.copy(self.buf.get_selected_text())
+
+    def paste(self):
+        text = self.clipboard.paste()
+        if text is not None:
+            self.buf.insert_text(text)
+            self._invalidate(self.buf.cursor_row - text.count('\n'))
+
+    def undo(self):
+        self.buf.undo()
+        self._invalidate(0)
+
+    def redo(self):
+        self.buf.redo()
+        self._invalidate(0)
+
+    def backspace(self):
+        self.buf.delete_char()
+        self._invalidate(self.buf.cursor_row - 1)
+
+    def delete(self):
+        self.buf.delete_char_forward()
+        self._invalidate(self.buf.cursor_row)
+
+    def delete_word_fwd(self):
+        self.buf.delete_word_after_cursor()
+        self._invalidate(self.buf.cursor_row)
+
+    def kill_word_bwd(self):
+        row_before = self.buf.cursor_row
+        self.buf.kill_word_backward()
+        self._invalidate(min(row_before, self.buf.cursor_row))
+
+    def delete_line(self):
+        self.buf.delete_line()
+        self._invalidate(self.buf.cursor_row)
+
+    def newline(self):
+        self.buf.insert_newline()
+        self._invalidate(self.buf.cursor_row - 1)
+
+    def tab(self):
+        self.buf.insert_char(' ' * TAB_SIZE)
+
+    # ── View commands ────────────────────────────────────────────────────────
+
+    def toggle_wrap(self):
+        self.view.wrap = not self.view.wrap
+        self.view.scroll_col = 0
+        # The two modes count rows differently; start the new one at a line
+        # boundary and let ensure_cursor_visible place the view again.
+        self.view.scroll_vrow = 0
+
+    def toggle_mark(self):
+        r = self.buf.cursor_row
+        if r in self.buf.marked_lines:
+            self.buf.marked_lines.discard(r)
+        else:
+            self.buf.marked_lines.add(r)
+
+
+# ─── Renderer ─────────────────────────────────────────────────────────────────
+class Renderer:
+    """Composes a frame: the editor's text area (drawn by :class:`TextView`),
+    the two bars below it, and whatever popup or overlay is up."""
+
+    GUTTER = TextView.GUTTER  # kept as the historical name for the gutter width
+
+    def __init__(self, stdscr: curses.window, colors: ColorManager, view: 'TextView'):
+        self.stdscr = stdscr
+        self.colors = colors
+        self.view = view
+        self.buf = view.buf
+        self.lexer = view.lexer
+        self._height = 0
+        self._width = 0
+        self.debug_text = ''
+        self.status_name: Optional[str] = None
+        self.status_notification: Optional[str] = None
+        self.status_notification_error = False  # show status_notification in the error color
+        self.input_pending = False  # a prompt is waiting for the user
+        self.resize()
+
+    def resize(self):
+        self._height, self._width = self.stdscr.getmaxyx()
+        # Reserve the bottom 2 rows: status bar + filename/search bar
+        self.view.set_rect(0, 0, max(1, self._height - 2), max(1, self._width))
+
+    # The view owns the text-area geometry and scrolling; these forward to it so
+    # `renderer.wrap`, `renderer.text_rows` … keep working as before.
+    view_attrs = ('scroll_row', 'scroll_col', 'scroll_vrow', 'wrap',
+                  'cursor_line_range', 'search_matches', 'search_current')
+
+    def __getattr__(self, name):
+        view = self.__dict__.get('view')
+        if view is not None and name in Renderer.view_attrs:
+            return getattr(view, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name in Renderer.view_attrs and 'view' in self.__dict__:
+            setattr(self.view, name, value)
+            return
+        object.__setattr__(self, name, value)
+
+    @property
+    def text_rows(self) -> int:
+        return self.view.text_rows
+
+    @property
+    def text_cols(self) -> int:
+        return self.view.text_cols
+
+    def ensure_cursor_visible(self):
+        self.view.ensure_cursor_visible()
+
+    def draw(
+        self,
+        popup: Optional['SelectPopup'] = None,
+        search: Optional['SearchBar'] = None,
+        running_popup: Optional['RunningPopup'] = None,
+        info_popup: Optional['InfoPopup'] = None,
+        input_bar: Optional['InputBar'] = None,
+        overlay=None,
+    ):
+        self.stdscr.erase()
+
+        # A full-screen overlay (the lock screen, the LLM chat) hides everything
+        # else.  An overlay with a text field tells us where its cursor is; one
+        # without (the lock screen) leaves it hidden.
+        if overlay is not None:
+            overlay.draw(self.stdscr, self._height, self._width)
+            cursor_pos = getattr(overlay, 'cursor_pos', None)
+            position = cursor_pos() if cursor_pos is not None else None
+            try:
+                if position is None:
+                    curses.curs_set(0)
+                else:
+                    curses.curs_set(1)
+                    self.stdscr.move(*position)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            return
+
+        self.view.draw()
+        if search and search.active:
+            self._draw_search_bar(search)
+        elif input_bar and input_bar.active:
+            self._draw_input_bar(input_bar)
+        else:
+            self._draw_filename_bar()
+        if popup and popup.active:
+            popup.draw(self.stdscr, self.colors, self._height, self._width)
+        if running_popup and running_popup.active:
+            running_popup.draw(self.stdscr, self._height, self._width)
+        if info_popup and info_popup.active:
+            info_popup.draw(self.stdscr, self.colors, self._height, self._width)
+        self._draw_status_bar(search)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        # Position physical cursor
+        if search and search.active:
+            prompt = ' Search: '
+            cx = min(len(prompt) + search.cursor, self._width - 1)
+            cy = self._height - 2
+            try:
+                self.stdscr.move(cy, cx)
+            except curses.error:
+                pass
+        elif input_bar and input_bar.active:
+            cx = min(input_bar.cursor_x(), self._width - 1)
+            cy = self._height - 2
+            try:
+                self.stdscr.move(cy, cx)
+            except curses.error:
+                pass
+        else:
+            cy, cx = self.view.cursor_screen_pos()
+            try:
+                self.stdscr.move(cy, min(cx, self._width - 1))
+            except curses.error:
+                pass
+        self.stdscr.refresh()
+
+    def _safe_addstr(self, y: int, x: int, s: str, attr: int = 0):
+        if y < 0 or y >= self._height or x < 0 or x >= self._width:
+            return
+        s = s[:max(0, self._width - x)]
+        if not s:
+            return
+        try:
+            self.stdscr.addstr(y, x, s, attr)
+        except curses.error:
+            pass
 
     def _draw_search_bar(self, search: 'SearchBar'):
         y = self._height - 2
@@ -3036,61 +3786,6 @@ class Renderer:
         self._safe_addstr(y, 0, bar, curses.color_pair(pair))
 
 
-# ─── Function name enum ───────────────────────────────────────────────────────
-class Fn(str, enum.Enum):
-    """Named editor functions. Values are the string keys used in the function registry."""
-    MOVE_UP          = 'move_up'
-    MOVE_DOWN        = 'move_down'
-    MOVE_LEFT        = 'move_left'
-    MOVE_RIGHT       = 'move_right'
-    SEL_MOVE_UP      = 'sel_move_up'
-    SEL_MOVE_DOWN    = 'sel_move_down'
-    SEL_MOVE_LEFT    = 'sel_move_left'
-    SEL_MOVE_RIGHT   = 'sel_move_right'
-    MOVE_UP_5        = 'move_up_5'
-    MOVE_DOWN_5      = 'move_down_5'
-    MOVE_HOME        = 'move_home'
-    MOVE_END         = 'move_end'
-    SEL_MOVE_HOME    = 'sel_move_home'
-    SEL_MOVE_END     = 'sel_move_end'
-    PAGE_UP          = 'page_up'
-    PAGE_DOWN        = 'page_down'
-    SEL_PAGE_UP      = 'sel_page_up'
-    SEL_PAGE_DOWN    = 'sel_page_down'
-    FILE_START       = 'file_start'
-    FILE_END         = 'file_end'
-    WORD_LEFT        = 'word_left'
-    WORD_RIGHT       = 'word_right'
-    SEL_WORD_LEFT    = 'sel_word_left'
-    SEL_WORD_RIGHT   = 'sel_word_right'
-    OPEN_FILE        = 'open_file'
-    COPY             = 'copy'
-    PASTE            = 'paste'
-    UNDO             = 'undo'
-    REDO             = 'redo'
-    SAVE             = 'save'
-    SAVE_AS          = 'save_as'
-    TOGGLE_READONLY  = 'toggle_readonly'
-    SEARCH           = 'search'
-    AUTOCOMPLETE     = 'autocomplete'
-    QUIT             = 'quit'
-    HELP             = 'help'
-    TOGGLE_WRAP      = 'toggle_wrap'
-    TOGGLE_MARK      = 'toggle_mark'
-    SELECT_ALL       = 'select_all'
-    BACKSPACE        = 'backspace'
-    DELETE           = 'delete'
-    DELETE_WORD_FWD  = 'delete_word_fwd'
-    KILL_WORD_BWD    = 'kill_word_bwd'
-    DELETE_LINE      = 'delete_line'
-    NEWLINE          = 'newline'
-    TAB              = 'tab'
-    RESIZE           = 'resize'
-    CLEAR_SELECTION  = 'clear_selection'
-    COMMAND_PALETTE  = 'command_palette'
-    TOGGLE_FOLD      = 'toggle_fold'
-
-
 # ─── Editor ───────────────────────────────────────────────────────────────────
 class Editor:
     REMAPED_KEYS = {}
@@ -3106,14 +3801,18 @@ class Editor:
         self._apply_termios()
 
         self.colors = ColorManager()
-        self.buf = TextBuffer()
-        self.buf.readonly = readonly
         self.lexer = Lexer()
         self.clipboard = Clipboard()
+        # The document itself is an ordinary TextArea — the same widget dialogs
+        # use for their text fields, so both obey the very same editing keys.
+        self.textarea = TextArea(stdscr, self.colors, self.lexer,
+                                 clipboard=self.clipboard, readonly=readonly)
+        self.buf = self.textarea.buf
+        self.view = self.textarea.view
         self.search = SearchBar()
         self.popup = SelectPopup()
         self.running_popup = RunningPopup()
-        self.info_popup = InfoPopup()
+        self.info_popup = InfoPopup(self.clipboard)
         self.input_bar = InputBar()
         # Live-pipeline info popup state (driven by the pipeline `info()` helper).
         self._pipeline_info_live = False
@@ -3122,7 +3821,7 @@ class Editor:
         # Pending worker-thread prompt (pipeline choose()/select()/sselect()/
         # input()/ask()); see request_user_input().
         self._ui_request: Optional[dict] = None
-        self.renderer = Renderer(stdscr, self.colors, self.buf, self.lexer)
+        self.renderer = Renderer(stdscr, self.colors, self.view)
         self.running = True
         self._needs_redraw = True
         self._debug_mode = False
@@ -3139,6 +3838,13 @@ class Editor:
         self._fold_key = None
         self._init_ac_words([], [], [])
         self._editor_functions: dict = {}
+        # Extra help pages contributed by plugins (title -> text); linked from
+        # the help TOC by show_help().
+        self.extra_help_pages: dict = {}
+        # Full-screen overlays pushed over the editor (see push_overlay).
+        self._overlays: list = []
+        # Whether the key being dispatched came from typed text (see _dispatch).
+        self._key_is_text: bool = False
 
         self._directory: Optional[str] = directory
 
@@ -3198,12 +3904,70 @@ class Editor:
     def _dispatch_pre_hook(self, key) -> bool:
         """Called at the start of every dispatch cycle (including idle -1 wakeups).
         Return True to consume the event and skip normal dispatch."""
-        return False
+        overlay = self.active_overlay()
+        if overlay is None:
+            return False
+        # Idle ticks reach the overlay too, so one waiting on background work
+        # (the LLM chat on its request) can notice it finished.
+        tick = getattr(overlay, 'tick', None)
+        if tick is not None:
+            tick()
+        if key != -1:
+            if key == K(curses.KEY_MOUSE):
+                # A click, and this hook has no coordinates to route it with —
+                # let _dispatch carry on to _handle_click, which does.  It must
+                # not reach handle_key(): KEY_MOUSE is a printable code point
+                # and a text field would type it.
+                return False
+            if key == K(curses.KEY_RESIZE):
+                # The overlay is drawn with the renderer's screen size, and the
+                # editor's own resize command never runs while one is up.
+                self.renderer.resize()
+            overlay.handle_key(key)
+        self.request_redraw()
+        return True
+
+    # ── Full-screen overlays ─────────────────────────────────────────────────
+
+    def push_overlay(self, overlay) -> None:
+        """Show *overlay* over the editor and give it every keystroke.
+
+        An overlay needs ``draw(stdscr, H, W)`` and ``handle_key(key)``; it may
+        also offer ``tick()`` (called on every loop iteration) and
+        ``cursor_pos() -> (y, x) | None`` to place the terminal cursor — return
+        None, or omit it, and the cursor stays hidden.  The overlay removes
+        itself with :meth:`pop_overlay` when it is done.
+        """
+        if overlay in self._overlays:
+            self._overlays.remove(overlay)
+        self._overlays.append(overlay)
+        self.request_redraw()
+
+    def pop_overlay(self, overlay=None) -> None:
+        """Remove *overlay* (or the topmost one)."""
+        if overlay is None:
+            if self._overlays:
+                self._overlays.pop()
+        elif overlay in self._overlays:
+            self._overlays.remove(overlay)
+        self.request_redraw()
+
+    def active_overlay(self):
+        """The topmost pushed overlay, or None."""
+        return self._overlays[-1] if self._overlays else None
+
+    @property
+    def last_key_was_text(self) -> bool:
+        """Whether the key being dispatched is a character the user typed, as
+        opposed to a special key read as a curses constant.  Widgets must
+        consult this before inserting a key as text — see
+        :meth:`TextArea.insert_printable`."""
+        return getattr(self, '_key_is_text', False)
 
     def _get_overlay(self):
-        """Return an object with draw(stdscr, H, W) to render as a full-screen overlay,
-        or None for normal rendering. Override in a subclass."""
-        return None
+        """The overlay to render this frame instead of the normal editor view,
+        or None. Subclasses override to add overlays of their own."""
+        return self.active_overlay()
 
     def on_before_draw(self) -> None:
         """Called before every redraw, after each keypress.
@@ -3430,6 +4194,66 @@ class Editor:
         """Open autocomplete popup with a list of PopupItem objects."""
         self.popup.open(items, filter_text=self.buf.word_at_cursor(), title='Autocomplete')
 
+    def show_menu(self, title: str, items, on_select=None, multi: bool = False,
+                  default=None) -> None:
+        """Put a filterable list on screen — the widget autocomplete and the
+        command palette use.
+
+        *items* are strings, or ``(value, label)`` pairs when what is shown
+        differs from what is chosen.  *on_select* receives the chosen value
+        (once per marked value with *multi*)."""
+        entries = []
+        for item in items:
+            if isinstance(item, PopupItem):
+                entries.append(item)
+            elif isinstance(item, (tuple, list)):
+                value, label = item[0], item[1]
+                entries.append(PopupItem(insert=str(value), label=str(label)))
+            else:
+                entries.append(PopupItem(insert=str(item), label=str(item)))
+        self.popup.open(entries, on_select=on_select, title=title, multi=multi,
+                        default=default)
+        self.request_redraw()
+
+    # ── The document, as plugins see it ──────────────────────────────────────
+
+    def statement_rows(self) -> List[int]:
+        """Row indices of the statement under the cursor.  A plain text editor
+        has no statements — the current line is as close as it gets; DbEditor
+        overrides this with the SQL-aware version."""
+        return [self.buf.cursor_row]
+
+    def get_statement(self) -> str:
+        """The text the user is working on: the selection if there is one,
+        otherwise the statement under the cursor."""
+        if self.buf.has_selection():
+            return self.buf.get_selected_text()
+        rows = self.statement_rows()
+        return '\n'.join(self.buf.lines[row] for row in rows) if rows else ''
+
+    def replace_statement(self, text: str) -> bool:
+        """Replace that same text with *text* as one undoable edit.
+        False when the document is read-only."""
+        if self.buf.readonly:
+            return False
+        if not self.buf.has_selection():
+            rows = self.statement_rows()
+            if rows:
+                self.buf.move_cursor(rows[0], 0)
+                self.buf.move_cursor(rows[-1], len(self.buf.lines[rows[-1]]),
+                                     extend_selection=True)
+        return self.insert_text(text)
+
+    def insert_text(self, text: str) -> bool:
+        """Insert *text* at the cursor, replacing the selection if there is one.
+        False when the document is read-only."""
+        if self.buf.readonly:
+            return False
+        self.buf.insert_text(text)
+        self.lexer.invalidate(0)
+        self.request_redraw()
+        return True
+
     def add_editor_function(self, name: str, func: Callable[[], None], description: str = '', keybinding: str = '') -> None:
         self._editor_functions[name] = {'func': func, 'description': description, 'keybinding': keybinding}
 
@@ -3446,35 +4270,11 @@ class Editor:
 
     def _register_default_functions(self):
         add = self.add_editor_function
-        add(Fn.MOVE_UP,         self._cmd_move_up,              'Move cursor up')
-        add(Fn.MOVE_DOWN,       self._cmd_move_down,            'Move cursor down')
-        add(Fn.MOVE_LEFT,       self._cmd_move_left,            'Move cursor left')
-        add(Fn.MOVE_RIGHT,      self._cmd_move_right,           'Move cursor right')
-        add(Fn.SEL_MOVE_UP,     self._cmd_sel_move_up,          'Extend selection up')
-        add(Fn.SEL_MOVE_DOWN,   self._cmd_sel_move_down,        'Extend selection down')
-        add(Fn.SEL_MOVE_LEFT,   self._cmd_sel_move_left,        'Extend selection left')
-        add(Fn.SEL_MOVE_RIGHT,  self._cmd_sel_move_right,       'Extend selection right')
-        add(Fn.MOVE_UP_5,       self.move_up_5,                 'Move 5 lines up',        'Alt+Up')
-        add(Fn.MOVE_DOWN_5,     self.move_down_5,               'Move 5 lines down',      'Alt+Down')
-        add(Fn.MOVE_HOME,       self._cmd_move_home,            'Move to line start',     '^A / Cmd+Left')
-        add(Fn.MOVE_END,        self._cmd_move_end,             'Move to line end',       '^E / Cmd+Right')
-        add(Fn.SEL_MOVE_HOME,   self._cmd_sel_move_home,        'Select to line start',   'Shift+Home')
-        add(Fn.SEL_MOVE_END,    self._cmd_sel_move_end,         'Select to line end',     'Shift+End')
-        add(Fn.PAGE_UP,         self._cmd_page_up,              'Page up')
-        add(Fn.PAGE_DOWN,       self._cmd_page_down,            'Page down')
-        add(Fn.SEL_PAGE_UP,     self._cmd_sel_page_up,          'Select page up')
-        add(Fn.SEL_PAGE_DOWN,   self._cmd_sel_page_down,        'Select page down')
-        add(Fn.FILE_START,      self._cmd_file_start,           'Go to file start',       '^Home')
-        add(Fn.FILE_END,        self._cmd_file_end,             'Go to file end',         '^End')
-        add(Fn.WORD_LEFT,       self._cmd_word_left,            'Move word left',         '^Left / Alt+b')
-        add(Fn.WORD_RIGHT,      self._cmd_word_right,           'Move word right',        '^Right / Alt+f')
-        add(Fn.SEL_WORD_LEFT,   self._cmd_sel_word_left,        'Select word left')
-        add(Fn.SEL_WORD_RIGHT,  self._cmd_sel_word_right,       'Select word right')
+        # Editing and movement — shared verbatim with every TextArea.
+        for fn, _keys, description, keybinding in TEXT_EDIT_BINDINGS:
+            add(fn, getattr(self.textarea, fn.value), description, keybinding)
+        # Commands that belong to a whole editor rather than a text field.
         add(Fn.OPEN_FILE,       self._open_from_directory,      'Open file',              '^G')
-        add(Fn.COPY,            self._cmd_copy,                 'Copy',                   '^C')
-        add(Fn.PASTE,           self._cmd_paste,                'Paste',                  '^V')
-        add(Fn.UNDO,            self._cmd_undo,                 'Undo',                   '^Z')
-        add(Fn.REDO,            self._cmd_redo,                 'Redo',                   '^Y')
         add(Fn.SAVE,            self._save_file,                'Save',                   '^S')
         add(Fn.SAVE_AS,         self._save_file_as,             'Save As')
         add(Fn.TOGGLE_READONLY, self._toggle_readonly,          'Toggle read-only mode')
@@ -3482,72 +4282,22 @@ class Editor:
         add(Fn.AUTOCOMPLETE,    self._cmd_autocomplete,         'Base autocomplete',      '^N')
         add(Fn.QUIT,            self._quit,                     'Quit',                   '^Q')
         add(Fn.HELP,            self.show_help,                 'Show help',              'F1 / Alt+H')
-        add(Fn.TOGGLE_WRAP,     self._cmd_toggle_wrap,          'Toggle word wrap',       '^W')
-        add(Fn.TOGGLE_MARK,     self._cmd_toggle_mark,          'Toggle line mark',       '^K')
-        add(Fn.SELECT_ALL,      self._cmd_select_all,           'Select all',             'Esc+^A')
-        add(Fn.BACKSPACE,       self._cmd_backspace,            'Delete char backward',   'Backspace')
-        add(Fn.DELETE,          self._cmd_delete_forward,       'Delete char forward',    'Del')
-        add(Fn.DELETE_WORD_FWD, self._cmd_delete_word_forward,  'Delete word forward',    'Alt+Del')
-        add(Fn.KILL_WORD_BWD,   self._cmd_kill_word_backward,   'Delete word backward',   'Alt+Backspace')
-        add(Fn.DELETE_LINE,     self._cmd_delete_line,          'Clear current line',     '^U / Cmd+Backspace')
-        add(Fn.NEWLINE,         self._cmd_newline,              'New line',               'Enter')
-        add(Fn.TAB,             self._cmd_tab,                  'Insert tab',             'Tab')
         add(Fn.RESIZE,          self._cmd_resize,               'Handle terminal resize')
-        add(Fn.CLEAR_SELECTION, self.buf.clear_selection,       'Clear selection',        'Esc')
         add(Fn.COMMAND_PALETTE, self._cmd_command_palette,      'Command palette',        'Alt+P')
         add(Fn.TOGGLE_FOLD,     self._cmd_toggle_fold,          'Toggle >>> <<< block folding', '^P')
 
     def _register_default_keybindings(self):
         add = self.add_keybinding
-        # Movement
-        add(Fn.MOVE_UP,         K(curses.KEY_UP))
-        add(Fn.MOVE_DOWN,       K(curses.KEY_DOWN))
-        add(Fn.MOVE_LEFT,       K(curses.KEY_LEFT))
-        add(Fn.MOVE_RIGHT,      K(curses.KEY_RIGHT))
-        add(Fn.SEL_MOVE_UP,     K(curses.KEY_SR))
-        add(Fn.SEL_MOVE_DOWN,   K(curses.KEY_SF))
-        add(Fn.SEL_MOVE_LEFT,   K(curses.KEY_SLEFT))
-        add(Fn.SEL_MOVE_RIGHT,  K(curses.KEY_SRIGHT))
-        add(Fn.MOVE_UP_5,       K(578))
-        add(Fn.MOVE_DOWN_5,     K(537))
-        add(Fn.MOVE_HOME,       [K(curses.KEY_HOME), K(604), K(ord('\x01'))])
-        add(Fn.MOVE_END,        [K(curses.KEY_END),  K(605), K(ord('\x05'))])
-        add(Fn.SEL_MOVE_HOME,   [K(curses.KEY_SHOME), key_csi('[', '1', ';', '1', '0', 'D')])
-        add(Fn.SEL_MOVE_END,    [K(curses.KEY_SEND),  key_csi('[', '1', ';', '1', '0', 'C')])
-        add(Fn.PAGE_UP,         K(curses.KEY_PPAGE))
-        add(Fn.PAGE_DOWN,       K(curses.KEY_NPAGE))
-        add(Fn.SEL_PAGE_UP,     K(curses.KEY_SPREVIOUS))
-        add(Fn.SEL_PAGE_DOWN,   K(curses.KEY_SNEXT))
-        add(Fn.FILE_START,      K(549))
-        add(Fn.FILE_END,        K(544))
-        add(Fn.WORD_LEFT,       list(WORD_LEFT_KEYS))
-        add(Fn.WORD_RIGHT,      list(WORD_RIGHT_KEYS))
-        add(Fn.SEL_WORD_LEFT,   [K(553), K(559), K(558), K(600), K(602)])
-        add(Fn.SEL_WORD_RIGHT,  [K(568), K(574), K(573), K(601), K(603)])
+        for fn, keys, _description, _keybinding in TEXT_EDIT_BINDINGS:
+            add(fn, list(keys))
         # Ctrl shortcuts
         add(Fn.OPEN_FILE,       K(ord('\x07')))
-        add(Fn.COPY,            K(ord('\x03')))
-        add(Fn.PASTE,           K(ord('\x16')))
-        add(Fn.UNDO,            K(ord('\x1a')))
-        add(Fn.REDO,            K(ord('\x19')))
         add(Fn.SAVE,            K(ord('\x13')))
         add(Fn.SEARCH,          K(ord('\x06')))
         add(Fn.AUTOCOMPLETE,    K(ord('\x0e')))
         add(Fn.QUIT,            K(ord('\x11')))
         add(Fn.HELP,            [K(curses.KEY_F1), key_alt(ord('h'))])
-        add(Fn.TOGGLE_WRAP,     K(ord('\x17')))
-        add(Fn.TOGGLE_MARK,     K(ord('\x0b')))
-        add(Fn.SELECT_ALL,      key_alt(ord('\x01')))  # Alt+Ctrl+A
-        # Editing
-        add(Fn.BACKSPACE,       [K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))])
-        add(Fn.DELETE,          K(curses.KEY_DC))
-        add(Fn.DELETE_WORD_FWD, K(608))
-        add(Fn.KILL_WORD_BWD,   [key_alt(127), key_alt(ord('\b')), key_alt(curses.KEY_BACKSPACE)])  # Alt+Backspace (DEL or ^H)
-        add(Fn.DELETE_LINE,     K(ord('\x15')))  # Ctrl+U (Cmd+Backspace in terminals with natural text editing)
-        add(Fn.NEWLINE,         [K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))])
-        add(Fn.TAB,             K(ord('\t')))
         add(Fn.RESIZE,          K(curses.KEY_RESIZE))
-        add(Fn.CLEAR_SELECTION, K(27))
         add(Fn.COMMAND_PALETTE, key_alt(ord('p')))   # Alt+P
         add(Fn.TOGGLE_FOLD,     K(ord('\x10')))      # Ctrl+P
 
@@ -3693,6 +4443,13 @@ class Editor:
         return key << 2
 
     def _dispatch(self, key):
+        # get_wch() hands back a str for text the user actually typed and an int
+        # for everything else.  That is the only thing telling the two apart —
+        # curses constants sit inside the printable Unicode range (KEY_MOUSE is
+        # 409, 'ƙ'), so a key code must never be inserted as a character on the
+        # strength of looking printable.  See _handle_printable.
+        self._key_is_text = isinstance(key, str) and len(key) == 1
+
         key = self._normalize_key(key)
         if key == curses.KEY_MOUSE:
             BUTTON5_PRESSED = 134217728
@@ -3701,19 +4458,21 @@ class Editor:
             except curses.error as exc:
                 self.set_status_notification('KEY_MOUSE but getmouse() failed — ' + str(exc))
                 return
-            # Mouse events go through the pre-hook like keys: while the lock
-            # screen is active clicks/scrolls are swallowed here; while
-            # unlocked this counts as activity (resets the inactivity timer).
-            if self._dispatch_pre_hook(self._encode_key(key)):
-                return
-            if bstate & curses.BUTTON1_PRESSED or bstate & curses.BUTTON1_CLICKED:
-                self._handle_mouse_click(mx, my)
-                return
-            elif bstate & curses.BUTTON4_PRESSED:
+            # The wheel becomes Up/Down here, before anything else sees the
+            # event: whoever handles keys next — the lock screen, an overlay,
+            # the editor — should get a movement key, never the raw KEY_MOUSE.
+            if bstate & curses.BUTTON4_PRESSED:
                 key = curses.KEY_UP
             elif bstate & BUTTON5_PRESSED:
                 key = curses.KEY_DOWN
             else:
+                # Clicks keep going through the pre-hook as KEY_MOUSE: while the
+                # lock screen is up they are swallowed there; while unlocked this
+                # counts as activity (resets the inactivity timer).
+                if self._dispatch_pre_hook(self._encode_key(key)):
+                    return
+                if bstate & curses.BUTTON1_PRESSED or bstate & curses.BUTTON1_CLICKED:
+                    self._handle_click(mx, my)
                 return
         key = self._resolve_key(key)
         key = self._encode_key(key)
@@ -3815,190 +4574,20 @@ class Editor:
 
     # ── Mouse handling ────────────────────────────────────────────────────────
 
+    def _handle_click(self, mx, my):
+        """Route a click: to the overlay on top if it wants one, else to the
+        document."""
+        overlay = self.active_overlay()
+        if overlay is not None:
+            handler = getattr(overlay, 'handle_click', None)
+            if handler is not None:
+                handler(mx, my)
+            return
+        self._handle_mouse_click(mx, my)
+
     def _handle_mouse_click(self, mx, my):
-        if my >= self.renderer.text_rows:
-            return  # clicked in status bar area — ignore
-
-        gutter = self.renderer.GUTTER
-        text_x = max(0, mx - gutter)  # clicks in the gutter go to start of that line
-
-        hidden = self.buf.hidden_rows
-        if self.renderer.wrap:
-            tc = self.renderer.text_cols
-            screen_y = 0
-            line_idx = self.renderer.scroll_row
-            while line_idx < len(self.buf.lines):
-                if line_idx in hidden:
-                    line_idx += 1
-                    continue
-                line_len = len(self.buf.lines[line_idx])
-                num_vrows = max(1, (line_len + tc - 1) // tc) if line_len > 0 else 1
-                for vrow in range(num_vrows):
-                    if screen_y == my:
-                        col = min(vrow * tc + text_x, len(self.buf.lines[line_idx]))
-                        self.buf.move_cursor(line_idx, col)
-                        return
-                    screen_y += 1
-                line_idx += 1
-            # Clicked below last line — go to end of buffer
-            row = self.buf.prev_visible_row(len(self.buf.lines) - 1)
-            self.buf.move_cursor(row, len(self.buf.lines[row]))
-        else:
-            # Walk down `my` visible rows from scroll_row
-            row = self.renderer.scroll_row
-            for _ in range(my):
-                nxt = self.buf.next_visible_row(row + 1)
-                if nxt is None:
-                    break
-                row = nxt
-            row = self.buf.prev_visible_row(max(0, min(row, len(self.buf.lines) - 1)))
-            col = text_x + self.renderer.scroll_col
-            col = max(0, min(col, len(self.buf.lines[row])))
-            self.buf.move_cursor(row, col)
-
-    # ── Movement commands ─────────────────────────────────────────────────────
-
-    def _cmd_move_up(self):
-        if self.renderer.wrap:
-            self._move_up_wrap()
-        else:
-            self.buf.move_up()
-
-    def _cmd_move_down(self):
-        if self.renderer.wrap:
-            self._move_down_wrap()
-        else:
-            self.buf.move_down()
-
-    def _cmd_move_left(self):
-        self.buf.move_left()
-
-    def _cmd_move_right(self):
-        self.buf.move_right()
-
-    def _cmd_move_home(self):
-        self.buf.move_cursor(self.buf.cursor_row, 0)
-
-    def _cmd_move_end(self):
-        self.buf.move_cursor(self.buf.cursor_row, len(self.buf.lines[self.buf.cursor_row]))
-
-    def _cmd_page_up(self):
-        rows = self.renderer.text_rows - 3
-        pc = self.buf.preferred_col
-        self.buf.move_cursor(self.buf.visible_row_offset(self.buf.cursor_row, -rows), pc)
-        self.buf.preferred_col = pc
-
-    def _cmd_page_down(self):
-        rows = self.renderer.text_rows - 3
-        pc = self.buf.preferred_col
-        self.buf.move_cursor(self.buf.visible_row_offset(self.buf.cursor_row, rows), pc)
-        self.buf.preferred_col = pc
-
-    def _cmd_file_start(self):
-        self.buf.move_cursor(0, 0)
-
-    def _cmd_file_end(self):
-        last = len(self.buf.lines) - 1
-        self.buf.move_cursor(last, len(self.buf.lines[last]))
-
-    def _cmd_word_left(self):
-        self.buf.move_word_left()
-
-    def _cmd_word_right(self):
-        self.buf.move_word_right()
-
-    # ── Selection movement commands ───────────────────────────────────────────
-
-    def _cmd_sel_move_up(self):
-        if self.renderer.wrap:
-            self._move_up_wrap(extend=True)
-        else:
-            self.buf.move_up(extend=True)
-
-    def _cmd_sel_move_down(self):
-        if self.renderer.wrap:
-            self._move_down_wrap(extend=True)
-        else:
-            self.buf.move_down(extend=True)
-
-    def _cmd_sel_move_left(self):
-        self.buf.move_left(extend=True)
-
-    def _cmd_sel_move_right(self):
-        self.buf.move_right(extend=True)
-
-    def _cmd_sel_move_home(self):
-        self.buf.move_cursor(self.buf.cursor_row, 0, extend_selection=True)
-
-    def _cmd_sel_move_end(self):
-        self.buf.move_cursor(self.buf.cursor_row, len(self.buf.lines[self.buf.cursor_row]), extend_selection=True)
-
-    def _cmd_sel_page_up(self):
-        rows = self.renderer.text_rows - 3
-        pc = self.buf.preferred_col
-        self.buf.move_cursor(self.buf.visible_row_offset(self.buf.cursor_row, -rows), pc,
-                             extend_selection=True)
-        self.buf.preferred_col = pc
-
-    def _cmd_sel_page_down(self):
-        rows = self.renderer.text_rows - 3
-        pc = self.buf.preferred_col
-        self.buf.move_cursor(self.buf.visible_row_offset(self.buf.cursor_row, rows), pc,
-                             extend_selection=True)
-        self.buf.preferred_col = pc
-
-    def _cmd_sel_word_left(self):
-        self.buf.move_word_left(extend=True)
-
-    def _cmd_sel_word_right(self):
-        self.buf.move_word_right(extend=True)
-
-    # ── Editing commands ──────────────────────────────────────────────────────
-
-    def _cmd_copy(self):
-        if self.buf.has_selection():
-            self.clipboard.copy(self.buf.get_selected_text())
-
-    def _cmd_paste(self):
-        text = self.clipboard.paste()
-        if text is not None:
-            self.buf.insert_text(text)
-
-    def _cmd_undo(self):
-        self.buf.undo()
-        self.lexer.invalidate(0)
-
-    def _cmd_redo(self):
-        self.buf.redo()
-        self.lexer.invalidate(0)
-
-    def _cmd_backspace(self):
-        self.buf.delete_char()
-        self.lexer.invalidate(max(0, self.buf.cursor_row - 1))
-
-    def _cmd_delete_forward(self):
-        self.buf.delete_char_forward()
-        self.lexer.invalidate(self.buf.cursor_row)
-
-    def _cmd_delete_word_forward(self):
-        self.buf.delete_word_after_cursor()
-        self.lexer.invalidate(self.buf.cursor_row)
-
-    def _cmd_kill_word_backward(self):
-        row_before = self.buf.cursor_row
-        self.buf.kill_word_backward()
-        self.lexer.invalidate(min(row_before, self.buf.cursor_row))
-
-    def _cmd_delete_line(self):
-        self.buf.delete_line()
-        self.lexer.invalidate(self.buf.cursor_row)
-
-    def _cmd_newline(self):
-        self.buf.insert_newline()
-        self.lexer.invalidate(max(0, self.buf.cursor_row - 1))
-
-    def _cmd_tab(self):
-        self.buf.insert_char(' ' * TAB_SIZE)
+        # Clicks outside the text area (the two bars) are ignored by the view.
+        self.view.click_to_cursor(mx, my)
 
     # ── Other commands ────────────────────────────────────────────────────────
 
@@ -4037,10 +4626,6 @@ class Editor:
 
         self.popup.open(items, filter_text='', on_select=on_select, title='Commands')
 
-    def _cmd_toggle_wrap(self):
-        self.renderer.wrap = not self.renderer.wrap
-        self.renderer.scroll_col = 0
-
     def _cmd_toggle_fold(self):
         self.fold_enabled = not self.fold_enabled
         self._fold_key = None
@@ -4071,27 +4656,13 @@ class Editor:
             if buf.sel_end == old:  # keep an in-progress selection consistent
                 buf.sel_end = (buf.cursor_row, buf.cursor_col)
 
-    def _cmd_toggle_mark(self):
-        r = self.buf.cursor_row
-        if r in self.buf.marked_lines:
-            self.buf.marked_lines.discard(r)
-        else:
-            self.buf.marked_lines.add(r)
-
-    def _cmd_select_all(self):
-        self.buf.select_all()
-
     def _cmd_resize(self):
         self.renderer.resize()
 
     # ── Printable character ───────────────────────────────────────────────────
 
     def _handle_printable(self, key):
-        # After encoding, printable chars have no flags and base >= 32
-        if isinstance(key, int) and key_flags(key) == 0:
-            base = key_base(key)
-            if base >= 32 and chr(base).isprintable():
-                self.buf.insert_char(chr(base))
+        self.textarea.insert_printable(key, self.last_key_was_text)
 
     # ── Key dispatch ──────────────────────────────────────────────────────────
 
@@ -4138,7 +4709,14 @@ class Editor:
             'Read-only mode enabled' if self.buf.readonly else 'Read-only mode disabled')
 
     def show_help(self) -> None:
-        self.info_popup.open('Help', self._help_pages())
+        pages = self._help_pages()
+        if self.extra_help_pages:
+            # Plugin pages are reachable from the table of contents, otherwise
+            # nothing would ever link to them.
+            links = '\n'.join(f'-->>{title}<<--' for title in self.extra_help_pages)
+            pages['main'] = pages.get('main', '') + '\n' + links
+            pages.update(self.extra_help_pages)
+        self.info_popup.open('Help', pages)
 
     def _help_pages(self) -> dict:
         return {'main': '-->>Editor<<--', 'Editor': EDITOR_HELP}
@@ -4214,47 +4792,6 @@ class Editor:
                 if self.buf.dirty:  # save was cancelled (e.g. no filepath and prompt escaped)
                     return
         self.running = False
-
-    def move_up_5(self):
-        buf = self.buf
-        pc = buf.preferred_col
-        buf.move_cursor(buf.visible_row_offset(buf.cursor_row, -5), pc)
-        buf.preferred_col = pc
-
-    def move_down_5(self):
-        buf = self.buf
-        pc = buf.preferred_col
-        buf.move_cursor(buf.visible_row_offset(buf.cursor_row, 5), pc)
-        buf.preferred_col = pc
-
-    def _move_up_wrap(self, extend: bool = False):
-        tc = self.renderer.text_cols
-        buf = self.buf
-        if buf.cursor_col >= tc:
-            buf.move_cursor(buf.cursor_row, buf.cursor_col - tc, extend)
-        elif buf.cursor_row > 0:
-            pr = buf.prev_visible_row(buf.cursor_row - 1)
-            visual_col = buf.cursor_col % tc
-            prev_len = len(buf.lines[pr])
-            last_vline_start = (prev_len // tc) * tc
-            new_col = min(last_vline_start + visual_col, prev_len)
-            buf.move_cursor(pr, new_col, extend)
-
-    def _move_down_wrap(self, extend: bool = False):
-        tc = self.renderer.text_cols
-        buf = self.buf
-        line_len = len(buf.lines[buf.cursor_row])
-        next_vline_start = (buf.cursor_col // tc + 1) * tc
-        if next_vline_start <= line_len:
-            new_col = min(buf.cursor_col + tc, line_len)
-            buf.move_cursor(buf.cursor_row, new_col, extend)
-        elif buf.cursor_row < len(buf.lines) - 1:
-            nr = buf.next_visible_row(buf.cursor_row + 1)
-            if nr is None:
-                return
-            visual_col = buf.cursor_col % tc
-            new_col = min(visual_col, len(buf.lines[nr]))
-            buf.move_cursor(nr, new_col, extend)
 
     def _check_external_file_change(self):
         # Deferred while a full-screen overlay (lock screen) is up: the prompt

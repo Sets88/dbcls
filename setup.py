@@ -19,7 +19,7 @@ def get_requirements():
 
 setup(
     name='dbcls',
-    version='1.3.2',
+    version='1.3.3',
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',
@@ -28,7 +28,7 @@ setup(
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
     include_package_data=True,
-    package_data={'dbcls': ['weights.json']},
+    package_data={'dbcls': ['weights.json'], 'dbcls.llm': ['*.md']},
     zip_safe=False,
     platforms='any',
     install_requires=get_requirements(),
@@ -40,6 +40,6 @@ setup(
     entry_points={
         'console_scripts': [
             'dbcls = dbcls:main',
-        ]
+        ],
     }
 )

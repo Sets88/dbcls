@@ -8,6 +8,8 @@ DbCls is a terminal-based database client that pairs a built-in SQL editor with 
 - LM-ranked autocomplete for tables, columns, keywords, and functions
 - Direct query execution from the editor, results opened straight in visidata
 - Pipelines — chain queries, Python, loops, functions and user prompts with `|` to automate multi-step work right in the editor
+- Optional LLM chat (`Ctrl+L`) that writes and fixes queries, reading your schema through read-only tools — any OpenAI-compatible model, local or hosted
+- Plugin API for third-party extensions: editor commands, pipeline commands, LLM tools and windows of their own
 - Powerful interactive data exploration via visidata (filter, sort, pivot, frequency tables, cross-sheet references)
 - Support for multiple database engines (MySQL, PostgreSQL, ClickHouse, SQLite, Cassandra / ScyllaDB)
 - Unix socket connections with optional auto-SSH tunneling
@@ -25,6 +27,8 @@ DbCls is a terminal-based database client that pairs a built-in SQL editor with 
 - [Data Visualization (visidata)](#data-visualization-visidata)
 - [SQL Commands](#sql-commands)
 - [Pipelines](#pipelines)
+- [LLM Chat](#llm-chat)
+- [Plugins](#plugins)
 - [Supported Database Engines](#supported-database-engines)
 - [Unix Socket Connections](#unix-socket-connections)
 - [Screen Lock](#screen-lock)
@@ -49,6 +53,8 @@ For Cassandra / ScyllaDB support:
 ```bash
 pip install 'dbcls[cassandra]'
 ```
+
+The [LLM chat](#llm-chat) needs nothing installed — it talks to the endpoint over the standard library and is switched on by configuration alone.
 
 ## Quick Start
 
@@ -77,6 +83,19 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `--lock-init-command` | Shell command run at startup to initialise a lock session |
 | `--lock-timeout` | Seconds of inactivity before the screen locks |
 | `--lock-check-command` | Shell command run when the user attempts to unlock |
+| `--plugin-dir` | Directory of [plugin](#plugins) `.py` files or packages (several separated like `PATH`) |
+| `--plugin` | Comma-separated plugin names to load; by default every one found is loaded |
+| `--no-plugins` | Do not load any plugin |
+
+Plugins add options of their own — they show up in `dbcls --help` alongside these. The bundled [LLM chat](#llm-chat) contributes:
+
+| Option | Description |
+|--------|-------------|
+| `--llm-base-url` | OpenAI-compatible API base URL; enables the chat |
+| `--llm-api-key` | API key sent as a Bearer token (omit for a local model) |
+| `--llm-model` | Model name, e.g. `qwen2.5-coder` or `anthropic/claude-sonnet-4` |
+| `--llm-max-tokens` | Maximum tokens in a reply (default `131072`) |
+| `--llm-timeout` | Seconds to wait for a reply (default `600`) |
 
 ## Configuration
 
@@ -132,6 +151,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Alt+e` | Show database list with table submenu |
 | `Alt+t` | Show tables list with schema and sample data options |
 | `Alt+s` | Show list of open VisiData sheets |
+| `Ctrl+l` | Ask a model about the query under the cursor (see [LLM Chat](#llm-chat); bound only when configured) |
 | `Alt+p` | Open command palette (run any editor command by name) |
 | `Ctrl+p` | Toggle folding of `>>>` ... `<<<` blocks (see [Fold Blocks](#fold-blocks)) |
 | `Ctrl+g` | Open a file from the current directory |
@@ -699,6 +719,234 @@ if mtime is not None:
 ```
 
 Mark users and press `Enter` to run the chosen action for them; the same list opens again afterwards. `Enter` with nothing marked leaves the loop, `q` cancels the pipeline.
+
+## LLM Chat
+
+`Ctrl+L` opens a chat with a language model that can write and fix queries for the database you are connected to. It is off unless you configure it: with no `--llm-*` settings nothing is registered and `Ctrl+L` is not bound.
+
+The model is given the pipeline language reference and the engine you are connected to, and it can look at the database on its own through four read-only tools — `list_databases`, `list_tables`, `get_table_schema` and `sample_data`. Two more read the [pipeline variables](#pipelines) an earlier run left behind: `get_vars_keys` lists what is in the store with each variable's type and size, `get_var` reads one of them. So "filter by the ids I saved" is something it can act on — the same store `.SET_VAR` writes and `.VARS` shows. A long variable arrives cut to its first 20 rows with the real length alongside, so a stashed result set cannot flood the request.
+
+It is never given a way to run SQL of its own, or to change a variable: what it writes only ever runs when you run it. When a choice is yours to make rather than its to guess, it can [ask you](#when-the-model-asks-you) and wait for the answer.
+
+### Setup
+
+Any OpenAI-compatible endpoint works — OpenRouter, Ollama, vLLM, LM Studio, llama.cpp, or a corporate proxy. Nothing is installed for this: the requests go out through the standard library.
+
+```bash
+# a local model through Ollama
+dbcls --llm-base-url http://localhost:11434/v1 --llm-model qwen2.5-coder ...
+
+# OpenRouter
+dbcls --llm-base-url https://openrouter.ai/api/v1 \
+      --llm-api-key "$OPENROUTER_KEY" \
+      --llm-model anthropic/claude-sonnet-4 ...
+```
+
+The same settings work as `DBCLS_LLM_BASE_URL` / `DBCLS_LLM_API_KEY` / `DBCLS_LLM_MODEL` environment variables, or as an `"llm"` section in the config file:
+
+```json
+{
+    "engine": "postgres",
+    "dbname": "shop",
+    "llm": {
+        "base_url": "http://localhost:11434/v1",
+        "model": "qwen2.5-coder",
+        "timeout": 120
+    }
+}
+```
+
+Keep the key out of the process list the same way as a database password — see [Password safety](#password-safety).
+
+### Using it
+
+`Ctrl+L` opens the window on whatever the cursor is on: the selection if there is one, otherwise the statement under the cursor (the same text `Alt+R` would run), or nothing on a blank line. The window has three panes:
+
+| Pane | What it is |
+|------|------------|
+| `Chat` | What has been said so far, including which tools the model called |
+| `Your request` | What you want — several lines if you like; `Enter` starts a new one |
+| `Result` | The query the model came back with |
+
+The request and result panes are ordinary editor fields: selection, word jumps, `Ctrl+C` / `Ctrl+V`, `Ctrl+Z` and the rest work there exactly as they do in the document.
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Move between panes |
+| `Alt+Enter` | Send the request. Whatever is in the Result pane goes along with it, so "add a LIMIT" works on what is there right now |
+| `Ctrl+T` | Take the Result into the document, replacing the selection or the statement under the cursor. `Ctrl+Z` in the editor undoes it |
+| `Ctrl+N` | Start over: the conversation is forgotten and the query in the Result pane becomes the context of the new one |
+| `Esc` | Close and change nothing; while a request is running, cancel it |
+
+The conversation is kept for the session, so reopening the window continues it. `Ctrl+N` — or `Start a new model conversation` in the command palette — throws it away.
+
+### When the model asks you
+
+Some choices are not the model's to guess: which of two plausible tables you meant, which column identifies a row, whether you want the rows or a count. Rather than assume, it can put the question to you through the `ask_user` tool — and it waits for the answer before carrying on.
+
+The question opens as a list over the chat, the same one the command palette and the pipeline's `choose()` use:
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move through the options |
+| *any text* | Filter the list |
+| `Tab` | Mark an option, when the question takes several answers |
+| `Enter` | Answer with the highlighted option (or every marked one) |
+| `Esc` | Drop the request instead of answering it |
+
+Your answer goes back as the result of that tool call, so the same turn continues with it and ends with a query as usual. `Esc` cancels the request rather than answering "nothing" — the conversation is kept, so you can type the answer in your own words and send that instead.
+
+The letter shortcuts are `Ctrl` rather than `Alt` on purpose: a control code is the same whatever keyboard layout is active, while `Alt+L` on a Cyrillic layout arrives as `Alt+д` and matches nothing. `Alt+Enter` is unaffected — `Enter` is not a letter.
+
+### How the answer gets to you
+
+The Result pane is written by one thing only: the model calling the `propose_query` tool. A query the model merely writes in its message text is left in the transcript and never applied. Nothing parses the model's prose looking for a query, so a mangled answer cannot quietly end up looking like a result.
+
+Models forget that call, so it is not left to good intentions: a turn that ends without `propose_query` gets one more request that *forces* the call through the endpoint's `tool_choice`. Only when that is refused as well are you told nothing was handed over — the answer is still there in the transcript to read.
+
+Not every request is a request for a query, though. "What does this pipeline do?", "why does this fail?", "which of these two is faster?" are answered in the Chat pane through a second tool, `answer_question`, and that ends the turn just as validly: nothing is proposed, nothing is forced, and the Result pane keeps the query you were working on. Without it a model told it must always call `propose_query` answers "explain this" by handing the same query straight back, explaining nothing.
+
+Pipeline syntax is not carried in every request either. The language reference (~17 KB) sits behind a `get_pipeline_reference` tool, which the model calls when it decides a pipeline is what you want — so an ordinary SQL question never pays for it.
+
+What that tool returns is the reference *plus* whatever your [plugins](#plugins) added to the language — every `add_pipeline_command` and `add_pipeline_function`, with the `help_text` its author wrote. It is built when the tool is called, so it is the language as it stands in your installation rather than the one dbcls ships, and it comes under a heading that says so: the model uses those commands where they fit, and knows the pipeline it wrote is not portable to a dbcls without your plugins.
+
+## Plugins
+
+DbCls loads extensions written by anyone. A plugin is a Python module with two functions — `setup(setup)`, which runs before the command line is parsed, and `register(api)`, which runs once the editor exists. That split is what lets a plugin be self-contained: it declares its own options in `setup`, and gets them back already resolved in `register`.
+
+Nothing in dbcls knows about any particular plugin. The bundled [LLM chat](#llm-chat) is written against exactly this API and is loaded exactly like a third-party one.
+
+```python
+# ./example_plugins/rowcount.py
+from dbcls.editor import key_alt
+
+
+def setup(setup):
+    """Runs before argparse — these show up in `dbcls --help`."""
+    setup.add_argument('--rowcount-label', dest='rowcount_label', default='rows',
+                       help='column name .ROWCOUNT gives its count')
+
+
+def register(api):
+    label = api.settings['label']          # from --rowcount-label / DBCLS_ROWCOUNT_LABEL
+                                           # / {"rowcount": {"label": ...}}
+
+    async def rowcount(executor, args, data):
+        return [{args[0] if args else label: len(data)}]
+
+    api.add_pipeline_command('rowcount', '.ROWCOUNT [<LABEL>]', rowcount,
+                             help_text='\n    Count the incoming rows.')
+
+    api.add_pipeline_function('shout', lambda text: str(text).upper())
+
+    api.add_editor_function('comment_out',
+                            lambda: api.replace_statement('-- ' + api.get_statement()),
+                            'Comment out the statement under the cursor', 'Alt+9')
+    api.add_keybinding('comment_out', key_alt(ord('9')))
+```
+
+```bash
+dbcls --plugin-dir ./example_plugins --rowcount-label lines ...
+```
+
+`.ROWCOUNT` is then a pipeline command like any other, complete with autocomplete and a help entry:
+
+```
+.TABLES | .ROWCOUNT "tables"
+```
+
+`shout()` is likewise in scope wherever a pipeline evaluates Python — `{{expr}}` placeholders and `.PY` / `.SET_VAR` / `.SLEEP` / `.FOR` alike:
+
+```
+.TABLES | .PY "[{'t': shout(r['name'])} for r in data]"
+```
+
+A fuller example — a menu on a key, a filter that transforms every query result, its own CLI option — is in [`example_plugins/rowcount.py`](example_plugins/rowcount.py).
+
+### Where plugins come from
+
+- `--plugin-dir DIR` — every `*.py` in the directory, and every subdirectory holding an `__init__.py` (names starting with `_` or `.` are skipped). Also `DBCLS_PLUGIN_DIR`, several directories separated like `PATH`. This is the quickest way to write one: no packaging involved.
+
+  A plugin too big for one file goes in as a package. Its modules import each other relatively, and files next to them are read as usual:
+
+  ```
+  my_plugins/
+      bigplugin/
+          __init__.py     # register() lives here...
+          plugin.py       # ...or here, if __init__ imports nothing on purpose
+          client.py       # from .client import ... works
+          reference.md    # os.path.dirname(__file__) works
+  ```
+
+- Installed packages declaring an entry point:
+
+  ```python
+  entry_points={'dbcls.plugins': ['myplugin = mypkg.plugin:register']}
+  ```
+
+- Plugins bundled with dbcls itself (currently just the LLM chat).
+
+`--plugin name1,name2` narrows loading to those names; `--no-plugins` disables all of them, bundled ones included. A plugin that raises is reported in the status bar and skipped — a broken extension never stops the editor from starting. Set `DBCLS_PLUGIN_DEBUG=1` to get its traceback on stderr.
+
+### Settings
+
+Each option a plugin declares is read from, in order: the command line, a `DBCLS_<DEST>` environment variable, and the plugin's own section of the JSON config file. The keys of `api.settings` have the plugin's name prefix stripped, so `--llm-model` on the `llm` plugin is `api.settings['model']`, `DBCLS_LLM_MODEL`, or:
+
+```json
+{"llm": {"model": "qwen2.5-coder"}}
+```
+
+Keys present in that section but never declared as options reach `api.settings` too, so a plugin can read settings it does not want on the command line.
+
+### The plugin API
+
+**Registering**
+
+| Method | What it does |
+|--------|--------------|
+| `api.add_editor_function(name, func, description, keybinding)` | Add a command; with a description it appears in the command palette |
+| `api.add_keybinding(name, key)` | Bind a key (build codes with `dbcls.editor.K` / `key_alt` / `key_csi`) |
+| `api.add_pipeline_command(name, hint, handler, help_text, raw_data)` | Add a `.COMMAND`; the handler is `async def handler(executor, args, data)`. `help_text` goes to the help page *and* to the [LLM chat](#llm-chat)'s language reference |
+| `api.add_pipeline_function(name, value, help_text)` | Add a function (or any value) to the namespace `{{expr}}` and `.PY` run in; `help_text` reaches the model too |
+| `api.add_llm_tool(name, description, parameters, handler)` | Offer a tool to the [LLM chat](#llm-chat); load order does not matter, a tool offered before the chat is up waits for it. A no-op when the chat is not configured |
+| `api.add_help_page(title, text)` | Add a page to the in-app help (`F1`) |
+| `api.add_filter(event, func)` | Transform data on its way through the editor (see below) |
+
+**Showing things**
+
+| Method | What it does |
+|--------|--------------|
+| `api.show_menu(title, items, on_select, multi, default)` | A filterable list; items are strings or `(value, label)` pairs |
+| `api.show_info(title, text)` | Scrollable text in a popup |
+| `api.show_rows(name, rows)` | Put row dicts on the VisiData sheet stack (`Alt+S`) |
+| `api.confirm(message)` | A y/n question in the status bar |
+| `api.notify(text, error=False)` | A message in the status bar |
+| `api.push_overlay(overlay)` / `api.pop_overlay(overlay)` | A full-screen window (`draw(stdscr, H, W)`, `handle_key(key)`, optional `tick()` and `cursor_pos()`) |
+
+**The document**
+
+| Method | What it does |
+|--------|--------------|
+| `api.get_statement()` | The selection, or the statement under the cursor (what `Alt+R` would run) |
+| `api.replace_statement(text)` | Replace it, as one undoable edit; False when read-only |
+| `api.insert_text(text)` | Insert at the cursor, replacing the selection |
+
+**The editor's world**
+
+`api.settings`, `api.client`, `api.autocomplete`, `api.vars`, `api.editor`, `api.submit(coro)`.
+
+**Filters**
+
+`api.add_filter(event, func)` puts a plugin in the path of the data. The function returns a replacement, or `None` to leave the value alone; one that raises is reported and skipped.
+
+| Event | Signature |
+|-------|-----------|
+| `before_query` | `func(sql) -> str` — just before a query or pipeline runs |
+| `after_query` | `func(result) -> Result` — just before the result is handed to VisiData |
+
+Built-in pipeline commands cannot be replaced — registering `.RUN` is refused. Neither can the pipeline context: a function named after a helper (`info`, `get_var`, `data`, …) or a built-in value (`datetime`, `json`, …) is refused too, as is any name starting with `_` (those are the `_0` / `_i` overlays). A registered name does shadow a same-named result column inside `{{…}}`, so pick one no column is likely to have.
+
+To build a text field that behaves like the editor (selection, undo, wrap, clipboard), use `dbcls.editor.TextArea`; the chat window is made of three of them.
 
 ## Supported Database Engines
 
