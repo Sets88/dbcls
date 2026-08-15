@@ -33,7 +33,6 @@ DbCls is a terminal-based database client that pairs a built-in SQL editor with 
 - [Unix Socket Connections](#unix-socket-connections)
 - [Screen Lock](#screen-lock)
 - [Password safety](#password-safety)
-- [Model Training](#model-training)
 
 ## Screenshots
 
@@ -258,17 +257,25 @@ combinations (Alt or Shift ones, for example):
    ```
    Now `Ctrl+x Enter` executes the query under cursor.
 
-### LM-Powered Autocomplete
+### Context-Aware Autocomplete
 
-When `dbcls/weights.json` is present (see [Model Training](#model-training) below),
-autocomplete suggestions (`Alt+1`) are ranked by a trained language model that predicts
-the most likely next SQL token given the current query context.
+Autocomplete suggestions (`Alt+1`) are ordered by what can legally follow the cursor.
+DbCls looks at the last SQL keyword before it and picks the matching priority order:
 
-- Tables, columns, keywords, and functions are sorted by predicted relevance
-- When the model expects a column name next, DbCls automatically loads columns from
-  all tables referenced in the current query
-- Degrades gracefully: if `weights.json` is absent or `sql_metadata` is not installed,
-  autocomplete falls back to alphabetical/prefix ranking
+| Position | Ordered by |
+|----------|------------|
+| `FROM`, `JOIN`, `INTO`, `UPDATE`, `TABLE`, … | tables → databases → columns → functions → keywords |
+| `USE`, `DATABASE` | databases → tables → columns → … |
+| `SELECT`, `WHERE`, `ON`, `HAVING`, `GROUP BY`, `SET`, … | columns → functions → tables → keywords |
+| start of a statement, or a filled slot such as `SELECT * FROM users ⎸` | keywords → pipeline commands → tables → columns |
+
+Within a category, exact matches come before prefix matches, then substring matches.
+
+- Columns of every table referenced in the current statement are offered by name —
+  and skipped entirely in a table position, which saves a round-trip to the database
+- Table aliases are resolved: with `SELECT … FROM users u`, typing `u.` completes the
+  columns of `users`
+- Comments and string literals never influence the ordering
 
 ### Navigation in Database and Table Listings
 
@@ -1155,55 +1162,6 @@ EOF
 
 dbcls -c <(echo "$CONFIG") mydb.sql
 ```
-
-
-## Model Training
-
-DbCls ships with a `train.py` script for training or fine-tuning the language model
-that powers LM-ranked autocomplete. The model is a small MLP trained on SQL corpora;
-its weights are stored in `dbcls/weights.json`.
-
-### Training from scratch
-
-```bash
-python train.py train --corpus my_queries.sql
-```
-
-### Fine-tuning an existing model
-
-```bash
-python train.py train --corpus my_queries.sql --finetune
-python train.py train --corpus my_queries.sql --finetune --weights custom.json --output custom.json
-```
-
-### Inspecting tokenization
-
-Use `--debug` to print how each SQL statement is tokenized during training:
-
-```bash
-python train.py train --corpus my_queries.sql --debug
-```
-
-### Running inference
-
-```bash
-python train.py infer --sql "SELECT * FROM"
-python train.py infer --sql "SELECT id FROM users WHERE" --top-k 5
-```
-
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `--corpus FILE` | SQL file for training, one statement per line |
-| `--finetune` | Load existing weights and continue training |
-| `--weights FILE` | Weights file to load for fine-tuning (default: `dbcls/weights.json`) |
-| `--output FILE` | Where to save trained weights (default: `dbcls/weights.json`) |
-| `--epochs N` | Number of training epochs (default: 20) |
-| `--lr FLOAT` | Learning rate (default: 0.01) |
-| `--debug` | Print tokenization for each training sentence |
-| `--sql TEXT` | *(infer only)* SQL prefix to complete |
-| `--top-k N` | *(infer only)* Number of predictions to show (default: 10) |
 
 
 ## Contributing

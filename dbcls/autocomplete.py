@@ -1,166 +1,254 @@
-import os
-import json
-import logging
-import math
 from time import time
 from typing import List, Optional, Tuple, Union
 
-import sql_metadata
-from sql_metadata.keywords_lists import TokenType
-
-# sql_metadata.Parser logs an error (e.g. "Not supported query type: SHOW")
-# before raising ValueError; the exception is handled here, so mute the log too
-logging.getLogger('Parser').setLevel(logging.CRITICAL)
+import sqlparse
+from sqlparse.tokens import Comment as CommentToken
+from sqlparse.tokens import Keyword, Literal, Name, Punctuation, String, Wildcard
 
 from .pipeline import PIPELINE_COMMANDS, PIPELINE_COMMAND_HINTS
 
-_CONTEXT_LENGTH = 3
-_WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), 'weights.json')
+# ── suggestion categories ─────────────────────────────────────────────────────
+# The values double as the label suffix shown in the popup: "users (TABLE)".
 
-# ── inference helpers ─────────────────────────────────────────────────────────
+CAT_COMMAND = 'COMMAND'
+CAT_FUNCTION = 'FUNCTION'
+CAT_PIPELINE = 'PIPELINE'
+CAT_TABLE = 'TABLE'
+CAT_COLUMN = 'COLUMN'
+CAT_DATABASE = 'DATABASE'
 
-def _softmax(logits: list) -> list:
-    max_logit = max(logits)
-    exp_values = [math.exp(x - max_logit) for x in logits]
-    total = sum(exp_values)
-    return [x / total for x in exp_values]
+# Category orders, best first. Which one applies is decided by the last keyword
+# before the cursor — see _clause_order().
+OBJECT_ORDER = (CAT_TABLE, CAT_DATABASE, CAT_COLUMN, CAT_FUNCTION, CAT_COMMAND, CAT_PIPELINE)
+DATABASE_ORDER = (CAT_DATABASE, CAT_TABLE, CAT_COLUMN, CAT_FUNCTION, CAT_COMMAND, CAT_PIPELINE)
+EXPR_ORDER = (CAT_COLUMN, CAT_FUNCTION, CAT_TABLE, CAT_COMMAND, CAT_DATABASE, CAT_PIPELINE)
+DEFAULT_ORDER = (CAT_COMMAND, CAT_PIPELINE, CAT_TABLE, CAT_COLUMN, CAT_FUNCTION, CAT_DATABASE)
+
+# Keyed by the *last word* of the keyword: sqlparse emits "GROUP BY", "LEFT OUTER
+# JOIN" and "INSERT INTO" as single tokens, so BY/JOIN/INTO cover all variants.
+ORDER_BY_KEYWORD = {
+    # A database object is expected next
+    'FROM': OBJECT_ORDER,
+    'JOIN': OBJECT_ORDER,
+    'INTO': OBJECT_ORDER,
+    'UPDATE': OBJECT_ORDER,
+    'TABLE': OBJECT_ORDER,
+    'DESCRIBE': OBJECT_ORDER,
+    'DESC': OBJECT_ORDER,
+    'TRUNCATE': OBJECT_ORDER,
+    'OPTIMIZE': OBJECT_ORDER,
+    'ANALYZE': OBJECT_ORDER,
+    # A database name is expected next
+    'USE': DATABASE_ORDER,
+    'DATABASE': DATABASE_ORDER,
+    'SCHEMA': DATABASE_ORDER,
+    # An expression (column/function) is expected next
+    'SELECT': EXPR_ORDER,
+    'WHERE': EXPR_ORDER,
+    'AND': EXPR_ORDER,
+    'OR': EXPR_ORDER,
+    'NOT': EXPR_ORDER,
+    'ON': EXPR_ORDER,
+    'USING': EXPR_ORDER,
+    'HAVING': EXPR_ORDER,
+    'BY': EXPR_ORDER,
+    'SET': EXPR_ORDER,
+    'DISTINCT': EXPR_ORDER,
+    'IN': EXPR_ORDER,
+    'LIKE': EXPR_ORDER,
+    'ILIKE': EXPR_ORDER,
+    'BETWEEN': EXPR_ORDER,
+    'VALUES': EXPR_ORDER,
+    'RETURNING': EXPR_ORDER,
+}
+
+# Keywords after which sqlparse yields the table reference(s) as the next group.
+TABLE_KEYWORDS = frozenset({'FROM', 'JOIN', 'INTO', 'UPDATE', 'TABLE'})
+
+# sqlparse marks a large open-ended set of words as Token.Keyword — ADMIN, USER,
+# SOURCE, KEY, TYPE, LEVEL, LOCATION … — and plenty of them are ordinary table
+# names. Only the words below actually carry SQL structure; a "keyword" outside
+# this set standing where a name belongs is treated as a name.
+STRUCTURAL_KEYWORDS = frozenset(ORDER_BY_KEYWORD) | frozenset({
+    'AS', 'IS', 'ALL', 'ANY', 'EXISTS', 'INTERVAL', 'ASC', 'ORDER', 'GROUP',
+    'LIMIT', 'OFFSET', 'TOP', 'FETCH', 'ONLY',
+    'UNION', 'EXCEPT', 'INTERSECT', 'WITH', 'WINDOW', 'OVER',
+    'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'FULL', 'NATURAL', 'LATERAL',
+    'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
+    'INSERT', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'RENAME', 'EXPLAIN', 'SHOW',
+    'GRANT', 'REVOKE', 'BEGIN', 'COMMIT', 'ROLLBACK',
+    # engine-specific clause words that may follow a table reference
+    'PREWHERE', 'FINAL', 'SAMPLE', 'SETTINGS', 'FORMAT', 'GLOBAL', 'ARRAY',
+    'PARTITION', 'CLUSTER', 'ALLOW_FILTERING',
+})
+
+_OPERAND_TOKENS = (Name, Literal, Wildcard)
 
 
-def _tokenize_sql(sql: str, vocab_values: set) -> list:
-    """Normalize SQL string into structural tokens. Returns [] on failure."""
-    def add_token(result_tokens, token):
-        if token in vocab_values:
-            result_tokens.append(token)
+def _keyword_root(value: str) -> str:
+    """Last word of a keyword: 'GROUP BY' -> 'BY', 'LEFT OUTER JOIN' -> 'JOIN'."""
+    words = value.upper().split()
+    return words[-1] if words else ''
 
-    result_tokens = []
+
+def _is_structural(token) -> bool:
+    """True when a Keyword token really is SQL structure rather than a name."""
+    return token.ttype in Keyword and _keyword_root(token.value) in STRUCTURAL_KEYWORDS
+
+
+# ── SQL context analysis ──────────────────────────────────────────────────────
+
+def _scan_back(sql: str) -> Tuple[Optional[str], bool]:
+    """Walk the statement backwards from the cursor.
+
+    Returns (keyword_root, ends_with_operand): the closest keyword before the
+    cursor, and whether the very last meaningful token is an operand (a name,
+    literal or `*`) rather than an operator, comma or the keyword itself.
+    """
+    if not sql or not sql.strip():
+        return None, False
+
     try:
-        parsed_tokens = sql_metadata.Parser(sql).tokens
+        statements = sqlparse.parse(sql)
     except Exception:
-        return []
+        return None, False
+    if not statements:
+        return None, False
 
-    for token in parsed_tokens:
-        token_value = token.value.upper()
-        if token.is_keyword and 'JOIN' in token_value:
-            for x in token_value.split(' '):
-                add_token(result_tokens, x)
-        elif token.is_potential_table_name and token.token_type == TokenType.TABLE:
-            add_token(result_tokens, '<TABLE>')
-        elif token.is_keyword:
-            add_token(result_tokens, token_value)
-        elif token.is_potential_table_name:
-            add_token(result_tokens, '<TABLE>')
-        elif token.is_potential_column_name and token_value in (
-            'COUNT', 'AVG', 'SUM', 'NOW', 'CONCAT_WS', 'MONTH', 'YEAR', 'LPAD',
-            'TRIM', 'REGEXP_REPLACE', 'TIMESTAMPDIFF', 'DATE_ADD', 'MD5'
-        ):
-            add_token(result_tokens, '<FUNC>')
-        elif token.is_potential_column_name and (token.is_name or token.value == '*'):
-            add_token(result_tokens, '<COLUMN>')
-        elif token.value in ('=', '<>', '>=', '<=', '>', '<', '!=', '+', '-', '*', '/'):
-            add_token(result_tokens, '<OPERATOR>')
-        elif token.is_integer or token.is_float or token.is_a_valid_alias or token.is_potential_alias:
-            add_token(result_tokens, '<VALUE>')
-        elif token.value in ('(', ')'):
-            add_token(result_tokens, token.value)
-    return result_tokens
+    ends_with_operand = None
+    for token in reversed(list(statements[-1].flatten())):
+        if token.is_whitespace or token.ttype in CommentToken:
+            continue
+        if _is_structural(token):
+            return _keyword_root(token.value), bool(ends_with_operand)
+        if ends_with_operand is None:
+            # A non-structural keyword here is a table or column named `admin`,
+            # `user`, `source`… — an operand, not a clause boundary.
+            ends_with_operand = (
+                token.ttype in Keyword
+                or any(token.ttype in ttype for ttype in _OPERAND_TOKENS)
+            )
+
+    return None, bool(ends_with_operand)
 
 
-class _SQLModel:
-    """Minimal inference-only MLP. Created only via _load_weights()."""
-    __slots__ = (
-        'vocab_size', 'embed_dim', 'hidden_size', 'input_dim',
-        'embedding_matrix', 'hidden_weights', 'hidden_bias',
-        'output_weights', 'output_bias',
+def _clause_order(sql_context: str, parts: list) -> tuple:
+    """Pick the category order that fits the position of the cursor."""
+    keyword, ends_with_operand = _scan_back(sql_context)
+    if keyword is None:
+        return DEFAULT_ORDER
+
+    order = ORDER_BY_KEYWORD.get(keyword)
+    if order is None:
+        return DEFAULT_ORDER
+
+    # `FROM users |` / `WHERE id |`: the slot after the keyword is already
+    # filled and nothing is being typed, so a keyword comes next, not an object.
+    if ends_with_operand and not parts:
+        return DEFAULT_ORDER
+
+    return order
+
+
+def _add_ref(ref: tuple, refs: list, seen: set) -> None:
+    """Append a (database, table, alias) ref unless it is empty or already there."""
+    if ref[1] and ref not in seen:
+        seen.add(ref)
+        refs.append(ref)
+
+
+def _clean_name(value: str) -> str:
+    """Strip identifier quoting: `tb` / "tb" / [tb] -> tb."""
+    return value.strip().strip('`"[]')
+
+
+def _is_name_token(token) -> bool:
+    return (
+        token.ttype in Name
+        or token.ttype in String.Symbol
+        or (token.ttype in Keyword and not _is_structural(token))
     )
 
-    def forward(self, context_indices: list) -> list:
-        input_embeddings = []
-        for token_idx in context_indices:
-            emb_start = token_idx * self.embed_dim
-            input_embeddings.extend(
-                self.embedding_matrix[emb_start: emb_start + self.embed_dim]
-            )
-        pre_hidden = [
-            self.hidden_bias[i] + sum(
-                self.hidden_weights[i * self.input_dim + j] * input_embeddings[j]
-                for j in range(self.input_dim)
-            )
-            for i in range(self.hidden_size)
-        ]
-        hidden_activations = [math.tanh(v) for v in pre_hidden]
-        logits = [
-            self.output_bias[i] + sum(
-                self.output_weights[i * self.hidden_size + j] * hidden_activations[j]
-                for j in range(self.hidden_size)
-            )
-            for i in range(self.vocab_size)
-        ]
-        return _softmax(logits)
 
-    def predict(self, context_indices: list, top_k: int = 5) -> list:
-        probs = self.forward(context_indices)
-        sorted_indices = sorted(range(len(probs)), key=lambda i: -probs[i])
-        return [(i, probs[i]) for i in sorted_indices[:top_k]]
+def _extract_table_refs(sql: str) -> List[Tuple[Optional[str], str, Optional[str]]]:
+    """Return (database, table, alias) for every table referenced in the query.
 
-
-def _load_weights(path: str = _WEIGHTS_PATH):
-    """Load model weights from JSON. Returns (model, token_to_index, index_to_token)."""
-    with open(path) as fh:
-        payload = json.load(fh)
-
-    hyper = payload['hyper']
-    token_to_index = payload['vocab']['token_to_index']
-    index_to_token = {int(k): v for k, v in payload['vocab']['index_to_token'].items()}
-
-    model = _SQLModel.__new__(_SQLModel)
-    model.vocab_size = hyper['vocab_size']
-    model.embed_dim = hyper['embed_dim']
-    model.hidden_size = hyper['hidden_size']
-    model.input_dim = hyper['context_length'] * hyper['embed_dim']
-
-    w = payload['weights']
-    model.embedding_matrix = w['embedding_matrix']
-    model.hidden_weights = w['hidden_weights']
-    model.hidden_bias = w['hidden_bias']
-    model.output_weights = w['output_weights']
-    model.output_bias = w['output_bias']
-
-    return model, token_to_index, index_to_token
-
-
-def _get_tables_from_sql(sql: str) -> list[str]:
-    """Extract table names from SQL using sql_metadata. Returns [] on failure."""
+    Reads the flat token stream rather than sqlparse's parse tree: autocomplete
+    always runs on half-written SQL, where the grouping is unreliable. A dangling
+    comma in `SELECT a, | FROM t` is enough for sqlparse to swallow the FROM into
+    the preceding IdentifierList, hiding `t` from a tree walk entirely.
+    """
     if not sql or not sql.strip():
         return []
+
     try:
-        return sql_metadata.Parser(sql).tables
+        tokens = [
+            token
+            for statement in sqlparse.parse(sql)
+            for token in statement.flatten()
+            if not token.is_whitespace and token.ttype not in CommentToken
+        ]
     except Exception:
         return []
 
+    refs = []
+    seen = set()
+    name_parts = []       # dotted parts of the reference being read
+    alias = None
+    in_table_list = False  # inside a FROM/JOIN/INTO/UPDATE clause
+    expecting_table = False
+    after_dot = False
 
-def _predict_next(
-    sql_input: str,
-    model: _SQLModel,
-    token_to_index: dict,
-    index_to_token: dict,
-    vocab_values: set,
-    top_k: int = 20,
-) -> list:
-    """Return top-k (token_name, probability) predictions for the next SQL token."""
-    unknown_index = 0
-    tokens = _tokenize_sql(sql_input, vocab_values)
-    indices = [token_to_index.get(t, unknown_index) for t in tokens][-_CONTEXT_LENGTH:]
-    padded = [0] * (_CONTEXT_LENGTH - len(indices)) + indices
-    return [
-        (index_to_token[idx], prob)
-        for idx, prob in model.predict(padded, top_k)
-    ]
+    def flush():
+        nonlocal name_parts, alias, after_dot
+        if name_parts:
+            database = '.'.join(name_parts[:-1]) or None
+            _add_ref((database, name_parts[-1], alias), refs, seen)
+        name_parts = []
+        alias = None
+        after_dot = False
+
+    for token in tokens:
+        if _is_structural(token):
+            root = _keyword_root(token.value)
+            # `FROM users AS u`: keep reading, the alias is still to come
+            if root == 'AS' and name_parts:
+                continue
+            flush()
+            in_table_list = expecting_table = root in TABLE_KEYWORDS
+        elif token.ttype in Punctuation:
+            if token.value == '.' and name_parts:
+                after_dot = True
+            elif token.value == ',':
+                flush()
+                expecting_table = in_table_list
+            else:
+                # `(`, `)`, `;` — end of the reference, and of any subquery
+                flush()
+                in_table_list = expecting_table = False
+        elif _is_name_token(token):
+            if not expecting_table:
+                continue
+            if after_dot or not name_parts:
+                name_parts.append(_clean_name(token.value))
+                after_dot = False
+            else:
+                # A bare name right after the table is its alias
+                alias = _clean_name(token.value)
+                flush()
+                expecting_table = False
+        else:
+            flush()
+            in_table_list = expecting_table = False
+
+    flush()
+    return refs
 
 
 # ── ranking ───────────────────────────────────────────────────────────────────
 
-def predictions_weights(query: str, candidate: str, lm_rank: int = 999) -> tuple:
-    """Return (lm_rank, text_rank, candidate) sort key. Lower values sort first."""
+def predictions_weights(query: str, candidate: str, category_rank: int = 999) -> tuple:
+    """Return (category_rank, text_rank, candidate) sort key. Lower values sort first."""
     q = query.upper()
     c = candidate.upper()
 
@@ -173,7 +261,7 @@ def predictions_weights(query: str, candidate: str, lm_rank: int = 999) -> tuple
     else:
         text_rank = 3
 
-    return (lm_rank, text_rank, candidate)
+    return (category_rank, text_rank, candidate)
 
 
 # ── cache ─────────────────────────────────────────────────────────────────────
@@ -238,81 +326,6 @@ class AutoComplete:
     def __init__(self, client):
         self.client = client
         self.cache = DbStructureCache()
-        self._lm_model = None
-        self._lm_token_to_index = None
-        self._lm_index_to_token = None
-        self._lm_vocab_values = None
-        self._lm_load_attempted = False
-
-    def _load_model(self) -> bool:
-        """Load LM weights once. Returns True if model is ready."""
-        if self._lm_model is not None:
-            return True
-        if self._lm_load_attempted:
-            return False
-        self._lm_load_attempted = True
-
-        try:
-            model, t2i, i2t = _load_weights(_WEIGHTS_PATH)
-            self._lm_model = model
-            self._lm_token_to_index = t2i
-            self._lm_index_to_token = i2t
-            self._lm_vocab_values = set(t2i.keys())
-            return True
-        except Exception:
-            return False
-
-    def _get_lm_rank_map(self, sql_context: str) -> dict:
-        """Return a dict mapping candidate keys to integer LM ranks (lower = better)."""
-        if not sql_context or not sql_context.strip():
-            return {}
-        if not self._load_model():
-            return {}
-
-        predictions = _predict_next(
-            sql_context,
-            self._lm_model,
-            self._lm_token_to_index,
-            self._lm_index_to_token,
-            self._lm_vocab_values,
-            top_k=20,
-        )
-
-        rank_map = {}
-        for rank, (token_name, _prob) in enumerate(predictions):
-            if token_name == '<TABLE>':
-                rank_map['__TABLE__'] = rank
-            elif token_name == '<COLUMN>':
-                rank_map['__COLUMN__'] = rank
-            elif token_name == '<FUNC>':
-                rank_map['__FUNC__'] = rank
-            elif token_name not in ('<VALUE>', '<OPERATOR>', ''):
-                rank_map[token_name.upper()] = rank
-
-        return rank_map
-
-    @staticmethod
-    def _candidate_lm_rank(candidate: str, rank_map: dict) -> int:
-        """Return LM rank for a suggestion string like 'users (TABLE)' or 'WHERE (COMMAND)'."""
-        if not rank_map:
-            return 999
-
-        paren = candidate.rfind(' (')
-        if paren == -1:
-            bare = candidate.upper()
-            suffix = ''
-        else:
-            bare = candidate[:paren].upper()
-            suffix = candidate[paren + 2:-1].upper()
-
-        if suffix == 'TABLE' and '__TABLE__' in rank_map:
-            return rank_map['__TABLE__']
-        if suffix == 'COLUMN' and '__COLUMN__' in rank_map:
-            return rank_map['__COLUMN__']
-        if suffix == 'FUNCTION' and '__FUNC__' in rank_map:
-            return rank_map['__FUNC__']
-
-        return rank_map.get(bare, 999)
 
     async def get_cached_databases(self) -> list[str]:
         databases = self.cache.get()
@@ -352,14 +365,10 @@ class AutoComplete:
 
     async def _fetch_columns_for_tables(
         self,
-        table_specs: list[str],
-    ) -> list[tuple[str, str]]:
+        table_refs: List[Tuple[Optional[str], str, Optional[str]]],
+    ) -> List[Tuple[str, str]]:
         results = []
-        for spec in table_specs:
-            db = None
-            table = spec
-            if '.' in spec:
-                db, table = spec.split('.', 1)
+        for db, table, _alias in table_refs:
             cols = None
             try:
                 cols = await self.get_cached_columns(table) if db is None \
@@ -368,7 +377,7 @@ class AutoComplete:
                 pass
             if cols:
                 for col in cols:
-                    results.append((col, f"{table}.{col} (COLUMN)"))
+                    results.append((col, f"{table}.{col} ({CAT_COLUMN})"))
         return results
 
     async def _get_schema_suggestions(
@@ -376,7 +385,8 @@ class AutoComplete:
         parts: list[str],
         part1: Union[str, None],
         part2: Union[str, None],
-    ) -> List[Tuple[str, str]]:
+        query_tables: dict,
+    ) -> List[Tuple[str, str, str]]:
         results = []
         curr_tables_list = None
 
@@ -384,7 +394,7 @@ class AutoComplete:
             try:
                 databases_list = sorted(await self.get_cached_databases())
                 if databases_list:
-                    results += [(x, f"{x} (DATABASE)") for x in databases_list]
+                    results += [(x, f"{x} ({CAT_DATABASE})", CAT_DATABASE) for x in databases_list]
             except Exception:
                 pass
 
@@ -392,19 +402,36 @@ class AutoComplete:
             try:
                 curr_tables_list = sorted(await self.get_cached_tables())
                 if len(parts) < 2 and curr_tables_list:
-                    results += [(x, f"{x} (TABLE)") for x in curr_tables_list]
+                    results += [(x, f"{x} ({CAT_TABLE})", CAT_TABLE) for x in curr_tables_list]
             except Exception:
                 pass
 
         if part1 is not None and part2 is None:
+            # `u.` / `users.` where the query says `FROM users u`: the qualifier
+            # names a table of this very query, so complete its columns first.
+            qualified = query_tables.get(part1.lower())
+            if qualified is not None:
+                try:
+                    qualified_db, qualified_table = qualified
+                    columns_list = sorted(
+                        await self.get_cached_columns(qualified_table, qualified_db))
+                    if columns_list:
+                        results += [
+                            (x, f"{part1}.{x} ({CAT_COLUMN})", CAT_COLUMN) for x in columns_list
+                        ]
+                except Exception:
+                    pass
+
             try:
                 tables_list = sorted(await self.get_cached_tables(part1))
                 if tables_list:
-                    results += [(x, f"{x} (TABLE)") for x in tables_list]
-                if curr_tables_list and part1 in curr_tables_list:
+                    results += [(x, f"{x} ({CAT_TABLE})", CAT_TABLE) for x in tables_list]
+                if qualified is None and curr_tables_list and part1 in curr_tables_list:
                     columns_list = sorted(await self.get_cached_columns(part1))
                     if columns_list:
-                        results += [(x, f"{part1}.{x} (COLUMN)") for x in columns_list]
+                        results += [
+                            (x, f"{part1}.{x} ({CAT_COLUMN})", CAT_COLUMN) for x in columns_list
+                        ]
             except Exception:
                 pass
 
@@ -412,7 +439,9 @@ class AutoComplete:
             try:
                 columns_list = sorted(await self.get_cached_columns(part2, part1))
                 if columns_list:
-                    results += [(x, f"{part1}.{x} (COLUMN)") for x in columns_list]
+                    results += [
+                        (x, f"{part1}.{x} ({CAT_COLUMN})", CAT_COLUMN) for x in columns_list
+                    ]
             except Exception:
                 pass
 
@@ -429,23 +458,59 @@ class AutoComplete:
             part1 = parts[0]
             part2 = parts[1]
 
-        suggestions = [(x, f"{x} (COMMAND)", '') for x in self.client.all_commands]
+        order = _clause_order(sql_context, parts)
+
+        suggestions = [(x, f"{x} ({CAT_COMMAND})", '', CAT_COMMAND) for x in self.client.all_commands]
         functions_list = self.client.all_functions
         if functions_list:
-            suggestions += [(x, f"{x} (FUNCTION)", '') for x in functions_list]
+            suggestions += [(x, f"{x} ({CAT_FUNCTION})", '', CAT_FUNCTION) for x in functions_list]
         suggestions += [
-            (f'.{cmd.upper()}', f'.{cmd.upper()} (PIPELINE)', PIPELINE_COMMAND_HINTS.get(cmd, ''))
+            (f'.{cmd.upper()}', f'.{cmd.upper()} ({CAT_PIPELINE})',
+             PIPELINE_COMMAND_HINTS.get(cmd, ''), CAT_PIPELINE)
             for cmd in PIPELINE_COMMANDS
         ]
 
-        query_tables = _get_tables_from_sql(full_sql)
-        suggestions += [(ins, lbl, '') for ins, lbl in await self._fetch_columns_for_tables(query_tables)]
-        suggestions += [(ins, lbl, '') for ins, lbl in await self._get_schema_suggestions(parts, part1, part2)]
+        table_refs = _extract_table_refs(full_sql)
+        # Every name a column of this query can be qualified with — the table
+        # name itself and its alias, if any.
+        query_tables = {}
+        for db, table, alias in table_refs:
+            query_tables.setdefault(table.lower(), (db, table))
+            if alias:
+                query_tables[alias.lower()] = (db, table)
 
-        rank_map = self._get_lm_rank_map(sql_context)
+        suggestions += [
+            (ins, lbl, '', CAT_COLUMN)
+            for ins, lbl in await self._fetch_columns_for_tables(table_refs)
+        ]
+        suggestions += [
+            (ins, lbl, '', cat)
+            for ins, lbl, cat in await self._get_schema_suggestions(parts, part1, part2, query_tables)
+        ]
+
+        # `o.` — columns of the qualifier the user typed sort ahead of the rest.
+        # Nothing is dropped: a suggestion that does not fit here is only pushed
+        # down, since the popup is filterable and hiding candidates is worse.
+        typed_qualifier = part1.lower() if part1 else None
 
         def sort_key(candidate: tuple) -> tuple:
-            lm_rank = self._candidate_lm_rank(candidate[1], rank_map)
-            return predictions_weights(word, candidate[1], lm_rank)
+            _insert, label, _hint, category = candidate
+            # Match against the bare name, not the decorated label: "(COLUMN)"
+            # contains a U, "(COMMAND)" an M, and every one of them an N.
+            name = label[:-(len(category) + 3)]
+            qualifier, _, rest = name.partition('.')
+            qualifier_rank = int(
+                typed_qualifier is not None
+                and not (rest and qualifier.lower() == typed_qualifier)
+            )
+            category_rank, text_rank, tiebreak = predictions_weights(
+                word, name, order.index(category))
+            return (category_rank, qualifier_rank, text_rank, tiebreak)
 
-        return sorted(suggestions, key=sort_key)
+        # Identical labels arise when a table is reachable both by its own name
+        # and through _fetch_columns_for_tables; keep the first of each.
+        unique = {}
+        for candidate in sorted(suggestions, key=sort_key):
+            unique.setdefault(candidate[1], candidate)
+
+        return [(ins, lbl, hint) for ins, lbl, hint, _cat in unique.values()]
