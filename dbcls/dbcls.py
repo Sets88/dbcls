@@ -34,6 +34,7 @@ from .pipeline import PipelineStepError
 from .pipeline import PipelineCancelled
 from .pipeline import HELP_ENTRIES
 from .plugins import HookBus, PluginManager, resolve_plugin_names, resolve_plugin_paths
+from .utils import beautify_sql
 
 
 warnings.filterwarnings("ignore")
@@ -53,6 +54,7 @@ class DbFn(str, enum.Enum):
     SHOW_PREDICTION = 'show_prediction'
     SHOW_VD_SHEETS  = 'show_vd_sheets'
     TOGGLE_COMPRESSION = 'toggle_compression'
+    BEAUTIFY        = 'beautify'
 
 
 logging.basicConfig(level=logging.ERROR)
@@ -273,7 +275,11 @@ DB_HELP_DATABASE = """\
       only its `>>>` line); with the cursor on a marker line `Alt+R` runs
       the whole block with the marker lines stripped
   `Shift+Tab` / `Alt+1`
-      DB autocomplete (tables, columns, functions)
+      DB autocomplete (tables, columns, table aliases, functions)
+  `Ctrl+B`
+      Beautify the query at cursor (or the selection): one clause per
+      line, keywords upper-cased. Pipelines and dot-commands are left
+      untouched; `Ctrl+Z` undoes the reformat
   `Alt+T`
       Browse tables
   `Alt+E`
@@ -665,6 +671,8 @@ class DbEditor(Editor):
         self.add_keybinding(DbFn.SHOW_PREDICTION, [key_alt(ord('1')), K(353)])   # Alt+1, Shift+Tab
         self.add_editor_function(DbFn.SHOW_VD_SHEETS, self._db_show_vd_sheets, 'Browse VisiData sheets', 'Alt+S')
         self.add_keybinding(DbFn.SHOW_VD_SHEETS, key_alt(ord('s')))              # Alt+S
+        self.add_editor_function(DbFn.BEAUTIFY, self._db_beautify, 'Beautify SQL', '^B')
+        self.add_keybinding(DbFn.BEAUTIFY, K(ord('\x02')))                       # Ctrl+B
 
         if self.client:
             self.set_status_name(self.client.get_title())
@@ -968,6 +976,53 @@ class DbEditor(Editor):
                     f'{round(end - start, 2)}s  {message}', error=is_error, popup=not is_error)
 
         self.open_running_popup(task, start, on_done)
+
+    def _db_beautify(self):
+        """Reformat the statement under the cursor (or the selection) in place.
+
+        Dot-commands and pipelines are left alone: sqlparse knows nothing about
+        `.RUN`/`|`, and reflowing them would break the statement it reformats.
+        The rewrite goes through the buffer as a single edit, so `Ctrl+Z` takes
+        the original text back."""
+        if self.buf.readonly:
+            self.set_status_notification('Read-only mode', error=True)
+            return
+
+        if self.buf.has_selection():
+            rows = None
+            first_row = min(self.buf.sel_start[0], self.buf.sel_end[0])
+            text = self.buf.get_selected_text()
+        else:
+            # Fold markers are control lines, not SQL — keep them as they are
+            # and reformat only the statement between them.
+            rows = [
+                i for i in get_sql_rows(self.buf)
+                if not (is_fold_start(self.buf.lines[i]) or is_fold_end(self.buf.lines[i]))
+            ]
+            first_row = rows[0] if rows else 0
+            text = '\n'.join(self.buf.lines[i] for i in rows)
+
+        if not text.strip():
+            self.set_status_notification('Nothing to beautify')
+            return
+        if text.lstrip().startswith('.') or is_pipeline(text):
+            self.set_status_notification('Pipelines and dot-commands are not beautified')
+            return
+
+        formatted = beautify_sql(text)
+        if formatted == text:
+            self.set_status_notification('Already formatted')
+            return
+
+        if rows is not None:
+            # Select the statement so insert_text replaces it.
+            self.buf.move_cursor(rows[-1], len(self.buf.lines[rows[-1]]))
+            self.buf.sel_start = (rows[0], 0)
+            self.buf.sel_end = (self.buf.cursor_row, self.buf.cursor_col)
+        self.buf.insert_text(formatted)
+        self.buf.clear_selection()
+        self.lexer.invalidate(max(0, first_row))
+        self.set_status_notification('Beautified')
 
     def _db_show_prediction(self):
         parts = get_word_parts(self.buf)

@@ -479,6 +479,14 @@ class AutoComplete:
             if alias:
                 query_tables[alias.lower()] = (db, table)
 
+        # `FROM users AS u`: `u` stands for a table in this query, so offer it
+        # as one — it is what the rest of the statement has to qualify with.
+        suggestions += [
+            (alias, f'{alias} ({CAT_TABLE})',
+             f'alias of {db + "." if db else ""}{table}', CAT_TABLE)
+            for db, table, alias in table_refs if alias
+        ]
+
         suggestions += [
             (ins, lbl, '', CAT_COLUMN)
             for ins, lbl in await self._fetch_columns_for_tables(table_refs)

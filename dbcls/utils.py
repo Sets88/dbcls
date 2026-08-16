@@ -2,6 +2,8 @@ import re
 import json
 import datetime
 
+import sqlparse
+
 
 NUMBER_MATCHER = re.compile(r'^[-]?\d+(\.\d+)?$')
 
@@ -31,6 +33,28 @@ def sql_literal(v) -> str:
     if isinstance(v, datetime.date):
         return f"'{v.isoformat()}'"
     return str(v)
+
+
+def beautify_sql(sql: str, indent_width: int = 4) -> str:
+    """Reformat SQL: one clause per line, keywords upper-cased, comments kept.
+
+    Returns the text unchanged when sqlparse produces nothing usable — an
+    unparseable fragment must never wipe out what the user typed."""
+    if not sql or not sql.strip():
+        return sql
+    try:
+        formatted = sqlparse.format(
+            sql,
+            reindent=True,
+            keyword_case='upper',
+            indent_width=indent_width,
+            use_space_around_operators=True,
+            strip_comments=False,
+        )
+    except Exception:
+        return sql
+    formatted = formatted.strip()
+    return formatted or sql
 
 
 def format_json(json_string, indent=2):

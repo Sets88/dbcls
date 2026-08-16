@@ -143,7 +143,8 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 
 | Hotkey | Action |
 |--------|--------|
-| `Alt+1` / `Shift+Tab` | Show DB autocompletion suggestions (tables, columns, functions) |
+| `Alt+1` / `Shift+Tab` | Show DB autocompletion suggestions (tables, columns, table aliases, functions) |
+| `Ctrl+b` | Beautify the query under cursor or the selected text (see [Beautify](#beautify)) |
 | `Ctrl+n` | Base autocomplete (words from the current file) |
 | `Alt+r` | Execute query under cursor or selected text |
 | `Esc` | Cancel running query |
@@ -275,7 +276,42 @@ Within a category, exact matches come before prefix matches, then substring matc
   and skipped entirely in a table position, which saves a round-trip to the database
 - Table aliases are resolved: with `SELECT … FROM users u`, typing `u.` completes the
   columns of `users`
+- The aliases themselves are offered as tables (`u (TABLE)`, hinted with the table they
+  stand for), since that is the name the rest of the statement has to qualify with
 - Comments and string literals never influence the ordering
+
+### Beautify
+
+`Ctrl+b` reformats SQL in place — one clause per line, keywords upper-cased, comments
+kept:
+
+```sql
+select u.id, u.name, count(*) from users u join orders o on o.user_id=u.id where u.active=1 group by u.id, u.name
+```
+
+becomes
+
+```sql
+SELECT u.id,
+       u.name,
+       count(*)
+FROM users u
+JOIN orders o ON o.user_id = u.id
+WHERE u.active = 1
+GROUP BY u.id,
+         u.name
+```
+
+- With a selection, only the selected text is reformatted; without one, the statement
+  under the cursor (the same text `Alt+r` would run)
+- Pipelines and dot-commands are left untouched — `sqlparse` knows nothing about `.RUN`
+  or `|`, and reflowing them would break the statement
+- `>>> ... <<<` fold markers stay where they are; only the SQL between them is reformatted
+- The rewrite is a single edit — `Ctrl+Z` brings the original text back
+
+If your terminal multiplexer already owns `Ctrl+b` (it is tmux's default prefix), run
+`Beautify SQL` from the command palette (`Alt+p`) or remap the key (see
+[Key Remapping](#key-remapping)).
 
 ### Navigation in Database and Table Listings
 
