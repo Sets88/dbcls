@@ -4677,7 +4677,7 @@ class Editor:
 
     def _save_file(self):
         if self.buf.readonly:
-            self.set_status_notification('Read-only mode — saving is disabled')
+            self.set_status_notification('Read-only mode — saving is disabled', error=True)
             return
         if self.buf.filepath:
             if self.buf.file_changed_on_disk():
@@ -4695,7 +4695,7 @@ class Editor:
 
     def _save_file_as(self):
         if self.buf.readonly:
-            self.set_status_notification('Read-only mode — saving is disabled')
+            self.set_status_notification('Read-only mode — saving is disabled', error=True)
             return
         path = self._prompt('Save as: ', default=self.buf.filepath or '')
         if path:

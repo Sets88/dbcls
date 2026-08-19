@@ -1,21 +1,32 @@
 # DbCls
 
-DbCls is a terminal-based database client that pairs a built-in SQL editor with [visidata](https://www.visidata.org/) for exploring query results. The editor offers syntax highlighting, LM-ranked autocomplete, and customizable keybindings, while visidata turns query output into an interactive, spreadsheet-like view you can filter, sort, pivot, reshape and drill into — all without leaving the terminal. Together they make writing queries and inspecting their results a single, seamless workflow.
+DbCls is a terminal database client in which a SQL editor and [visidata](https://www.visidata.org/) work as one thing: you write the query in an editor with syntax highlighting and schema-aware autocomplete, and its result opens straight away as an interactive table you can filter, sort, pivot, reshape, chart and drill into. On top of that sits a pipeline language that turns the editor into the place multi-step work happens — "collect ids from one query, run them against every shard, show progress" — right inside the `.sql` file, instead of in a throwaway Python script.
 
-## Features
+## Key capabilities
 
-- Built-in SQL editor with syntax highlighting and customizable keybindings
-- LM-ranked autocomplete for tables, columns, keywords, and functions
-- Direct query execution from the editor, results opened straight in visidata
-- Pipelines — chain queries, Python, loops, functions and user prompts with `|` to automate multi-step work right in the editor
-- Optional LLM chat (`Ctrl+L`) that writes and fixes queries, reading your schema through read-only tools — any OpenAI-compatible model, local or hosted
-- Plugin API for third-party extensions: editor commands, pipeline commands, LLM tools and windows of their own
-- Powerful interactive data exploration via visidata (filter, sort, pivot, frequency tables, cross-sheet references)
-- Support for multiple database engines (MySQL, PostgreSQL, ClickHouse, SQLite, Cassandra / ScyllaDB)
-- Unix socket connections with optional auto-SSH tunneling
-- Configuration via command line arguments or JSON config file
-- Table schema inspection and database / table browsing
-- Export results to SQL `INSERT` statements or any visidata-supported format
+**Editor**
+- SQL editor with syntax highlighting, `>>> ... <<<` block folding, search, undo/redo and a command palette
+- Schema-aware autocomplete ranked by SQL context: tables, columns, table aliases, functions, keywords
+- Beautify SQL (`Ctrl+B`), read-only mode, remappable key codes and a tmux-style `Ctrl+X` prefix
+
+**Pipelines**
+- Steps chained with `|` right in the editor: SQL, Python, regex filters, loops, functions, variables
+- Prompts mid-run (`choose` / `select` / `input` / `ask`) — a pipeline becomes a small tool a colleague can use without knowing the schema
+- A pipeline is just text in your `.sql` file: save it, version it, re-run it
+
+**LLM chat (optional)**
+- `Ctrl+L` — a model writes and fixes queries, reading your schema through read-only tools
+- Any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter, a corporate proxy); nothing to install
+
+**Data**
+- The whole of visidata: filtering, sorting, pivots, frequency tables, joins between sheets
+- DB-aware extensions: cross-sheet references, in-terminal charts (plotext), export to SQL `INSERT`, and table editing that shows you the SQL before anything is committed
+
+**Connecting and extending**
+- MySQL, PostgreSQL, ClickHouse, SQLite, Cassandra / ScyllaDB
+- With no connection arguments it starts on an in-memory SQLite — just open a file and type
+- Unix sockets (including ones forwarded over SSH), JSON config, inactivity screen lock
+- Plugin API: your own editor commands, pipeline commands, LLM tools and full-screen windows
 
 ## Table of Contents
 
@@ -57,6 +68,13 @@ The [LLM chat](#llm-chat) needs nothing installed — it talks to the endpoint o
 
 ## Quick Start
 
+With no connection arguments at all, dbcls opens the file on an in-memory SQLite database —
+enough to try the editor, the pipelines and the visidata integration on `CREATE TABLE` /
+`INSERT` of your own:
+```bash
+dbcls scratch.sql
+```
+
 Basic usage with command line arguments:
 ```bash
 dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
@@ -69,16 +87,16 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-H, --host` | Database host address |
 | `-u, --user` | Database username |
 | `-p, --password` | Database password |
-| `-E, --engine` | Database engine (mysql, postgres, clickhouse, sqlite3) |
+| `-E, --engine` | Database engine: `mysql`, `postgres`, `clickhouse`, `sqlite3`, and `cassandra` when the driver is installed. Defaults to `sqlite3` |
 | `-d, --dbname` | Database name |
-| `-f, --filepath` | Database file path (SQLite only) |
+| `-f, --filepath` | Database file path (SQLite only). Without it SQLite runs on an in-memory database that lives as long as dbcls does |
 | `-P, --port` | Port number (optional) |
 | `-S, --unix-socket` | Path to Unix socket file (optional, overrides host/port) |
 | `-c, --config` | Path to configuration file |
 | `--no-compress` | Disable compression for ClickHouse connections (can also be switched at runtime via the `Toggle connection compression` command in the command palette) |
 | `--key-remap` | Remap key codes, e.g. `"36:1412,1412:36"` to swap Tab and Shift+Tab |
 | `--fold` | Start with `>>>` ... `<<<` block folding enabled (see [Fold Blocks](#fold-blocks)) |
-| `-R, --readonly` | Open the editor in read-only mode: the document cannot be modified or saved (`[RO]` is shown next to the file name). Also `DBCLS_READONLY=1` or `"readonly": true` in the config file |
+| `-R, --readonly` | Open the editor in read-only mode: the document cannot be modified or saved (`[RO]` is shown next to the file name), and `Enter` runs the query under the cursor since there is no text to insert. Also `DBCLS_READONLY=1` or `"readonly": true` in the config file |
 | `--lock-init-command` | Shell command run at startup to initialise a lock session |
 | `--lock-timeout` | Seconds of inactivity before the screen locks |
 | `--lock-check-command` | Shell command run when the user attempts to unlock |
@@ -146,7 +164,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Alt+1` / `Shift+Tab` | Show DB autocompletion suggestions (tables, columns, table aliases, functions) |
 | `Ctrl+b` | Beautify the query under cursor or the selected text (see [Beautify](#beautify)) |
 | `Ctrl+n` | Base autocomplete (words from the current file) |
-| `Alt+r` | Execute query under cursor or selected text |
+| `Alt+Enter` | Execute query under cursor or selected text (`Alt+r` does the same — a deprecated alias kept for now; in read-only mode plain `Enter` runs it too) |
 | `Esc` | Cancel running query |
 | `Alt+e` | Show database list with table submenu |
 | `Alt+t` | Show tables list with schema and sample data options |
@@ -163,12 +181,18 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `F1` / `Alt+h` | Show help with all available hotkeys |
 
 The full list of editor keybindings (navigation, selection, editing) is available on the
-`Editor` page of the in-app help (`F1` / `Alt+h`).
+`Editor` page of the in-app help (`F1` / `Alt+h`). The help popup is not just scrollable:
+once you are on a text page, `/` starts a less-style regex search over it, `n` / `N` walk the
+matches, `Esc` clears the highlights, and `c` copies the page's text to the clipboard.
 
 `Save As` and `Toggle read-only mode` have no default hotkey — run them from the command
 palette (`Alt+p`). Toggling read-only mode at runtime has the same effect as starting with
 `--readonly` (see [Command Line Options](#command-line-options) below): the document cannot
 be modified or saved until it's toggled off again.
+
+Two more conveniences that need no key: clicking in the text area moves the cursor there, and
+if the open file changes on disk underneath you (a `git checkout`, another editor), dbcls
+notices within about a second and asks whether to reload it.
 
 ### Fold Blocks
 
@@ -206,7 +230,7 @@ into the hidden block.
 Folding is off by default. To start with it enabled, use the `--fold` CLI flag,
 set `DBCLS_FOLD=1`, or add `"fold": true` to the JSON config file.
 
-The markers also work as statement separators for `Alt+r`:
+The markers also work as statement separators for `Alt+Enter`:
 
 - with the cursor **on a `>>>` or `<<<` line** (e.g. on a collapsed block),
   the whole block is executed and the `>>>`/`<<<` control lines are stripped
@@ -303,7 +327,7 @@ GROUP BY u.id,
 ```
 
 - With a selection, only the selected text is reformatted; without one, the statement
-  under the cursor (the same text `Alt+r` would run)
+  under the cursor (the same text `Alt+Enter` would run)
 - Pipelines and dot-commands are left untouched — `sqlparse` knows nothing about `.RUN`
   or `|`, and reflowing them would break the statement
 - `>>> ... <<<` fold markers stay where they are; only the SQL between them is reformatted
@@ -370,6 +394,8 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 | `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only) |
 | `gT` | Save current or selected rows to pipeline vars |
 | `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
+| `Alt+↑` / `Alt+↓` | Jump 5 rows up / down |
+| `Alt+←` / `Alt+→` | Jump 3 columns left / right |
 
 ### Plotting
 
@@ -803,7 +829,7 @@ Keep the key out of the process list the same way as a database password — see
 
 ### Using it
 
-`Ctrl+L` opens the window on whatever the cursor is on: the selection if there is one, otherwise the statement under the cursor (the same text `Alt+R` would run), or nothing on a blank line. The window has three panes:
+`Ctrl+L` opens the window on whatever the cursor is on: the selection if there is one, otherwise the statement under the cursor (the same text `Alt+Enter` would run), or nothing on a blank line. The window has three panes:
 
 | Pane | What it is |
 |------|------------|
@@ -951,7 +977,7 @@ Keys present in that section but never declared as options reach `api.settings` 
 | `api.add_keybinding(name, key)` | Bind a key (build codes with `dbcls.editor.K` / `key_alt` / `key_csi`) |
 | `api.add_pipeline_command(name, hint, handler, help_text, raw_data)` | Add a `.COMMAND`; the handler is `async def handler(executor, args, data)`. `help_text` goes to the help page *and* to the [LLM chat](#llm-chat)'s language reference |
 | `api.add_pipeline_function(name, value, help_text)` | Add a function (or any value) to the namespace `{{expr}}` and `.PY` run in; `help_text` reaches the model too |
-| `api.add_llm_tool(name, description, parameters, handler)` | Offer a tool to the [LLM chat](#llm-chat); load order does not matter, a tool offered before the chat is up waits for it. A no-op when the chat is not configured |
+| `api.add_llm_tool(name, description, parameters, handler, max_result_chars)` | Offer a tool to the [LLM chat](#llm-chat); load order does not matter, a tool offered before the chat is up waits for it. A no-op when the chat is not configured. `max_result_chars` caps how much text one call may hand the model (omit it to send the result whole) |
 | `api.add_help_page(title, text)` | Add a page to the in-app help (`F1`) |
 | `api.add_filter(event, func)` | Transform data on its way through the editor (see below) |
 
@@ -970,7 +996,7 @@ Keys present in that section but never declared as options reach `api.settings` 
 
 | Method | What it does |
 |--------|--------------|
-| `api.get_statement()` | The selection, or the statement under the cursor (what `Alt+R` would run) |
+| `api.get_statement()` | The selection, or the statement under the cursor (what `Alt+Enter` would run) |
 | `api.replace_statement(text)` | Replace it, as one undoable edit; False when read-only |
 | `api.insert_text(text)` | Insert at the cursor, replacing the selection |
 
@@ -1101,7 +1127,7 @@ DbCls can lock the terminal after a period of inactivity and require re-authenti
 | Parameter | Description |
 |-----------|-------------|
 | `--lock-init-command CMD` | Shell command that receives a random secret via stdin and outputs a challenge code to stdout |
-| `--lock-timeout SECONDS` | Inactivity timeout in seconds (float). Measured by monotonic clock — unaffected by system time changes |
+| `--lock-timeout SECONDS` | Inactivity timeout in seconds (float). Idle time is the larger of the monotonic and the wall-clock delta, so the lock engages whichever one runs out first — neither a system sleep (monotonic stops) nor an NTP jump (wall clock moves) can hold it off |
 | `--lock-check-command CMD` | Shell command that receives the challenge code via stdin and outputs the recovered secret to stdout |
 
 ### How it works

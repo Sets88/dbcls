@@ -268,12 +268,14 @@ def get_word_parts(buf) -> list:
 
 
 DB_HELP_DATABASE = """\
-  `Alt+R`
-      Execute query at cursor (or selection)
+  `Alt+Enter`
+      Execute query at cursor (or selection).  `Alt+R` is a deprecated
+      alias for the same command; in read-only mode plain `Enter` runs
+      the query too
   `>>>` ... `<<<`
       Fold-block markers: `Ctrl+P` toggles folding (a folded block shows
-      only its `>>>` line); with the cursor on a marker line `Alt+R` runs
-      the whole block with the marker lines stripped
+      only its `>>>` line); with the cursor on a marker line `Alt+Enter`
+      runs the whole block with the marker lines stripped
   `Shift+Tab` / `Alt+1`
       DB autocomplete (tables, columns, table aliases, functions)
   `Ctrl+B`
@@ -387,7 +389,7 @@ DB-specific extensions
       Save current column values from selected rows to pipeline vars
       as a flat list
 
-Edit mode (table browser `Edit` option; MySQL/SQLite only)
+Edit mode (table browser `Edit` option; MySQL/PostgreSQL/SQLite only)
   `e`
       Edit cell — kept pending (yellow) until committed
   `a`
@@ -1197,8 +1199,9 @@ def main():
     parser.add_argument('--filepath', '-f', dest='dbfilepath', help='specify db filepath', required=False)
     parser.add_argument('--no-compress', dest='compress', action='store_false', default=True,
         help='disable compression for ClickHouse')
-    parser.add_argument('--key-remap', dest='key_remap', default='', help='specify key remap config string,' \
-        ' e.g. "9:353,353:9" to remap Tab to behave like Shift+Tab and Shift+Tab to behave like Tab')
+    parser.add_argument('--key-remap', dest='key_remap', default='', help='specify key remap config string' \
+        ' of key codes as shown in debug mode (Ctrl+D), e.g. "36:1412,1412:36" to remap Tab to behave like' \
+        ' Shift+Tab and Shift+Tab to behave like Tab')
     parser.add_argument('--fold', dest='fold', action='store_true', default=False,
         help='start with >>> ... <<< block folding enabled (same as pressing Ctrl+P)')
     parser.add_argument('--readonly', '-R', dest='readonly', action='store_true', default=False,
@@ -1208,7 +1211,7 @@ def main():
     parser.add_argument('--lock-timeout', dest='lock_timeout', type=float, default=None,
         help='seconds of inactivity before the screen locks')
     parser.add_argument('--lock-check-command', dest='lock_check_command', default=None,
-        help='shell command to verify a lock session (receives same secret via stdin, must output same code)')
+        help='shell command to verify a lock session (receives the code via stdin, must output the original secret)')
     plugin_arguments(parser)
     # Every plugin declares its own options here — the core knows none of them.
     plugins.add_arguments(parser)

@@ -623,7 +623,9 @@ class ChatWindow:
         if self.question_popup.active:
             text = (self.HINT_ASK_MULTI if self.question_popup.multi
                     else self.HINT_ASK)
-            pair = colors.status_bar
+            # Red: the run is stopped until the user answers, and the bar is the
+            # only thing on screen that says so — the same colour an error uses.
+            pair = colors.status_warn
         elif self._error:
             text = f' {self._error} '
             pair = colors.status_warn

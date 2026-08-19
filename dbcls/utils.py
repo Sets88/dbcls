@@ -35,8 +35,37 @@ def sql_literal(v) -> str:
     return str(v)
 
 
+def _collapse_blank_lines(statement) -> str:
+    """Join a parsed statement back to text with its blank lines removed.
+
+    Works on the token stream rather than on the text, so newlines *inside*
+    string literals and block comments (single tokens) are left alone —
+    only the whitespace sqlparse itself inserted between tokens is collapsed.
+    """
+    lines = ['']
+    for token in statement.flatten():
+        value = token.value
+        if token.is_whitespace and '\n' in value:
+            indent = value.rsplit('\n', 1)[1]
+            if lines[-1].strip():
+                lines.append(indent)
+            else:
+                # Already at the start of an empty line — reuse it instead of
+                # opening another one, which is what makes the line blank.
+                lines[-1] = indent
+            continue
+        head, *rest = value.split('\n')
+        lines[-1] += head
+        lines.extend(rest)
+    return '\n'.join(lines)
+
+
 def beautify_sql(sql: str, indent_width: int = 4) -> str:
     """Reformat SQL: one clause per line, keywords upper-cased, comments kept.
+
+    Blank lines are removed *within* a statement (dbcls treats a blank line as
+    a statement separator, so a beautified statement containing one would no
+    longer run as a whole) but kept *between* statements.
 
     Returns the text unchanged when sqlparse produces nothing usable — an
     unparseable fragment must never wipe out what the user typed."""
@@ -51,6 +80,13 @@ def beautify_sql(sql: str, indent_width: int = 4) -> str:
             use_space_around_operators=True,
             strip_comments=False,
         )
+        statements = [
+            text for text in (
+                _collapse_blank_lines(statement).strip()
+                for statement in sqlparse.parse(formatted)
+            ) if text
+        ]
+        formatted = '\n\n'.join(statements)
     except Exception:
         return sql
     formatted = formatted.strip()
