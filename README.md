@@ -628,7 +628,7 @@ To carry loop rows forward past a `.NOFOR`, stash them with `.SET_VAR` inside th
 ```sql
 .FN "articles" |
     .RUN "SELECT * FROM articles WHERE user_id IN {{sql_in_list([x['id'] for x in data])}}" |
-    .SHEET "articles" |
+    .VIEW "articles" |
 .ENDFN |
 .RUN "SELECT * FROM users" | .CALL "articles"
 ```
@@ -775,11 +775,11 @@ if mtime is not None:
 ```sql
 .FN "articles" |
   .RUN "SELECT * FROM articles WHERE user_id IN {{sql_in_list([x['id'] for x in data])}}" |
-  .SHEET "articles" |
+  .VIEW "articles" |
 .ENDFN |
 .FN "orders" |
   .RUN "SELECT * FROM orders WHERE user_id IN {{sql_in_list([x['id'] for x in data])}}" |
-  .SHEET "orders" |
+  .VIEW "orders" |
 .ENDFN |
 .RUN "SELECT * FROM users" |
 .WHILE "sselect('Users', data)" |
