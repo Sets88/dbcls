@@ -23,7 +23,7 @@ setup(
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',
-    packages=find_packages(exclude=("tests",)),
+    packages=find_packages(exclude=("tests", "tests.*")),
     description='dbcls is a versatile client that supports various databases',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',

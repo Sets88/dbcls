@@ -1,2 +1,8 @@
 include requirements.txt
 include dbcls/llm/pipeline_reference.md
+
+# distutils puts tests/test*.py into the sdist on its own (sdist.py's
+# _add_defaults_optional), which find_packages(exclude=...) does not affect --
+# that one only keeps them out of the wheel.  They ship without conftest.py or
+# the dev requirements anyway, so nobody could run them from the tarball.
+prune tests
