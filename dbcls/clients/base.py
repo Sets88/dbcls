@@ -1,7 +1,7 @@
 import abc
 import re
 from time import time
-from typing import Optional
+from typing import Callable, Optional
 from dataclasses import dataclass, field
 
 from ..utils import sql_literal
@@ -50,6 +50,9 @@ class ClientClass(abc.ABC):
     # Whether connection compression can be switched at runtime
     # (the client must then implement toggle_compression())
     SUPPORTS_COMPRESSION = False
+    # Whether a query already running on the server can be stopped
+    # (the client must then implement request_cancel())
+    SUPPORTS_QUERY_CANCEL = False
 
     COMMANDS = [
         'tables', 'databases', 'schema', 'use'
@@ -85,6 +88,9 @@ class ClientClass(abc.ABC):
         self.port = port
         self.unix_socket = unix_socket
         self.connection = None
+        # Set by the app for the duration of a run: called with the number of
+        # rows fetched so far, so the running overlay can show live progress.
+        self.on_progress: Optional[Callable[[int], None]] = None
 
     @property
     def all_commands(self):
@@ -109,6 +115,21 @@ class ClientClass(abc.ABC):
     @abc.abstractmethod
     def is_db_error_exception(self, exc: Exception) -> bool:
         pass
+
+    def report_progress(self, rows: int) -> None:
+        """Tell the app how many rows of the current query have been fetched.
+        Ignored when nobody is listening (no run overlay on screen)."""
+        if self.on_progress is not None:
+            self.on_progress(rows)
+
+    def request_cancel(self) -> None:
+        """Stop the query that is running right now on the server.
+
+        Called from the main (UI) thread while the worker loop still owns the
+        connection, so an implementation must not touch it — it has to reach
+        the server some other way (a throwaway connection of its own) and must
+        not block the UI.  The default is a no-op: for engines that cannot do
+        this, cancelling the asyncio task is all the cancellation there is."""
 
     def get_internal_command_params(self, sql: str) -> Optional[CommandParams]:
         command = sql.strip().rstrip(';')

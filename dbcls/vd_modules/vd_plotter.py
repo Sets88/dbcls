@@ -100,6 +100,11 @@ plotext chart built from the source sheet key columns: (datetime, [bucket,] valu
         if cols[-1].typestr not in ('int', 'float', 'vlen'):
             raise Exception('Last key column must be of type number')
 
+    def reload(self):
+        # The chart draws straight from the source sheet, it has no rows of its
+        # own; without this override BaseSheet.reload() errors with 'no reload'.
+        self.rows = []
+
     def draw(self, scr):
         window_height, window_width = scr.getmaxyx()
         self.draw_plot(scr, window_height, window_width)

@@ -14,22 +14,50 @@ from visidata import ReturnValue
 from visidata import vd
 
 
-class SselectSheet(ListOfDictSheet):
-    """Pipeline sselect() row picker: Enter confirms the selected rows
-    ([] when nothing is marked), q aborts the pipeline.  The commands are
-    bound to this class only (see vd_modules.__init__), so the regular result
-    viewer keeps VisiData's stock Enter/q behavior."""
+class RowPicker:
+    """The Enter / g Enter contract of every sheet that hands rows back to a
+    running pipeline.
+
+    It follows VisiData's own rule that `g` widens a command from the cursor to
+    the selection: `Enter` answers with the row under the cursor — the common
+    case, with nothing to mark first — and `g Enter` with the rows marked with
+    s/t/gs.  An empty answer is a real answer, not a dismissal (that is `q`).
+
+    A plain mixin with no base class of its own, so both the ListOfDictSheet
+    pickers here and the TableSheet-derived live sheet (see
+    vd_modules.vd_live) can use it."""
+
+    def confirm_current(self):
+        """`Enter`: answer with the row under the cursor.
+
+        An empty sheet has no cursor row, and sselect() accepts empty rows —
+        then there is simply nothing to hand back."""
+        self.answer_rows([self.cursorRow] if self.cursorRow is not None else [])
+
+    def confirm_selected(self):
+        """`g Enter`: answer with the selected rows ([] when none are marked)."""
+        self.answer_rows(list(self.selectedRows))
+
+    def answer_rows(self, rows: list):
+        """Hand *rows* to the pipeline step waiting on this sheet."""
+        raise ReturnValue(rows)
+
+
+class SselectSheet(RowPicker, ListOfDictSheet):
+    """Pipeline sselect() row picker: Enter returns the row under the cursor,
+    g Enter the selected rows ([] when nothing is marked), q aborts the
+    pipeline.  The commands are bound to this class only (see
+    vd_modules.__init__), so the regular result viewer keeps VisiData's stock
+    Enter/q behavior."""
     guide = '''# Pipeline row picker
 Select the rows to hand back to the sselect() pipeline step.
 
-- `s` / `t` / `u` to select / toggle / unselect rows (stock VisiData keys).
-- `Enter` to confirm: the selected rows are returned to the pipeline.
+- `Enter` to return the row under the cursor.
+- `s` / `t` / `u` to select / toggle / unselect rows (stock VisiData keys),
+  then `g Enter` to return the selected ones (none marked returns no rows).
 - `q` to abort the pipeline.
 '''
     precious = False
-
-    def confirm_selection(self):
-        raise ReturnValue(list(self.selectedRows))
 
     def abort_selection(self):
         # Sub-sheets of the picker (e.g. `"` dup-selected) stay sselect
@@ -64,17 +92,19 @@ Rows handed over by a .VIEW pipeline step. The pipeline is paused meanwhile.
 
 
 class SchooseSheet(SselectSheet):
-    """Pipeline schoose() row chooser: Enter picks the single row under the
-    cursor (VisiData's selection is ignored), q aborts the pipeline."""
+    """Pipeline schoose() row chooser: the single-row half of the picker.
+
+    Nothing to override — Enter already answers with the row under the cursor.
+    What differs is g Enter, rebound to that same command (see
+    vd_modules.__init__): schoose() returns exactly one item, so the widening
+    it means everywhere else would have to silently drop the other marked
+    rows."""
     guide = '''# Pipeline row chooser
 Pick one row to hand back to the schoose() pipeline step.
 
 - `Enter` to choose the row under the cursor.
 - `q` to abort the pipeline.
 '''
-
-    def confirm_selection(self):
-        raise ReturnValue([self.cursorRow])
 
 
 # ── .VARS: the pipeline variables as an editable sheet ────────────────────────

@@ -1,7 +1,7 @@
 """The pipeline-language reference handed to the model.
 
 It lives beside this module as a Markdown file rather than in the code: it is
-prose written for a model to read, it is long (~17 KB), and keeping it a
+prose written for a model to read, it is long (~24 KB), and keeping it a
 document means it can be edited and diffed as one.
 
 The document covers the language dbcls ships.  Plugins extend that language at

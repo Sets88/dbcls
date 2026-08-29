@@ -10,7 +10,7 @@ NUMBER_MATCHER = re.compile(r'^[-]?\d+(\.\d+)?$')
 
 class SqlExpr(str):
     """A raw SQL expression (e.g. ``NOW()``) entered by the user via the
-    edit-sheet `z=`/`g=` commands.  sql_literal() emits it verbatim instead
+    edit-sheet `zE`/`gE` commands.  sql_literal() emits it verbatim instead
     of quoting it as a string literal."""
 
 

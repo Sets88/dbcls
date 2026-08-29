@@ -128,6 +128,12 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
         # would otherwise block every threaded command (edit, sort, ...)
         # for as long as the sheet keeps loading.
         threading.current_thread().lastCommand = False
+        # For the same reason, keep vd.sync() from waiting on this thread:
+        # save/syscopy call a bare vd.sync() (save.py: `vd.sync(*vd.ensureLoaded([]))`),
+        # which joins *every* unfinished thread and would deadlock here forever,
+        # leaving syscopyCells_async stuck and every later command failing with
+        # "still running syscopyCells_async from previous command".
+        threading.current_thread().noblock = True
 
         loaded = False
         offset = 0
@@ -183,7 +189,7 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
 
 class EditTableSheet(TableSampleDataSheet):
     """Sample-data browsing with pending edits: `e`/`zd` mark cell changes
-    (yellow), `z=`/`g=` set cell(s) to a raw (unquoted) SQL expression,
+    (yellow), `zE`/`gE` set cell(s) to a raw (unquoted) SQL expression,
     `a` adds pending rows (green), `d` marks rows for deletion (red);
     Ctrl+S shows the INSERT/UPDATE/DELETE statements on a PendingSqlSheet
     for confirmation."""
@@ -192,8 +198,8 @@ Changes are collected locally and only executed after confirmation.
 
 - `e` to edit the current cell (yellow until committed).
 - `zd` or `Bksp` to set the current cell to NULL.
-- `z=` to set the current cell to a raw SQL expression (e.g. `NOW()`), emitted unquoted in the generated SQL.
-- `g=` to do the same for all selected rows in the current column.
+- `zE` to set the current cell to a raw SQL expression (e.g. `NOW()`), emitted unquoted in the generated SQL.
+- `gE` to do the same for all selected rows in the current column.
 - `a` to add a new row (green until committed).
 - `d` / `gd` to mark the current / selected rows for deletion (red until committed).
 - `E` to edit the underlying SQL (add WHERE / ORDER BY, ...).
@@ -284,7 +290,7 @@ Editing and deleting existing rows requires the table to have a primary key; wit
         if value is None:
             return None
         if isinstance(value, SqlExpr):
-            # entered via z=/g=: a raw SQL expression, not a column-typed
+            # entered via zE/gE: a raw SQL expression, not a column-typed
             # literal -- col.type() would coerce/strip it (e.g. str(value)
             # drops the SqlExpr subclass), so pass it through untouched
             return value
@@ -465,8 +471,8 @@ EditTableSheet.bindkey('Bksp', 'delete-cell')  # shadow the stock menu-help
 # Shadow stock visidata's Python-expression commands ('=' evaluates the input
 # as Python): here the input is a raw SQL expression stored verbatim and
 # emitted unquoted (see SqlExpr / _typed), e.g. z= "NOW()" -> SET col=NOW().
-EditTableSheet.addCommand('z=', 'edit-cell-sql-expr', 'sheet.edit_cell_sql_expr(cursorCol, cursorRow)', 'set current cell to a raw SQL expression, e.g. NOW() (pending until Ctrl+S)')
-EditTableSheet.addCommand('g=', 'edit-selected-sql-expr', 'sheet.edit_selected_sql_expr(cursorCol, someSelectedRows)', 'set current column for selected rows to a raw SQL expression (pending until Ctrl+S)')
+EditTableSheet.addCommand('zE', 'edit-cell-sql-expr', 'sheet.edit_cell_sql_expr(cursorCol, cursorRow)', 'set current cell to a raw SQL expression, e.g. NOW() (pending until Ctrl+S)')
+EditTableSheet.addCommand('gE', 'edit-selected-sql-expr', 'sheet.edit_selected_sql_expr(cursorCol, someSelectedRows)', 'set current column for selected rows to a raw SQL expression (pending until Ctrl+S)')
 EditTableSheet.addCommand('d', 'delete-row', 'ensure_editable(cursorRow); delete_row(cursorRowIndex); cursorDown(1)', 'mark row for deletion (pending until Ctrl+S)')
 EditTableSheet.addCommand('gd', 'delete-selected', 'ensure_rows_editable(onlySelectedRows); deleteSelected()', 'mark selected rows for deletion (pending until Ctrl+S)')
 EditTableSheet.addCommand('Ctrl+S', 'show-pending-sql', 'sheet.show_pending_sql()', 'show SQL for pending changes')

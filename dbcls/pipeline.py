@@ -128,6 +128,20 @@ Pipeline commands
     Closing the sheet is not an answer — it never cancels the pipeline.
     As the last step the rows are not opened a second time.
 
+.WATCH [INTERVAL]
+    Like .VIEW, but live: everything to the left of the step *in the same
+    block* is re-run every INTERVAL seconds (default 1) and merged into the
+    sheet in place, so the sort order, the column layout and the cursor
+    position survive each refresh.  Inside a .FOR / .WHILE / .FN body that
+    prefix is the body alone, and the loop item _i is frozen at the parked
+    iteration — what the monitor shows has to be produced by the prefix
+    itself.  Row identity is the whole row unless key columns are set with
+    `!`.  It is a row picker too, like sselect(): Enter hands the row under the
+    cursor to the next step, g Enter the marked rows.  On the sheet: q ends the
+    run, Ctrl+R refreshes now, p pauses, zi changes the interval, gf shows only
+    the rows whose current column matches a regex (! to hide those instead,
+    empty to clear) — the prompt reopens on the rule, so it can be changed.
+
 Template placeholders
 ---------------------
 {{_0}}             first column value of the current row (for a list row —
@@ -202,10 +216,11 @@ schoose(title, rows)
             row under the cursor and returns that one item itself, not a list.
             q aborts the pipeline without a result.
 sselect(title, rows)
-            multi-row variant of schoose(): mark rows with VisiData's selection
-            (s/t/gs...), Enter confirms and returns only the marked rows ([]
-            when nothing is marked).  q on the last sselect sheet (sub-sheets
-            like `"` just close) or quitting VisiData aborts the pipeline.
+            multi-row variant of schoose(): the rows open the same way and
+            Enter returns the row under the cursor, while g Enter returns the
+            rows marked with VisiData's selection (s/t/gs...) — [] when nothing
+            is marked.  q on the last sselect sheet (sub-sheets like `"` just
+            close) or quitting VisiData aborts the pipeline.
 input(title, default=None)
             ask the user to type a line of text; returns the string.  default
             pre-fills the input line.
@@ -220,6 +235,7 @@ stop(), nothing is displayed, only a 'Cancelled' notification.
 import time
 import json
 import asyncio
+import concurrent.futures
 import inspect
 import keyword
 import re
@@ -249,6 +265,7 @@ _COMMAND_TABLE: List[tuple] = [
     ('void',    '.VOID',                           '_cmd_void'),
     ('sheet',   '.SHEET <NAME>',                   '_cmd_sheet'),
     ('view',    '.VIEW <NAME>',                    '_cmd_view'),
+    ('watch',   '.WATCH [<INTERVAL>]',             '_cmd_watch'),
     ('call',    '.CALL <FN_NAME>',                 '_cmd_call'),
 ]
 
@@ -278,6 +295,16 @@ _BLOCK_END_KEYWORDS: frozenset = frozenset(_BLOCK_CLOSERS.values())
 #: cancels the running task at the per-iteration ``await``) remains the normal
 #: way out.
 MAX_WHILE_ITERATIONS: int = 100_000
+
+#: Refresh period ``.WATCH`` uses when it is given no INTERVAL argument, and the
+#: floor it clamps to — below that the sheet would re-run its source faster than
+#: VisiData can draw it, for no visible gain.
+WATCH_DEFAULT_INTERVAL: float = 1.0
+WATCH_MIN_INTERVAL: float = 0.1
+
+#: Title of the ``.WATCH`` sheet.  Fixed, unlike ``.SHEET``/``.VIEW``: only one
+#: live sheet can be on screen at a time, so there is nothing to tell apart.
+WATCH_SHEET_NAME: str = 'watch'
 
 #: How deeply ``.CALL`` may nest before the pipeline is aborted — a runaway
 #: recursion (a function calling itself) would otherwise blow the Python stack.
@@ -322,7 +349,7 @@ can filter, extract, iterate over rows, or post-process results —
 all without leaving the editor.
 
 Commands: `.RUN` `.URUN` `.RFILTER` `.RGET` `.FOR_RUN` `.FOR` `.NOFOR` `.SLEEP`
-          `.PY` `.SET_VAR` `.GET_VAR` `.VARS` `.VOID` `.SHEET`
+          `.PY` `.SET_VAR` `.GET_VAR` `.VARS` `.VOID` `.SHEET` `.VIEW` `.WATCH`
 
 Example:
 ```
@@ -450,8 +477,10 @@ loop, exactly as in Python.
 The condition is re-evaluated on every iteration against the data that
 entered the block: it is **frozen**, so the steps before the loop never run
 again (`.WHILE "sselect('Users', data)"` keeps offering the same rows). The
-condition's value — the marked rows, the next page, … — becomes the input of
-the body's first step and is exposed as `{{_i}}` / `_i`.
+condition's value — the picked rows, the next page, … — becomes the input of
+the body's first step and is exposed as `{{_i}}` / `_i`. A browser loop is
+left by answering with nothing: on an `sselect()` sheet that is `g Enter` with
+no rows marked (`q` cancels the whole run instead).
 
 The body's output is **not** accumulated: each iteration starts afresh from
 the condition's value and the loop hands its own input data to the step after
@@ -664,7 +693,7 @@ set_var('some_var', 42)
 ```
                  popup        VisiData sheet
   pick one       choose()     schoose()
-  mark any       select()     sselect()
+  mark any       select()     sselect()   (Enter = cursor row, g Enter = marked)
 ```
 
 `choose(title, options, default=None)`
@@ -719,12 +748,13 @@ result(choose('Pick a table', data))
 ```
 
 `sselect(title, rows)`
-  multi-row variant of `schoose()`: the rows open the same way, but you mark
-  them with VisiData's selection (`s`/`t`/`gs`...) and `Enter` returns only the
-  marked ones — an empty list when nothing is marked, which the pipeline
-  continues with. `q` on a sub-sheet (e.g. `"` dup-selected) just closes it;
-  `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels
-  the pipeline — no result is shown.
+  multi-row variant of `schoose()`: the rows open the same way and `Enter`
+  returns the row under the cursor, but you can also mark rows with VisiData's
+  selection (`s`/`t`/`gs`...) and return all of them with `g Enter` — an empty
+  list when nothing is marked, which the pipeline continues with (and which is
+  how a `.WHILE "sselect(...)"` loop is left). `q` on a sub-sheet (e.g. `"`
+  dup-selected) just closes it; `q` on the last sselect sheet or quitting
+  VisiData (`gq`, `Ctrl+Q`) cancels the pipeline — no result is shown.
 
   Example:
 ```
@@ -741,9 +771,10 @@ result(choose('Pick a table', data))
   space-separated part are offered, e.g. `te st` matches `my test string`.
   `items` offers values the user never typed — a list of strings or rows of a
   previous step (the first column is taken) — as entries older than the ones
-  actually entered at this title; they stay in the history afterwards. `Esc`
-  closes the list, and cancels the pipeline when no list is up — no result is
-  shown.
+  actually entered at this title; they stay in the history afterwards. `Ctrl+V`
+  pastes the clipboard into the line (a multi-line clipboard is joined with
+  spaces — the bar holds one line). `Esc` closes the list, and cancels the
+  pipeline when no list is up — no result is shown.
 
   Example:
 ```
@@ -924,6 +955,87 @@ Example:
 ```
 """)
 
+HELP_WATCH = _help_entry('watch', """
+Show the input rows on a **live** sheet: everything to the left of `.WATCH`
+**in the same block** is re-run every INTERVAL seconds (default 1) and merged
+into the sheet, which blocks the pipeline until it is left. The refreshing
+counterpart of `.VIEW`.
+
+The sheet is also a row picker, like `sselect()`: `Enter` hands the row under
+the cursor to the next step, `g Enter` the rows marked with `s`/`t`/`gs` (none
+marked hands over no rows). That is how a monitor drives an action —
+`.RUN "SHOW PROCESSLIST" | .WATCH 1 | .FOR_RUN "KILL {{_0}}"`. The rows handed
+over are the sheet's own dicts: every refresh rebuilds them from the prefix, so
+there are no original items behind them (unlike `sselect()`).
+
+`q` is the other way out and **cancels the run** instead: nothing after the
+`.WATCH` runs and nothing is shown, which is the way out of a `.WHILE` loop
+wrapped around it.
+
+Because the source is the pipeline prefix, the same step watches SQL and Python
+alike. INTERVAL is the only argument: the sheet is always named `watch`.
+
+Rows are replaced, not re-created: the sort order is applied again to the new
+values, and the column layout and cursor position stay where they were. Row
+identity is the whole row by default — press `!` on a column (an id, a pid) to
+key on it instead, and selections then stick to a row while its other values
+change.
+
+On the sheet: `Ctrl+R` refreshes now, `p` pauses, `zi` changes the interval.
+
+`gf` narrows what is on display to the rows whose **current column** matches a
+regex — `gf` again reopens the prompt on that rule, so it is changed rather than
+retyped, `!regex` hides the matching rows instead, and an empty answer clears it.
+The rule only hides: the prefix keeps producing every row and the sheet keeps
+watching them, so widening the rule brings them straight back. The status bar
+shows `shown/watched` and the rule in force.
+
+The loop is not what refreshes the sheet either: `.WATCH` re-runs its own prefix
+every INTERVAL, so `.WHILE "1" | ... | .WATCH 1 | .ENDWHILE` is a longer way to
+write `... | .WATCH 1`.
+
+Inside a block the prefix is that **block's** steps, not the whole pipeline: a
+`.WATCH` in a `.FOR` / `.WHILE` / `.FN` body re-runs the body's own steps only,
+and what stands before the block never runs again. In a `.FOR` this freezes
+`_i` too — the sheet blocks, so the loop stays parked on the iteration that
+opened it and every tick evaluates the prefix with that same item:
+
+```
+.FOR "range(10000)" | .PY "_i" | .WATCH 1   -- shows 0 and never moves
+```
+
+`Enter` picks a row and ends the iteration, so the next one reopens the sheet
+with the next `_i`, but nothing moves by itself. Whatever the monitor should
+show has to be produced by the prefix — a query, or a `.PY` step keeping its
+state in `_vars`, which outlive a prefix re-run:
+
+```
+.PY '''
+n = get_var('n', 0) + 1
+set_var('n', n)
+result([n])
+''' | .WATCH 1
+```
+
+The prefix must not prompt (`choose()`, `sselect()`, `.VIEW`) and must not hold
+a second `.WATCH`: VisiData owns the terminal while the live sheet is open, so
+such a step is refused. Leaving the sheet waits for a refresh that is still
+running, so the next step never overlaps with it.
+
+Examples:
+```
+.RUN "SHOW PROCESSLIST" | .WATCH 1
+
+.RUN "SHOW PROCESSLIST" | .WATCH 1 | .FOR_RUN "KILL {{_0}}"
+
+.RUN "SELECT * FROM pg_stat_activity" |
+.RFILTER "{{state}}" "^active$" | .WATCH 2
+
+.PY "import subprocess; result([dict(zip(('pid','user','cpu','mem','cmd'), l.split(None, 4))) for l in subprocess.run(['ps','-Ao','pid,user,%cpu,%mem,command'], capture_output=True, text=True).stdout.splitlines()[1:]])" |
+.WATCH 1
+```
+""")
+
 HELP_TEMPLATE_POS = """
 `Template: {{_0}}, {{_1}}`
 Positional placeholder — value of the N-th column (0-based).
@@ -1016,6 +1128,7 @@ HELP_ENTRIES: List[str] = [
     HELP_VARS,
     HELP_SHEET,
     HELP_VIEW,
+    HELP_WATCH,
     HELP_PY_FUNCTIONS,
 ]
 
@@ -2038,6 +2151,14 @@ class PipelineExecutor:
         # screen.  If the pipeline ends up returning that very object, the host
         # is told not to open a second sheet showing the same rows again.
         self._shown_data: Any = NOTHING_SHOWN
+        # (nodes already run in the current node list, the value that list
+        # started from) — what .WATCH re-executes on every refresh.  Maintained
+        # by _execute_nodes; see _cmd_watch.
+        self._watch_prefix: Tuple[List[Node], Any] = ([], NO_DATA)
+        # True while a .WATCH sheet is on screen: the pipeline is parked in the
+        # hand-over and the terminal belongs to VisiData, so nothing running
+        # underneath may open an editor prompt (see _ask_user).
+        self._in_watch: bool = False
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -2082,7 +2203,11 @@ class PipelineExecutor:
         ``sselect()``).  ``NO_DATA`` passes through as-is so the first-step /
         post-``.VOID`` client fallback still works.
         """
-        for node in nodes:
+        initial = data
+        for i, node in enumerate(nodes):
+            # What a .WATCH in this position would have to re-run to produce
+            # fresh rows: every node to its left, from the same starting value.
+            self._watch_prefix = (list(nodes[:i]), initial)
             # The user asked to stop (Esc on a live info() popup) — abort with
             # stop() semantics: the data reached so far is the final result.
             if self.host.pipeline_stop_requested():
@@ -2406,7 +2531,7 @@ class PipelineExecutor:
     def _warn(self, msg: Any) -> None:
         """Show *msg* in the info popup and *block* until the user closes it;
         Esc aborts the pipeline without a result.  Exposed as ``warn()``."""
-        answer = self.host.request_user_input(
+        answer = self._ask_user(
             {'kind': 'warn', 'title': str(msg)})
         if answer is None:
             self._cancel()
@@ -2443,7 +2568,8 @@ class PipelineExecutor:
     # may pick:
     #
     #     single choice   choose()    schoose()
-    #     any number      select()    sselect()
+    #     any number      select()    sselect()   (Enter picks the cursor row
+    #                                              there too, g Enter the marked)
     #
     # Each pair shares its plumbing (_ask_options / _prompt_rows below).
     # Dismissing any prompt (Esc in the popup, q in the viewer) resolves the
@@ -2485,7 +2611,7 @@ class PipelineExecutor:
         request = {'kind': kind, 'title': str(title), 'options': labels}
         if (pre := self._default_labels(labels, values, default, multi=multi)):
             request['default'] = pre if multi else pre[0]
-        answer = self.host.request_user_input(request)
+        answer = self._ask_user(request)
         if answer is None:
             self._cancel()
         mapping = self._label_map(labels, values)
@@ -2515,15 +2641,15 @@ class PipelineExecutor:
         behind them.  ``None`` means the user dismissed the sheet, which both
         ``sselect()`` and ``schoose()`` treat as cancelling the pipeline."""
         request = {'kind': kind, 'title': str(title), 'rows': shaped}
-        picked = self.host.request_user_input(request)
+        picked = self._ask_user(request)
         if picked is None:
             return None
         return self._map_selection(raw, shaped, picked)
 
     def _user_sselect(self, title: Any, rows: Any) -> list:
-        """Open *rows* (e.g. ``data``) in VisiData; the user marks rows with
-        VisiData's selection (s/t/gs...), Enter confirms and returns only the
-        marked rows (nothing marked returns ``[]``).  ``q`` or quitting
+        """Open *rows* (e.g. ``data``) in VisiData; Enter returns the row under
+        the cursor, and g Enter the rows marked with VisiData's selection
+        (s/t/gs...) — nothing marked returns ``[]``.  ``q`` or quitting
         VisiData aborts the pipeline without a result.  Exposed as
         ``sselect()``.
 
@@ -2539,7 +2665,8 @@ class PipelineExecutor:
         """Open *rows* in VisiData and let the user pick exactly one of them
         with Enter (the row under the cursor); return that single item — the
         raw one, not a list.  This is the single-choice counterpart of
-        ``sselect()``, which marks any number of rows.  ``q`` or quitting
+        ``sselect()``, whose ``g Enter`` returns any number of marked rows (on
+        a schoose sheet that key picks the cursor row too).  ``q`` or quitting
         VisiData aborts the pipeline without a result.  Exposed as
         ``schoose()``."""
         raw = _as_item_list(rows)
@@ -2574,7 +2701,7 @@ class PipelineExecutor:
             request['default'] = str(default)
         if (offered := _option_pairs(items)[0]):
             request['items'] = offered
-        text = self.host.request_user_input(request)
+        text = self._ask_user(request)
         if text is None:
             self._cancel()
         return text
@@ -2583,7 +2710,7 @@ class PipelineExecutor:
         """Ask a yes/no question; return ``True`` on 'y'/Enter, ``False`` on
         'n'.  Esc aborts the pipeline without a result; any other key is
         ignored and the question keeps waiting.  Exposed as ``ask()``."""
-        answer = self.host.request_user_input(
+        answer = self._ask_user(
             {'kind': 'ask', 'title': str(title)})
         if answer is None:
             self._cancel()
@@ -2701,6 +2828,29 @@ class PipelineExecutor:
         """The variables as display rows, in insertion order."""
         return [{'key': k, 'value': v} for k, v in self.host.vars.items()]
 
+    def _refuse_prompt_during_watch(self, kind: Any) -> None:
+        """Raise when a *kind* prompt would open while a ``.WATCH`` sheet owns
+        the screen.
+
+        The editor's main loop is inside VisiData then, so the request would sit
+        unanswered until the sheet is closed and then pop up out of nowhere — and
+        a nested ``.WATCH`` would never be opened at all, since its producer only
+        runs *because* the outer sheet is on screen: it would take the editor's
+        single request slot and block forever.  A clear failure beats a mystery
+        stall."""
+        if self._in_watch:
+            raise ValueError(
+                f'a {kind} prompt cannot open while a .WATCH sheet '
+                'is on screen — move the interactive step out of the pipeline '
+                'prefix that .WATCH re-runs'
+            )
+
+    def _ask_user(self, request: dict) -> Any:
+        """Put *request* to the user and block until it is answered — the one
+        place the whole executor talks to the host's UI."""
+        self._refuse_prompt_during_watch(request.get('kind'))
+        return self.host.request_user_input(request)
+
     def _show_blocking_sheet(self, kind: str, title: str, rows: list) -> None:
         """Show *rows* on a blocking VisiData sheet and wait for it to close.
 
@@ -2709,7 +2859,7 @@ class PipelineExecutor:
         ``sselect()`` / ``schoose()`` prompts, so it works in the middle of a
         run.  Closing the sheet is not an answer, so (unlike a dismissed
         prompt) it never cancels the pipeline."""
-        self.host.request_user_input({'kind': kind, 'title': title, 'rows': rows})
+        self._ask_user({'kind': kind, 'title': title, 'rows': rows})
 
     def _mark_shown(self, data: Any) -> Any:
         """Record *data* as the value a display step has just had on screen and
@@ -2794,6 +2944,122 @@ class PipelineExecutor:
         # the data itself, not the shaped copy: that is what a following step
         # would pass on and what the final result would be normalised from
         return self._mark_shown(data)
+
+    async def _cmd_watch(self, args: List[str], data: Optional[list]) -> Any:
+        """Show the input rows on a *live* sheet that re-reads them every
+        ``args[0]`` seconds, and return the rows the user picks off it.
+
+        The refreshing counterpart of ``.VIEW``.  Its source is everything to
+        the left of it in the pipeline, re-executed on each tick, so the same
+        step covers SQL (``.RUN "SHOW PROCESSLIST" | .WATCH 1``) and Python
+        (``.PY "ps_rows()" | .WATCH 1``) with no extra syntax.
+
+        The sheet is a row picker like ``sselect()`` (see ``LiveRowsSheet``):
+        ``Enter`` answers with the row under the cursor, ``g Enter`` with the
+        selected rows, and that answer flows into the next step — which is how
+        ``.RUN "SHOW PROCESSLIST" | .WATCH 1 | .FOR_RUN "KILL {{_0}}"`` acts on
+        what the monitor is showing.  The rows are the sheet's dicts, not the
+        original items: every refresh builds fresh ones from the prefix, so
+        there is nothing to map back to (unlike ``sselect()``, see
+        ``_map_selection``).
+
+        ``q`` is the other way out and cancels the run instead, which is what
+        gets the user out of a ``.WHILE`` loop that keeps re-opening the sheet.
+
+        The refresh runs on the sheet's own thread while this coroutine is
+        parked, which is why the wait below goes through ``asyncio.to_thread``:
+        ``request_user_input`` blocks on an Event, and blocking it *on the
+        event loop* — as ``.VIEW`` may — would leave no loop for the refresh to
+        run its queries on."""
+        interval = self._watch_interval(args)
+        # Before the flag is claimed below, so this step does not refuse itself;
+        # a .WATCH *inside* a watched prefix hits the flag its parent set.
+        self._refuse_prompt_during_watch('watch')
+
+        prefix, initial = self._watch_prefix
+        loop = asyncio.get_running_loop()
+        in_flight: List[concurrent.futures.Future] = []
+
+        def produce() -> List[dict]:
+            """Re-run the pipeline prefix and return its rows.  Called from the
+            sheet's refresh thread, so it hops back onto the pipeline's event
+            loop and waits for the result there."""
+            future = asyncio.run_coroutine_threadsafe(
+                self._execute_nodes(list(prefix), initial), loop)
+            in_flight.append(future)
+            try:
+                return normalize_to_dicts(future.result())
+            finally:
+                in_flight.remove(future)
+
+        request = {
+            'kind': 'watch',
+            'title': WATCH_SHEET_NAME,
+            'rows': normalize_to_dicts(data),
+            'extra': {'producer': produce, 'interval': interval},
+        }
+        self._in_watch = True
+        try:
+            # Off the event loop on purpose — see the docstring.
+            picked = await asyncio.to_thread(self.host.request_user_input, request)
+        finally:
+            # Drain before clearing the flag, so a refresh that is still
+            # unwinding keeps getting the same refusal it got while the sheet
+            # was up instead of reaching an editor able to open prompts again.
+            try:
+                await self._drain_watch_runs(in_flight)
+            finally:
+                self._in_watch = False
+        if picked is None:
+            # Quit rather than picked from (`q`, `gq`, Ctrl+Q): the run ends
+            # here — that is the way out of a loop that keeps re-opening the
+            # sheet (.WHILE, .FN).  Cancelled, so nothing is shown afterwards:
+            # the rows were on screen until the moment `q` was pressed.
+            self._cancel()
+        # An empty pick is a real answer ("nothing to act on"), like sselect().
+        return picked
+
+    @staticmethod
+    async def _drain_watch_runs(in_flight: List[concurrent.futures.Future]) -> None:
+        """Wait for the refresh runs a just-closed ``.WATCH`` still has in flight.
+
+        The producer re-runs the pipeline prefix on *this* event loop while the
+        step is parked in ``asyncio.to_thread``.  Closing the sheet does not stop
+        a run that has already started, and the loop outlives the pipeline (see
+        ``AsyncLoopThread``), so ending the run with one in flight would leave it
+        querying while the user's *next* run starts — two coroutines on the one
+        ``client.connection``, whose driver cursors cannot be interleaved.  The
+        step does not finish until the loop is its own again.
+
+        The run is awaited rather than cancelled: it is somewhere inside
+        ``_execute_nodes`` and its ``finally`` blocks (``_loop_stack``, the
+        ``.CALL`` stack) have to unwind normally.  Its outcome is dropped — a
+        failed refresh is the sheet's business, not the pipeline's."""
+        for future in list(in_flight):
+            try:
+                await asyncio.wrap_future(future)
+            except Exception:       # noqa: BLE001 — a stale refresh cannot fail the run
+                pass
+
+    @staticmethod
+    def _watch_interval(args: List[str]) -> float:
+        """Parse the optional ``INTERVAL``, the step's only argument."""
+        if len(args) > 1:
+            raise ValueError(
+                f'.WATCH takes only an INTERVAL, got {len(args)} arguments — '
+                'the live sheet is always named "watch"'
+            )
+        if not args or not str(args[0]).strip():
+            return WATCH_DEFAULT_INTERVAL
+        try:
+            interval = float(args[0])
+        except ValueError:
+            raise ValueError(
+                f'.WATCH INTERVAL must be a number of seconds, got {args[0]!r}'
+            ) from None
+        if interval <= 0:
+            raise ValueError('.WATCH INTERVAL must be positive')
+        return max(WATCH_MIN_INTERVAL, interval)
 
     async def _cmd_call(self, args: List[str], data: Any) -> Any:
         """Run the ``.FN`` block named by ``args[0]`` and return its output.

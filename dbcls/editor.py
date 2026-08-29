@@ -31,10 +31,11 @@ TAB_SIZE = 4
 
 #: request_user_input() kinds that are answered in an external viewer rather
 #: than by an editor widget — see Editor.run_sheet_prompt().  'view' (.VIEW)
-#: only shows rows and has no answer to give back, and 'vars' (.VARS) writes
-#: the edited variables back itself; both are handled here because they need
-#: the very same terminal handover as the row pickers.
-SHEET_PROMPT_KINDS = ('sselect', 'schoose', 'view', 'vars')
+#: only shows rows and has no answer to give back, 'watch' (.WATCH) is the same
+#: but keeps re-reading them, and 'vars' (.VARS) writes the edited variables
+#: back itself; all are handled here because they need the very same terminal
+#: handover as the row pickers.
+SHEET_PROMPT_KINDS = ('sselect', 'schoose', 'view', 'vars', 'watch')
 
 # ─── Key code bitfield ────────────────────────────────────────────────────────
 # Layout (LSB-first):
@@ -265,6 +266,9 @@ Search
       Move by word within the query (also in input prompts)
   `Alt+Backspace / Ctrl+U`
       Delete word / whole query (also in input prompts)
+  `Ctrl+V`
+      Paste the clipboard into the query, joined into one line
+      (also in input prompts)
   `Enter / Esc`
       Close search bar
 
@@ -1365,11 +1369,12 @@ class LineInputBar:
     text-editing key handling.  Subclasses decide what Enter/Esc mean and how
     to react to edits (see :class:`SearchBar` / :class:`InputBar`)."""
 
-    def __init__(self):
+    def __init__(self, clipboard: Optional['Clipboard'] = None):
         self.active = False
         self.query = ''
         self.prompt = ''
         self.cursor = 0   # position within query
+        self.clipboard = clipboard
 
     def open(self, prompt: str = '', text: str = ''):
         self.active = True
@@ -1391,6 +1396,25 @@ class LineInputBar:
             while start > 0 and not (q[start - 1].isalnum() or q[start - 1] == '_'):
                 start -= 1
         return start
+
+    def _paste(self) -> bool:
+        """Insert the clipboard at the cursor; True if the query text changed.
+        The bar holds a single line, so a multi-line paste is joined with single
+        spaces (and tabs become spaces) rather than losing everything past the
+        first line break."""
+        if self.clipboard is None:
+            return False
+        text = self.clipboard.paste()
+        if not text:
+            return False
+        text = re.sub(r'[ \t]*[\r\n]+[ \t]*', ' ', text.strip())
+        text = ''.join(ch if ch.isprintable() else ' ' for ch in text)
+        if not text:
+            return False
+        c = self.cursor
+        self.query = self.query[:c] + text + self.query[c:]
+        self.cursor = c + len(text)
+        return True
 
     def _edit_key(self, key) -> bool:
         """Apply a text-editing/movement key to the query; True if the query
@@ -1449,6 +1473,8 @@ class LineInputBar:
                 self.cursor = 0
                 return True
             return False
+        if key == K(ord('\x16')):  # Ctrl+V — paste the clipboard at the cursor
+            return self._paste()
         if key_flags(key) == 0:
             base = key_base(key)
             if base >= 32 and chr(base).isprintable():
@@ -1533,8 +1559,8 @@ class InputBar(LineInputBar):
     HISTORY_KEYS = (K(curses.KEY_UP), K(curses.KEY_DOWN),
                     K(curses.KEY_PPAGE), K(curses.KEY_NPAGE))
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, clipboard: Optional['Clipboard'] = None):
+        super().__init__(clipboard)
         self.history = InputHistory()
         self.history_popup = SelectPopup()
         self._draft = ''      # the typed line — also the popup's filter
@@ -1637,8 +1663,8 @@ class InputBar(LineInputBar):
 
 # ─── SearchBar ────────────────────────────────────────────────────────────────
 class SearchBar(LineInputBar):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, clipboard: Optional['Clipboard'] = None):
+        super().__init__(clipboard)
         self.matches: List[Tuple[int, int, int]] = []
         self.current_idx = 0
 
@@ -2071,18 +2097,24 @@ class RunningPopup:
         self.cancelled = False
         self._start: float = 0.0
         self._task = None
+        self._on_cancel = None
         self.rows_loaded: int = 0
 
-    def open(self, task, start: float) -> None:
+    def open(self, task, start: float, on_cancel=None) -> None:
+        """*on_cancel*, if given, is called on ESC in addition to cancelling the
+        task — it is what stops the work still going on outside of asyncio's
+        reach (a query the server is running, a thread mid-transfer)."""
         self.active = True
         self.cancelled = False
         self._start = start
         self._task = task
+        self._on_cancel = on_cancel
         self.rows_loaded = 0
 
     def close(self) -> None:
         self.active = False
         self._task = None
+        self._on_cancel = None
 
     @property
     def task(self):
@@ -2095,6 +2127,10 @@ class RunningPopup:
         """Returns 'cancel' on ESC, None otherwise.
         key is in the bitfield format produced by Editor._encode_key."""
         if key == K(27):
+            # on_cancel first: it needs to know what is running, and cancelling
+            # the task is what tears that state down.
+            if self._on_cancel:
+                self._on_cancel()
             if self._task:
                 self._task.cancel()
             self.cancelled = True
@@ -3218,10 +3254,16 @@ TEXT_EDIT_BINDINGS = (
     (Fn.SEL_MOVE_RIGHT,  [K(curses.KEY_SRIGHT)],                 'Extend selection right', ''),
     (Fn.MOVE_UP_5,       [K(578)],                               'Move 5 lines up',       'Alt+Up'),
     (Fn.MOVE_DOWN_5,     [K(537)],                               'Move 5 lines down',     'Alt+Down'),
-    (Fn.MOVE_HOME,       [K(curses.KEY_HOME), K(604), K(ord('\x01'))],
-                                                                 'Move to line start',    '^A / Cmd+Left'),
-    (Fn.MOVE_END,        [K(curses.KEY_END), K(605), K(ord('\x05'))],
-                                                                 'Move to line end',      '^E / Cmd+Right'),
+    # Home/End also arrive as raw escape sequences: ncurses only turns one into
+    # KEY_HOME/KEY_END when terminfo lists that exact form (xterm-256color lists
+    # \EOH / \EOF), and tmux sends \E[1~ / \E[4~ instead, which would otherwise
+    # do nothing at all inside a multiplexer.
+    (Fn.MOVE_HOME,       [K(curses.KEY_HOME), K(604), K(ord('\x01')),
+                          key_csi('[', '1', '~'), key_csi('[', '7', '~'), key_csi('[', 'H')],
+                                                                 'Move to line start',    '^A / Home / Cmd+Left'),
+    (Fn.MOVE_END,        [K(curses.KEY_END), K(605), K(ord('\x05')),
+                          key_csi('[', '4', '~'), key_csi('[', '8', '~'), key_csi('[', 'F')],
+                                                                 'Move to line end',      '^E / End / Cmd+Right'),
     (Fn.SEL_MOVE_HOME,   [K(curses.KEY_SHOME), key_csi('[', '1', ';', '1', '0', 'D')],
                                                                  'Select to line start',  'Shift+Home'),
     (Fn.SEL_MOVE_END,    [K(curses.KEY_SEND), key_csi('[', '1', ';', '1', '0', 'C')],
@@ -3809,11 +3851,11 @@ class Editor:
                                  clipboard=self.clipboard, readonly=readonly)
         self.buf = self.textarea.buf
         self.view = self.textarea.view
-        self.search = SearchBar()
+        self.search = SearchBar(self.clipboard)
         self.popup = SelectPopup()
         self.running_popup = RunningPopup()
         self.info_popup = InfoPopup(self.clipboard)
-        self.input_bar = InputBar()
+        self.input_bar = InputBar(self.clipboard)
         # Live-pipeline info popup state (driven by the pipeline `info()` helper).
         self._pipeline_info_live = False
         # Esc on a live info popup asks the pipeline to stop at its next step.
@@ -4023,11 +4065,12 @@ class Editor:
         self.lexer.set_words(keywords=keywords, types=types, functions=functions)
         self._init_ac_words(self.lexer._keywords, self.lexer._types, self.lexer._functions)
 
-    def open_running_popup(self, task, start: float, on_done) -> None:
+    def open_running_popup(self, task, start: float, on_done, on_cancel=None) -> None:
         """Start the running overlay for *task*. *on_done()* is called when the
-        task finishes or is cancelled, from within the main editor loop."""
+        task finishes or is cancelled, from within the main editor loop;
+        *on_cancel()* on Esc, from the key handler (see RunningPopup.open)."""
         self._running_done_cb = on_done
-        self.running_popup.open(task, start)
+        self.running_popup.open(task, start, on_cancel)
 
     # ── Live pipeline info popup (driven from the pipeline `info()` helper) ──────
 
@@ -4074,12 +4117,12 @@ class Editor:
         ``items`` — strings offered in its history list.
 
         Returns the chosen string (choose), the list of marked strings
-        (select), the list of picked row dicts (sselect/schoose), the typed
-        string (input), a bool (ask), or True once the popup is closed (warn).
-        An empty list is a real answer ("nothing marked"); dismissing the
-        prompt (Esc, or q in the viewer) always resolves as None — the caller
-        decides what that means (the pipeline helpers abort the run with no
-        result displayed)."""
+        (select), the list of picked row dicts (sselect/schoose/watch), the
+        typed string (input), a bool (ask), or True once the popup is closed
+        (warn).  An empty list is a real answer ("nothing picked"); dismissing
+        the prompt (Esc, or q in the viewer) always resolves as None — the
+        caller decides what that means (the pipeline helpers abort the run with
+        no result displayed)."""
         if threading.current_thread() is threading.main_thread():
             raise RuntimeError(
                 'request_user_input() must be called from a worker thread '
@@ -4121,18 +4164,24 @@ class Editor:
             # Synchronous like 'ask': the viewer owns the terminal on the main
             # loop while the worker thread waits for the answer.
             self._resolve_ui_request(self.run_sheet_prompt(
-                kind, req['title'], req.get('rows') or []))
+                kind, req['title'], req.get('rows') or [], req.get('extra')))
         else:
             self._resolve_ui_request(None)
 
-    def run_sheet_prompt(self, kind: str, title: str, rows: list) -> Optional[list]:
+    def run_sheet_prompt(self, kind: str, title: str, rows: list,
+                         extra: Optional[dict] = None) -> Optional[list]:
         """Show *rows* in an external viewer and block until the user answers.
 
-        *kind* is one of :data:`SHEET_PROMPT_KINDS`: ``'sselect'`` (mark any
-        number of rows), ``'schoose'`` (pick the row under the cursor) or
-        ``'view'`` (just show the rows).  It returns the picked rows ([] when
-        nothing is marked), or None when the user quit the viewer — which is
-        the only possible outcome of ``'view'``, and the caller ignores it.
+        *kind* is one of :data:`SHEET_PROMPT_KINDS`: ``'sselect'`` (pick the
+        cursor row, or any number of marked ones), ``'schoose'`` (pick the row
+        under the cursor), ``'view'`` (just show the rows) or ``'watch'`` (show
+        them, keep them up to date, and pick from them like ``'sselect'``).  It
+        returns the picked rows ([] when nothing is marked), or None when the
+        user quit the viewer — which is the only possible outcome of
+        ``'view'``, and the caller ignores it there.
+
+        *extra* carries whatever else the viewer for this kind needs (for
+        ``'watch'``: the callable that produces fresh rows and the interval).
 
         The base editor has no viewer — DbEditor overrides this with VisiData."""
         return None

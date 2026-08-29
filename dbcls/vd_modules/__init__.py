@@ -10,7 +10,9 @@ from .vd_db_browser import DataBaseSheet, TablesSheet  # re-exported for dbcls.p
 from .vd_utils import SheetWithReference
 from .vd_utils import SselectSheet, SchooseSheet, ViewSheet, VarsSheet  # re-exported for dbcls.py
 from .vf_funcs import LiveFormatSheet
+from .vd_live import LiveRowsSheet  # re-exported for dbcls.py
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
+from . import vd_idle  # noqa: F401 — installs the idle-polling get_curses_timeout wrapper
 
 
 IndexSheet.guide += '''- `^` to make new sheet with reference column between two sheets'''
@@ -40,10 +42,28 @@ TableSheet.addCommand('z'+ENTER, 'open-cell', 'vd.push(openCellAltered(sheet, cu
 # freezing on the rows that were selected.
 LiveFormatSheet.addCommand('"', 'dup-selected', 'vd.push(Sheet(sheet.name + "_selectedref", columns=[Column("formated", getter=lambda col, row: row)], rows=list(selectedRows) or fail("no rows selected")))', 'open a duplicate sheet with only the selected rows')
 
-SselectSheet.addCommand('Enter', 'sselect-confirm', 'sheet.confirm_selection()', 'confirm the selected rows and return to dbcls')
+# The row pickers follow VisiData's own `g` rule — the plain key acts on the
+# cursor, the g-prefixed one on the selection — so both shadow stock commands
+# here: Enter (open-row) and g Enter (dive-selected).
+SselectSheet.addCommand('Enter', 'sselect-confirm-current', 'sheet.confirm_current()', 'return the row under the cursor to the pipeline')
+SselectSheet.addCommand('g'+ENTER, 'sselect-confirm-selected', 'sheet.confirm_selected()', 'return the selected rows to the pipeline')
 SselectSheet.addCommand('q', 'sselect-abort', 'sheet.abort_selection()', 'abort the pipeline')
-# SchooseSheet inherits both commands; only what they do differs (see the class).
+# SchooseSheet inherits Enter and q as they are; g Enter is narrowed back to the
+# cursor row, since schoose() answers with exactly one item (see the class).
+SchooseSheet.addCommand('g'+ENTER, 'schoose-confirm-current', 'sheet.confirm_current()', 'return the row under the cursor to the pipeline')
 ViewSheet.addCommand('q', 'view-close', 'sheet.close_view()', 'close the view and resume the pipeline')
+
+# .WATCH: the picker contract above, plus control over the refresh itself.
+# `p` and `zi` shadow stock paste-after / addcol-incr-step, and Ctrl+R stock
+# reload-sheet — all three are meaningless on a sheet whose contents are
+# replaced every tick anyway.
+LiveRowsSheet.addCommand('Enter', 'watch-confirm-current', 'sheet.confirm_current()', 'return the row under the cursor to the pipeline')
+LiveRowsSheet.addCommand('g'+ENTER, 'watch-confirm-selected', 'sheet.confirm_selected()', 'return the selected rows to the pipeline')
+LiveRowsSheet.addCommand('q', 'watch-close', 'sheet.close_view()', 'close the live sheet and end the pipeline run')
+LiveRowsSheet.addCommand('Ctrl+R', 'watch-refresh', 'sheet.refresh_now()', 'refresh the live sheet now')
+LiveRowsSheet.addCommand('p', 'watch-pause', 'sheet.toggle_pause()', 'pause/resume the live sheet')
+LiveRowsSheet.addCommand('zi', 'watch-interval', 'sheet.set_interval()', 'set the live sheet refresh interval')
+LiveRowsSheet.addCommand('gf', 'watch-filter', 'sheet.set_filter()', 'show only the rows whose current column matches a regex (! to hide them, empty to clear)')
 
 TableSheet.addCommand('gT', 'save-to-vars', 'save_rows_to_vars(sheet, selectedRows or [cursorRow])', 'Save selected rows (or current row) to _vars under a prompted name')
 TableSheet.addCommand('gzT', 'save-col-to-vars', 'save_col_values_to_vars(sheet, cursorCol, selectedRows or [cursorRow])', 'Save selected values of current column (or current cell) to _vars as a flat list')

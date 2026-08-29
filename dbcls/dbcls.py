@@ -21,7 +21,8 @@ import visidata
 
 from .clients.base import Result
 from .vd_modules import (
-    DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet, VarsSheet)
+    DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet, VarsSheet,
+    LiveRowsSheet)
 from .clients.sqlite3 import Sqlite3Client
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
@@ -297,7 +298,8 @@ DB_HELP_DATABASE = """\
       ClickHouse only: switch compression on/off (as `--no-compress`),
       applied when the connection is re-established by the next query
   `Esc`
-      Cancel running query"""
+      Cancel running query (ClickHouse: killed on the server too,
+      so a long transfer stops instead of running on)"""
 
 DB_HELP_KEY_REMAP = """\
   `--key-remap "A:B,C:D"`
@@ -630,6 +632,9 @@ class DbEditor(Editor):
         plugins: Optional[PluginManager] = None,
     ):
         visidata.vd.addGlobals(dbeditor=self)
+        # VisiData's pristine idle threshold, captured before anything of ours
+        # has had a chance to change it — see _fix_visidata_curses.
+        self._vd_timeouts_before_idle = visidata.vd.timeouts_before_idle
         self.client = client
         self.autocomplete = autocomplete
         self.asyncloop_thread = AsyncLoopThread(daemon=True)
@@ -793,11 +798,15 @@ class DbEditor(Editor):
             curses.endwin()
         except Exception:
             pass
-        if self.lock_screen is not None:
-            # VisiData blocks indefinitely once idle (curses_timeout = -1), which
-            # would stop the lock from ever engaging. Keep its mainloop polling so
-            # our getkeystroke wrapper can check the inactivity timer (~100 ms).
-            visidata.vd.timeouts_before_idle = -1
+        # VisiData blocks indefinitely once idle (curses_timeout = -1), which
+        # would stop the lock from ever engaging. Keep its mainloop polling so
+        # our getkeystroke wrapper can check the inactivity timer (~100 ms).
+        # A .WATCH sheet needs the same and sets it for itself while it is open
+        # (see vd_modules.vd_live.LiveRowsSheet); it normally puts it back, but
+        # a session ended with Ctrl+Q never gets the chance — hence restoring
+        # the pristine value here rather than only setting it.
+        visidata.vd.timeouts_before_idle = (
+            -1 if self.lock_screen is not None else self._vd_timeouts_before_idle)
         if visidata.color.colors.color_pairs:
             for (fg, bg), (pairnum, _) in visidata.color.colors.color_pairs.items():
                 curses.init_pair(pairnum, fg, bg)
@@ -829,14 +838,17 @@ class DbEditor(Editor):
 
     #: Pipeline sheet-handover kind → the VisiData sheet class that implements
     #: it; they all share run_sheet_prompt's handover and differ only in what
-    #: their Enter/q commands do (see vd_modules.vd_utils).  'view' and 'vars'
-    #: are the odd ones out: they give no answer back — 'view' only shows rows
-    #: (.VIEW), and 'vars' (.VARS) edits self.vars in place.
+    #: their Enter/q commands do (see vd_modules.vd_utils).  'sselect',
+    #: 'schoose' and 'watch' answer with rows — the live sheet (.WATCH, see
+    #: vd_modules.vd_live) is a picker too, it just keeps re-reading what it
+    #: shows.  'view' (.VIEW) and 'vars' (.VARS) give no answer back: the first
+    #: only shows rows, the second edits self.vars in place.
     _PICKER_SHEETS = {
         'sselect': SselectSheet,
         'schoose': SchooseSheet,
         'view': ViewSheet,
         'vars': VarsSheet,
+        'watch': LiveRowsSheet,
     }
 
     def _run_picker_sheet(self, sheet) -> Optional[list]:
@@ -857,7 +869,8 @@ class DbEditor(Editor):
                            if isinstance(s, tuple(self._PICKER_SHEETS.values()))]:
                     visidata.vd.remove(vs)
 
-    def run_sheet_prompt(self, kind: str, title: str, rows: list) -> Optional[list]:
+    def run_sheet_prompt(self, kind: str, title: str, rows: list,
+                         extra: Optional[dict] = None) -> Optional[list]:
         """Show a pipeline row prompt in VisiData (see Editor.run_sheet_prompt).
 
         Every picker kind is the same handover — only the sheet class differs
@@ -865,9 +878,12 @@ class DbEditor(Editor):
 
         The editor is handed to the sheet as ``host`` (VisiData assigns unknown
         kwargs as attributes); only VarsSheet uses it, to write the edited
-        variables straight into self.vars."""
+        variables straight into self.vars.  *extra* goes the same way — it is
+        how .WATCH passes its row producer and refresh interval to
+        LiveRowsSheet."""
         return self._run_picker_sheet(
-            self._PICKER_SHEETS[kind](str(title) or kind, source=rows, host=self))
+            self._PICKER_SHEETS[kind](str(title) or kind, source=rows, host=self,
+                                      **(extra or {})))
 
     def _vd_run(self, sheet) -> None:
         """Run a VisiData mainloop starting at `sheet`, guarding against a
@@ -941,6 +957,9 @@ class DbEditor(Editor):
             return Result(all_data, len(all_data), has_more=False)
 
         self._pipeline_sheets = []
+        # Live row counter in the overlay: engines that fetch in blocks report
+        # their progress here; the others simply never call it.
+        self.client.on_progress = self._set_rows_loaded
         task = self.asyncloop_thread.submit(fetch_all())
 
         def on_done():
@@ -971,13 +990,20 @@ class DbEditor(Editor):
                 is_error = True
                 self.info_popup.open('Error', {'main': message})
             finally:
+                self.client.on_progress = None
                 self.set_status_name(self.client.get_title())
                 # popup=False: the error branch above already opened the popup
                 # with the full text — the bar only carries the short version.
                 self.set_status_notification(
                     f'{round(end - start, 2)}s  {message}', error=is_error, popup=not is_error)
 
-        self.open_running_popup(task, start, on_done)
+        # request_cancel stops the query on the server; without it Esc only
+        # stops us from waiting, and the rows keep coming.
+        self.open_running_popup(task, start, on_done, on_cancel=self.client.request_cancel)
+
+    def _set_rows_loaded(self, rows: int) -> None:
+        """ClientClass.on_progress hook: rows fetched so far by the running query."""
+        self.running_popup.rows_loaded = rows
 
     def _db_beautify(self):
         """Reformat the statement under the cursor (or the selection) in place.

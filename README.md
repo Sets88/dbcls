@@ -30,6 +30,7 @@ DbCls is a terminal database client in which a SQL editor and [visidata](https:/
 
 ## Table of Contents
 
+- [Demo](#demo)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -45,13 +46,40 @@ DbCls is a terminal database client in which a SQL editor and [visidata](https:/
 - [Screen Lock](#screen-lock)
 - [Password safety](#password-safety)
 
-## Screenshots
+## Demo
 
-### SQL Editor
-![Editor](/data/editor.png)
+Four recordings of a real session — the captions under the terminal say what is
+happening and which key was pressed.
 
-### Data Visualization
-![Data representation](/data/data.png)
+### The editor
+
+Syntax highlighting, `Ctrl+B` to beautify, schema-aware autocomplete, the
+database and table browsers, and editing table data with the SQL shown before
+anything is committed. See [Editor Commands](#editor-commands).
+
+![Editor](/data/demo/editor.gif)
+
+### The result
+
+Every query opens as a visidata sheet: sorting, a frequency table, key columns
+and an in-terminal chart. See [Data Visualization](#data-visualization-visidata).
+
+![Data](/data/demo/visidata.gif)
+
+### Pipelines in the editor
+
+A chain of steps in the editor: a prompt in the middle of a run, a fan-out over
+shards, a live monitor, and a file of named blocks used as a menu. See
+[Pipelines](#pipelines).
+
+![Pipelines](/data/demo/pipelines.gif)
+
+### The model
+
+`Ctrl+L` — the model reads the schema through read-only tools and hands back a
+query, then a pipeline. See [LLM Chat](#llm-chat).
+
+![LLM chat](/data/demo/llm.gif)
 
 ## Installation
 
@@ -165,7 +193,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Ctrl+b` | Beautify the query under cursor or the selected text (see [Beautify](#beautify)) |
 | `Ctrl+n` | Base autocomplete (words from the current file) |
 | `Alt+Enter` | Execute query under cursor or selected text (`Alt+r` does the same — a deprecated alias kept for now; in read-only mode plain `Enter` runs it too) |
-| `Esc` | Cancel running query |
+| `Esc` | Cancel running query. On ClickHouse the query is killed on the server too (`KILL QUERY`), so a long transfer stops instead of running on in the background |
 | `Alt+e` | Show database list with table submenu |
 | `Alt+t` | Show tables list with schema and sample data options |
 | `Alt+s` | Show list of open VisiData sheets |
@@ -208,7 +236,7 @@ FROM User
 
 which can become very useful for grouping scripts into sections, like:
 ```sql
->>> -- Terminate running queries (select and hit Enter)
+>>> -- Terminate running queries (mark them and hit g Enter)
 .RUN "SHOW PROCESSLIST" |
 .PY "sselect('queries_to_terminate', [x for x in data if x['Command'] == 'Query'])" |
 .FOR_RUN "KILL {{_0}}" | .PY "info('done')"
@@ -217,7 +245,7 @@ which can become very useful for grouping scripts into sections, like:
 
 collapses to:
 ```sql
->>> -- Terminate running queries (select and hit Enter)
+>>> -- Terminate running queries (mark them and hit g Enter)
 ```
 
 `Ctrl+p` toggles folding on and off. While folding is on, each block collapses
@@ -359,14 +387,14 @@ edits — nothing is sent to the database until you confirm.
 |--------|--------|
 | `e` | Edit the current cell (pending, shown in yellow, until committed) |
 | `zd` / `Bksp` | Set the current cell to `NULL` |
-| `z=` | Set the current cell to a **raw SQL expression** (e.g. `NOW()`), emitted unquoted in the generated SQL — unlike stock VisiData's `z=`, this is not evaluated as Python |
-| `g=` | Same as `z=`, applied to all selected rows in the current column |
+| `zE` | Set the current cell to a **raw SQL expression** (e.g. `NOW()`), emitted unquoted in the generated SQL — unlike stock VisiData's `z=`, this is not evaluated as Python |
+| `gE` | Same as `zE`, applied to all selected rows in the current column |
 | `a` | Add a new row (pending, shown in green) |
 | `d` / `gd` | Mark the current / selected rows for deletion (pending, shown in red) |
 | `E` | Edit the underlying SQL (add `WHERE` / `ORDER BY`, ...); the sheet reloads with the new query |
 | `Ctrl+S` | Review the generated `INSERT`/`UPDATE`/`DELETE` statements on a confirmation sheet; `Enter` there executes them sequentially, `q` goes back without executing |
 
-For example, on a `DATE`/`DATETIME` column, pressing `z=` and typing `NOW()` produces
+For example, on a `DATE`/`DATETIME` column, pressing `zE` and typing `NOW()` produces
 `UPDATE table SET col=NOW() WHERE id=1` rather than quoting `NOW()` as a string.
 
 Editing and deleting existing rows requires the table to have a primary key; without one
@@ -571,6 +599,89 @@ A pipeline may span several lines: keep a trailing `|` on every line except the 
 | `.VARS` | Open all stored pipeline variables as an **editable** `key` / `value` sheet, then return them as rows. Blocking like `.VIEW`, and it opens even when there are no variables yet; as the last step the rows are not opened a second time. Edits hit the store immediately: `e` renames the key or sets the value (as a string), `z=` / `g=` set the value to the result of a Python expression, `a` adds a variable once its key is filled in, `d` / `gd` delete, `U` undoes. |
 | `.SHEET NAME` | Create a VisiData sheet named `NAME` (a template) from the input rows and pass the data through unchanged. The sheet is built in the background as the step runs — it never blocks the pipeline and it survives a cancelled run; reach it mid-run with VisiData's `Shift+S` from a picker sheet, or with `Alt+S` afterwards. The whole stack opens when the pipeline finishes. |
 | `.VIEW NAME` | Like `.SHEET`, but **blocking**: the sheet is shown immediately and the pipeline waits until it is closed with `q`. Use it inside a `.WHILE` loop or a `.FN` function to see rows at the point they are produced. Closing the sheet is not an answer — it never cancels the pipeline. As the last step the rows are not opened a second time. |
+| `.WATCH [INTERVAL]` | Like `.VIEW`, but **live**: everything to the left of the step **in the same block** is re-run every `INTERVAL` seconds (default `1`) and merged into the sheet. `INTERVAL` is the only argument — the sheet is always named `watch`. It is a row picker too: `Enter` hands the row under the cursor to the next step, `g Enter` the marked ones, while `q` cancels the run. `gf` on the sheet filters what is shown by a regex on the current column. See below. |
+
+### Live sheets (`.WATCH`)
+
+`.WATCH` turns the sheet into a monitor. Its source is the pipeline to its left, re-executed on every tick, so the same step watches SQL and Python alike:
+
+```sql
+.RUN "SHOW PROCESSLIST" | .WATCH 1
+```
+
+```sql
+.RUN "SELECT * FROM pg_stat_activity" |
+.RFILTER "{{state}}" "^active$" |
+.WATCH 2
+```
+
+```sql
+.PY """
+import subprocess
+out = subprocess.run(['ps', '-Ao', 'pid,user,%cpu,%mem,command'],
+                     capture_output=True, text=True).stdout.splitlines()[1:]
+result([dict(zip(('pid', 'user', 'cpu', 'mem', 'command'), l.split(None, 4))) for l in out])
+""" |
+.WATCH 1
+```
+
+The rows are **replaced, not re-created**: rows that are still there are updated in place, new ones are added, gone ones are dropped, and your sort order is applied again to the fresh values. The column layout (widths, hidden columns, expressions you added) and the cursor position stay where they were.
+
+Sheets you derive from a live one are **snapshots**: `"` / `g"` (duplicate) and drilling into a group of a frequency table (`F`, then Enter) all copy the sheet, and the copy keeps the rows and the layout it was given but does not refresh. Only the sheet `.WATCH` opened re-runs the pipeline, so the query never doubles up and the subset you drilled into is not overwritten. (The rows are the same objects, so a value the monitor updates in place changes in the copy too — only the *set* of rows is frozen.)
+
+Row identity is the whole row by default, so a row that changed counts as a new one. Press `!` on a column that identifies the row (a `pid`, an `Id`) and identity follows that column instead — then `s` / `t` selections stick to a row while its other values keep moving.
+
+On the sheet: `Enter` / `g Enter` pick rows (see below), `q` **ends the run**, `Ctrl+R` refreshes now, `p` pauses, `zi` changes the interval, `gf` filters what is shown (see below). The right status bar shows the row count, how many were added and removed on the last tick, and how long it took.
+
+#### Filtering what is shown (`gf`)
+
+`gf` asks for a regular expression and leaves only the rows whose **current column** matches it — put the cursor on `state`, press `gf`, type `^active$`. Press `gf` again and the prompt opens on the rule that is in force, so a rule is *changed* (or moved to another column) rather than retyped; an empty answer clears it, `Esc` leaves it as it was. A rule starting with `!` is turned around: `!Sleep` hides the rows that match and shows everything else.
+
+The rule only decides what is **on screen**. The pipeline prefix keeps producing every row and the sheet keeps merging them all, so a hidden row is still watched — it keeps its place in the sort order and comes straight back when the rule is widened. What the status bar shows becomes `shown/watched` (`12/89 rows`) plus the rule itself (`state~^active$`), and `g Enter` hands over only rows you can see: a selection the rule hides is dropped, not passed on.
+
+A monitor is also a place to pick from. Like an `sselect()` sheet, `Enter` hands the row under the cursor to the next step and `g Enter` hands over the rows marked with `s` / `t` / `gs` (nothing marked hands over no rows) — so acting on what you are watching is one pipeline:
+
+```sql
+.RUN "SHOW PROCESSLIST" | .WATCH 1 | .FOR_RUN "KILL {{_0}}"
+```
+
+What is handed over are the sheet's own row dicts: every refresh rebuilds them from the prefix, so there are no original items behind them the way there are for `sselect()`.
+
+`q` is the other way out, and it means something else: the live sheet does **not** hand control back to the pipeline — it **cancels the run**, nothing after the `.WATCH` runs and nothing is opened afterwards. That is how you get out of a `.WHILE` loop wrapped around one.
+
+Note that the loop is not what refreshes the sheet. `.WATCH` re-runs its own prefix every `INTERVAL` seconds by itself, so these two are the same monitor and the second one is the one to write:
+
+```sql
+-- the loop adds nothing: `q` ends the run either way
+.WHILE "1" | .PY "result([randint(1, 100)])" | .WATCH 1 | .ENDWHILE
+
+-- the same monitor, two steps shorter
+.PY "result([randint(1, 100)])" | .WATCH 1
+```
+
+#### Inside a loop or a function
+
+The prefix is everything to the `.WATCH`'s left **in its own block**, not the whole pipeline. A `.WATCH` in a `.FOR` / `.WHILE` / `.FN` body re-runs that body's steps only — what stands before the block is outside the prefix and never runs again.
+
+In a `.FOR` this freezes `_i` as well. The live sheet blocks, so the loop stays parked on the iteration that opened it, and every tick evaluates the body's prefix with that same item:
+
+```sql
+-- shows 0 and never moves: each refresh re-runs `.PY "_i"` with the parked item
+.FOR "range(10000)" | .PY "_i" | .WATCH 1
+```
+
+`Enter` picks a row and ends the iteration, so the next one reopens the sheet with the next `_i` — but nothing moves on its own. Whatever the monitor should show has to be produced by the prefix itself: a query, or a `.PY` step that keeps its state in `_vars`, which outlive a prefix re-run.
+
+```sql
+.PY """
+n = get_var('n', 0) + 1
+set_var('n', n)
+result([n])
+""" |
+.WATCH 1
+```
+
+The watched prefix must not prompt (`choose()`, `sselect()`, `.VIEW`) and must not contain a second `.WATCH`: VisiData owns the terminal while the live sheet is up, so such a step is refused rather than left hanging. Closing the sheet waits for a refresh that is still running, so it can never overlap with the next run.
 
 ### Comments
 
@@ -617,7 +728,7 @@ To carry loop rows forward past a `.NOFOR`, stash them with `.SET_VAR` inside th
 ```
 
 - The condition is re-evaluated every iteration against the data that entered the loop — **frozen**, so the steps before it never run again and `sselect()` keeps offering the same rows.
-- The condition's value (the marked rows, the next page, …) becomes the input of the body's first step and is exposed as `{{_i}}` / `_i`.
+- The condition's value (the picked rows, the next page, …) becomes the input of the body's first step and is exposed as `{{_i}}` / `_i`. A browser loop is left by answering with nothing — on an `sselect()` sheet that is `g Enter` with no rows marked (`q` cancels the whole run instead).
 - The body's output is **not** accumulated: the loop hands its own input data to the step after `.ENDWHILE`, so carry results out with `.SET_VAR` / `set_var()`.
 - `br()` ends the loop with that iteration's data, `stop()` aborts the whole pipeline, `Esc` cancels it. A condition that never turns falsy aborts the pipeline after 100000 iterations.
 
@@ -649,6 +760,8 @@ The four row prompts come as two pairs — `choose`/`select` as a popup over the
 | pick one   | `choose()`  | `schoose()`    |
 | mark any   | `select()`  | `sselect()`    |
 
+On the VisiData sheets `Enter` always answers with the row under the cursor; `sselect()` adds `g Enter`, which answers with the rows marked with `s` / `t` / `gs` instead.
+
 | Helper | Effect |
 |--------|--------|
 | `result(val)` | Set the step's output value (the last call wins). Lets a multi-statement snippet return a value, e.g. `.SLEEP "from random import randint; result(randint(1, 10))"`. Inside a `{{expr}}` placeholder it sets what the placeholder renders to — and since `result(val)` returns `val`, it chains with other calls: `.RUN "SHOW TABLES" \| .FOR_RUN "SELECT * FROM {{result(_0) and info(_0)}}"` substitutes `_0` and shows it in a popup. |
@@ -661,11 +774,11 @@ The four row prompts come as two pairs — `choose`/`select` as a popup over the
 | `choose(title, options, default=None)` | Pause the pipeline and open a popup; returns the chosen option's value. `options` is a list of strings, rows from a previous step (the first column value is shown), or `(label, value)` pairs — the label is displayed, the value is returned. `default` pre-highlights the option with that value, e.g. `choose('Limit', [('few', 10), ('many', 1000)], default=10)`. |
 | `select(title, options, default=None)` | Multi-choice variant of `choose()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms. Returns the list of marked options' values — `[]` when nothing is marked, which is a normal answer the pipeline continues with. `(label, value)` pairs work as in `choose()`. `default` is a list of option values to pre-mark, e.g. `select('Params', [1, 2, 3, 4], default=[1, 2])`. |
 | `schoose(title, rows)` | Open `rows` (e.g. `data`; non-dict rows are shown as a `value` column, the answer holds the original items) in VisiData. `Enter` picks the row under the cursor (VisiData's selection is ignored) and returns *that item itself*, not a list — so it can be compared to a value directly. `q` or quitting VisiData cancels the pipeline. |
-| `sselect(title, rows)` | Multi-row variant of `schoose()`: mark rows with VisiData's selection (`s`/`t`/`gs`...); `Enter` confirms and returns only the marked rows (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
-| `input(title, default=None, items=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. `↑`/`↓` walk what was entered at the same `title` earlier and list the matches in a popup above the bar — every title keeps its own history (up to 500 lines, for as long as dbcls runs). Whatever is typed filters that list live, the way the autocomplete popup filters: only the entries containing every space-separated part are offered, e.g. `te st` matches `my test string`. `items` adds values the user never typed (strings, or rows of a previous step — the first column) as older entries, e.g. `input('path', items=data)`. `Esc` closes the list first and cancels the pipeline only when no list is up. |
+| `sselect(title, rows)` | Multi-row variant of `schoose()`: the rows open the same way and `Enter` returns the row under the cursor, but you can also mark rows with VisiData's selection (`s`/`t`/`gs`...) and return all of them with `g Enter` (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
+| `input(title, default=None, items=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. `↑`/`↓` walk what was entered at the same `title` earlier and list the matches in a popup above the bar — every title keeps its own history (up to 500 lines, for as long as dbcls runs). Whatever is typed filters that list live, the way the autocomplete popup filters: only the entries containing every space-separated part are offered, e.g. `te st` matches `my test string`. `items` adds values the user never typed (strings, or rows of a previous step — the first column) as older entries, e.g. `input('path', items=data)`. `Ctrl+V` pastes the clipboard into the line (a multi-line clipboard is joined with spaces — the bar holds one line). `Esc` closes the list first and cancels the pipeline only when no list is up. |
 | `ask(title)` | Ask a yes/no question in the status bar; `y`/`Enter` return `True`, `n` returns `False`, `Esc` cancels the pipeline. Any other key is ignored and the question keeps waiting. |
 
-Dismissing any of these prompts with `Esc` (`q` for the VisiData sheets, since `Esc` is a regular key inside VisiData) cancels the pipeline: unlike `stop()`, no result is displayed — only a `Cancelled` notification in the status bar. An empty selection is *not* a dismissal: `select()` / `sselect()` return `[]` and the pipeline keeps running.
+Dismissing any of these prompts with `Esc` (`q` for the VisiData sheets, since `Esc` is a regular key inside VisiData) cancels the pipeline: unlike `stop()`, no result is displayed — only a `Cancelled` notification in the status bar. An empty selection is *not* a dismissal: `select()` and `sselect()`'s `g Enter` return `[]` and the pipeline keeps running.
 
 ### Template Placeholders
 
@@ -875,7 +988,7 @@ Models forget that call, so it is not left to good intentions: a turn that ends 
 
 Not every request is a request for a query, though. "What does this pipeline do?", "why does this fail?", "which of these two is faster?" are answered in the Chat pane through a second tool, `answer_question`, and that ends the turn just as validly: nothing is proposed, nothing is forced, and the Result pane keeps the query you were working on. Without it a model told it must always call `propose_query` answers "explain this" by handing the same query straight back, explaining nothing.
 
-Pipeline syntax is not carried in every request either. The language reference (~17 KB) sits behind a `get_pipeline_reference` tool, which the model calls when it decides a pipeline is what you want — so an ordinary SQL question never pays for it.
+Pipeline syntax is not carried in every request either. The language reference (~24 KB) sits behind a `get_pipeline_reference` tool, which the model calls when it decides a pipeline is what you want — so an ordinary SQL question never pays for it.
 
 What that tool returns is the reference *plus* whatever your [plugins](#plugins) added to the language — every `add_pipeline_command` and `add_pipeline_function`, with the `help_text` its author wrote. It is built when the tool is called, so it is the language as it stands in your installation rather than the one dbcls ships, and it comes under a heading that says so: the model uses those commands where they fit, and knows the pipeline it wrote is not portable to a dbcls without your plugins.
 
