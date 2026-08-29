@@ -57,14 +57,14 @@ Syntax highlighting, `Ctrl+B` to beautify, schema-aware autocomplete, the
 database and table browsers, and editing table data with the SQL shown before
 anything is committed. See [Editor Commands](#editor-commands).
 
-![Editor](/data/demo/editor.gif)
+![Editor](/data/editor.gif)
 
 ### The result
 
 Every query opens as a visidata sheet: sorting, a frequency table, key columns
 and an in-terminal chart. See [Data Visualization](#data-visualization-visidata).
 
-![Data](/data/demo/visidata.gif)
+![Data](/data/visidata.gif)
 
 ### Pipelines in the editor
 
@@ -72,14 +72,14 @@ A chain of steps in the editor: a prompt in the middle of a run, a fan-out over
 shards, a live monitor, and a file of named blocks used as a menu. See
 [Pipelines](#pipelines).
 
-![Pipelines](/data/demo/pipelines.gif)
+![Pipelines](/data/pipelines.gif)
 
 ### The model
 
 `Ctrl+L` — the model reads the schema through read-only tools and hands back a
 query, then a pipeline. See [LLM Chat](#llm-chat).
 
-![LLM chat](/data/demo/llm.gif)
+![LLM chat](/data/llm.gif)
 
 ## Installation
 
