@@ -164,6 +164,75 @@ Example `config.json`:
 }
 ```
 
+### Multiple connections and tabs
+
+A `connections` section names several databases at once. dbcls opens one tab per
+connection, each with its own file, buffer, cursor position and undo history, and
+shows a tab bar at the top as soon as there is more than one:
+
+```json
+{
+    "connections": {
+        "mysql01": {
+            "engine": "mysql",
+            "host": "127.0.0.1",
+            "username": "user",
+            "password": "mypasswd",
+            "dbname": "shop",
+            "filename": "mysql.sql"
+        },
+        "clickhouse01": {
+            "engine": "clickhouse",
+            "host": "127.0.0.1",
+            "username": "user",
+            "password": "mypasswd",
+            "dbname": "analytics",
+            "filename": "clickhouse.sql"
+        },
+        "local": {
+            "engine": "sqlite3",
+            "dbfilepath": "test.sqlite",
+            "filename": "local.sql"
+        }
+    },
+    "fold": "1",
+    "readonly": "1"
+}
+```
+
+Inside a connection block:
+
+| Key | Meaning |
+|-----|---------|
+| `engine`, `host`, `port`, `username`, `password`, `dbname`, `unix_socket` | The same as their top-level counterparts, for this connection |
+| `filename` | The `.sql` file this connection's tab opens |
+| `dbfilepath` | The database file (SQLite only) — the per-connection spelling of `-f, --filepath`. `filepath` is accepted as an alias |
+| `compress` | ClickHouse compression for this connection |
+| `fold`, `readonly` | Override the global setting for this tab |
+
+The connection id is what the tab is labelled with, and what [`.CONN`](#moving-data-between-databases)
+takes — the tab bar therefore always says which database each tab talks to.
+`fold`, `readonly` and the lock options stay global unless a connection
+overrides them.
+
+Everything about the single-connection setup still works: a config without a
+`connections` section, and the command-line options, describe one connection
+named `default`. Given both, the command line's `default` comes first and the
+named connections follow.
+
+**Working with tabs**
+
+| Action | How |
+|--------|-----|
+| Next / previous tab | `Ctrl+Shift+→` / `Ctrl+Shift+←`, or `Ctrl+X →` / `Ctrl+X ←` in terminals that send Ctrl+Shift+arrow as a key code of its own (it is `select word left/right` there) |
+| Pick a tab from a list | `Ctrl+X ↓`, or `Switch to tab…` in the command palette (`Alt+P`). A click on a tab works too |
+| Open another tab | `New tab…` in the command palette — pick any configured connection. A tab always carries the name of its connection, so a second tab on the same one is labelled `mysql01#2`, a third `mysql01#3`, and each opens a database connection of its own |
+| Close the current tab | `Close tab` in the command palette. Closing the last one quits |
+| Quit | `Ctrl+Q` — every tab with unsaved changes is brought to the front and asked about in turn |
+
+A running query owns the screen until it finishes or is cancelled with `Esc`, so
+tabs cannot be switched while one is in flight.
+
 ### Using Bash Configuration
 
 You can also provide configuration directly from a bash script:
@@ -199,6 +268,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 | `Alt+s` | Show list of open VisiData sheets |
 | `Ctrl+l` | Ask a model about the query under the cursor (see [LLM Chat](#llm-chat); bound only when configured) |
 | `Alt+p` | Open command palette (run any editor command by name) |
+| `Ctrl+Shift+←` / `Ctrl+Shift+→` | Previous / next tab, one per configured connection (see [Multiple connections and tabs](#multiple-connections-and-tabs)). `Ctrl+x ←` / `Ctrl+x →` do the same where the terminal sends Ctrl+Shift+arrow as its own key code |
 | `Ctrl+p` | Toggle folding of `>>>` ... `<<<` blocks (see [Fold Blocks](#fold-blocks)) |
 | `Ctrl+g` | Open a file from the current directory |
 | `Ctrl+f` | Search in the editor |
@@ -418,7 +488,9 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 |--------|--------|
 | `zf` | Format current cell (JSON indentation, number prettification); shown in a split pane (`Z`) it live-updates as the cursor moves. `e` on that pane tweaks the current line locally (e.g. before yanking it) — never written back to the source cell |
 | `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
-| `gp` | Draw a time-series chart from the current sheet's key columns (see [Plotting](#plotting) below) |
+| `g@` | Set the type of the current column to JSON (the counterpart of visidata's `@` for dates): cells are parsed once and then display as real JSON, expand with `(` / `g+`, and can be indexed in `=` expressions. Sorting such a column is not possible — visidata reports "sort incomplete due to TypeError" |
+| `g#` | Set the type of the current column to URL. The cells keep displaying the URL unchanged, but `(` expands the column into `schema`, `domain`, `port`, `path`, `query`, `anchor`, and `(` on the resulting `query` column expands it further into one column per query parameter, by name (a parameter repeated in the URL becomes a list). Values that are not URL-shaped display as a typing error, and editing such a cell still writes the URL text back to the database |
+| `gp` | Draw a chart from the columns you type at the prompt (see [Plotting](#plotting) below) |
 | `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only) |
 | `gT` | Save current or selected rows to pipeline vars |
 | `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
@@ -427,21 +499,33 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 
 ### Plotting
 
-Press `gp` on any VisiData sheet to open an inline terminal chart powered by [plotext](https://github.com/piccolomo/plotext). The chart is drawn from the sheet's **key columns** — set them with `!` on a column before pressing `gp`.
+Press `gp` on any VisiData sheet to open an inline terminal chart powered by [plotext](https://github.com/piccolomo/plotext). It asks which columns to chart:
 
-**Required key column layout (in order):**
+```
+plot columns (x[,bucket],y): ts,action,cnt
+```
+
+The prompt opens on the columns you charted last time on this sheet; failing that, on the sheet's key columns (`!`); failing that, on a guess — the first date/number column and the last numeric one. Anything there can be overwritten, so nothing has to be marked with `!` first. That matters on sheets where `!` is not free: on a `.WATCH` sheet key columns decide row identity between refreshes, and on a plain query result there are none at all.
+
+**Column roles:**
 
 | Position | Type | Role |
 |----------|------|------|
-| 1st key column | `date`, `datetime`, `int`, or `float` | X axis (time) |
-| 2nd key column *(optional)* | any | Bucket / series grouping |
-| Last key column | `int` or `float` | Y axis (value) |
+| 1st | `date`, `datetime`, `int`, `float`, or an untyped column holding timestamps | X axis (usually time) |
+| 2nd *(optional)* | non-numeric | Bucket / series grouping |
+| Last (or all the rest) | `int` or `float` | Y axis (value) |
 
-**Two-column mode** (`datetime` + `value`): draws a single line chart.
+**Two columns** (`ts,cnt`): a single line.
 
-**Three-column mode** (`datetime` + `bucket` + `value`): draws one line per unique bucket value. Each series is assigned a number (`1`, `2`, …). Press the corresponding number key to toggle that series on/off.
+**Bucket mode** (`ts,action,cnt`): one line per unique `action` value.
 
-If rows are selected (`s` / `t`), only the selected rows are plotted; otherwise all rows are used.
+**Multi-value mode** (`ts,ok,err,total`): one line per value column — used whenever every column after the first is numeric. To bucket by a *numeric* column instead (a shard id, a status code), mark it with `*`: `ts,*shard,cnt`.
+
+Each series is assigned a number (`1`, `2`, …) shown in the legend. Press the corresponding number key to toggle that series on/off.
+
+A timestamp column needs no `@` — an untyped column is accepted for the X axis as long as it holds timestamps or numbers. Value columns do have to be typed as numbers (`#` / `%` on the column) if the driver returned them as anything else.
+
+If rows are selected (`s` / `t`), only the selected rows are plotted; otherwise all rows are used. On a live (`.WATCH`) sheet the chart follows the sheet and redraws with it.
 
 **Example query:**
 
@@ -455,7 +539,7 @@ GROUP BY 1, 2
 ORDER BY 1, 2
 ```
 
-Open the result in VisiData, mark `dt`, `status`, and `cnt` as key columns (press `!` on each), then press `gp`.
+Open the result in VisiData, press `gp` and answer `dt,status,cnt`.
 
 ### Exporting Data
 
@@ -600,6 +684,35 @@ A pipeline may span several lines: keep a trailing `|` on every line except the 
 | `.SHEET NAME` | Create a VisiData sheet named `NAME` (a template) from the input rows and pass the data through unchanged. The sheet is built in the background as the step runs — it never blocks the pipeline and it survives a cancelled run; reach it mid-run with VisiData's `Shift+S` from a picker sheet, or with `Alt+S` afterwards. The whole stack opens when the pipeline finishes. |
 | `.VIEW NAME` | Like `.SHEET`, but **blocking**: the sheet is shown immediately and the pipeline waits until it is closed with `q`. Use it inside a `.WHILE` loop or a `.FN` function to see rows at the point they are produced. Closing the sheet is not an answer — it never cancels the pipeline. As the last step the rows are not opened a second time. |
 | `.WATCH [INTERVAL]` | Like `.VIEW`, but **live**: everything to the left of the step **in the same block** is re-run every `INTERVAL` seconds (default `1`) and merged into the sheet. `INTERVAL` is the only argument — the sheet is always named `watch`. It is a row picker too: `Enter` hands the row under the cursor to the next step, `g Enter` the marked ones, while `q` cancels the run. `gf` on the sheet filters what is shown by a regex on the current column. See below. |
+| `.CONN ID` | Run every following step against the connection named `ID` (an id from the [`connections`](#multiple-connections-and-tabs) section of the config file). Data passes through unchanged, so `.CONN` can sit anywhere and be used any number of times. Only the running pipeline is switched — when it finishes the tab is still on its own connection. `ID` is a template. See [Moving data between databases](#moving-data-between-databases). |
+
+### Moving data between databases
+
+`.CONN` names a tab, and the following steps run on **that tab's connection**.
+It only affects the pipeline that is running — the tab it was started from stays
+on its own connection — so a single expression can read from one database and
+write to another:
+
+```sql
+.CONN "mysql01" | .RUN "SELECT id, name FROM users WHERE created_at > now() - interval 1 day" |
+.CONN "clickhouse01" | .FOR_RUN "INSERT INTO users VALUES ({{_0}}, '{{_1}}')"
+```
+
+The names are the ones on the tab bar — `mysql01`, and `mysql01#2` for a second
+tab on the same connection. With a single tab open that is simply its
+connection's id from the [`connections`](#multiple-connections-and-tabs) section
+(`default` for a config without one). A connection that is configured but has no
+tab open on it can be named too: the pipeline opens a client for it on the spot.
+
+`.CONN` may appear anywhere and any number of times, the data passes through it
+unchanged, and the name is a template like every other argument:
+
+```sql
+.CONN "{{choose('Where', ['dev', 'prod'])}}" | .RUN "SELECT version()"
+```
+
+Pipeline variables (`.SET_VAR` / `.GET_VAR`) are shared by every tab, which is
+the other way to carry a result across.
 
 ### Live sheets (`.WATCH`)
 
@@ -681,7 +794,16 @@ result([n])
 .WATCH 1
 ```
 
-The watched prefix must not prompt (`choose()`, `sselect()`, `.VIEW`) and must not contain a second `.WATCH`: VisiData owns the terminal while the live sheet is up, so such a step is refused rather than left hanging. Closing the sheet waits for a refresh that is still running, so it can never overlap with the next run.
+A prompt in the watched prefix is asked **once**. The run that fills the sheet before it opens puts the question, and every refresh reuses that answer instead of stopping on it, so a monitor can be parameterised by hand:
+
+```
+.RUN "SELECT * FROM pg_stat_activity WHERE datname = '{{input('Database')}}'" |
+.WATCH 2
+```
+
+The answer is kept per prompt title and only while the sheet is up — close it and the next run asks again. Blocking display steps (`.VIEW`, `.VARS`, `warn()`) have no answer to give, so they are shown once, before the sheet, and the refreshes step past them.
+
+What the prefix must not do is prompt with **nothing remembered** — a title that changes on every tick, or a branch only a refresh reaches — or contain a second `.WATCH`: VisiData owns the terminal while the live sheet is up, so such a step is refused rather than left hanging. Closing the sheet waits for a refresh that is still running, so it can never overlap with the next run.
 
 ### Comments
 
@@ -907,6 +1029,8 @@ Mark users and press `Enter` to run the chosen action for them; the same list op
 `Ctrl+L` opens a chat with a language model that can write and fix queries for the database you are connected to. It is off unless you configure it: with no `--llm-*` settings nothing is registered and `Ctrl+L` is not bound.
 
 The model is given the pipeline language reference and the engine you are connected to, and it can look at the database on its own through four read-only tools — `list_databases`, `list_tables`, `get_table_schema` and `sample_data`. Two more read the [pipeline variables](#pipelines) an earlier run left behind: `get_vars_keys` lists what is in the store with each variable's type and size, `get_var` reads one of them. So "filter by the ids I saved" is something it can act on — the same store `.SET_VAR` writes and `.VARS` shows. A long variable arrives cut to its first 20 rows with the real length alongside, so a stashed result set cannot flood the request.
+
+With [several connections open](#multiple-connections-and-tabs) the model is also told which tabs there are — name, engine, database — and which one is current, refreshed every time the chat is opened, so switching tabs between questions is enough to change what it writes for. Each of the four database tools takes an optional `tab` argument, so it can read the schema of one connection while writing a query for another, and it knows it can join them in a pipeline with [`.CONN`](#moving-data-between-databases). With a single connection nothing of this appears in the prompt.
 
 It is never given a way to run SQL of its own, or to change a variable: what it writes only ever runs when you run it. When a choice is yours to make rather than its to guess, it can [ask you](#when-the-model-asks-you) and wait for the answer.
 

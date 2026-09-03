@@ -1,4 +1,4 @@
-"""Tests for Editor._dispatch: key remapping and the tmux-style Ctrl+X prefix.
+"""Tests for EditorShell._dispatch: key remapping and the tmux-style Ctrl+X prefix.
 
 Key codes used here are the encoded (bitfield) codes shown in debug mode
 (Ctrl+D): K(x) = x << 2, Alt combos get bit 0, Ctrl+X-prefixed combos bit 1.
@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from dbcls.editor import (
-    Editor,
+    EditorShell,
     K,
     KEY_PREFIX_TRIGGER,
     key_alt,
@@ -21,17 +21,20 @@ SHIFT_TAB = 353  # curses.KEY_BTAB
 
 
 def make_editor():
-    """Build a minimal Editor without initialising curses."""
-    ed = object.__new__(Editor)
+    """Build a minimal shell (with one stub document) without touching curses."""
+    ed = object.__new__(EditorShell)
     ed.stdscr = MagicMock()
     ed.renderer = MagicMock()
-    ed.buf = MagicMock()
-    ed.textarea = MagicMock(buf=ed.buf)
+    doc = MagicMock()
+    doc.buf = MagicMock()
+    doc.textarea = MagicMock(buf=doc.buf)
+    doc.search = MagicMock(active=False)
+    ed.documents = [doc]
+    ed.active = 0
     ed._overlays = []
     ed.popup = MagicMock(active=False)
     ed.info_popup = MagicMock(active=False)
     ed.running_popup = MagicMock(active=False)
-    ed.search = MagicMock(active=False)
     ed.input_bar = MagicMock(active=False)
     ed._ui_request = None
     ed._prefix_pending = False
@@ -207,9 +210,9 @@ class TestMouse:
 
     def test_a_click_without_an_overlay_moves_the_document_cursor(self):
         ed = make_editor()
-        ed.view = MagicMock()
+        ed.doc.view = MagicMock()
         self._mouse(ed, BUTTON1_PRESSED)
-        ed.view.click_to_cursor.assert_called_once_with(10, 5)
+        ed.doc.view.click_to_cursor.assert_called_once_with(10, 5)
 
 
 class TestTmuxPrefix:

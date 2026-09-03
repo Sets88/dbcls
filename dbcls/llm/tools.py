@@ -28,48 +28,81 @@ MAX_VALUE_CHARS = 200
 MAX_VAR_ROWS = 20
 
 
-class DbTools:
-    """Binds the read-only tools to one client + autocomplete pair."""
+#: Description of the `tab` argument every DB tool takes, so the model can
+#: inspect any open connection and not only the one on screen.
+TAB_ARG = {
+    'type': 'string',
+    'description': 'Name of the tab to run against, as listed under "Tabs" in '
+                   'the system prompt. Omit for the current tab.',
+}
 
-    def __init__(self, client, autocomplete=None):
-        self.client = client
-        self.autocomplete = autocomplete
+
+class DbTools:
+    """The read-only database tools, reached through the plugin API.
+
+    Nothing here is bound to one connection.  Each tool takes an optional
+    ``tab`` naming which open tab to run against, and without it uses the tab
+    the user is on *at the time of the call* — the chat is registered once,
+    while the tab can change under it at any time."""
+
+    def __init__(self, api):
+        self.api = api
+
+    def _for(self, tab: Optional[str] = None):
+        """The (client, autocomplete, tab name) a call should use."""
+        return (self.api.tab_client(tab), self.api.tab_autocomplete(tab),
+                tab or self._current_tab())
+
+    def _current_tab(self) -> str:
+        for described in self.api.tabs:
+            if described['current']:
+                return described['name']
+        return ''
 
     # ── The tools ────────────────────────────────────────────────────────────
 
-    async def list_databases(self) -> List[str]:
-        if self.autocomplete is not None:
-            return await self.autocomplete.get_cached_databases() or []
-        result = await self.client.get_databases()
-        return [row['database'] for row in (result.data or [])]
-
-    async def list_tables(self, database: Optional[str] = None) -> Dict[str, Any]:
-        database = database or self.client.dbname
-        if self.autocomplete is not None:
-            tables = await self.autocomplete.get_cached_tables(database)
+    async def list_databases(self, tab: Optional[str] = None) -> Dict[str, Any]:
+        client, autocomplete, name = self._for(tab)
+        if autocomplete is not None:
+            databases = await autocomplete.get_cached_databases() or []
         else:
-            result = await self.client.get_tables(database)
-            tables = [row['table'] for row in (result.data or [])]
-        return {'database': database, 'tables': tables or []}
+            result = await client.get_databases()
+            databases = [row['database'] for row in (result.data or [])]
+        return {'tab': name, 'databases': databases}
 
-    async def get_table_schema(self, table: str,
-                               database: Optional[str] = None) -> Dict[str, Any]:
-        database = database or self.client.dbname
-        result = await self.client.get_schema(table, database)
+    async def list_tables(self, database: Optional[str] = None,
+                          tab: Optional[str] = None) -> Dict[str, Any]:
+        client, autocomplete, name = self._for(tab)
+        database = database or client.dbname
+        if autocomplete is not None:
+            tables = await autocomplete.get_cached_tables(database)
+        else:
+            result = await client.get_tables(database)
+            tables = [row['table'] for row in (result.data or [])]
+        return {'tab': name, 'database': database, 'tables': tables or []}
+
+    async def get_table_schema(self, table: str, database: Optional[str] = None,
+                               tab: Optional[str] = None) -> Dict[str, Any]:
+        client, _autocomplete, name = self._for(tab)
+        database = database or client.dbname
+        result = await client.get_schema(table, database)
         return {
+            'tab': name,
             'database': database,
             'table': table,
             'schema': _shorten_rows(result.data or []),
         }
 
     async def sample_data(self, table: str, database: Optional[str] = None,
-                          limit: int = 5) -> Dict[str, Any]:
-        database = database or self.client.dbname
+                          limit: int = 5, tab: Optional[str] = None) -> Dict[str, Any]:
+        client, _autocomplete, name = self._for(tab)
+        database = database or client.dbname
         limit = max(1, min(int(limit or 5), MAX_SAMPLE_ROWS))
-        sql = self.client.get_sample_data_sql(table, database)
-        sql = f'{sql} {self.client.get_limit_sql(limit)}'
-        result = await self.client.execute(sql)
+        sql = client.get_sample_data_sql(table, database)
+        sql = f'{sql} {client.get_limit_sql(limit)}'
+        result = await client.execute(sql)
         return {
+            'tab': name,
             'database': database,
             'table': table,
             'sql': sql,
@@ -82,18 +115,19 @@ class DbTools:
         """Add every tool to *registry* (a :class:`~dbcls.llm.client.ToolRegistry`)."""
         registry.add(
             'list_databases',
-            'List the databases (schemas/keyspaces) on the connected server.',
-            {'type': 'object', 'properties': {}},
+            'List the databases (schemas/keyspaces) on a tab\'s server.',
+            {'type': 'object', 'properties': {'tab': TAB_ARG}},
             self.list_databases,
         )
         registry.add(
             'list_tables',
-            'List the tables of a database. Defaults to the database the editor '
-            'is connected to.',
+            'List the tables of a database. Defaults to the database the tab is '
+            'connected to.',
             {
                 'type': 'object',
                 'properties': {
                     'database': {'type': 'string', 'description': 'Database name; optional.'},
+                    'tab': TAB_ARG,
                 },
             },
             self.list_tables,
@@ -107,6 +141,7 @@ class DbTools:
                 'properties': {
                     'table': {'type': 'string', 'description': 'Table name.'},
                     'database': {'type': 'string', 'description': 'Database name; optional.'},
+                    'tab': TAB_ARG,
                 },
                 'required': ['table'],
             },
@@ -125,6 +160,7 @@ class DbTools:
                         'type': 'integer',
                         'description': f'Rows to read (1-{MAX_SAMPLE_ROWS}), 5 by default.',
                     },
+                    'tab': TAB_ARG,
                 },
                 'required': ['table'],
             },

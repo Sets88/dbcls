@@ -493,6 +493,43 @@ class TestPluginAPI:
             't', 'desc', {'type': 'object'}, handler, max_result_chars=None)
 
 
+class TestTabsThroughTheAPI:
+    """A plugin reaches every open connection, not just the one on screen."""
+
+    def _api(self, *names, active=0):
+        editor = MagicMock()
+        editor.documents = []
+        for index, name in enumerate(names):
+            document = MagicMock()
+            document.tab_title.return_value = name
+            document.client = MagicMock(ENGINE='Mysql', dbname=f'db_{name}')
+            document.autocomplete = MagicMock()
+            editor.documents.append(document)
+        editor.doc = editor.documents[active] if editor.documents else None
+        return editor, PluginAPI(editor, 'demo')
+
+    def test_tabs_are_described_in_order_with_the_current_one_marked(self):
+        _editor, api = self._api('one', 'two', active=1)
+        assert api.tabs == [
+            {'name': 'one', 'engine': 'Mysql', 'database': 'db_one', 'current': False},
+            {'name': 'two', 'engine': 'Mysql', 'database': 'db_two', 'current': True},
+        ]
+
+    def test_a_named_tab_hands_back_its_own_client(self):
+        editor, api = self._api('one', 'two')
+        assert api.tab_client('two') is editor.documents[1].client
+        assert api.tab_autocomplete('two') is editor.documents[1].autocomplete
+
+    def test_no_name_means_the_current_tab(self):
+        editor, api = self._api('one', 'two', active=1)
+        assert api.tab_client() is editor.documents[1].client
+
+    def test_an_unknown_tab_lists_the_open_ones(self):
+        _editor, api = self._api('one', 'two')
+        with pytest.raises(ValueError, match='one, two'):
+            api.tab_client('nope')
+
+
 class TestLLMToolsOfferedBeforeTheChatExists:
     """The chat is a plugin like any other and registers last, so a tool
     offered by another plugin arrives before there is anywhere to put it.  It

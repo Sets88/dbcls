@@ -6,13 +6,15 @@ from visidata import ENTER
 # inside addCommand execstrings below resolve through the VisiData API at
 # runtime, not through imports in this module.
 from . import vd_plotter  # noqa: F401
+from . import vd_types  # noqa: F401 — registers the `jsontype`/`urltype` column types
 from .vd_db_browser import DataBaseSheet, TablesSheet  # re-exported for dbcls.py
 from .vd_utils import SheetWithReference
 from .vd_utils import SselectSheet, SchooseSheet, ViewSheet, VarsSheet  # re-exported for dbcls.py
 from .vf_funcs import LiveFormatSheet
 from .vd_live import LiveRowsSheet  # re-exported for dbcls.py
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
-from . import vd_idle  # noqa: F401 — installs the idle-polling get_curses_timeout wrapper
+from . import vd_idle  # noqa: F401 — installs the idle-polling get_curses_timeout wrapper (asks vd_live how long it may sleep)
+from . import vd_sidebar  # noqa: F401 — installs the "b to close" hint in every sidebar title
 
 
 IndexSheet.guide += '''- `^` to make new sheet with reference column between two sheets'''
@@ -23,14 +25,21 @@ TableSheet.guide += '''
 - `zf` to prettify the current cell on a live-updating sheet (best in a split pane).
 - `z Enter` to open the rows referenced in the current cell.
 - `g+` to expand a list cell vertically on a new sheet.
-- `gp` to draw a plotext chart from the key columns (datetime, [bucket,] value).
+- `g@` to type the current column as JSON (like `@` for dates), so its cells expand with `(` / `g+` and display as real JSON.
+- `g#` to type the current column as URL: cells look unchanged, but `(` expands them into schema/domain/port/path/query/anchor, and `(` on `query` into one column per parameter.
+- `gp` to draw a plotext chart from the columns you type at the prompt: `x[,bucket],y` or `x,y1,y2,…`.
 - `gT` / `gzT` to save the selected rows / column values to pipeline _vars.
 - `Alt+Up` / `Alt+Down` to move the cursor 5 rows, `Alt+b` / `Alt+f` 3 columns.
 '''
 
 TableSheet.addCommand('zf', 'cell-formated-table', 'vd.push(make_formated_table(sheet))', 'Prettify cell under cursor on new sheet, live-updating as the cursor moves when shown in a split pane')
 TableSheet.addCommand('g+', 'expand-vert', 'vd.push(ExpandVert(source=sheet, curcol=cursorCol))', 'Expand array vertically on new sheet')
-TableSheet.addCommand('gp', 'alt-plot', 'vd.push(Plot(source=sheet))', 'Draw plotext chart from the sheet key columns (datetime, [bucket,] value)')
+TableSheet.addCommand('gp', 'alt-plot', 'plot_sheet(sheet)', 'Draw plotext chart from the prompted columns (x[,bucket],y or x,y1,y2,…)')
+# `g@` is stock only on ColumnsSheet (type-date-selected); that binding is more
+# specific than this one and keeps winning there.
+TableSheet.addCommand('g@', 'type-json', 'cursorCol.type = jsontype', 'set type of current column to JSON')
+# `g#` is stock only on ColumnsSheet too (type-int-selected), same as `g@` above.
+TableSheet.addCommand('g#', 'type-url', 'cursorCol.type = urltype', 'set type of current column to URL')
 IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')
 SheetWithReference.addCommand('gz'+ENTER, 'dive-selected-cells', 'openRefCells(cursorCol, selectedRows)', 'open combined reference sheet for selected cells')
 TableSheet.addCommand('z'+ENTER, 'open-cell', 'vd.push(openCellAltered(sheet, cursorCol, cursorRow))', 'open sheet with copies of rows referenced in current cell')

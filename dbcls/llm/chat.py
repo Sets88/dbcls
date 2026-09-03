@@ -279,15 +279,25 @@ class ChatWindow:
         self._start_conversation(query, selection)
         self.editor.push_overlay(self)
 
+    def _system_message(self) -> dict:
+        """The system prompt for the tab the user is on right now."""
+        return {
+            'role': 'system',
+            'content': build_system_prompt(getattr(self.editor, 'client', None),
+                                           tabs=self.api.tabs),
+        }
+
     def _start_conversation(self, query: str, selection: bool = False) -> None:
         """Lay down the system prompt and the editor context, unless a
-        conversation is already going."""
+        conversation is already going.
+
+        An ongoing one keeps its history but has its system message refreshed:
+        the user may have switched tabs since the last question, and which tab
+        is current decides where the query they get back will run."""
         if self.messages:
+            self.messages[0] = self._system_message()
             return
-        self.messages = [{
-            'role': 'system',
-            'content': build_system_prompt(getattr(self.editor, 'client', None)),
-        }]
+        self.messages = [self._system_message()]
         context = build_context_message(query, selection)
         if context is not None:
             self.messages.append(context)

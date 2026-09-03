@@ -1244,26 +1244,67 @@ class TestPipelineWatch:
         assert calls == ['each']
         assert dbeditor.request_user_input.call_count == 1
 
-    async def test_a_prompt_in_the_watched_prefix_is_refused(self):
-        # VisiData owns the terminal while the live sheet is up, so a prompt
-        # opened underneath it would never be answered.
-        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
-        errors: list = []
-
+    @staticmethod
+    def _answering(answer, refreshes=2, produced=None):
+        """A request_user_input side effect that answers the prefix's prompt
+        with *answer* and then runs *refreshes* refreshes of the sheet."""
         def show(request):
-            if request['kind'] != 'watch':  # the .VIEW in the prefix
-                return None
-            try:
-                request['extra']['producer']()
-            except Exception as e:          # noqa: BLE001 — that is the assertion
-                errors.append(e)
+            if request['kind'] != 'watch':      # the prompt in the prefix
+                return answer
+            for _ in range(refreshes):
+                rows = request['extra']['producer']()
+                if produced is not None:
+                    produced.append(rows)
             return None
+        return show
 
-        dbeditor.request_user_input = MagicMock(side_effect=show)
+    async def test_a_prompt_in_the_watched_prefix_is_asked_once(self):
+        # VisiData owns the terminal while the live sheet is up, so a prompt
+        # opened underneath it would never be answered.  It is put to the user
+        # once — on the run that fills the sheet — and every refresh reuses
+        # that answer instead of stopping on it.
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        produced: list = []
+        dbeditor.request_user_input = MagicMock(
+            side_effect=self._answering('db1', produced=produced))
+        exe = PipelineExecutor(dbeditor)
+        await self._watch(exe, ".PY \"result([{'v': input('Server')}])\" | .WATCH 1")
+
+        kinds = [c.args[0]['kind']
+                 for c in dbeditor.request_user_input.call_args_list]
+        assert kinds == ['input', 'watch']      # asked once, not once per tick
+        assert produced == [[{'v': 'db1'}], [{'v': 'db1'}]]
+
+    async def test_a_display_step_in_the_watched_prefix_is_shown_once(self):
+        # .VIEW has no answer to give, so its remembered answer is the empty
+        # one: the refreshes step past it rather than reopening the sheet.
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        dbeditor.request_user_input = MagicMock(side_effect=self._answering(None))
         exe = PipelineExecutor(dbeditor)
         await self._watch(exe, '.RUN "q" | .VIEW "v" | .WATCH 1')
-        assert len(errors) == 1
-        assert 'cannot open while a .WATCH sheet' in str(errors[0])
+
+        kinds = [c.args[0]['kind']
+                 for c in dbeditor.request_user_input.call_args_list]
+        assert kinds == ['view', 'watch']
+
+    async def test_the_answers_are_forgotten_when_the_sheet_closes(self):
+        # They belong to the sheet that was up: the next .WATCH asks again.
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        dbeditor.request_user_input = MagicMock(side_effect=self._answering('db1'))
+        exe = PipelineExecutor(dbeditor)
+        await self._watch(exe, ".PY \"result([input('Server')])\" | .WATCH 1")
+        assert exe._prompt_answers == {}
+
+    async def test_a_prompt_with_no_remembered_answer_is_refused(self):
+        # Nothing was recorded under this (kind, title) before the sheet opened
+        # — a title that changes on every tick, or a branch only a refresh
+        # reaches.  There is nobody to answer it, so it fails loudly.
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        exe = PipelineExecutor(dbeditor)
+        exe._in_watch = True
+        with pytest.raises(ValueError, match='cannot open while a .WATCH sheet'):
+            exe._ask_user({'kind': 'input', 'title': 'Server'})
+        dbeditor.request_user_input.assert_not_called()
 
     async def test_a_nested_watch_is_refused(self):
         # A second .WATCH would take the editor's single request slot while the
@@ -2366,6 +2407,148 @@ class TestPipelineFn:
         assert dbeditor.show_pipeline_info.call_count == 1
 
 
+# ── .CONN ────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestPipelineConn:
+    def _two_connections(self):
+        """A host with two clients, `first` (its own) and `second`."""
+        first = _make_client([{'n': 1}])
+        second = _make_client([{'n': 2}])
+        host = _make_dbeditor(first)
+        clients = {'first': first, 'second': second}
+
+        def get_client(conn_id):
+            if conn_id not in clients:
+                raise ValueError(f'Unknown connection {conn_id!r}')
+            return clients[conn_id]
+
+        host.get_client.side_effect = get_client
+        return host, first, second
+
+    async def test_following_steps_use_the_named_connection(self):
+        host, first, second = self._two_connections()
+        exe = PipelineExecutor(host)
+        result = await exe.execute('.CONN "second" | .RUN "SELECT 1"')
+        second.execute.assert_awaited_once_with('SELECT 1')
+        first.execute.assert_not_awaited()
+        assert result.data == [{'n': 2}]
+
+    async def test_switching_back_and_forth_within_one_run(self):
+        host, first, second = self._two_connections()
+        exe = PipelineExecutor(host)
+        await exe.execute(
+            '.RUN "one" | .CONN "second" | .RUN "two" | .CONN "first" | .RUN "three"')
+        assert [c.args[0] for c in first.execute.await_args_list] == ['one', 'three']
+        assert [c.args[0] for c in second.execute.await_args_list] == ['two']
+
+    async def test_the_host_connection_is_left_alone(self):
+        host, first, _second = self._two_connections()
+        exe = PipelineExecutor(host)
+        await exe.execute('.CONN "second" | .RUN "SELECT 1"')
+        assert host.client is first
+
+    async def test_data_passes_through_untouched(self):
+        host, _first, _second = self._two_connections()
+        exe = PipelineExecutor(host)
+        result = await exe.execute('.PY "[{\'a\': 7}]" | .CONN "second" | .PY "data"')
+        assert result.data == [{'a': 7}]
+
+    async def test_the_client_in_use_is_what_the_host_cancels(self):
+        # The host resolves Esc through exe.client, so the switch has to be
+        # visible there and not only inside the .RUN steps.
+        host, _first, second = self._two_connections()
+        exe = PipelineExecutor(host)
+        await exe.execute('.CONN "second" | .RUN "SELECT 1"')
+        assert exe.client is second
+
+    async def test_the_progress_hook_travels_with_the_switch(self):
+        host, first, second = self._two_connections()
+        first.on_progress = counter = MagicMock()   # as the host hooks it up
+        second.on_progress = None
+        exe = PipelineExecutor(host)
+        await exe.execute('.CONN "second" | .RUN "SELECT 1"')
+        assert first.on_progress is None
+        assert second.on_progress is counter
+
+    async def test_switching_back_returns_the_progress_hook(self):
+        host, first, second = self._two_connections()
+        first.on_progress = counter = MagicMock()
+        second.on_progress = None
+        exe = PipelineExecutor(host)
+        await exe.execute('.CONN "second" | .RUN "one" | .CONN "first" | .RUN "two"')
+        assert first.on_progress is counter
+        assert second.on_progress is None
+
+    async def test_the_id_is_a_template(self):
+        host, _first, second = self._two_connections()
+        host.vars['target'] = 'second'
+        exe = PipelineExecutor(host)
+        await exe.execute('.CONN "{{_vars[\'target\']}}" | .RUN "q"')
+        second.execute.assert_awaited_once_with('q')
+
+    async def test_an_unknown_connection_is_reported(self):
+        host, _first, _second = self._two_connections()
+        exe = PipelineExecutor(host)
+        with pytest.raises(Exception, match='nope'):
+            await exe.execute('.CONN "nope" | .RUN "SELECT 1"')
+
+    async def test_without_an_id_it_is_a_usage_error(self):
+        host, _first, _second = self._two_connections()
+        exe = PipelineExecutor(host)
+        with pytest.raises(ValueError, match='.CONN requires'):
+            await exe.execute('.CONN | .RUN "SELECT 1"')
+
+
+# ── Live row counter ─────────────────────────────────────────────────────────
+
+def _make_progress_client():
+    """A client that records the interleaving of row-counter resets and queries."""
+    client = MagicMock()
+    calls: list = []
+
+    async def execute(sql):
+        calls.append(('execute', sql))
+        return Result(data=[{'sql': sql}], rowcount=1)
+
+    client.execute = execute
+    client.report_progress = lambda rows: calls.append(('progress', rows))
+    return client, calls
+
+
+@pytest.mark.asyncio
+class TestPipelineProgress:
+    async def test_the_counter_is_zeroed_before_every_query(self):
+        # Without the reset the overlay would go on showing the rows of the
+        # previous step while the next query is already running.
+        client, calls = _make_progress_client()
+        exe = PipelineExecutor(_make_dbeditor(client))
+        await exe.execute('.RUN "one" | .RUN "two"')
+        assert calls == [
+            ('progress', 0), ('execute', 'one'),
+            ('progress', 0), ('execute', 'two'),
+        ]
+
+    async def test_for_run_zeroes_the_counter_per_row(self):
+        client, calls = _make_progress_client()
+        exe = PipelineExecutor(_make_dbeditor(client))
+        await exe.execute('.PY "[\'t1\', \'t2\']" | .FOR_RUN "q {{_0}}"')
+        assert calls == [
+            ('progress', 0), ('execute', 'q t1'),
+            ('progress', 0), ('execute', 'q t2'),
+        ]
+
+    async def test_the_reset_follows_a_conn_switch(self):
+        first, first_calls = _make_progress_client()
+        second, second_calls = _make_progress_client()
+        host = _make_dbeditor(first)
+        host.get_client.side_effect = {'second': second}.__getitem__
+        exe = PipelineExecutor(host)
+        await exe.execute('.RUN "one" | .CONN "second" | .RUN "two"')
+        assert first_calls == [('progress', 0), ('execute', 'one')]
+        assert second_calls == [('progress', 0), ('execute', 'two')]
+
+
 # ── .WHILE / .ENDWHILE ───────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -2579,6 +2762,36 @@ class TestParseArgs:
     def test_unterminated_triple_raises(self):
         with pytest.raises(ValueError, match='Unterminated triple-quoted string'):
             _parse_args('"""oops')
+
+
+class TestMissingPipeDetection:
+    """An unquoted dot-command as an argument means a `|` was forgotten."""
+
+    def test_missing_pipe_between_steps_raises(self):
+        with pytest.raises(ValueError, match=r'missing `\|` before \.PY'):
+            parse_pipeline('.RUN "SELECT 1" |\n.WATCH "1"\n.PY "info(1)"')
+
+    def test_missing_pipe_reports_offending_command(self):
+        with pytest.raises(ValueError, match=r'\.WATCH got \.PY as an argument'):
+            parse_pipeline('.WATCH "1" .PY "info(1)"')
+
+    def test_soft_marker_still_detected(self):
+        with pytest.raises(ValueError, match=r'missing `\|` before \.RUN\?'):
+            parse_pipeline('.WATCH "1" .RUN? "SELECT 1"')
+
+    def test_quoted_dot_command_is_an_argument(self):
+        steps = parse_pipeline('.PY "\'.PY\'"')
+        assert steps[0].args == ["'.PY'"]
+
+    def test_triple_quoted_dot_command_is_an_argument(self):
+        steps = parse_pipeline('.RUN """SELECT \'.RUN\'"""')
+        assert steps[0].args == ["SELECT '.RUN'"]
+
+    def test_unquoted_dotted_token_is_not_a_command(self):
+        # Only exact command names are suspicious — file names / numbers are not.
+        steps = parse_pipeline('.SHEET out.tsv | .PY ./dump.sql')
+        assert steps[0].args == ['out.tsv']
+        assert steps[1].args == ['./dump.sql']
 
 
 class TestSplitPipelineTripleQuote:

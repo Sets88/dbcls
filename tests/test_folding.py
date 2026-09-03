@@ -37,7 +37,7 @@ def make_text_buffer(text, hidden=()):
 
 
 def make_editor(text, fold_enabled=True):
-    """Minimal Editor for _update_folds / _cmd_toggle_fold, no curses init."""
+    """Minimal Editor for update_folds / toggle_fold, no curses init."""
     ed = object.__new__(Editor)
     ed.buf = TextBuffer()
     ed.buf.lines = text.split('\n')
@@ -76,37 +76,36 @@ class TestFindFoldBlocks:
 class TestUpdateFolds:
     def test_hides_block_body_and_end_marker(self):
         ed = make_editor(BLOCK)
-        ed._update_folds()
+        ed.update_folds()
         # Only the '>>> -- По' line stays visible.
         assert ed.buf.hidden_rows == {1, 2, 3}
 
     def test_disabled_mode_hides_nothing(self):
         ed = make_editor(BLOCK, fold_enabled=False)
         ed.buf.hidden_rows = {1, 2, 3}
-        ed._update_folds()
+        ed.update_folds()
         assert ed.buf.hidden_rows == set()
 
     def test_toggle_switches_state(self):
         ed = make_editor(BLOCK, fold_enabled=False)
-        ed._cmd_toggle_fold()
+        assert ed.toggle_fold() is True
         assert ed.fold_enabled and ed.buf.hidden_rows == {1, 2, 3}
-        ed._cmd_toggle_fold()
+        assert ed.toggle_fold() is False
         assert not ed.fold_enabled and ed.buf.hidden_rows == set()
-        assert len(ed.notifications) == 2
 
     def test_cursor_inside_fold_snaps_to_header(self):
         ed = make_editor(BLOCK)
         ed.buf.cursor_row, ed.buf.cursor_col = 2, 5
-        ed._update_folds()
+        ed.update_folds()
         assert ed.buf.cursor_row == 0
         assert ed.buf.cursor_col <= len(ed.buf.lines[0])
 
     def test_recomputes_after_edit(self):
         ed = make_editor(BLOCK)
-        ed._update_folds()
+        ed.update_folds()
         ed.buf.lines.insert(1, 'WHERE 1=1')
         ed.buf.dirty = True  # bumps version
-        ed._update_folds()
+        ed.update_folds()
         assert ed.buf.hidden_rows == {1, 2, 3, 4}
 
 
@@ -201,7 +200,7 @@ class TestDeletionAtFoldBoundaries:
         ed = DbEditor(stdscr, fold=True)
         assert ed.fold_enabled is True
         ed.buf.lines = BLOCK.split('\n')
-        ed._update_folds()
+        ed.doc.update_folds()
         assert ed.buf.hidden_rows == {1, 2, 3}
         assert DbEditor(stdscr).fold_enabled is False  # default stays off
 

@@ -129,7 +129,9 @@ def register(api):
 
     tools = ToolRegistry()
     if api.client is not None:
-        DbTools(api.client, api.autocomplete).register(tools)
+        # Through the api, never a captured client: every tool takes a `tab`
+        # and the current tab changes under the chat as the user switches.
+        DbTools(api).register(tools)
     # Not about the database, and useful with or without a connection: what an
     # earlier pipeline left in the variable store.
     VarsTools(api).register(tools)

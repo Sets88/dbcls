@@ -77,6 +77,13 @@ class ClientClass(abc.ABC):
     SQL_COMMANDS = []
     SQL_FUNCTIONS = []
 
+    # Set by the app for the duration of a run: called with the number of rows
+    # fetched so far, so the running overlay can show live progress.  A class
+    # attribute, not an instance one: not every client goes through this
+    # __init__ (Sqlite3Client takes a file name and builds its own state), and
+    # report_progress() has to be safe to call on all of them.
+    on_progress: Optional[Callable[[int], None]] = None
+
     def __init__(
         self, host: str, username: str, password: str, dbname: str,
         port: Optional[str], unix_socket: Optional[str] = None
@@ -88,9 +95,6 @@ class ClientClass(abc.ABC):
         self.port = port
         self.unix_socket = unix_socket
         self.connection = None
-        # Set by the app for the duration of a run: called with the number of
-        # rows fetched so far, so the running overlay can show live progress.
-        self.on_progress: Optional[Callable[[int], None]] = None
 
     @property
     def all_commands(self):

@@ -9,8 +9,8 @@ import re
 import pytest
 
 from dbcls.vd_modules.vd_live import (
-    NO_FILTER, RSTATUS_PREFIX, cell_text, filter_rows, merge_rows,
-    new_column_names, parse_row_filter, row_key, rstatus_fmt)
+    NO_FILTER, RSTATUS_PREFIX, cell_text, filter_rows, frame_wait_ms,
+    merge_rows, new_column_names, parse_row_filter, row_key, rstatus_fmt)
 
 
 class TestRowKey:
@@ -168,3 +168,23 @@ class TestNewColumnNames:
 
     def test_no_rows_is_empty(self):
         assert new_column_names([], []) == []
+
+
+class TestFrameWait:
+    def test_what_is_left_of_the_interval(self):
+        assert frame_wait_ms(1.0, last_start=100.0, now=100.25, busy=False) == 750
+
+    def test_a_run_in_flight_wants_the_ordinary_rate(self):
+        # the result is applied on a frame and drawn on the next one, so the
+        # sheet cannot afford to sleep out the rest of the interval here
+        assert frame_wait_ms(60.0, last_start=100.0, now=100.1, busy=True) == 0
+
+    def test_a_refresh_that_is_due_does_not_go_negative(self):
+        assert frame_wait_ms(1.0, last_start=100.0, now=105.0, busy=False) == 0
+
+    def test_a_reset_last_start_asks_for_the_next_frame(self):
+        # toggle_pause() and set_interval() zero _last_start to refresh at once
+        assert frame_wait_ms(10.0, last_start=0.0, now=100.0, busy=False) == 0
+
+    def test_a_sub_second_interval_is_milliseconds(self):
+        assert frame_wait_ms(0.5, last_start=100.0, now=100.0, busy=False) == 500

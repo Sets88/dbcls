@@ -84,6 +84,14 @@ Pipeline commands
     br() inside the function (with no .FOR of its own) is an early return
     and cannot break the caller's loop; stop() still aborts everything.
 
+.CONN "ID"
+    Run every following step against the connection of the tab named ID
+    (the tab bar's label: "mysql01", "mysql01#2" for a second tab on the
+    same connection).  The data passes through unchanged, and only this
+    run is switched — the tab the pipeline started from keeps its own
+    connection — so one pipeline can read from one database and write to
+    another.  ID is a template, like NAME above.
+
 .SLEEP "python_code"
     Evaluate python_code to a number of seconds, pause, then pass the
     input data through unchanged.  Like every Python-executing step the
@@ -136,11 +144,14 @@ Pipeline commands
     prefix is the body alone, and the loop item _i is frozen at the parked
     iteration — what the monitor shows has to be produced by the prefix
     itself.  Row identity is the whole row unless key columns are set with
-    `!`.  It is a row picker too, like sselect(): Enter hands the row under the
-    cursor to the next step, g Enter the marked rows.  On the sheet: q ends the
-    run, Ctrl+R refreshes now, p pauses, zi changes the interval, gf shows only
-    the rows whose current column matches a regex (! to hide those instead,
-    empty to clear) — the prompt reopens on the rule, so it can be changed.
+    `!`.  A prompt in the prefix (input(), choose(), .VIEW…) is put to the user
+    once, before the sheet opens, and its answer is reused by every refresh
+    until the sheet is closed.  It is a row picker too, like sselect(): Enter
+    hands the row under the cursor to the next step, g Enter the marked rows.
+    On the sheet: q ends the run, Ctrl+R refreshes now, p pauses, zi changes
+    the interval, gf shows only the rows whose current column matches a regex
+    (! to hide those instead, empty to clear) — the prompt reopens on the rule,
+    so it can be changed.
 
 Template placeholders
 ---------------------
@@ -267,6 +278,7 @@ _COMMAND_TABLE: List[tuple] = [
     ('view',    '.VIEW <NAME>',                    '_cmd_view'),
     ('watch',   '.WATCH [<INTERVAL>]',             '_cmd_watch'),
     ('call',    '.CALL <FN_NAME>',                 '_cmd_call'),
+    ('conn',    '.CONN <ID>',                      '_cmd_conn'),
 ]
 
 #: Control-flow keywords are part of the grammar (handled by the parser/executor
@@ -313,9 +325,11 @@ MAX_CALL_DEPTH: int = 20
 #: Commands whose handler wants the inter-step value *raw* (``NO_DATA``
 #: included) instead of the ``_as_rows()`` view every other handler gets:
 #: ``.CALL`` only forwards the value into the function body, so a function
-#: starting with a client dot-command (``.TABLES``) must still see ``NO_DATA``.
+#: starting with a client dot-command (``.TABLES``) must still see ``NO_DATA``;
+#: ``.CONN`` passes its input straight through, and an opening ``.CONN`` must
+#: leave ``NO_DATA`` intact for the client fallback of the step after it.
 #: Plugins may add to it via ``register_command(raw_data=True)``.
-_RAW_DATA_COMMANDS: set = {'call'}
+_RAW_DATA_COMMANDS: set = {'call', 'conn'}
 
 #: name → handler: the name of a ``PipelineExecutor`` method for the built-in
 #: commands, or (for plugin commands, see :func:`register_command`) a coroutine
@@ -350,6 +364,7 @@ all without leaving the editor.
 
 Commands: `.RUN` `.URUN` `.RFILTER` `.RGET` `.FOR_RUN` `.FOR` `.NOFOR` `.SLEEP`
           `.PY` `.SET_VAR` `.GET_VAR` `.VARS` `.VOID` `.SHEET` `.VIEW` `.WATCH`
+          `.CONN`
 
 Example:
 ```
@@ -534,6 +549,32 @@ Example:
 HELP_ENDFN = _help_entry('endfn', """
 End a `.FN` definition. Mandatory: a `.FN` without a matching `.ENDFN` is a
 parse error.
+""")
+
+HELP_CONN = _help_entry('conn', """
+Run every following step against the connection of the tab named ID — the name
+as the tab bar shows it (`mysql01`, and `mysql01#2` for a second tab on the
+same connection). With a single tab open, that name is its connection's id from
+the config, `default` for a config with no `connections` section. The data
+passes through untouched, so a `.CONN` can sit anywhere in the pipeline and may
+be used any number of times.
+
+Only the running pipeline is switched: when it finishes, the tab it was started
+from is still on its own connection. That is what lets one pipeline read from
+one database and write to another.
+
+A connection configured but with no tab open on it can be named too — the
+pipeline then opens a client for it on the spot.
+
+ID is a template, so it can be computed at run time.
+
+Examples:
+```
+.CONN "mysql01" | .RUN "SELECT id, name FROM users" |
+.CONN "clickhouse01" | .FOR_RUN "INSERT INTO users VALUES ({{_0}}, '{{_1}}')"
+
+.CONN "{{choose('Where', ['dev', 'prod'])}}" | .RUN "SELECT version()"
+```
 """)
 
 HELP_CALL = _help_entry('call', """
@@ -1017,10 +1058,27 @@ result([n])
 ''' | .WATCH 1
 ```
 
-The prefix must not prompt (`choose()`, `sselect()`, `.VIEW`) and must not hold
-a second `.WATCH`: VisiData owns the terminal while the live sheet is open, so
-such a step is refused. Leaving the sheet waits for a refresh that is still
-running, so the next step never overlaps with it.
+A prompt in the prefix (`input()`, `choose()`, `ask()`, `sselect()`, `.VIEW`…)
+is asked **once**: the run that fills the sheet before it opens puts the
+question, and every refresh after that reuses the answer, so the monitor keeps
+ticking instead of stopping on it. The answer is remembered per prompt title and
+only for as long as the sheet is up — closing it and running the pipeline again
+asks anew:
+
+```
+.RUN "SELECT * FROM pg_stat_activity WHERE datname = '{{input('Database')}}'" |
+.WATCH 2
+```
+
+Blocking display steps in the prefix (`.VIEW`, `.VARS`, `warn()`) have no answer
+to give, so they are shown once, before the sheet, and refreshes step past them.
+
+What still has to stay out of the prefix is a prompt with **nothing
+remembered** — a title that changes on every tick, or a branch only a refresh
+reaches — and a second `.WATCH`: VisiData owns the terminal while the live sheet
+is open, so such a step is refused rather than left hanging. Leaving the sheet
+waits for a refresh that is still running, so the next step never overlaps
+with it.
 
 Examples:
 ```
@@ -1120,6 +1178,7 @@ HELP_ENTRIES: List[str] = [
     HELP_FN,
     HELP_ENDFN,
     HELP_CALL,
+    HELP_CONN,
     HELP_SLEEP,
     HELP_PY,
     HELP_SET_VAR,
@@ -1837,7 +1896,15 @@ def _parse_args(s: str) -> List[str]:
     - ``\"…\"`` and ``\'…\'``  regular quoted strings  (backslash escapes)
     - unquoted tokens  (split on whitespace)
     """
-    args: List[str] = []
+    return [value for value, _quoted in _scan_args(s)]
+
+
+def _scan_args(s: str) -> 'List[tuple[str, bool]]':
+    """The parser behind :func:`_parse_args`, keeping one extra bit per token:
+    whether it was quoted.  ``.PY`` written as an argument is a typo worth
+    reporting (see :func:`_missing_pipe_arg`), while ``".PY"`` in quotes is a
+    perfectly ordinary string, and only the scanner can tell them apart."""
+    args: 'List[tuple[str, bool]]' = []
     pos = 0
     n = len(s)
 
@@ -1858,7 +1925,7 @@ def _parse_args(s: str) -> List[str]:
                 raise ValueError(
                     f'Unterminated triple-quoted string starting near: {s[pos-3:pos+20]!r}'
                 )
-            args.append(s[pos:end])
+            args.append((s[pos:end], True))
             pos = end + 3
 
         elif ch in ('"', "'"):
@@ -1882,16 +1949,39 @@ def _parse_args(s: str) -> List[str]:
                 else:
                     buf.append(c)
                     pos += 1
-            args.append(''.join(buf))
+            args.append((''.join(buf), True))
 
         else:
             # ── Unquoted token ──────────────────────────────────────────
             start = pos
             while pos < n and s[pos] not in (' ', '\t', '\r', '\n'):
                 pos += 1
-            args.append(s[start:pos])
+            args.append((s[start:pos], False))
 
     return args
+
+
+def _missing_pipe_arg(scanned: 'List[tuple[str, bool]]') -> Optional[str]:
+    """Return the first *unquoted* argument that is really a pipeline command —
+    the tell-tale sign of a missing ``|`` between two steps::
+
+        .WATCH "1"
+        .PY "info('done')"
+
+    parses as a single ``.WATCH`` step with the arguments ``1``, ``.PY`` and
+    ``info('done')``, which would silently do the wrong thing.  Quoted
+    arguments are never suspicious (``.RUN "SELECT '.PY'"``), and neither are
+    unquoted tokens that merely start with a dot (``.5``, ``./dump.sql``,
+    ``.view.json``) — the token has to be exactly a known command name,
+    optionally with the ``?`` soft-failure marker.
+    """
+    for value, quoted in scanned:
+        if quoted or not value.startswith('.'):
+            continue
+        name = value[1:].rstrip('?').lower()
+        if name in PIPELINE_COMMANDS:
+            return value
+    return None
 
 
 def _parse_step(raw: str) -> PipelineStep:
@@ -1918,13 +2008,21 @@ def _parse_step(raw: str) -> PipelineStep:
     rest = raw[pos:].strip()
 
     try:
-        args = _parse_args(rest) if rest else []
+        scanned = _scan_args(rest) if rest else []
     except ValueError as exc:
         raise ValueError(
             f'Cannot parse arguments for .{command.upper()}: {exc}'
         ) from exc
 
-    return PipelineStep(command=command, args=args, original_text=raw, soft=soft)
+    if (stray := _missing_pipe_arg(scanned)):
+        raise ValueError(
+            f'.{command.upper()} got {stray} as an argument — '
+            f'a missing `|` before {stray}? '
+            f'Quote it ("{stray}") if it really is an argument.'
+        )
+
+    return PipelineStep(command=command, args=[v for v, _q in scanned],
+                        original_text=raw, soft=soft)
 
 
 def parse_pipeline(sql: str) -> List[Node]:
@@ -2058,6 +2156,8 @@ class PipelineHost(Protocol):
     client: Any
     vars: dict
 
+    def get_client(self, conn_id: str) -> Any: ...
+
     def reset_pipeline_info(self) -> None: ...
 
     def show_pipeline_info(self, text: str) -> None: ...
@@ -2159,8 +2259,38 @@ class PipelineExecutor:
         # hand-over and the terminal belongs to VisiData, so nothing running
         # underneath may open an editor prompt (see _ask_user).
         self._in_watch: bool = False
+        # (kind, title) → the answer the user has already given in this run.
+        # Recorded by _ask_user and read back only while a .WATCH sheet is up:
+        # its refreshes cannot ask anything (VisiData owns the terminal), so a
+        # prompt in the watched prefix is put once — on the run that produced
+        # the sheet's first rows — and every refresh reuses that answer.
+        # Cleared when the sheet closes, so the next .WATCH asks again.
+        self._prompt_answers: dict = {}
 
     # ── Public entry point ────────────────────────────────────────────────────
+
+    def use_client(self, client) -> None:
+        """Run the rest of the pipeline on *client* (see `.CONN`).
+
+        The host's live row counter is hooked onto the client object itself, so
+        it has to travel with the switch — otherwise the progress of every step
+        after a `.CONN` would be reported by nobody.  The host resolves the
+        cancel callback through ``self.client`` for the same reason: Esc has to
+        reach the connection the run is on now, not the one it started on."""
+        if client is self.client:
+            return
+        self.client.on_progress, client.on_progress = None, self.client.on_progress
+        self.client = client
+
+    async def _run_sql(self, sql: str):
+        """Run one step's query on the client the pipeline is on right now.
+
+        The overlay's row counter belongs to the query that is running *now*:
+        it is zeroed before the query starts, or the next step would go on
+        showing the row count of the previous one until (and unless) its own
+        engine reports progress of its own."""
+        self.client.report_progress(0)
+        return await self.client.execute(sql)
 
     async def execute(self, sql: str):
         """Execute the full pipeline *sql* and return a ``Result`` object."""
@@ -2170,6 +2300,7 @@ class PipelineExecutor:
         self._loop_stack = []
         self._call_stack = []
         self._shown_data = NOTHING_SHOWN
+        self._prompt_answers = {}
         self.host.reset_pipeline_info()
 
         nodes = parse_pipeline(sql)
@@ -2391,7 +2522,7 @@ class PipelineExecutor:
 
         # Fall back to the client's own command handling (e.g. .TABLES,
         # .DATABASES, .SCHEMA …) — only valid as the first step or right after .VOID.
-        result = await self.client.execute(step.original_text)
+        result = await self._run_sql(step.original_text)
         if result is None:
             return []
         return result.data or []
@@ -2423,7 +2554,7 @@ class PipelineExecutor:
 
         sql = self._render_template(args[0], data=data)
 
-        result = await self.client.execute(sql)
+        result = await self._run_sql(sql)
         return (result.data or []) if result else []
 
     async def _cmd_urun(
@@ -2436,7 +2567,7 @@ class PipelineExecutor:
 
         sql = self._render_template(args[0], data=data)
 
-        result = await self.client.execute(sql)
+        result = await self._run_sql(sql)
         new_rows = (result.data or []) if result else []
         return _as_item_list(data) + new_rows
 
@@ -2492,7 +2623,7 @@ class PipelineExecutor:
                 raise _PipelineStop(result)   # rows collected so far
             try:
                 sql = self._render_template(sql_template, row, data)
-                res = await self.client.execute(sql)
+                res = await self._run_sql(sql)
             except (_PipelineBreak, _PipelineStop, PipelineCancelled):
                 raise
             except Exception as exc:
@@ -2639,7 +2770,12 @@ class PipelineExecutor:
         """Ask the UI to pick rows out of *shaped* (the dict-shaped view of
         *raw*, built by the caller) and map the answer back to the *raw* items
         behind them.  ``None`` means the user dismissed the sheet, which both
-        ``sselect()`` and ``schoose()`` treat as cancelling the pipeline."""
+        ``sselect()`` and ``schoose()`` treat as cancelling the pipeline.
+
+        Under a ``.WATCH`` the pick comes from the memory of the run before the
+        sheet opened (see ``_ask_user``), so its rows belong to that run:
+        ``_map_selection`` finds no *raw* item behind them and hands them back
+        as they are — the answer the user gave, held while the sheet is up."""
         request = {'kind': kind, 'title': str(title), 'rows': shaped}
         picked = self._ask_user(request)
         if picked is None:
@@ -2830,26 +2966,46 @@ class PipelineExecutor:
 
     def _refuse_prompt_during_watch(self, kind: Any) -> None:
         """Raise when a *kind* prompt would open while a ``.WATCH`` sheet owns
-        the screen.
+        the screen and there is no remembered answer to give it instead.
 
         The editor's main loop is inside VisiData then, so the request would sit
         unanswered until the sheet is closed and then pop up out of nowhere — and
         a nested ``.WATCH`` would never be opened at all, since its producer only
         runs *because* the outer sheet is on screen: it would take the editor's
         single request slot and block forever.  A clear failure beats a mystery
-        stall."""
+        stall.
+
+        A prompt the watched prefix already put to the user before the sheet
+        opened never gets here: ``_ask_user`` answers it from
+        ``_prompt_answers``.  What is left is a prompt with nothing recorded
+        under its (kind, title) — a title that changes on every refresh, a
+        branch only a refresh reaches — and a nested ``.WATCH``."""
         if self._in_watch:
             raise ValueError(
-                f'a {kind} prompt cannot open while a .WATCH sheet '
-                'is on screen — move the interactive step out of the pipeline '
-                'prefix that .WATCH re-runs'
+                f'a {kind} prompt cannot open while a .WATCH sheet is on '
+                'screen, and it was not answered before the sheet opened — '
+                'move the interactive step out of the pipeline prefix that '
+                '.WATCH re-runs, or give it a title that stays the same '
+                'across refreshes'
             )
 
     def _ask_user(self, request: dict) -> Any:
         """Put *request* to the user and block until it is answered — the one
-        place the whole executor talks to the host's UI."""
-        self._refuse_prompt_during_watch(request.get('kind'))
-        return self.host.request_user_input(request)
+        place the whole executor talks to the host's UI.
+
+        Every answer is remembered under the request's (kind, title), and while
+        a ``.WATCH`` sheet is up that memory answers instead of the user: its
+        refreshes re-run the prefix with the terminal in VisiData's hands, so
+        the question is asked once — on the run that produced the sheet's first
+        rows — and kept until the sheet is closed (see ``_cmd_watch``)."""
+        key = (str(request.get('kind')), str(request.get('title', '')))
+        if self._in_watch:
+            if key in self._prompt_answers:
+                return self._prompt_answers[key]
+            self._refuse_prompt_during_watch(request.get('kind'))
+        answer = self.host.request_user_input(request)
+        self._prompt_answers[key] = answer
+        return answer
 
     def _show_blocking_sheet(self, kind: str, title: str, rows: list) -> None:
         """Show *rows* on a blocking VisiData sheet and wait for it to close.
@@ -2858,7 +3014,11 @@ class PipelineExecutor:
         (``.VIEW``, ``.VARS``); it uses the same handover as the
         ``sselect()`` / ``schoose()`` prompts, so it works in the middle of a
         run.  Closing the sheet is not an answer, so (unlike a dismissed
-        prompt) it never cancels the pipeline."""
+        prompt) it never cancels the pipeline.
+
+        In a watched prefix the sheet is shown once, before the ``.WATCH``
+        opens: there is nothing to answer, so the refreshes replay the empty
+        answer (see ``_ask_user``) and step straight past it."""
         self._ask_user({'kind': kind, 'title': title, 'rows': rows})
 
     def _mark_shown(self, data: Any) -> Any:
@@ -2966,6 +3126,11 @@ class PipelineExecutor:
         ``q`` is the other way out and cancels the run instead, which is what
         gets the user out of a ``.WHILE`` loop that keeps re-opening the sheet.
 
+        A prompt in the prefix is asked once — on the run that produced *data*,
+        while the terminal was still the editor's — and the refreshes are
+        answered from ``_prompt_answers``, which this step drops again when the
+        sheet closes (see ``_ask_user``).
+
         The refresh runs on the sheet's own thread while this coroutine is
         parked, which is why the wait below goes through ``asyncio.to_thread``:
         ``request_user_input`` blocks on an Event, and blocking it *on the
@@ -3010,6 +3175,10 @@ class PipelineExecutor:
                 await self._drain_watch_runs(in_flight)
             finally:
                 self._in_watch = False
+                # After the drain, so a refresh still unwinding keeps being
+                # answered from the memory it ran with.  The answers belong to
+                # this sheet: the next .WATCH asks its questions itself.
+                self._prompt_answers.clear()
         if picked is None:
             # Quit rather than picked from (`q`, `gq`, Ctrl+Q): the run ends
             # here — that is the way out of a loop that keeps re-opening the
@@ -3095,6 +3264,23 @@ class PipelineExecutor:
             return _as_item_list(brk.data)
         finally:
             self._call_stack.pop()
+
+    async def _cmd_conn(self, args: List[str], data: Any) -> Any:
+        """Point the rest of this run at another tab's connection, and pass the
+        data straight through.
+
+        The argument is a tab name as the tab bar shows it, and the pipeline
+        goes on running against that tab's connection.  Only this executor is
+        switched — the tab the pipeline was started from keeps its own — so one
+        pipeline can read from one database and write to another.  The name is a
+        template, so it can be computed at run time
+        (``.CONN "{{choose('Where', ['dev', 'prod'])}}"``).
+        """
+        if not args:
+            raise ValueError('.CONN requires a connection ID argument')
+        name = self._render_template(args[0], data=_as_rows(data)).strip()
+        self.use_client(self.host.get_client(name))
+        return data
 
 
 # Fail fast at import time if the command table references a handler that does

@@ -43,6 +43,43 @@ class TestSystemPrompt:
         prompt = build_system_prompt(None)
         assert 'get_pipeline_reference' in prompt
 
+
+class TestTabsInThePrompt:
+    """With several connections open the model has to know which tabs exist,
+    which one it is writing for, and that the tools can reach the others."""
+
+    TABS = [
+        {'name': 'mysql01', 'engine': 'Mysql', 'database': 'shop', 'current': True},
+        {'name': 'ch01', 'engine': 'Clickhouse', 'database': 'analytics', 'current': False},
+        {'name': 'ch01#2', 'engine': 'Clickhouse', 'database': '', 'current': False},
+    ]
+
+    def test_lists_every_tab_with_its_engine_and_database(self):
+        prompt = build_system_prompt(None, tabs=self.TABS)
+        assert '- mysql01 (Mysql, database shop)' in prompt
+        assert '- ch01 (Clickhouse, database analytics)' in prompt
+        assert '- ch01#2 (Clickhouse)' in prompt   # no database to name
+
+    def test_marks_the_current_tab(self):
+        prompt = build_system_prompt(None, tabs=self.TABS)
+        listed = [line for line in prompt.splitlines() if line.startswith('- ') and '(' in line]
+        assert [line for line in listed if '←' in line] == [
+            '- mysql01 (Mysql, database shop)  ← current tab']
+
+    def test_explains_the_tab_argument_and_conn(self):
+        prompt = build_system_prompt(None, tabs=self.TABS)
+        assert '`tab` argument' in prompt
+        assert '.CONN' in prompt
+
+    def test_a_single_tab_is_not_listed_at_all(self):
+        # Nothing to choose between: naming it would only invite a needless
+        # `tab` argument.
+        prompt = build_system_prompt(None, tabs=[self.TABS[0]])
+        assert '## Tabs' not in prompt
+
+    def test_no_tabs_given_is_the_single_connection_prompt(self):
+        assert build_system_prompt(None) == build_system_prompt(None, tabs=[])
+
     def test_requires_the_result_tool(self):
         prompt = build_system_prompt(None)
         assert 'propose_query' in prompt
@@ -125,7 +162,11 @@ class TestPipelineReference:
                 continue
             body = '\n'.join(line for line in block.split('\n')
                              if not line.strip().startswith('-- ')).strip()
-            pipeline.parse_pipeline(body)     # raises if the example is malformed
+            # A blank line ends a pipeline, so one block may hold several
+            # independent examples — parse each on its own, the way dbcls runs it.
+            for example in re.split(r'\n\s*\n', body):
+                if example.strip():
+                    pipeline.parse_pipeline(example)   # raises if malformed
 
     def test_no_example_indents_the_body_of_a_triple_quoted_argument(self):
         """A triple-quoted argument is verbatim, so an example indented as a

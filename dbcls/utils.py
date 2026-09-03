@@ -14,6 +14,28 @@ class SqlExpr(str):
     of quoting it as a string literal."""
 
 
+class UrlParts(dict):
+    """The parsed form of a `g#` URL cell: the six URL fields as a dict, with
+    the original text kept so the cell still displays -- and round-trips into
+    SQL -- as the URL it was parsed from.
+
+    It lives here rather than in vd_types so that sql_literal() can recognise
+    it without dragging visidata into this module.
+    """
+
+    def __init__(self, url, parts):
+        super().__init__(parts)
+        self.url = url
+
+    def __str__(self):
+        return self.url
+
+    def __lt__(self, other):
+        # dicts are unorderable, which would make sorting a URL column fail the
+        # way sorting a JSON one does; compare the URL text instead
+        return self.url < str(other)
+
+
 def sql_literal(v) -> str:
     """Format *v* as a SQL literal: strings and dates are quoted (``'``
     doubled), ``None`` becomes ``NULL``, everything else is ``str()``."""
@@ -32,6 +54,15 @@ def sql_literal(v) -> str:
         return f"'{v.isoformat(sep=' ')}'"
     if isinstance(v, datetime.date):
         return f"'{v.isoformat()}'"
+    if isinstance(v, UrlParts):
+        # a URL-typed cell (`g#`) is a dict, but round-trips as the URL text it
+        # was parsed from -- so this has to come before the dict branch below
+        return sql_literal(str(v))
+    if isinstance(v, (dict, list)):
+        # a JSON-typed cell (`g@`) round-trips as JSON text, not as the
+        # Python repr str() would produce (single quotes, True, None)
+        text = json.dumps(v, ensure_ascii=False, default=str).replace("'", "''")
+        return f"'{text}'"
     return str(v)
 
 
@@ -176,6 +207,10 @@ def prettify_number(number):
 
 
 def prettify(value):
+    if isinstance(value, (dict, list)):
+        # already-parsed JSON: a `g@` column, or postgres jsonb as psycopg2
+        # hands it over
+        return json.dumps(value, indent=2, ensure_ascii=False, default=str)
     if isinstance(value, (int, float)):
         return prettify_number(value)
     elif isinstance(value, str):
@@ -183,5 +218,8 @@ def prettify(value):
             return prettify_number(value)
 
         return format_json(value)
+    # everything else (dates, None, …) is shown as-is instead of falling
+    # through as None, which `zf` would render as an error
+    return '' if value is None else str(value)
 
     return str(value)

@@ -40,6 +40,15 @@ Looking at the database:
   guessing column names, and sample_data when the shape of the values matters.
 - Match the dialect of the engine named below, and quote identifiers the way
   that engine does.
+- The editor has one tab per connection, listed under Tabs below, and the query
+  you propose runs on the current one. Every database tool takes an optional
+  `tab` argument: omit it to work on the current tab, pass a name from that
+  list to inspect another connection. Match the dialect of whichever tab the
+  query will run on.
+- A pipeline can switch connection mid-run with `.CONN "tab"`, which is how one
+  query reads from one database and writes to another. Only reach for it when
+  the task really does span two connections, and check the schema on both tabs
+  first.
 - The user may have results stashed in pipeline variables from an earlier run.
   get_vars_keys lists them, get_var reads one. Check there when they refer to
   something they saved, and before writing a pipeline that reads a variable.
@@ -103,9 +112,15 @@ and `<<<` marker lines, and you will see them around a query you are given:
 """
 
 
-def build_system_prompt(client=None) -> str:
-    """The system message: who the assistant is and what it is connected to."""
-    parts = [SYSTEM_PROMPT, describe_connection(client)]
+def build_system_prompt(client=None, tabs=None) -> str:
+    """The system message: who the assistant is, what it is connected to, and
+    which tabs (connections) it can reach.
+
+    *tabs* is what :attr:`dbcls.plugins.PluginAPI.tabs` returns.  It is rebuilt
+    every time the chat is opened, so the model always sees which tab is
+    current — the user may well have switched since the last question.
+    """
+    parts = [SYSTEM_PROMPT, describe_connection(client), describe_tabs(tabs)]
     return '\n\n'.join(part for part in parts if part)
 
 
@@ -118,6 +133,28 @@ def describe_connection(client) -> str:
     lines = [f'## Connection\n\nEngine: {engine}']
     if dbname:
         lines.append(f'Current database: {dbname}')
+    return '\n'.join(lines)
+
+
+def describe_tabs(tabs) -> str:
+    """The open tabs, one per line, with the current one marked.
+
+    Left out entirely when there is only one: with nothing to choose between,
+    naming it would only invite the model to pass a `tab` argument it does not
+    need."""
+    tabs = list(tabs or ())
+    if len(tabs) < 2:
+        return ''
+    lines = ['## Tabs\n',
+             'One tab per connection. Pass a name as the `tab` argument of a '
+             'database tool to inspect that connection, or as the argument of '
+             '`.CONN` in a pipeline to run steps on it.\n']
+    for tab in tabs:
+        engine = tab.get('engine') or 'unknown'
+        database = tab.get('database')
+        where = f'{engine}, database {database}' if database else engine
+        current = '  ← current tab' if tab.get('current') else ''
+        lines.append(f'- {tab["name"]} ({where}){current}')
     return '\n'.join(lines)
 
 

@@ -74,6 +74,20 @@ class TestClientClass:
     def client(self):
         return MockClient("localhost", "user", "password", "test_db", "5432")
 
+    def test_report_progress_reaches_the_hook(self, client):
+        client.on_progress = MagicMock()
+        client.report_progress(7)
+        client.on_progress.assert_called_once_with(7)
+
+    def test_report_progress_without_a_hook_is_a_no_op(self, client):
+        client.report_progress(7)   # nobody listening — must not raise
+
+    def test_report_progress_works_on_a_client_that_skips_the_base_init(self):
+        # Sqlite3Client and friends build their own state instead of calling
+        # ClientClass.__init__, so the hook has to default at class level.
+        skipped = MockClient.__new__(MockClient)
+        skipped.report_progress(7)
+
     def test_all_commands_property(self, client):
         """Test all_commands property combines SQL_COMMON_COMMANDS and SQL_COMMANDS"""
         assert client.all_commands == client.SQL_COMMON_COMMANDS + client.SQL_COMMANDS

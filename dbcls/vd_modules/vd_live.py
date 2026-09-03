@@ -25,6 +25,11 @@ its mainloop calls ``getkeystroke`` exactly once per iteration.  For that
 loop to keep spinning while the user is idle, ``vd.timeouts_before_idle``
 must be -1; the sheet sets it while it is open and puts it back afterwards
 (see ``DbEditor._fix_visidata_curses``, which does the same for the lock).
+
+How *often* the loop spins is then up to :mod:`dbcls.vd_modules.vd_idle`,
+which stretches the poll interval once nothing is happening.  It asks
+:func:`live_sheet_wait_ms` first, so a live sheet gets its frame when its
+interval is up rather than when the idle poll happens to come round.
 """
 import re
 import threading
@@ -193,6 +198,21 @@ def filter_rows(rows: Iterable[dict], rowfilter: RowFilter) -> List[dict]:
     if rowfilter.pattern is None:
         return list(rows)
     return [row for row in rows if rowfilter.keeps(row)]
+
+
+# ── Refresh schedule (pure, and asked by vd_idle) ─────────────────────────────
+
+def frame_wait_ms(interval: float, last_start: float, now: float,
+                  busy: bool) -> float:
+    """How long the mainloop may sleep before a live sheet needs a frame.
+
+    0 means "the ordinary frame rate": while a producer run is *busy* the sheet
+    wants frames as usual, since its result is picked up on one frame (see
+    :meth:`LiveRowsSheet.tick`) and drawn on the next.  Otherwise the wait is
+    what is left of *interval* since the run started."""
+    if busy:
+        return 0.0
+    return max(0.0, interval - (now - last_start)) * 1000
 
 
 #: What the live sheet puts in front of ``disp_rstatus_fmt`` (see
@@ -424,6 +444,16 @@ cursor position survive every refresh.
                 self.refresh_now()
         except Exception as e:
             vd.exceptionCaught(e, status=False)
+
+    def next_wait_ms(self) -> Optional[float]:
+        """How long the mainloop may sleep before this sheet needs a frame, or
+        ``None`` when it needs none at all — a snapshot copy (see
+        :meth:`__copy__`) has no refresh cycle, and a paused sheet waits for the
+        keypress that resumes it.  Read by :mod:`dbcls.vd_modules.vd_idle`."""
+        if self.producer is None or self.paused:
+            return None
+        return frame_wait_ms(self.interval, self._last_start, time.monotonic(),
+                             self._worker is not None or self._produced is not None)
 
     def refresh_now(self) -> None:
         """Start one producer run on a background thread (no-op if one is already
@@ -670,6 +700,31 @@ cursor position survive every refresh.
         # `[:alpha:]` or `[/tmp]` reads as a VisiData colour code — so it goes
         # out escaped, and the sheet says which column it applies to.
         return f'{status}  [:warning]{escape_vdcode(self._filter.summary)}[/]'
+
+
+# ── Mainloop seams ────────────────────────────────────────────────────────────
+
+def live_sheet_wait_ms() -> Optional[float]:
+    """The shortest wait any open live sheet needs, ``None`` when none does.
+
+    Asked by :mod:`dbcls.vd_modules.vd_idle` before it stretches the poll
+    interval, so a live sheet keeps its refresh rate however long the user
+    leaves the keyboard alone.  The stack is walked the way the per-frame hook
+    below walks it, so a sheet under an open chart or drill-down counts too.
+
+    Never raises: it is called from the mainloop, where an exception would take
+    the loop down."""
+    waits = []
+    try:
+        for sheet in list(vd.sheets):
+            if isinstance(sheet, LiveRowsSheet):
+                wait = sheet.next_wait_ms()
+                if wait is not None:
+                    waits.append(wait)
+    except Exception as e:
+        vd.exceptionCaught(e, status=False)
+        return None
+    return min(waits) if waits else None
 
 
 # ── Per-frame hook ────────────────────────────────────────────────────────────

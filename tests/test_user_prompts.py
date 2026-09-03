@@ -2,7 +2,7 @@
 
 * InputBar — the generic free-text bar built on LineInputBar
 * SelectPopup multi-select mode (Tab marks, checked_values)
-* Editor.request_user_input / _open_ui_request / _handle_ui_request_key wiring
+* EditorShell.request_user_input / _open_ui_request / _handle_ui_request_key wiring
 
 Key codes are the encoded (bitfield) codes: K(x) = x << 2.
 """
@@ -15,6 +15,7 @@ import pytest
 
 from dbcls.editor import (
     Editor,
+    EditorShell,
     InputBar,
     InputHistory,
     K,
@@ -32,18 +33,21 @@ DOWN = K(curses.KEY_DOWN)
 
 
 def make_editor():
-    """Build a minimal Editor without initialising curses."""
-    ed = object.__new__(Editor)
+    """Build a minimal shell (with one stub document) without touching curses."""
+    ed = object.__new__(EditorShell)
     ed.stdscr = MagicMock()
     ed.stdscr.getch.return_value = -1   # so a dispatched Esc resolves as bare Esc
     ed.renderer = MagicMock()
-    ed.buf = MagicMock()
-    ed.textarea = MagicMock(buf=ed.buf)
+    doc = MagicMock()
+    doc.buf = MagicMock()
+    doc.textarea = MagicMock(buf=doc.buf)
+    doc.search = MagicMock(active=False)
+    ed.documents = [doc]
+    ed.active = 0
     ed._overlays = []
     ed.popup = MagicMock(active=False)
     ed.info_popup = MagicMock(active=False)
     ed.running_popup = MagicMock(active=False)
-    ed.search = MagicMock(active=False)
     ed.input_bar = MagicMock(active=False)
     ed._ui_request = None
     ed._pipeline_info_live = False
@@ -638,11 +642,11 @@ class TestRequestUserInput:
         # hook inline and resolves with whatever it returns.
         ed = make_editor()
         rows = [{'a': 1}, {'a': 2}]
-        ed.run_sheet_prompt = MagicMock(return_value=[{'a': 2}])
+        ed.doc.run_sheet_prompt = MagicMock(return_value=[{'a': 2}])
         th, results = _submit_request(ed, {'kind': kind, 'title': 't', 'rows': rows})
         ed._open_ui_request(ed._ui_request)
         th.join(timeout=2)
-        ed.run_sheet_prompt.assert_called_once_with(kind, 't', rows, None)
+        ed.doc.run_sheet_prompt.assert_called_once_with(kind, 't', rows, None)
         assert results == [[{'a': 2}]]
 
     def test_sheet_prompt_forwards_extra(self):
@@ -650,17 +654,17 @@ class TestRequestUserInput:
         # the branch must hand them to the viewer alongside the rows.
         ed = make_editor()
         extra = {'producer': lambda: [], 'interval': 2.0}
-        ed.run_sheet_prompt = MagicMock(return_value=None)
+        ed.doc.run_sheet_prompt = MagicMock(return_value=None)
         th, _results = _submit_request(
             ed, {'kind': 'watch', 'title': 't', 'rows': [], 'extra': extra})
         ed._open_ui_request(ed._ui_request)
         th.join(timeout=2)
-        ed.run_sheet_prompt.assert_called_once_with('watch', 't', [], extra)
+        ed.doc.run_sheet_prompt.assert_called_once_with('watch', 't', [], extra)
 
     def test_sheet_prompt_hook_none_resolves_none(self):
         # Quitting the viewer (q/gq) returns None — the abort/leave signal.
         ed = make_editor()
-        ed.run_sheet_prompt = MagicMock(return_value=None)
+        ed.doc.run_sheet_prompt = MagicMock(return_value=None)
         th, results = _submit_request(
             ed, {'kind': 'sselect', 'title': 't', 'rows': [{'a': 1}]})
         ed._open_ui_request(ed._ui_request)
@@ -668,10 +672,10 @@ class TestRequestUserInput:
         assert results == [None]
 
     def test_sheet_prompt_base_hook_returns_none(self):
-        # The base Editor has no viewer: the default hook aborts.
-        ed = make_editor()
-        assert ed.run_sheet_prompt('sselect', 't', [{'a': 1}]) is None
-        assert ed.run_sheet_prompt('schoose', 't', [{'a': 1}]) is None
+        # A plain document has no viewer: the default hook aborts.
+        doc = object.__new__(Editor)
+        assert doc.run_sheet_prompt('sselect', 't', [{'a': 1}]) is None
+        assert doc.run_sheet_prompt('schoose', 't', [{'a': 1}]) is None
 
 
 class TestUiRequestDispatch:
@@ -862,8 +866,8 @@ class TestConfirmFileChange:
         ed = make_editor()
         ed.buf.readonly = readonly
         ed.buf.filepath = '/tmp/x.sql'
-        ed.lexer = MagicMock()
-        ed._file_change_dismissed = False
+        ed.doc.lexer = MagicMock()
+        ed.doc._file_change_dismissed = False
         return ed
 
     def test_unrelated_key_keeps_asking(self):
@@ -872,14 +876,14 @@ class TestConfirmFileChange:
         ed._confirm_file_change()
         assert ed._read_answer.call_count == 3
         ed.buf.load.assert_called_once_with('/tmp/x.sql')
-        assert ed._file_change_dismissed is False
+        assert ed.doc._file_change_dismissed is False
 
     def test_write_saves_buffer(self):
         ed = self._editor()
         ed._read_answer = MagicMock(return_value=ord('w'))
         ed._confirm_file_change()
         ed.buf.save.assert_called_once()
-        assert ed._file_change_dismissed is False
+        assert ed.doc._file_change_dismissed is False
 
     def test_esc_dismisses(self):
         ed = self._editor()
@@ -887,14 +891,14 @@ class TestConfirmFileChange:
         ed._confirm_file_change()
         ed.buf.load.assert_not_called()
         ed.buf.save.assert_not_called()
-        assert ed._file_change_dismissed is True
+        assert ed.doc._file_change_dismissed is True
 
     def test_write_ignored_in_readonly_mode(self):
         ed = self._editor(readonly=True)
         ed._read_answer = MagicMock(side_effect=[ord('w'), 27])
         ed._confirm_file_change()
         ed.buf.save.assert_not_called()
-        assert ed._file_change_dismissed is True
+        assert ed.doc._file_change_dismissed is True
         assert '(w)rite' not in ed._read_answer.call_args.args[0]
 
 

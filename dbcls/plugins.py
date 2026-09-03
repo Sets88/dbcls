@@ -172,6 +172,48 @@ class PluginAPI:
         """The pipeline variable store (``.SET_VAR`` / ``.GET_VAR``)."""
         return self.editor.vars
 
+    # ── Tabs ─────────────────────────────────────────────────────────────────
+
+    @property
+    def tabs(self) -> List[dict]:
+        """The open tabs, in tab-bar order.
+
+        One dict per tab: ``name`` (what the tab bar shows, and what
+        :meth:`tab_client` and the pipeline's ``.CONN`` take), ``engine``,
+        ``database`` and ``current``.  A single-connection editor has exactly
+        one entry, so the shape does not change with the setup.
+        """
+        described = []
+        for document in getattr(self.editor, 'documents', None) or []:
+            client = getattr(document, 'client', None)
+            described.append({
+                'name': document.tab_title(),
+                'engine': getattr(client, 'ENGINE', '') or '',
+                'database': getattr(client, 'dbname', '') or '',
+                'current': document is getattr(self.editor, 'doc', None),
+            })
+        return described
+
+    def tab_client(self, name: Optional[str] = None):
+        """The DB client of the tab called *name*, or the current tab's when
+        *name* is empty.  Raises ValueError naming the open tabs if there is no
+        such tab."""
+        return getattr(self._tab(name), 'client', None)
+
+    def tab_autocomplete(self, name: Optional[str] = None):
+        """The :class:`~dbcls.autocomplete.AutoComplete` of that same tab."""
+        return getattr(self._tab(name), 'autocomplete', None)
+
+    def _tab(self, name: Optional[str]):
+        documents = getattr(self.editor, 'documents', None) or []
+        if not name:
+            return getattr(self.editor, 'doc', self.editor)
+        for document in documents:
+            if document.tab_title() == name:
+                return document
+        known = ', '.join(d.tab_title() for d in documents) or 'none'
+        raise ValueError(f'Unknown tab {name!r} (open tabs: {known})')
+
     def submit(self, coro):
         """Run a coroutine on the editor's background loop; returns a Task."""
         return self.editor.asyncloop_thread.submit(coro)

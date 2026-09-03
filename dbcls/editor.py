@@ -186,6 +186,10 @@ class Fn(str, enum.Enum):
     CLEAR_SELECTION  = 'clear_selection'
     COMMAND_PALETTE  = 'command_palette'
     TOGGLE_FOLD      = 'toggle_fold'
+    NEXT_TAB         = 'next_tab'
+    PREV_TAB         = 'prev_tab'
+    SWITCH_TAB       = 'switch_tab'
+    CLOSE_TAB        = 'close_tab'
 
 
 EDITOR_HELP = """\
@@ -3630,18 +3634,104 @@ class TextArea:
 
 
 # ─── Renderer ─────────────────────────────────────────────────────────────────
+class TabBar:
+    """The one-row strip of open tabs drawn above the text area.
+
+    It is told what to show once per frame (:meth:`set_tabs`) and owns only its
+    horizontal scroll: with more tabs than fit, it keeps the active one visible
+    and marks the hidden sides with ``<`` / ``>``.  :meth:`hit` maps a click
+    back to a tab index."""
+
+    #: Row the bar occupies, and the height it claims from the text area.
+    ROW = 0
+    HEIGHT = 1
+
+    def __init__(self) -> None:
+        #: (title, dirty) per tab, in tab order.
+        self.tabs: List[Tuple[str, bool]] = []
+        self.active = 0
+        self._scroll = 0
+        #: (x_start, x_end, index) of every tab actually drawn last frame.
+        self._spans: List[Tuple[int, int, int]] = []
+
+    def set_tabs(self, tabs: List[Tuple[str, bool]], active: int) -> None:
+        self.tabs = list(tabs)
+        self.active = active
+
+    def _label(self, index: int) -> str:
+        title, dirty = self.tabs[index]
+        return f' {title}{"*" if dirty else ""} '
+
+    def _fit(self, W: int) -> None:
+        """Scroll so the active tab is fully visible."""
+        if not self.tabs:
+            self._scroll = 0
+            return
+        self._scroll = max(0, min(self._scroll, len(self.tabs) - 1, self.active))
+        while self._scroll < self.active:
+            # +1 for the '<' marker the scrolled-off left side gets; the last
+            # column is left to the '>' marker, as in draw().
+            used = sum(len(self._label(i)) for i in range(self._scroll, self.active + 1))
+            if used + (1 if self._scroll else 0) <= W - 1:
+                break
+            self._scroll += 1
+
+    def draw(self, stdscr: curses.window, colors, W: int, y: int = ROW) -> None:
+        self._spans = []
+        if not self.tabs:
+            return
+        self._fit(W)
+        attr = curses.color_pair(colors.status_bar)
+        try:
+            stdscr.addstr(y, 0, ' ' * max(0, W - 1), attr)
+        except curses.error:
+            pass
+        x = 0
+        if self._scroll:
+            _addstr(stdscr, y, x, '<', attr, W)
+            x += 1
+        for index in range(self._scroll, len(self.tabs)):
+            label = self._label(index)
+            if x + len(label) > W - 1:
+                _addstr(stdscr, y, max(0, W - 2), '>', attr, W)
+                break
+            cell = attr | (curses.A_REVERSE | curses.A_BOLD if index == self.active else 0)
+            _addstr(stdscr, y, x, label, cell, W)
+            self._spans.append((x, x + len(label), index))
+            x += len(label)
+
+    def hit(self, mx: int, my: int) -> Optional[int]:
+        """The tab a click landed on, or None."""
+        if my != self.ROW:
+            return None
+        for start, end, index in self._spans:
+            if start <= mx < end:
+                return index
+        return None
+
+
+def _addstr(stdscr: curses.window, y: int, x: int, text: str, attr: int, W: int) -> None:
+    """addstr that clips to *W* and never raises at the bottom-right cell."""
+    text = text[:max(0, W - x)]
+    if not text:
+        return
+    try:
+        stdscr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
 class Renderer:
     """Composes a frame: the editor's text area (drawn by :class:`TextView`),
     the two bars below it, and whatever popup or overlay is up."""
 
     GUTTER = TextView.GUTTER  # kept as the historical name for the gutter width
 
-    def __init__(self, stdscr: curses.window, colors: ColorManager, view: 'TextView'):
+    def __init__(self, stdscr: curses.window, colors: ColorManager,
+                 view: Optional['TextView'] = None):
         self.stdscr = stdscr
         self.colors = colors
         self.view = view
-        self.buf = view.buf
-        self.lexer = view.lexer
         self._height = 0
         self._width = 0
         self.debug_text = ''
@@ -3649,12 +3739,32 @@ class Renderer:
         self.status_notification: Optional[str] = None
         self.status_notification_error = False  # show status_notification in the error color
         self.input_pending = False  # a prompt is waiting for the user
+        # Rows taken above the text area — 1 while a tab bar is on screen.
+        self.top_offset = 0
+        self.resize()
+
+    @property
+    def buf(self):
+        return self.view.buf
+
+    @property
+    def lexer(self):
+        return self.view.lexer
+
+    def set_view(self, view: 'TextView') -> None:
+        """Draw *view* from now on — how the shell switches tabs."""
+        self.view = view
         self.resize()
 
     def resize(self):
         self._height, self._width = self.stdscr.getmaxyx()
-        # Reserve the bottom 2 rows: status bar + filename/search bar
-        self.view.set_rect(0, 0, max(1, self._height - 2), max(1, self._width))
+        if self.view is None:
+            return
+        # Reserve the bottom 2 rows (status bar + filename/search bar) and
+        # whatever the tab bar takes at the top.
+        self.view.set_rect(self.top_offset, 0,
+                           max(1, self._height - 2 - self.top_offset),
+                           max(1, self._width))
 
     # The view owns the text-area geometry and scrolling; these forward to it so
     # `renderer.wrap`, `renderer.text_rows` … keep working as before.
@@ -3692,6 +3802,7 @@ class Renderer:
         info_popup: Optional['InfoPopup'] = None,
         input_bar: Optional['InputBar'] = None,
         overlay=None,
+        tab_bar: Optional['TabBar'] = None,
     ):
         self.stdscr.erase()
 
@@ -3713,6 +3824,8 @@ class Renderer:
             self.stdscr.refresh()
             return
 
+        if tab_bar is not None:
+            tab_bar.draw(self.stdscr, self.colors, self._width)
         self.view.draw()
         if search and search.active:
             self._draw_search_bar(search)
@@ -3830,10 +3943,286 @@ class Renderer:
 
 # ─── Editor ───────────────────────────────────────────────────────────────────
 class Editor:
+    """One open document: its text, its view of it, and the API the rest of the
+    application works on it through.
+
+    Everything on screen around the document — popups, bars, menus, the key
+    dispatch and the main loop — belongs to the :class:`EditorShell` that hosts
+    it, and one shell can hold several documents as tabs.  The API methods below
+    that need the screen simply forward to that shell, so code holding a
+    document (a plugin, a DB tab) never has to know which of the two owns what.
+    """
+
+    def __init__(self, shell: 'EditorShell', filepath: Optional[str] = None,
+                 directory: Optional[str] = None, readonly: bool = False,
+                 fold: bool = False):
+        self.shell = shell
+        self.stdscr = shell.stdscr
+        self.lexer = Lexer()
+        # The document itself is an ordinary TextArea — the same widget dialogs
+        # use for their text fields, so both obey the very same editing keys.
+        self.textarea = TextArea(shell.stdscr, shell.colors, self.lexer,
+                                 clipboard=shell.clipboard, readonly=readonly)
+        self.buf = self.textarea.buf
+        self.view = self.textarea.view
+        self.search = SearchBar(shell.clipboard)
+        #: Name shown on the left of the status bar (the connection, for a DB tab).
+        self.status_name: Optional[str] = None
+        self._ac_words: List[PopupItem] = []
+        self._file_change_dismissed: bool = False
+        self._file_check_counter: int = 0
+        # >>> ... <<< block folding (Ctrl+P); _fold_key caches the buffer
+        # version the hidden-row set was computed for.
+        self.fold_enabled = fold
+        self._fold_key = None
+        self._init_ac_words([], [], [])
+
+        self._directory: Optional[str] = directory
+
+        if filepath:
+            self.buf.load(filepath)
+            # If no explicit directory was given, default to the file's parent directory
+            if not self._directory:
+                self._directory = os.path.dirname(os.path.abspath(filepath))
+
+    # ── Identity ──────────────────────────────────────────────────────────────
+
+    @property
+    def colors(self) -> 'ColorManager':
+        return self.shell.colors
+
+    @property
+    def clipboard(self) -> 'Clipboard':
+        return self.shell.clipboard
+
+    def tab_title(self) -> str:
+        """Label for this document in the tab bar."""
+        if self.status_name:
+            return self.status_name
+        return os.path.basename(self.buf.filepath) if self.buf.filepath else '[No Name]'
+
+    # ── Word sets ─────────────────────────────────────────────────────────────
+
+    def _init_ac_words(
+        self,
+        keywords: Optional[List[str]] = None,
+        types: Optional[List[str]] = None,
+        functions: Optional[List[str]] = None
+    ) -> None:
+        entries, seen = [], set()
+        for words, kind in ((keywords, 'keyword'), (types, 'type'), (functions, 'function')):
+            for w in words or ():
+                wu = w.upper()
+                if wu not in seen:
+                    entries.append(PopupItem(insert=wu, label=f'{wu}  ({kind})', weight=0))
+                    seen.add(wu)
+        self._ac_words = entries
+
+    def set_words(self, keywords=None, types=None, functions=None) -> None:
+        """Update syntax highlighting and autocomplete word sets.
+        Each argument, if given, replaces the corresponding set entirely."""
+        self.lexer.set_words(keywords=keywords, types=types, functions=functions)
+        self._init_ac_words(self.lexer._keywords, self.lexer._types, self.lexer._functions)
+
+    # ── The document, as plugins see it ──────────────────────────────────────
+
+    def statement_rows(self) -> List[int]:
+        """Row indices of the statement under the cursor.  A plain text editor
+        has no statements — the current line is as close as it gets; a DB tab
+        overrides this with the SQL-aware version."""
+        return [self.buf.cursor_row]
+
+    def get_statement(self) -> str:
+        """The text the user is working on: the selection if there is one,
+        otherwise the statement under the cursor."""
+        if self.buf.has_selection():
+            return self.buf.get_selected_text()
+        rows = self.statement_rows()
+        return '\n'.join(self.buf.lines[row] for row in rows) if rows else ''
+
+    def replace_statement(self, text: str) -> bool:
+        """Replace that same text with *text* as one undoable edit.
+        False when the document is read-only."""
+        if self.buf.readonly:
+            return False
+        if not self.buf.has_selection():
+            rows = self.statement_rows()
+            if rows:
+                self.buf.move_cursor(rows[0], 0)
+                self.buf.move_cursor(rows[-1], len(self.buf.lines[rows[-1]]),
+                                     extend_selection=True)
+        return self.insert_text(text)
+
+    def insert_text(self, text: str) -> bool:
+        """Insert *text* at the cursor, replacing the selection if there is one.
+        False when the document is read-only."""
+        if self.buf.readonly:
+            return False
+        self.buf.insert_text(text)
+        self.lexer.invalidate(0)
+        self.request_redraw()
+        return True
+
+    # ── View ──────────────────────────────────────────────────────────────────
+
+    def set_cursor_line(self, start: int, end: int) -> None:
+        """Highlight lines relative to the cursor row.
+        Lines where offset is in range(start, end) are highlighted.
+        (0, 0)  — disabled
+        (0, 1)  — current line only
+        (-1, 2) — line above, current line, line below"""
+        self.view.cursor_line_range = (start, end)
+
+    def on_before_draw(self) -> None:
+        """Called before every redraw, after each keypress.
+        Override in a subclass to add custom behaviour."""
+
+    def toggle_fold(self) -> bool:
+        """Turn ``>>>`` … ``<<<`` block folding on or off; returns the new state."""
+        self.fold_enabled = not self.fold_enabled
+        self._fold_key = None
+        self.update_folds()
+        return self.fold_enabled
+
+    def update_folds(self):
+        """Recompute the hidden rows of ``>>>`` ... ``<<<`` fold blocks (a folded
+        block shows only its ``>>>`` line) and keep the cursor off hidden rows —
+        any jump into a fold (page move, click, search, undo) snaps to the
+        block's ``>>>`` line. Runs every tick before drawing."""
+        buf = self.buf
+        if not self.fold_enabled:
+            if buf.hidden_rows:
+                buf.hidden_rows = set()
+            return
+        if self._fold_key != buf.version:
+            self._fold_key = buf.version
+            hidden = set()
+            for start, end in find_fold_blocks(buf.lines):
+                hidden.update(range(start + 1, end + 1))
+            buf.hidden_rows = hidden
+        if buf.cursor_row in buf.hidden_rows:
+            old = (buf.cursor_row, buf.cursor_col)
+            buf.cursor_row = buf.prev_visible_row(buf.cursor_row)
+            buf.cursor_col = min(buf.cursor_col, len(buf.lines[buf.cursor_row]))
+            if buf.sel_end == old:  # keep an in-progress selection consistent
+                buf.sel_end = (buf.cursor_row, buf.cursor_col)
+
+    # ── Forwarded to the shell ────────────────────────────────────────────────
+    # The screen belongs to the shell; these are here so that code holding a
+    # document keeps reading the way it did when Editor owned everything.
+
+    @property
+    def popup(self) -> 'SelectPopup':
+        return self.shell.popup
+
+    @property
+    def info_popup(self) -> 'InfoPopup':
+        return self.shell.info_popup
+
+    @property
+    def input_bar(self) -> 'InputBar':
+        return self.shell.input_bar
+
+    @property
+    def running_popup(self) -> 'RunningPopup':
+        return self.shell.running_popup
+
+    @property
+    def extra_help_pages(self) -> dict:
+        return self.shell.extra_help_pages
+
+    def request_redraw(self) -> None:
+        self.shell.request_redraw()
+
+    def set_status_name(self, name: str) -> None:
+        """Set a custom name shown on the left side of the status bar."""
+        self.status_name = name
+        self.shell.request_redraw()
+
+    def set_status_notification(self, text: str, error: bool = False, popup: bool = True) -> None:
+        self.shell.set_status_notification(text, error=error, popup=popup)
+
+    def show_menu(self, title: str, items, on_select=None, multi: bool = False,
+                  default=None) -> None:
+        self.shell.show_menu(title, items, on_select=on_select, multi=multi, default=default)
+
+    def show_autocomplete(self, items: 'List[PopupItem]') -> None:
+        self.shell.show_autocomplete(items)
+
+    def open_running_popup(self, task, start: float, on_done, on_cancel=None) -> None:
+        self.shell.open_running_popup(task, start, on_done, on_cancel=on_cancel, owner=self)
+
+    def push_overlay(self, overlay) -> None:
+        self.shell.push_overlay(overlay)
+
+    def pop_overlay(self, overlay=None) -> None:
+        self.shell.pop_overlay(overlay)
+
+    def add_editor_function(self, name: str, func: Callable[[], None], description: str = '',
+                            keybinding: str = '') -> None:
+        self.shell.add_editor_function(name, func, description, keybinding)
+
+    def add_keybinding(self, name: str, key: Union[int, List[int]]) -> None:
+        self.shell.add_keybinding(name, key)
+
+    def request_user_input(self, request: dict) -> Any:
+        return self.shell.request_user_input(request)
+
+    def reset_pipeline_info(self) -> None:
+        self.shell.reset_pipeline_info()
+
+    def show_pipeline_info(self, text: str) -> None:
+        self.shell.show_pipeline_info(text)
+
+    def pipeline_stop_requested(self) -> bool:
+        return self.shell.pipeline_stop_requested()
+
+    def run_sheet_prompt(self, kind: str, title: str, rows: list,
+                         extra: Optional[dict] = None) -> Optional[list]:
+        """Show *rows* in an external viewer and block until the user answers.
+
+        *kind* is one of :data:`SHEET_PROMPT_KINDS`: ``'sselect'`` (pick the
+        cursor row, or any number of marked ones), ``'schoose'`` (pick the row
+        under the cursor), ``'view'`` (just show the rows) or ``'watch'`` (show
+        them, keep them up to date, and pick from them like ``'sselect'``).  It
+        returns the picked rows ([] when nothing is marked), or None when the
+        user quit the viewer — which is the only possible outcome of
+        ``'view'``, and the caller ignores it there.
+
+        *extra* carries whatever else the viewer for this kind needs (for
+        ``'watch'``: the callable that produces fresh rows and the interval).
+
+        A plain document has no viewer — a DB tab overrides this with VisiData."""
+        return None
+
+
+@dataclass
+class QueryRun:
+    """The one query or pipeline currently running.
+
+    *owner* is the document it was started from.  Only one runs at a time
+    today — the running overlay swallows every key but Esc, so the user cannot
+    even reach another tab — but the shell still services a run only while its
+    owner is the visible document, which is what a queue of them would need.
+    """
+    owner: 'Editor'
+    task: Any
+    start: float
+    on_done: Callable
+    on_cancel: Optional[Callable] = None
+
+
+class EditorShell:
+    """The screen: everything drawn around a document, and the loop that drives it.
+
+    It owns the terminal, the shared widgets (popups, bars, prompts), the
+    command and keybinding registries, and the list of open documents — the
+    tabs.  Commands are registered once and always act on :attr:`doc`, the
+    document currently on screen."""
+
     REMAPED_KEYS = {}
 
-    def __init__(self, stdscr: curses.window, filepath: Optional[str] = None, directory: Optional[str] = None,
-                 readonly: bool = False):
+    def __init__(self, stdscr: curses.window):
         self.stdscr = stdscr
         stdscr.keypad(True)
         stdscr.timeout(50)
@@ -3843,15 +4232,7 @@ class Editor:
         self._apply_termios()
 
         self.colors = ColorManager()
-        self.lexer = Lexer()
         self.clipboard = Clipboard()
-        # The document itself is an ordinary TextArea — the same widget dialogs
-        # use for their text fields, so both obey the very same editing keys.
-        self.textarea = TextArea(stdscr, self.colors, self.lexer,
-                                 clipboard=self.clipboard, readonly=readonly)
-        self.buf = self.textarea.buf
-        self.view = self.textarea.view
-        self.search = SearchBar(self.clipboard)
         self.popup = SelectPopup()
         self.running_popup = RunningPopup()
         self.info_popup = InfoPopup(self.clipboard)
@@ -3863,22 +4244,18 @@ class Editor:
         # Pending worker-thread prompt (pipeline choose()/select()/sselect()/
         # input()/ask()); see request_user_input().
         self._ui_request: Optional[dict] = None
-        self.renderer = Renderer(stdscr, self.colors, self.view)
+        self.renderer = Renderer(stdscr, self.colors)
+        self.tab_bar = TabBar()
+        #: Open documents, in tab order, and the index of the visible one.
+        self.documents: List[Editor] = []
+        self.active: int = 0
         self.running = True
         self._needs_redraw = True
         self._debug_mode = False
         self._prefix_pending = False
         self._status_notification: Optional[str] = None
         self._keybindings: dict = {}
-        self._ac_words: List[PopupItem] = []
-        self._running_done_cb = None
-        self._file_change_dismissed: bool = False
-        self._file_check_counter: int = 0
-        # >>> ... <<< block folding (Ctrl+P); _fold_key caches the buffer
-        # version the hidden-row set was computed for.
-        self.fold_enabled = False
-        self._fold_key = None
-        self._init_ac_words([], [], [])
+        self._current_run: Optional[QueryRun] = None
         self._editor_functions: dict = {}
         # Extra help pages contributed by plugins (title -> text); linked from
         # the help TOC by show_help().
@@ -3888,16 +4265,131 @@ class Editor:
         # Whether the key being dispatched came from typed text (see _dispatch).
         self._key_is_text: bool = False
 
-        self._directory: Optional[str] = directory
-
-        if filepath:
-            self.buf.load(filepath)
-            # If no explicit directory was given, default to the file's parent directory
-            if not self._directory:
-                self._directory = os.path.dirname(os.path.abspath(filepath))
-
         self._register_default_functions()
         self._register_default_keybindings()
+
+    # ── Documents (tabs) ──────────────────────────────────────────────────────
+
+    @property
+    def doc(self) -> Editor:
+        """The document on screen — what every command acts on."""
+        return self.documents[self.active]
+
+    def add_document(self, document: Editor) -> Editor:
+        """Open *document* as the last tab (and show it if it is the first)."""
+        document.shell = self
+        self.documents.append(document)
+        if len(self.documents) == 1:
+            self.renderer.set_view(document.view)
+        self._sync_tab_bar()
+        return document
+
+    def switch_to(self, index: int) -> None:
+        """Show the tab at *index* (wrapping around)."""
+        if not self.documents:
+            return
+        index %= len(self.documents)
+        if index == self.active and self.renderer.view is self.doc.view:
+            return
+        self.active = index
+        self.renderer.set_view(self.doc.view)
+        # The file may well have changed while this tab was in the background.
+        self.doc._file_change_dismissed = False
+        self._sync_tab_bar()
+        self.request_redraw()
+
+    def close_document(self, index: Optional[int] = None) -> bool:
+        """Close a tab, offering to save it first.  Closing the last one quits.
+
+        Returns False when the user cancelled at the save prompt."""
+        if not self.documents:
+            return False
+        index = self.active if index is None else index % len(self.documents)
+        self.switch_to(index)
+        if self.doc.buf.dirty:
+            self._draw_frame()  # show the tab being closed behind the prompt
+            if self._prompt_save_before_close() == 'cancel':
+                return False
+        if len(self.documents) == 1:
+            self.running = False
+            return True
+        self.documents.pop(index)
+        self.active = min(index, len(self.documents) - 1)
+        self.renderer.set_view(self.doc.view)
+        self._sync_tab_bar()
+        self.request_redraw()
+        return True
+
+    def _cmd_next_tab(self):
+        self.switch_to(self.active + 1)
+
+    def _cmd_prev_tab(self):
+        self.switch_to(self.active - 1)
+
+    def _cmd_switch_tab(self):
+        if len(self.documents) < 2:
+            self.set_status_notification('Only one tab is open')
+            return
+        items = [
+            PopupItem(insert=str(i), label=d.tab_title(),
+                      weight=i, hint=d.buf.filepath or '')
+            for i, d in enumerate(self.documents)
+        ]
+        self.show_menu('Switch to tab', items,
+                       on_select=lambda choice: self.switch_to(int(choice)),
+                       default=self.doc.tab_title())
+
+    def _cmd_close_tab(self):
+        self.close_document()
+
+    def _sync_tab_bar(self) -> None:
+        """Show the bar (and give up a screen row for it) only with tabs to show."""
+        self.tab_bar.set_tabs(
+            [(d.tab_title(), d.buf.dirty) for d in self.documents], self.active)
+        top = TabBar.HEIGHT if len(self.documents) > 1 else 0
+        if top != self.renderer.top_offset:
+            self.renderer.top_offset = top
+            self.renderer.resize()
+
+    def _tab_bar_to_draw(self) -> Optional[TabBar]:
+        if len(self.documents) < 2:
+            return None
+        self._sync_tab_bar()
+        return self.tab_bar
+
+    # ── The active document, reached the way it always was ────────────────────
+
+    @property
+    def buf(self) -> 'TextBuffer':
+        return self.doc.buf
+
+    @property
+    def textarea(self) -> 'TextArea':
+        return self.doc.textarea
+
+    @property
+    def view(self) -> 'TextView':
+        return self.doc.view
+
+    @property
+    def lexer(self) -> 'Lexer':
+        return self.doc.lexer
+
+    @property
+    def search(self) -> 'SearchBar':
+        return self.doc.search
+
+    @property
+    def fold_enabled(self) -> bool:
+        return self.doc.fold_enabled
+
+    @fold_enabled.setter
+    def fold_enabled(self, value: bool) -> None:
+        self.doc.fold_enabled = value
+
+    @property
+    def _directory(self) -> Optional[str]:
+        return self.doc._directory
 
     @staticmethod
     def _apply_termios():
@@ -3913,33 +4405,6 @@ class Editor:
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
         except Exception:
             pass
-
-    def _init_ac_words(
-        self,
-        keywords: Optional[List[str]] = None,
-        types: Optional[List[str]] = None,
-        functions: Optional[List[str]] = None
-    ) -> None:
-        entries, seen = [], set()
-        if keywords:
-            for w in keywords:
-                wu = w.upper()
-                if wu not in seen:
-                    entries.append(PopupItem(insert=wu, label=f'{wu}  (keyword)', weight=0))
-                    seen.add(wu)
-        if types:
-            for w in types:
-                wu = w.upper()
-                if wu not in seen:
-                    entries.append(PopupItem(insert=wu, label=f'{wu}  (type)', weight=0))
-                    seen.add(wu)
-        if functions:
-            for w in functions:
-                wu = w.upper()
-                if wu not in seen:
-                    entries.append(PopupItem(insert=wu, label=f'{wu}  (function)', weight=0))
-                    seen.add(wu)
-        self._ac_words = entries
 
     # ── Public interface ───────────────────────────────────────────────────────
 
@@ -4011,18 +4476,6 @@ class Editor:
         or None. Subclasses override to add overlays of their own."""
         return self.active_overlay()
 
-    def on_before_draw(self) -> None:
-        """Called before every redraw, after each keypress.
-        Override in a subclass to add custom behaviour."""
-
-    def set_cursor_line(self, start: int, end: int) -> None:
-        """Highlight lines relative to the cursor row.
-        Lines where offset is in range(start, end) are highlighted.
-        (0, 0)  — disabled
-        (0, 1)  — current line only
-        (-1, 2) — line above, current line, line below"""
-        self.renderer.cursor_line_range = (start, end)
-
     def request_redraw(self) -> None:
         """Ask the main loop to redraw on its next tick. UI state changed from
         outside the key-dispatch path (e.g. worker-thread callbacks) must call
@@ -4030,9 +4483,8 @@ class Editor:
         self._needs_redraw = True
 
     def set_status_name(self, name: str) -> None:
-        """Set a custom name shown on the left side of the status bar."""
-        self.renderer.status_name = name
-        self.request_redraw()
+        """Set the name shown on the left of the status bar for the active tab."""
+        self.doc.set_status_name(name)
 
     @staticmethod
     def _fit_status_text(text: str, width: int) -> str:
@@ -4060,16 +4512,19 @@ class Editor:
         self.request_redraw()
 
     def set_words(self, keywords=None, types=None, functions=None) -> None:
-        """Update syntax highlighting and autocomplete word sets.
-        Each argument, if given, replaces the corresponding set entirely."""
-        self.lexer.set_words(keywords=keywords, types=types, functions=functions)
-        self._init_ac_words(self.lexer._keywords, self.lexer._types, self.lexer._functions)
+        """Update the active tab's syntax highlighting and autocomplete words."""
+        self.doc.set_words(keywords=keywords, types=types, functions=functions)
 
-    def open_running_popup(self, task, start: float, on_done, on_cancel=None) -> None:
+    def open_running_popup(self, task, start: float, on_done, on_cancel=None,
+                           owner: Optional[Editor] = None) -> None:
         """Start the running overlay for *task*. *on_done()* is called when the
         task finishes or is cancelled, from within the main editor loop;
-        *on_cancel()* on Esc, from the key handler (see RunningPopup.open)."""
-        self._running_done_cb = on_done
+        *on_cancel()* on Esc, from the key handler (see RunningPopup.open).
+
+        *owner* is the document the run belongs to (the active one by default);
+        the loop only delivers *on_done* while that document is on screen."""
+        self._current_run = QueryRun(owner=owner or self.doc, task=task, start=start,
+                                     on_done=on_done, on_cancel=on_cancel)
         self.running_popup.open(task, start, on_cancel)
 
     # ── Live pipeline info popup (driven from the pipeline `info()` helper) ──────
@@ -4163,28 +4618,11 @@ class Editor:
             # Row prompts shown in an external viewer (VisiData in DbEditor).
             # Synchronous like 'ask': the viewer owns the terminal on the main
             # loop while the worker thread waits for the answer.
-            self._resolve_ui_request(self.run_sheet_prompt(
+            # The viewer belongs to the document (VisiData, for a DB tab).
+            self._resolve_ui_request(self.doc.run_sheet_prompt(
                 kind, req['title'], req.get('rows') or [], req.get('extra')))
         else:
             self._resolve_ui_request(None)
-
-    def run_sheet_prompt(self, kind: str, title: str, rows: list,
-                         extra: Optional[dict] = None) -> Optional[list]:
-        """Show *rows* in an external viewer and block until the user answers.
-
-        *kind* is one of :data:`SHEET_PROMPT_KINDS`: ``'sselect'`` (pick the
-        cursor row, or any number of marked ones), ``'schoose'`` (pick the row
-        under the cursor), ``'view'`` (just show the rows) or ``'watch'`` (show
-        them, keep them up to date, and pick from them like ``'sselect'``).  It
-        returns the picked rows ([] when nothing is marked), or None when the
-        user quit the viewer — which is the only possible outcome of
-        ``'view'``, and the caller ignores it there.
-
-        *extra* carries whatever else the viewer for this kind needs (for
-        ``'watch'``: the callable that produces fresh rows and the interval).
-
-        The base editor has no viewer — DbEditor overrides this with VisiData."""
-        return None
 
     def _running_popup_to_draw(self) -> Optional['RunningPopup']:
         """The running overlay to draw this frame.  Hidden while a worker-thread
@@ -4264,44 +4702,19 @@ class Editor:
                         default=default)
         self.request_redraw()
 
-    # ── The document, as plugins see it ──────────────────────────────────────
+    # ── The active document, as plugins see it ───────────────────────────────
 
     def statement_rows(self) -> List[int]:
-        """Row indices of the statement under the cursor.  A plain text editor
-        has no statements — the current line is as close as it gets; DbEditor
-        overrides this with the SQL-aware version."""
-        return [self.buf.cursor_row]
+        return self.doc.statement_rows()
 
     def get_statement(self) -> str:
-        """The text the user is working on: the selection if there is one,
-        otherwise the statement under the cursor."""
-        if self.buf.has_selection():
-            return self.buf.get_selected_text()
-        rows = self.statement_rows()
-        return '\n'.join(self.buf.lines[row] for row in rows) if rows else ''
+        return self.doc.get_statement()
 
     def replace_statement(self, text: str) -> bool:
-        """Replace that same text with *text* as one undoable edit.
-        False when the document is read-only."""
-        if self.buf.readonly:
-            return False
-        if not self.buf.has_selection():
-            rows = self.statement_rows()
-            if rows:
-                self.buf.move_cursor(rows[0], 0)
-                self.buf.move_cursor(rows[-1], len(self.buf.lines[rows[-1]]),
-                                     extend_selection=True)
-        return self.insert_text(text)
+        return self.doc.replace_statement(text)
 
     def insert_text(self, text: str) -> bool:
-        """Insert *text* at the cursor, replacing the selection if there is one.
-        False when the document is read-only."""
-        if self.buf.readonly:
-            return False
-        self.buf.insert_text(text)
-        self.lexer.invalidate(0)
-        self.request_redraw()
-        return True
+        return self.doc.insert_text(text)
 
     def add_editor_function(self, name: str, func: Callable[[], None], description: str = '', keybinding: str = '') -> None:
         self._editor_functions[name] = {'func': func, 'description': description, 'keybinding': keybinding}
@@ -4317,11 +4730,17 @@ class Editor:
             return
         self._keybindings[key] = name
 
+    def _run_on_textarea(self, method: str) -> None:
+        """Run one of :data:`TEXT_EDIT_BINDINGS` on the active tab's text area."""
+        getattr(self.doc.textarea, method)()
+
     def _register_default_functions(self):
         add = self.add_editor_function
-        # Editing and movement — shared verbatim with every TextArea.
+        # Editing and movement — shared verbatim with every TextArea.  Resolved
+        # on each keypress rather than bound once: the command has to act on the
+        # tab that is on screen now, not on the one that was when it registered.
         for fn, _keys, description, keybinding in TEXT_EDIT_BINDINGS:
-            add(fn, getattr(self.textarea, fn.value), description, keybinding)
+            add(fn, functools.partial(self._run_on_textarea, fn.value), description, keybinding)
         # Commands that belong to a whole editor rather than a text field.
         add(Fn.OPEN_FILE,       self._open_from_directory,      'Open file',              '^G')
         add(Fn.SAVE,            self._save_file,                'Save',                   '^S')
@@ -4334,6 +4753,10 @@ class Editor:
         add(Fn.RESIZE,          self._cmd_resize,               'Handle terminal resize')
         add(Fn.COMMAND_PALETTE, self._cmd_command_palette,      'Command palette',        'Alt+P')
         add(Fn.TOGGLE_FOLD,     self._cmd_toggle_fold,          'Toggle >>> <<< block folding', '^P')
+        add(Fn.NEXT_TAB,        self._cmd_next_tab,             'Next tab',    'Ctrl+Shift+Right / ^X Right')
+        add(Fn.PREV_TAB,        self._cmd_prev_tab,             'Previous tab', 'Ctrl+Shift+Left / ^X Left')
+        add(Fn.SWITCH_TAB,      self._cmd_switch_tab,           'Switch to tab…', '^X Down')
+        add(Fn.CLOSE_TAB,       self._cmd_close_tab,            'Close tab')
 
     def _register_default_keybindings(self):
         add = self.add_keybinding
@@ -4349,6 +4772,12 @@ class Editor:
         add(Fn.RESIZE,          K(curses.KEY_RESIZE))
         add(Fn.COMMAND_PALETTE, key_alt(ord('p')))   # Alt+P
         add(Fn.TOGGLE_FOLD,     K(ord('\x10')))      # Ctrl+P
+        # Ctrl+Shift+arrow as the raw CSI sequence: the terminfo codes for it
+        # (kLFT6/kRIT6) already belong to select-word-left/right, so only the
+        # escape-sequence form is free.  Ctrl+X arrow always works.
+        add(Fn.NEXT_TAB,        [key_csi('[', '1', ';', '6', 'C'), key_pfx(curses.KEY_RIGHT)])
+        add(Fn.PREV_TAB,        [key_csi('[', '1', ';', '6', 'D'), key_pfx(curses.KEY_LEFT)])
+        add(Fn.SWITCH_TAB,      key_pfx(curses.KEY_DOWN))        # Ctrl+X Down
 
     def run(self):
         while self.running:
@@ -4394,19 +4823,21 @@ class Editor:
             # Deferred while a full-screen overlay (lock screen) is up: the
             # done-callback may open the result viewer (VisiData), drawing
             # query results over the lock.  Fires on the first tick after
-            # unlock instead.
-            if (self.running_popup.active and self.running_popup.is_done()
-                    and self._get_overlay() is None):
-                cb = self._running_done_cb
-                self._running_done_cb = None
+            # unlock instead.  Deferred just the same while the run's own tab is
+            # not the one on screen — today it always is.
+            run = self._current_run
+            if (run is not None and self.running_popup.active
+                    and self.running_popup.is_done()
+                    and run.owner is self.doc and self._get_overlay() is None):
+                self._current_run = None
                 self.running_popup.close()
-                if cb:
-                    cb()
+                if run.on_done:
+                    run.on_done()
                 self._needs_redraw = True
 
-            self._file_check_counter += 1
-            if self._file_check_counter >= 20:  # ~1 s at 50 ms timeout
-                self._file_check_counter = 0
+            self.doc._file_check_counter += 1
+            if self.doc._file_check_counter >= 20:  # ~1 s at 50 ms timeout
+                self.doc._file_check_counter = 0
                 self._check_external_file_change()
                 self._needs_redraw = True
 
@@ -4423,21 +4854,27 @@ class Editor:
             if not self._needs_redraw:
                 continue
             self._needs_redraw = False
+            self._draw_frame()
 
-            self._update_folds()
-            self.renderer.ensure_cursor_visible()
-            self.renderer.search_matches = self.search.matches
-            self.renderer.search_current = self.search.current_idx
-            self.on_before_draw()
-            self.renderer.input_pending = self._ui_request is not None
-            self.renderer.draw(
-                popup=self._popup_to_draw(),
-                search=self.search if self.search.active else None,
-                running_popup=self._running_popup_to_draw(),
-                info_popup=self.info_popup if self.info_popup.active else None,
-                input_bar=self.input_bar if self.input_bar.active else None,
-                overlay=self._get_overlay(),
-            )
+    def _draw_frame(self) -> None:
+        """Compose and paint one frame of the active tab."""
+        doc = self.doc
+        doc.update_folds()
+        self.renderer.ensure_cursor_visible()
+        self.renderer.search_matches = doc.search.matches
+        self.renderer.search_current = doc.search.current_idx
+        self.renderer.status_name = doc.status_name
+        doc.on_before_draw()
+        self.renderer.input_pending = self._ui_request is not None
+        self.renderer.draw(
+            popup=self._popup_to_draw(),
+            search=doc.search if doc.search.active else None,
+            running_popup=self._running_popup_to_draw(),
+            info_popup=self.info_popup if self.info_popup.active else None,
+            input_bar=self.input_bar if self.input_bar.active else None,
+            overlay=self._get_overlay(),
+            tab_bar=self._tab_bar_to_draw(),
+        )
 
     @staticmethod
     def _normalize_key(key):
@@ -4624,14 +5061,19 @@ class Editor:
     # ── Mouse handling ────────────────────────────────────────────────────────
 
     def _handle_click(self, mx, my):
-        """Route a click: to the overlay on top if it wants one, else to the
-        document."""
+        """Route a click: to the overlay on top if it wants one, else to the tab
+        bar, else to the document."""
         overlay = self.active_overlay()
         if overlay is not None:
             handler = getattr(overlay, 'handle_click', None)
             if handler is not None:
                 handler(mx, my)
             return
+        if self._tab_bar_to_draw() is not None:
+            index = self.tab_bar.hit(mx, my)
+            if index is not None:
+                self.switch_to(index)
+                return
         self._handle_mouse_click(mx, my)
 
     def _handle_mouse_click(self, mx, my):
@@ -4647,7 +5089,7 @@ class Editor:
         if self.popup.active:
             self.popup.close()
         else:
-            items = list(self._ac_words)
+            items = list(self.doc._ac_words)
             seen = {item.insert for item in items}
             for w in self.buf.document_words():
                 wu = w.upper()
@@ -4676,34 +5118,8 @@ class Editor:
         self.popup.open(items, filter_text='', on_select=on_select, title='Commands')
 
     def _cmd_toggle_fold(self):
-        self.fold_enabled = not self.fold_enabled
-        self._fold_key = None
-        self._update_folds()
         self.set_status_notification(
-            f'Block folding: {"on" if self.fold_enabled else "off"}')
-
-    def _update_folds(self):
-        """Recompute the hidden rows of ``>>>`` ... ``<<<`` fold blocks (a folded
-        block shows only its ``>>>`` line) and keep the cursor off hidden rows —
-        any jump into a fold (page move, click, search, undo) snaps to the
-        block's ``>>>`` line. Runs every tick before drawing."""
-        buf = self.buf
-        if not self.fold_enabled:
-            if buf.hidden_rows:
-                buf.hidden_rows = set()
-            return
-        if self._fold_key != buf.version:
-            self._fold_key = buf.version
-            hidden = set()
-            for start, end in find_fold_blocks(buf.lines):
-                hidden.update(range(start + 1, end + 1))
-            buf.hidden_rows = hidden
-        if buf.cursor_row in buf.hidden_rows:
-            old = (buf.cursor_row, buf.cursor_col)
-            buf.cursor_row = buf.prev_visible_row(buf.cursor_row)
-            buf.cursor_col = min(buf.cursor_col, len(buf.lines[buf.cursor_row]))
-            if buf.sel_end == old:  # keep an in-progress selection consistent
-                buf.sel_end = (buf.cursor_row, buf.cursor_col)
+            f'Block folding: {"on" if self.doc.toggle_fold() else "off"}')
 
     def _cmd_resize(self):
         self.renderer.resize()
@@ -4711,7 +5127,7 @@ class Editor:
     # ── Printable character ───────────────────────────────────────────────────
 
     def _handle_printable(self, key):
-        self.textarea.insert_printable(key, self.last_key_was_text)
+        self.doc.textarea.insert_printable(key, self.last_key_was_text)
 
     # ── Key dispatch ──────────────────────────────────────────────────────────
 
@@ -4733,13 +5149,13 @@ class Editor:
                 if not self._confirm('File changed on disk. Overwrite? (y/n): '):
                     return
             self.buf.save()
-            self._file_change_dismissed = False
+            self.doc._file_change_dismissed = False
             self.set_status_notification(f'Saved {self.buf.filepath}')
         else:
             path = self._prompt('Save as: ')
             if path:
                 self.buf.save(path)
-                self._file_change_dismissed = False
+                self.doc._file_change_dismissed = False
                 self.set_status_notification(f'Saved {path}')
 
     def _save_file_as(self):
@@ -4749,7 +5165,7 @@ class Editor:
         path = self._prompt('Save as: ', default=self.buf.filepath or '')
         if path:
             self.buf.save(path)
-            self._file_change_dismissed = False
+            self.doc._file_change_dismissed = False
             self.set_status_notification(f'Saved {path}')
 
     def _toggle_readonly(self):
@@ -4827,12 +5243,18 @@ class Editor:
                     return
             self.buf.load(new_path)
             self.lexer.invalidate(0)
-            self._file_change_dismissed = False
+            self.doc._file_change_dismissed = False
 
         self.popup.open(items, filter_text='', on_select=on_select, title='Open File')
 
     def _quit(self):
-        if self.buf.dirty:
+        # Every tab gets its own say: the one with unsaved changes is brought to
+        # the front first, so the user can see what they are being asked about.
+        for index, document in enumerate(self.documents):
+            if not document.buf.dirty:
+                continue
+            self.switch_to(index)
+            self._draw_frame()
             answer = self._confirm_3way('Unsaved changes. Save? (y)es / (n)o / (c)ancel: ')
             if answer == 'cancel':
                 return
@@ -4846,7 +5268,7 @@ class Editor:
         # Deferred while a full-screen overlay (lock screen) is up: the prompt
         # reads keys directly, bypassing _dispatch_pre_hook, so it must never
         # appear over the lock.
-        if (self._file_change_dismissed
+        if (self.doc._file_change_dismissed
                 or not self.buf.filepath
                 or self.running_popup.active
                 or self.popup.active
@@ -4892,14 +5314,14 @@ class Editor:
             if key in (ord('r'), ord('R'), 'r', 'R'):
                 self.buf.load(self.buf.filepath)
                 self.lexer.invalidate(0)
-                self._file_change_dismissed = False
+                self.doc._file_change_dismissed = False
                 return
             if key in (ord('w'), ord('W'), 'w', 'W') and not self.buf.readonly:
                 self.buf.save()
-                self._file_change_dismissed = False
+                self.doc._file_change_dismissed = False
                 return
             if key == 27:
-                self._file_change_dismissed = True
+                self.doc._file_change_dismissed = True
                 return
 
     def _confirm_3way(self, message: str) -> str:
@@ -4953,10 +5375,16 @@ class Editor:
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
+def _run_standalone(stdscr, filepath: Optional[str]) -> None:
+    shell = EditorShell(stdscr)
+    shell.add_document(Editor(shell, filepath))
+    shell.run()
+
+
 def main():
     locale.setlocale(locale.LC_ALL, '')
     filepath = sys.argv[1] if len(sys.argv) > 1 else None
-    curses.wrapper(lambda stdscr: Editor(stdscr, filepath).run())
+    curses.wrapper(lambda stdscr: _run_standalone(stdscr, filepath))
 
 
 if __name__ == '__main__':

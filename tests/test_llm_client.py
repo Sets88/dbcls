@@ -6,7 +6,7 @@ responses and records what was sent.
 """
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -373,6 +373,18 @@ class TestTruncation:
         assert 'object' in truncate_result({'v': object()})
 
 
+def fake_api(client=None, autocomplete=None, tabs=None):
+    """The slice of PluginAPI the DB tools use: one tab per client."""
+    api = MagicMock()
+    api.client = client
+    api.autocomplete = autocomplete
+    api.tabs = tabs if tabs is not None else [
+        {'name': 'default', 'engine': 'Mysql', 'database': 'shop', 'current': True}]
+    api.tab_client.side_effect = lambda name=None: client
+    api.tab_autocomplete.side_effect = lambda name=None: autocomplete
+    return api
+
+
 class TestDbTools:
     def _client(self):
         client = MagicMock()
@@ -388,8 +400,40 @@ class TestDbTools:
             return ['users']
 
         autocomplete.get_cached_tables = cached
-        tools = DbTools(self._client(), autocomplete)
-        assert asyncio.run(tools.list_tables()) == {'database': 'shop', 'tables': ['users']}
+        tools = DbTools(fake_api(self._client(), autocomplete))
+        assert asyncio.run(tools.list_tables()) == {
+            'tab': 'default', 'database': 'shop', 'tables': ['users']}
+
+    def test_a_tool_runs_against_the_tab_it_is_given(self):
+        other = self._client()
+        other.dbname = 'analytics'
+
+        async def tables(database=None):
+            return ['events']
+
+        autocomplete = MagicMock()
+        autocomplete.get_cached_tables = tables
+        api = fake_api(self._client(), autocomplete, tabs=[
+            {'name': 'mysql01', 'engine': 'Mysql', 'database': 'shop', 'current': True},
+            {'name': 'ch01', 'engine': 'Clickhouse', 'database': 'analytics', 'current': False},
+        ])
+        api.tab_client.side_effect = lambda name=None: other if name == 'ch01' else api.client
+        result = asyncio.run(DbTools(api).list_tables(tab='ch01'))
+        assert result == {'tab': 'ch01', 'database': 'analytics', 'tables': ['events']}
+
+    def test_without_a_tab_the_result_names_the_current_one(self):
+        api = fake_api(self._client(), tabs=[
+            {'name': 'mysql01', 'engine': 'Mysql', 'database': 'shop', 'current': False},
+            {'name': 'ch01', 'engine': 'Clickhouse', 'database': 'a', 'current': True},
+        ])
+        api.client.get_tables = AsyncMock(return_value=MagicMock(data=[{'table': 'users'}]))
+        assert asyncio.run(DbTools(api).list_tables())['tab'] == 'ch01'
+
+    def test_an_unknown_tab_is_reported_by_the_api(self):
+        api = fake_api(self._client())
+        api.tab_client.side_effect = ValueError('Unknown tab (open tabs: default)')
+        with pytest.raises(ValueError, match='Unknown tab'):
+            asyncio.run(DbTools(api).list_tables(tab='nope'))
 
     def test_sample_data_builds_a_limited_query(self):
         client = self._client()
@@ -398,7 +442,7 @@ class TestDbTools:
             return MagicMock(data=[{'id': 1, 'name': 'a'}])
 
         client.execute = execute
-        result = asyncio.run(DbTools(client, None).sample_data('users', limit=5))
+        result = asyncio.run(DbTools(fake_api(client)).sample_data('users', limit=5))
         assert result['sql'] == 'SELECT * FROM `users` LIMIT 0,5'
         assert result['rows'] == [{'id': 1, 'name': 'a'}]
 
@@ -409,7 +453,7 @@ class TestDbTools:
             return MagicMock(data=[])
 
         client.execute = execute
-        asyncio.run(DbTools(client, None).sample_data('users', limit=10_000))
+        asyncio.run(DbTools(fake_api(client)).sample_data('users', limit=10_000))
         client.get_limit_sql.assert_called_with(20)
 
     def test_long_values_are_shortened(self):
@@ -419,13 +463,13 @@ class TestDbTools:
             return MagicMock(data=[{'blob': 'y' * 500, 'raw': b'1234'}])
 
         client.execute = execute
-        row = asyncio.run(DbTools(client, None).sample_data('users'))['rows'][0]
+        row = asyncio.run(DbTools(fake_api(client)).sample_data('users'))['rows'][0]
         assert len(row['blob']) == 201 and row['blob'].endswith('…')
         assert row['raw'] == '<4 bytes>'
 
     def test_every_tool_is_registered_with_a_schema(self):
         registry = ToolRegistry()
-        DbTools(self._client(), None).register(registry)
+        DbTools(fake_api(self._client())).register(registry)
         assert set(registry.names()) == {
             'list_databases', 'list_tables', 'get_table_schema', 'sample_data',
             'get_pipeline_reference'}
@@ -440,7 +484,7 @@ class TestPipelineReferenceTool:
 
     def _registry(self):
         registry = ToolRegistry()
-        DbTools(MagicMock(dbname='x'), None).register(registry)
+        DbTools(fake_api(MagicMock(dbname='x'))).register(registry)
         return registry
 
     def test_the_reference_is_not_truncated(self, endpoint):

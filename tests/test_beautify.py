@@ -1,6 +1,6 @@
 """Tests for SQL beautify (Ctrl+B).
 
-``beautify_sql`` is the sqlparse wrapper; ``DbEditor._db_beautify`` is the
+``beautify_sql`` is the sqlparse wrapper; ``DbEditorTab._db_beautify`` is the
 editor command that decides *what* gets reformatted (the selection, or the
 statement under the cursor) and writes it back as one undoable edit.
 """
@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dbcls.dbcls import DbEditor
+from dbcls.dbcls import DbEditorTab
 from dbcls.editor import TextBuffer
 from dbcls.utils import beautify_sql
 
@@ -60,8 +60,8 @@ class TestBeautifySql:
 
 
 def make_editor(text, row=0, col=0, readonly=False):
-    """Minimal DbEditor for _db_beautify: a real buffer, stubs for the rest."""
-    ed = object.__new__(DbEditor)
+    """Minimal DbEditorTab for _db_beautify: a real buffer, stubs for the rest."""
+    ed = object.__new__(DbEditorTab)
     ed.buf = TextBuffer()
     ed.buf.lines = text.split('\n')
     ed.buf.cursor_row = row
