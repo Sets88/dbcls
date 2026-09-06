@@ -30,7 +30,7 @@ def cli(**overrides):
     """An argparse namespace with the connection options at their defaults."""
     args = dict(host='', unix_socket=None, user=None, password='', port='',
                 engine=None, dbname=None, dbfilepath=None, compress=True,
-                config='')
+                config='', use_config=True)
     args.update(overrides)
     return argparse.Namespace(**args)
 
@@ -205,6 +205,27 @@ class TestResolveConfigPath:
         # The positional .sql file says nothing about which database to open.
         path = self._home(tmp_path, monkeypatch)
         assert resolve_config_path(cli(filepath='query.sql')) == path
+
+    def test_no_config_leaves_the_default_file_unread(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        assert resolve_config_path(cli(use_config=False)) == ''
+
+    def test_no_config_beats_a_config_path_from_the_environment(self, tmp_path, monkeypatch):
+        # --config and --no-config cannot be given together, but DBCLS_CONFIG
+        # arrives as args.config all the same: the refusal still wins.
+        self._home(tmp_path, monkeypatch)
+        assert resolve_config_path(cli(config='other.json', use_config=False)) == ''
+
+    def test_no_config_from_the_environment_is_a_string(self, tmp_path, monkeypatch):
+        # DBCLS_USE_CONFIG=0, folded into args by env_override.
+        self._home(tmp_path, monkeypatch)
+        assert resolve_config_path(cli(use_config='0')) == ''
+
+    def test_an_absent_use_config_is_the_old_behaviour(self, tmp_path, monkeypatch):
+        path = self._home(tmp_path, monkeypatch)
+        args = cli()
+        del args.use_config
+        assert resolve_config_path(args) == path
 
 
 class TestMakeClient:

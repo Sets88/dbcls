@@ -269,7 +269,9 @@ DEFAULT_CONFIG_PATH = '~/.dbcls.json'
 def resolve_config_path(args: argparse.Namespace) -> str:
     """The config file dbcls starts from, or ``''`` for none.
 
-    ``--config`` decides it when it is given.  Without it the conventional
+    ``--no-config`` settles it first: no file is read, not even one named by
+    ``DBCLS_CONFIG``, and dbcls starts from the command line alone.
+    ``--config`` decides it when it is given.  Without either the conventional
     ``~/.dbcls.json`` is read — but only when the command line describes no
     connection of its own (the DBCLS_* environment variables count as the
     command line: :func:`~dbcls.dbcls.env_override` has folded them into *args*
@@ -277,6 +279,8 @@ def resolve_config_path(args: argparse.Namespace) -> str:
     silently get every tab of a config file along with it — so a connection on
     the command line leaves the file unread entirely, options and plugin
     sections included."""
+    if not as_bool(getattr(args, 'use_config', True), True):
+        return ''
     if args.config:
         return args.config
     if _cli_connection_given(args):

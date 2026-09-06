@@ -1888,7 +1888,12 @@ def main():
 
     parser = argparse.ArgumentParser(description='DB connection tool')
     parser.add_argument('filepath', nargs='?', default=None, help='SQL file to edit')
-    parser.add_argument('--config', '-c', dest='config', help='specify config path', default='')
+    # A config file is either named or refused — asking for both is a mistake
+    # worth reporting rather than silently resolving one way.
+    config_arg = parser.add_mutually_exclusive_group()
+    config_arg.add_argument('--config', '-c', dest='config', help='specify config path', default='')
+    config_arg.add_argument('--no-config', dest='use_config', action='store_false', default=True,
+        help='read no config file at all, not even ~/.dbcls.json')
     parser.add_argument('--host', '-H', dest='host', help='specify host name', default='')
     parser.add_argument('--unix-socket', '-S', dest='unix_socket', help='specify unix socket', default=None)
     parser.add_argument('--user', '-u', dest='user', help='specify user name', required=False)

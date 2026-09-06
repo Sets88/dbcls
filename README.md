@@ -124,6 +124,7 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-P, --port` | Port number (optional) |
 | `-S, --unix-socket` | Path to Unix socket file (optional, overrides host/port) |
 | `-c, --config` | Path to configuration file. Without it `~/.dbcls.json` is read when the command line names no connection of its own — see [Using a Config File](#using-a-config-file) |
+| `--no-config` | Read no config file at all, not even `~/.dbcls.json`. Cannot be combined with `-c` |
 | `--no-compress` | Disable compression for ClickHouse connections (can also be switched at runtime via the `Toggle connection compression` command in the command palette) |
 | `--key-remap` | Remap key codes, e.g. `"36:1412,1412:36"` to swap Tab and Shift+Tab |
 | `--fold` | Start with `>>>` ... `<<<` block folding enabled (see [Fold Blocks](#fold-blocks)) |
@@ -175,8 +176,9 @@ line (`-H`, `-u`, `-E`, `-d`, `-f`, `-P`, `-S`, `-p`, or the matching `DBCLS_*`
 variable)? Then the file is not read at all — neither its connections nor its
 `fold`, lock or plugin settings: naming a host means that database and nothing
 else. A `.sql` file to edit is not a connection, so `dbcls query.sql` still gets
-the default config. To start from no config at all when one exists, point `-c`
-at an empty JSON object (`dbcls -c <(echo '{}')`). An unreadable or malformed
+the default config. `--no-config` starts from no config at all even when one
+exists: the file is left unread whatever the command line says, and `DBCLS_CONFIG`
+does not bring it back — the two are mutually exclusive with `-c`. An unreadable or malformed
 `~/.dbcls.json` is reported on stderr and skipped rather than stopping the
 start — a file named with `-c` still stops it.
 
