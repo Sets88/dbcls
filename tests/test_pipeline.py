@@ -24,6 +24,8 @@ from dbcls.pipeline import (
     PipelineCancelled,
 )
 from dbcls import pipeline as pipeline_module
+from dbcls.pipeline import executor as executor_module
+from dbcls.pipeline import parser as parser_module
 from dbcls.clients.base import Result
 
 
@@ -91,6 +93,67 @@ class TestSqlValues:
     def test_bad_chunk_size_raises(self):
         with pytest.raises(ValueError):
             sql_values([(1,)], 0)
+
+
+# ── the compile cache ─────────────────────────────────────────────────────────
+
+class TestCompileCache:
+    """User code is compiled once per distinct source, not once per row."""
+
+    @pytest.fixture(autouse=True)
+    def _empty_cache(self):
+        from dbcls.pipeline import templates as pipeline
+        pipeline._CODE_CACHE.clear()
+        pipeline._NOT_AN_EXPRESSION.clear()
+        yield
+        pipeline._CODE_CACHE.clear()
+        pipeline._NOT_AN_EXPRESSION.clear()
+
+    def test_the_same_source_is_compiled_once(self, monkeypatch):
+        from dbcls.pipeline import templates as pipeline
+
+        compiles = []
+        real = pipeline.compile if hasattr(pipeline, 'compile') else compile
+        monkeypatch.setitem(
+            pipeline.__builtins__ if isinstance(pipeline.__builtins__, dict)
+            else pipeline.__builtins__.__dict__,
+            'compile',
+            lambda *a, **k: (compiles.append(a[0]), real(*a, **k))[1])
+
+        for _ in range(5):
+            render_template('{{name}}', {'name': 'x'})
+
+        assert len(compiles) == 1
+
+    def test_statements_are_not_re_attempted_as_an_expression(self):
+        from dbcls.pipeline import templates as pipeline
+
+        pipeline.run_user_code('x = 1', {}, None)
+        key = ('x = 1', 'eval')
+        assert key in pipeline._NOT_AN_EXPRESSION
+        assert ('x = 1', 'exec') in pipeline._CODE_CACHE
+
+    def test_the_cache_is_bounded(self):
+        from dbcls.pipeline import templates as pipeline
+
+        for i in range(pipeline._CODE_CACHE_MAX + 50):
+            render_template('{{%d}}' % i, {})
+        assert len(pipeline._CODE_CACHE) <= pipeline._CODE_CACHE_MAX
+
+    def test_the_oldest_entry_is_the_one_dropped(self):
+        from dbcls.pipeline import templates as pipeline
+
+        render_template('{{1}}', {})
+        first = ('f"""{1}"""', 'eval')
+        assert first in pipeline._CODE_CACHE
+        for i in range(2, pipeline._CODE_CACHE_MAX + 3):
+            render_template('{{%d}}' % i, {})
+        assert first not in pipeline._CODE_CACHE
+
+    def test_a_cached_expression_still_sees_a_fresh_context(self):
+        """The code object is shared; the namespace it runs in is not."""
+        assert render_template('{{name}}', {'name': 'a'}) == 'a'
+        assert render_template('{{name}}', {'name': 'b'}) == 'b'
 
 
 # ── render_template ───────────────────────────────────────────────────────────
@@ -490,7 +553,7 @@ def _make_dbeditor(client, vars=None):
     dbeditor = MagicMock()
     dbeditor.client = client
     dbeditor.vars = vars if vars is not None else {}
-    dbeditor.pipeline_stop_requested.return_value = False
+    dbeditor.task_stop_requested.return_value = False
     return dbeditor
 
 
@@ -602,7 +665,7 @@ class TestPipelineExecutor:
             '.PY "[\'t1\', \'t2\']" | .FOR_RUN "SELECT * FROM {{result(_0) and info(_0)}}"'
         )
         assert calls == ['SELECT * FROM t1', 'SELECT * FROM t2']
-        shown = [c.args[0] for c in dbeditor.show_pipeline_info.call_args_list]
+        shown = [c.args[0] for c in dbeditor.show_task_info.call_args_list]
         assert shown == ['t1', 't2']
 
     async def test_run_template_result_alias(self):
@@ -1293,7 +1356,7 @@ class TestPipelineWatch:
         dbeditor.request_user_input = MagicMock(side_effect=self._answering('db1'))
         exe = PipelineExecutor(dbeditor)
         await self._watch(exe, ".PY \"result([input('Server')])\" | .WATCH 1")
-        assert exe._prompt_answers == {}
+        assert exe.prompts.answers == {}
 
     async def test_a_prompt_with_no_remembered_answer_is_refused(self):
         # Nothing was recorded under this (kind, title) before the sheet opened
@@ -1301,9 +1364,9 @@ class TestPipelineWatch:
         # reaches.  There is nobody to answer it, so it fails loudly.
         dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
         exe = PipelineExecutor(dbeditor)
-        exe._in_watch = True
+        exe.prompts.in_watch = True
         with pytest.raises(ValueError, match='cannot open while a .WATCH sheet'):
-            exe._ask_user({'kind': 'input', 'title': 'Server'})
+            exe.prompts.request({'kind': 'input', 'title': 'Server'})
         dbeditor.request_user_input.assert_not_called()
 
     async def test_a_nested_watch_is_refused(self):
@@ -1314,7 +1377,7 @@ class TestPipelineWatch:
         # keeps that a clear error rather than a deadlock.
         dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
         exe = PipelineExecutor(dbeditor)
-        exe._in_watch = True
+        exe.prompts.in_watch = True
         with pytest.raises(ValueError, match='cannot open while a .WATCH sheet'):
             await exe._cmd_watch(['1'], [{'id': 1}])
         dbeditor.request_user_input.assert_not_called()
@@ -1489,8 +1552,8 @@ class TestPipelineSoftSteps:
         result = await exe.execute('.PY "[1, 2]" | .RUN? "SELECT {{_0}}"')
         # The failing step is skipped; the previous step's data flows through.
         assert result.data == [{'value': 1}, {'value': 2}]
-        dbeditor.show_pipeline_info.assert_called_once()
-        assert '.RUN?' in dbeditor.show_pipeline_info.call_args[0][0]
+        dbeditor.show_task_info.assert_called_once()
+        assert '.RUN?' in dbeditor.show_task_info.call_args[0][0]
 
     async def test_hard_step_failure_without_suffix_raises(self):
         client = MagicMock()
@@ -1503,7 +1566,7 @@ class TestPipelineSoftSteps:
         exe = PipelineExecutor(dbeditor)
         with pytest.raises(PipelineStepError):
             await exe.execute('.RUN "SELECT 1"')
-        dbeditor.show_pipeline_info.assert_not_called()
+        dbeditor.show_task_info.assert_not_called()
 
     async def test_for_run_soft_skips_failing_row_keeps_others(self):
         client = MagicMock()
@@ -1524,8 +1587,8 @@ class TestPipelineSoftSteps:
             {'sql': 'SELECT * FROM users'},
             {'sql': 'SELECT * FROM logs'},
         ]
-        dbeditor.show_pipeline_info.assert_called_once()
-        msg = dbeditor.show_pipeline_info.call_args[0][0]
+        dbeditor.show_task_info.assert_called_once()
+        msg = dbeditor.show_task_info.call_args[0][0]
         assert '.FOR_RUN?' in msg and 'orders' in msg
 
     async def test_for_run_without_suffix_aborts_on_row_failure(self):
@@ -1691,7 +1754,7 @@ class TestPipelineSleep:
         async def fake_sleep(secs):
             slept.append(secs)
 
-        monkeypatch.setattr('dbcls.pipeline.asyncio.sleep', fake_sleep)
+        monkeypatch.setattr('dbcls.pipeline.executor.asyncio.sleep', fake_sleep)
         client, calls = _make_recording_client()
         exe = PipelineExecutor(_make_dbeditor(client))
         await exe.execute('.FOR "range(3)" | .SLEEP "_i" | .RUN "SELECT \'{{_i}}\'"')
@@ -1714,7 +1777,7 @@ class TestPipelineSleep:
         async def fake_sleep(secs):
             slept.append(secs)
 
-        monkeypatch.setattr('dbcls.pipeline.asyncio.sleep', fake_sleep)
+        monkeypatch.setattr('dbcls.pipeline.executor.asyncio.sleep', fake_sleep)
         client, calls = _make_recording_client()
         exe = PipelineExecutor(_make_dbeditor(client))
         result = await exe.execute('.RUN "q" | .SLEEP "n = 2; result(n)"')
@@ -1802,9 +1865,9 @@ class TestPipelineBreakAndInfo:
         dbeditor = _make_dbeditor(client)
         exe = PipelineExecutor(dbeditor)
         await exe.execute('.FOR "range(3)" | .PY "info(_i)"')
-        # info() forwards to the editor's show_pipeline_info each iteration.
-        assert dbeditor.show_pipeline_info.call_count == 3
-        dbeditor.reset_pipeline_info.assert_called_once()
+        # info() forwards to the editor's show_task_info each iteration.
+        assert dbeditor.show_task_info.call_count == 3
+        dbeditor.reset_task_info.assert_called_once()
 
 
 # ── User prompt helpers: choose() / select() / input() / ask() ──────────────
@@ -2188,7 +2251,7 @@ class TestUserPrompts:
         client, calls = _make_recording_client()
         dbeditor = _make_dbeditor(client)
         # False for the first step, True before the second one.
-        dbeditor.pipeline_stop_requested.side_effect = [False, True]
+        dbeditor.task_stop_requested.side_effect = [False, True]
         exe = PipelineExecutor(dbeditor)
         result = await exe.execute('.RUN "q1" | .RUN "q2"')
         assert calls == ['q1']
@@ -2198,7 +2261,7 @@ class TestUserPrompts:
         client, calls = _make_recording_client()
         dbeditor = _make_dbeditor(client)
         # One check before the .PY node, one before .FOR_RUN, then per row.
-        dbeditor.pipeline_stop_requested.side_effect = [False, False, False, True]
+        dbeditor.task_stop_requested.side_effect = [False, False, False, True]
         exe = PipelineExecutor(dbeditor)
         await exe.execute(
             '.PY "[{\'v\': 1}, {\'v\': 2}, {\'v\': 3}]" | .FOR_RUN "q {{v}}"'
@@ -2209,10 +2272,10 @@ class TestUserPrompts:
         client, calls = _make_recording_client()
         dbeditor = _make_dbeditor(client)
         # The step-boundary check passes; info() itself sees the request.
-        dbeditor.pipeline_stop_requested.side_effect = [False, True]
+        dbeditor.task_stop_requested.side_effect = [False, True]
         exe = PipelineExecutor(dbeditor)
         await exe.execute('.PY "info(\'x\')" | .RUN "never"')
-        dbeditor.show_pipeline_info.assert_not_called()
+        dbeditor.show_task_info.assert_not_called()
         assert calls == []
 
     # ── prompts (and the other helpers) inside {{...}} templates ─────────────
@@ -2404,7 +2467,7 @@ class TestPipelineFn:
         )
         # The failing call is reported and skipped; the previous data flows on.
         assert result.data == [{'value': 1}]
-        assert dbeditor.show_pipeline_info.call_count == 1
+        assert dbeditor.show_task_info.call_count == 1
 
 
 # ── .CONN ────────────────────────────────────────────────────────────────────
@@ -2633,13 +2696,13 @@ class TestPipelineWhile:
         # loop ends with stop() semantics instead of spinning forever.
         client, calls = _make_recording_client()
         dbeditor = _make_dbeditor(client)
-        dbeditor.pipeline_stop_requested.side_effect = [False, False, True, True]
+        dbeditor.task_stop_requested.side_effect = [False, False, True, True]
         exe = PipelineExecutor(dbeditor)
         await exe.execute('.WHILE "True" | .PY "info(1)" | .ENDWHILE | .RUN "after"')
         assert calls == []
 
     async def test_iteration_limit_raises(self, monkeypatch):
-        monkeypatch.setattr(pipeline_module, 'MAX_WHILE_ITERATIONS', 3)
+        monkeypatch.setattr(executor_module, 'MAX_WHILE_ITERATIONS', 3)
         client, calls = _make_recording_client()
         exe = PipelineExecutor(_make_dbeditor(client))
         with pytest.raises(ValueError, match='exceeded 3 iterations'):
@@ -2704,7 +2767,12 @@ class TestPipelineWhile:
 
 # ── _parse_args / _split_pipeline triple-quote support ───────────────────────
 
-from dbcls.pipeline import _parse_args, _split_pipeline
+from dbcls.pipeline.parser import _scan_args, _split_pipeline
+
+
+def _parse_args(text):
+    """Just the token values — what the step parser keeps of _scan_args()."""
+    return [value for value, _quoted in _scan_args(text)]
 
 
 class TestParseArgs:

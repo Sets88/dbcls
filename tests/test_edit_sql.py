@@ -34,7 +34,7 @@ class TestSqlLiteral:
 
     def test_pipeline_reuses_utils(self):
         """pipeline._sql_literal must be the shared dbcls.utils.sql_literal"""
-        from dbcls.pipeline import _sql_literal
+        from dbcls.pipeline.templates import _sql_literal
         assert _sql_literal is sql_literal
 
 
@@ -82,27 +82,27 @@ class TestMysqlEditing:
     @pytest.mark.asyncio
     async def test_get_primary_key_sorted(self, client):
         """SHOW KEYS rows are sorted by Seq_in_index"""
-        client.execute = AsyncMock(return_value=Result([
+        client._execute = AsyncMock(return_value=Result([
             {"Column_name": "b", "Seq_in_index": 2},
             {"Column_name": "a", "Seq_in_index": 1},
         ]))
 
         assert await client.get_primary_key("t", "db") == ["a", "b"]
-        client.execute.assert_called_once_with(
+        client._execute.assert_called_once_with(
             "SHOW KEYS FROM `db`.`t` WHERE Key_name = 'PRIMARY'"
         )
 
     @pytest.mark.asyncio
     async def test_get_primary_key_missing(self, client):
-        client.execute = AsyncMock(return_value=Result([]))
+        client._execute = AsyncMock(return_value=Result([]))
         assert await client.get_primary_key("t", "db") == []
 
     @pytest.mark.asyncio
     async def test_get_primary_key_default_database(self, client):
         """Without an explicit database the client's dbname is used"""
-        client.execute = AsyncMock(return_value=Result([]))
+        client._execute = AsyncMock(return_value=Result([]))
         await client.get_primary_key("t")
-        client.execute.assert_called_once_with(
+        client._execute.assert_called_once_with(
             "SHOW KEYS FROM `testdb`.`t` WHERE Key_name = 'PRIMARY'"
         )
 
@@ -144,17 +144,17 @@ class TestPostgresEditing:
 
     @pytest.mark.asyncio
     async def test_get_primary_key(self, pg_client):
-        pg_client.execute = AsyncMock(return_value=Result([
+        pg_client._execute = AsyncMock(return_value=Result([
             {"column_name": "a"},
             {"column_name": "b"},
         ]))
         assert await pg_client.get_primary_key("t", "testdb") == ["a", "b"]
-        sql = pg_client.execute.call_args[0][0]
+        sql = pg_client._execute.call_args[0][0]
         assert "pg_index" in sql
         assert "indisprimary" in sql
         assert "'t'::regclass" in sql
 
     @pytest.mark.asyncio
     async def test_get_primary_key_missing(self, pg_client):
-        pg_client.execute = AsyncMock(return_value=Result([]))
+        pg_client._execute = AsyncMock(return_value=Result([]))
         assert await pg_client.get_primary_key("t") == []

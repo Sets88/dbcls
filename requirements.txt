@@ -1,8 +1,22 @@
-visidata==3.4
-clickhouse-connect==0.11.0
-ciso8601==2.3.0
-aiomysql==0.3.2
-aiopg==1.4.0
-cryptography
+# Upper bounds, not exact pins: dbcls is installed alongside whatever else is
+# in the user's environment, and `==` there turns every shared dependency into
+# a conflict.  The bound is the next release that may break us.
+
+# visidata is the tightest of them on purpose: vd_modules wraps internals that
+# are not public API (getkeystroke, drawSidebar/drawSidebarText,
+# ExpandedColumn.calcValue), so a minor release is a real risk.  Widening this
+# waits on a smoke test that imports the real visidata and checks the seams.
+visidata>=3.4,<3.5
+
+clickhouse-connect>=0.11,<0.12
+aiomysql>=0.3.2,<0.4
+aiopg>=1.4,<2
+plotext>=5.3.2,<6
 sqlparse>=0.4.4,<0.6
-plotext==5.3.2
+
+# Not imported by dbcls itself:
+#   cryptography — aiomysql/PyMySQL needs it for MySQL 8's default
+#                  caching_sha2_password authentication
+#   ciso8601     — visidata picks it up for fast date parsing when present
+cryptography>=40
+ciso8601>=2.3,<3

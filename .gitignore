@@ -158,3 +158,18 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# ── Local working files ───────────────────────────────────────────────────────
+# Connection scripts, scratch queries and throwaway data kept in the checkout.
+# They are personal to a machine and must never reach the repository; listing
+# them here is also what keeps `git status` readable enough to notice a real
+# file that was never added (dbcls/connection_form.py went missing that way).
+/*.sh
+/sqls/
+/coverage/
+
+# Virtualenvs, including one made inside the package directory
+.venv*/
+
+.DS_Store
+.claude/

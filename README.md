@@ -23,7 +23,7 @@ DbCls is a terminal database client in which a SQL editor and [visidata](https:/
 - DB-aware extensions: cross-sheet references, in-terminal charts (plotext), export to SQL `INSERT`, and table editing that shows you the SQL before anything is committed
 
 **Connecting and extending**
-- MySQL, PostgreSQL, ClickHouse, SQLite, Cassandra / ScyllaDB
+- MySQL, PostgreSQL, ClickHouse, SQLite — and Cassandra / ScyllaDB through the driver plugin in [`plugins/cassandra`](plugins/cassandra)
 - With no connection arguments it starts on an in-memory SQLite — just open a file and type
 - Unix sockets (including ones forwarded over SSH), JSON config, inactivity screen lock
 - Plugin API: your own editor commands, pipeline commands, LLM tools and full-screen windows
@@ -44,6 +44,7 @@ DbCls is a terminal database client in which a SQL editor and [visidata](https:/
 - [Supported Database Engines](#supported-database-engines)
 - [Unix Socket Connections](#unix-socket-connections)
 - [Screen Lock](#screen-lock)
+- [Logging](#logging)
 - [Password safety](#password-safety)
 
 ## Demo
@@ -87,9 +88,11 @@ query, then a pipeline. See [LLM Chat](#llm-chat).
 pip install dbcls
 ```
 
-For Cassandra / ScyllaDB support:
+Cassandra / ScyllaDB is not part of the package: it is a [driver plugin](#plugins) in this repository, loaded from a checkout.
+
 ```bash
-pip install 'dbcls[cassandra]'
+pip install scylla-driver
+dbcls --plugin-dir ./plugins -E cassandra -H node1 -P 9042 -u admin -d my_keyspace
 ```
 
 The [LLM chat](#llm-chat) needs nothing installed — it talks to the endpoint over the standard library and is switched on by configuration alone.
@@ -115,12 +118,12 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `-H, --host` | Database host address |
 | `-u, --user` | Database username |
 | `-p, --password` | Database password |
-| `-E, --engine` | Database engine: `mysql`, `postgres`, `clickhouse`, `sqlite3`, and `cassandra` when the driver is installed. Defaults to `sqlite3` |
+| `-E, --engine` | Database engine: `mysql`, `postgres`, `clickhouse`, `sqlite3`, plus whatever a [driver plugin](#plugins) added (`cassandra` with `--plugin-dir ./plugins`). Defaults to `sqlite3` |
 | `-d, --dbname` | Database name |
 | `-f, --filepath` | Database file path (SQLite only). Without it SQLite runs on an in-memory database that lives as long as dbcls does |
 | `-P, --port` | Port number (optional) |
 | `-S, --unix-socket` | Path to Unix socket file (optional, overrides host/port) |
-| `-c, --config` | Path to configuration file |
+| `-c, --config` | Path to configuration file. Without it `~/.dbcls.json` is read when the command line names no connection of its own — see [Using a Config File](#using-a-config-file) |
 | `--no-compress` | Disable compression for ClickHouse connections (can also be switched at runtime via the `Toggle connection compression` command in the command palette) |
 | `--key-remap` | Remap key codes, e.g. `"36:1412,1412:36"` to swap Tab and Shift+Tab |
 | `--fold` | Start with `>>>` ... `<<<` block folding enabled (see [Fold Blocks](#fold-blocks)) |
@@ -163,6 +166,19 @@ Example `config.json`:
     "engine": "mysql"
 }
 ```
+
+**The default config.** Started with no `-c` and no connection on the command
+line, dbcls reads `~/.dbcls.json` if it is there — the same file
+`Save connections to config…` offers to write to, so `dbcls` on its own comes
+back with the tabs the last save left. A connection *is* named on the command
+line (`-H`, `-u`, `-E`, `-d`, `-f`, `-P`, `-S`, `-p`, or the matching `DBCLS_*`
+variable)? Then the file is not read at all — neither its connections nor its
+`fold`, lock or plugin settings: naming a host means that database and nothing
+else. A `.sql` file to edit is not a connection, so `dbcls query.sql` still gets
+the default config. To start from no config at all when one exists, point `-c`
+at an empty JSON object (`dbcls -c <(echo '{}')`). An unreadable or malformed
+`~/.dbcls.json` is reported on stderr and skipped rather than stopping the
+start — a file named with `-c` still stops it.
 
 ### Multiple connections and tabs
 
@@ -209,6 +225,7 @@ Inside a connection block:
 | `dbfilepath` | The database file (SQLite only) — the per-connection spelling of `-f, --filepath`. `filepath` is accepted as an alias |
 | `compress` | ClickHouse compression for this connection |
 | `fold`, `readonly` | Override the global setting for this tab |
+| `ask_password` | Keep no password in the file: dbcls asks for it the first time this connection is really used, and remembers the answer until it exits. Written instead of `password` — see [Describing a connection in the editor](#describing-a-connection-in-the-editor) |
 
 The connection id is what the tab is labelled with, and what [`.CONN`](#moving-data-between-databases)
 takes — the tab bar therefore always says which database each tab talks to.
@@ -226,12 +243,78 @@ named connections follow.
 |--------|-----|
 | Next / previous tab | `Ctrl+Shift+→` / `Ctrl+Shift+←`, or `Ctrl+X →` / `Ctrl+X ←` in terminals that send Ctrl+Shift+arrow as a key code of its own (it is `select word left/right` there) |
 | Pick a tab from a list | `Ctrl+X ↓`, or `Switch to tab…` in the command palette (`Alt+P`). A click on a tab works too |
-| Open another tab | `New tab…` in the command palette — pick any configured connection. A tab always carries the name of its connection, so a second tab on the same one is labelled `mysql01#2`, a third `mysql01#3`, and each opens a database connection of its own |
-| Close the current tab | `Close tab` in the command palette. Closing the last one quits |
-| Quit | `Ctrl+Q` — every tab with unsaved changes is brought to the front and asked about in turn |
+| Open another tab | `Ctrl+N`, the `+` button left of line 1, or `New tab…` in the command palette — pick a connection that is already open, or `+ New connection…` to describe a new database. A tab always carries the name of its connection, so a second tab on the same one is labelled `mysql01#2`, a third `mysql01#3`, and each opens a database connection of its own |
+| Close the current tab | `Close tab` in the command palette. Its connection goes with it (a config file that describes the connection keeps it, and the next dbcls opens it again). Closing the last tab quits |
+| Quit | `Ctrl+Q` — every tab with unsaved changes is brought to the front and asked about in turn, and connections described in this session are offered to be saved |
 
 A running query owns the screen until it finishes or is cancelled with `Esc`, so
 tabs cannot be switched while one is in flight.
+
+### Describing a connection in the editor
+
+A database does not have to be in the config file to be opened, and a connection
+is not a separate thing to manage: **a connection is a tab.** `New tab…` in the
+command palette (`Alt+P`) offers `+ New connection…`, which puts a form on
+screen — id, engine, host, port, user, password, database, the `.sql` file the
+tab opens — with `Tab` / `↑↓` between the rows and `←→` (or `Enter`) to pick the
+engine. Only the rows the engine actually uses are shown: SQLite asks for a
+database file and nothing to log in with. `Edit connection` opens the same form
+on the connection of the tab you are looking at.
+
+Under the line at the bottom of the form are the things it can do; `Enter` on one
+of those rows does it. `Alt+Enter` is a shortcut for `Ok`, `Ctrl+T` for the test,
+and `Esc` for `Cancel`.
+
+| Row | What it does |
+|-----|--------------|
+| `Ok` (`Alt+Enter`) | Take the settings and open the connection's tab — a new connection arrives with one. Editing a connection that already has a tab opens no second one; the settings apply to that tab, which starts talking to the database they describe and opens the `.sql` file they name (a buffer with unsaved changes keeps what it holds, and says so). `New tab…` is what opens another tab |
+| `Test connection` (`Ctrl+T`) | Connect and ask for the list of databases, to check the settings without opening a tab. It uses the password typed in the form — while the form is on screen there is nowhere to ask for one — and gives up after 15 seconds |
+| `Delete connection` | Only when editing: forget the connection, close its tab and remove it from the config file it came from, after a confirmation. Drawn in red |
+| `Cancel` (`Esc`) | Close the form, changing nothing |
+
+Because a connection is its tab, the two go together: closing a tab lets its
+connection go (a config file that describes it keeps it — the next dbcls opens it
+again), and deleting a connection closes its tab. Closing the last tab of all
+still quits.
+
+Changing the `id` of an existing connection **renames** it: the old name goes
+from the editor and, on the next save, from the config file — the connection
+does not end up in it twice. Tabs open on it follow the new name. To copy a
+connection instead, describe it again with `+ New connection…`.
+
+**The password.** `ask password on connect` is on by default: the password is not
+written to the config file at all. What is written is `"ask_password": true`, and
+dbcls asks for it — masked, and never kept in the input history — the first time
+the connection actually connects. The answer is remembered for as long as dbcls
+runs and shared by every tab and `.CONN` client of that connection;
+`Forget connection passwords` in the palette drops it, so the next query asks
+again (what to do after typing one wrong). Turn the checkbox off to keep the old
+behaviour and have the password saved in the file in plain text.
+
+**Saving.** The form never writes to disk — a connection described or changed in
+the editor lives until dbcls exits. Writing is a separate, deliberate step:
+`Save connections to config…` in the palette (`Ctrl+S` is unchanged — it still
+saves the `.sql` file), and the question `Ctrl+Q` asks when something is unsaved.
+
+What gets written is **every** connection dbcls has, not only the new ones, so
+the file it produces is one dbcls could be started from to get the same tabs
+back. The path is asked for in the editor's usual input bar — pre-filled with
+the config given to `-c, --config` (or `~/.dbcls.json` when dbcls was started
+without one), and edited like any other line: `Ctrl+U` clears it, `Ctrl+V`
+pastes, `↑` walks the paths entered before.
+
+A file that is already there is asked about first (`… exists — overwrite it?
+(y/n)`), and overwriting is what happens: the file is written whole, never
+merged into, so it holds exactly the connections dbcls has and a connection
+deleted or renamed in this session is gone from it. What the file is written
+into is the config dbcls was given, carrying over `fold`, the lock options and
+any plugin's own section — which is how a config passed through a shell's
+process substitution ([below](#using-bash-configuration)), with no file to write
+back to, is saved to a real one. Anything else the file on disk held — settings
+that were not in the config dbcls started from, connections it does not know
+about — is not kept. If the write fails, dbcls says so in a popup and
+stays open — a save on the way out that could not happen never passes for one
+that did.
 
 ### Using Bash Configuration
 
@@ -260,15 +343,15 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 |--------|--------|
 | `Alt+1` / `Shift+Tab` | Show DB autocompletion suggestions (tables, columns, table aliases, functions) |
 | `Ctrl+b` | Beautify the query under cursor or the selected text (see [Beautify](#beautify)) |
-| `Ctrl+n` | Base autocomplete (words from the current file) |
 | `Alt+Enter` | Execute query under cursor or selected text (`Alt+r` does the same — a deprecated alias kept for now; in read-only mode plain `Enter` runs it too) |
 | `Esc` | Cancel running query. On ClickHouse the query is killed on the server too (`KILL QUERY`), so a long transfer stops instead of running on in the background |
-| `Alt+e` | Show database list with table submenu |
-| `Alt+t` | Show tables list with schema and sample data options |
+| `Alt+e` | Show database list with table submenu (also the `⛁` button in the filename bar) |
+| `Alt+t` | Show tables list with schema and sample data options (also the `▤` button in the filename bar) |
 | `Alt+s` | Show list of open VisiData sheets |
 | `Ctrl+l` | Ask a model about the query under the cursor (see [LLM Chat](#llm-chat); bound only when configured) |
 | `Alt+p` | Open command palette (run any editor command by name) |
 | `Ctrl+Shift+←` / `Ctrl+Shift+→` | Previous / next tab, one per configured connection (see [Multiple connections and tabs](#multiple-connections-and-tabs)). `Ctrl+x ←` / `Ctrl+x →` do the same where the terminal sends Ctrl+Shift+arrow as its own key code |
+| `Ctrl+n` | Open the `New tab…` menu — a tab on a connection that is already open, or `+ New connection…` to describe a new database |
 | `Ctrl+p` | Toggle folding of `>>>` ... `<<<` blocks (see [Fold Blocks](#fold-blocks)) |
 | `Ctrl+g` | Open a file from the current directory |
 | `Ctrl+f` | Search in the editor |
@@ -291,6 +374,15 @@ be modified or saved until it's toggled off again.
 Two more conveniences that need no key: clicking in the text area moves the cursor there, and
 if the open file changes on disk underneath you (a `git checkout`, another editor), dbcls
 notices within about a second and asks whether to reload it.
+
+Three commands are also a click away. `+`, left of line `1`, opens the
+`New tab…` menu — the same one the command palette has, listing every open
+connection plus `+ New connection…` (see
+[Describing a connection in the editor](#describing-a-connection-in-the-editor)).
+In the right corner of the filename bar, `⛁` browses databases and `▤` browses
+tables — `Alt+e` and `Alt+t` by another route. The buttons step aside when
+something covers them: they are inert while a popup is open, and the two icons
+are dropped when the file name is long enough to need their columns.
 
 ### Fold Blocks
 
@@ -496,6 +588,19 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 | `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
 | `Alt+↑` / `Alt+↓` | Jump 5 rows up / down |
 | `Alt+←` / `Alt+→` | Jump 3 columns left / right |
+
+### Aggregators
+
+`+` attaches an aggregator to the current column — `sum`, `mean`, `count`, `distinct`, … — which then shows up on every frequency (`Shift+F`) or pivot sheet built from it; `z+` computes it once and prints it in the status line instead.
+
+DbCls adds two parameterised names to the ones the prompt offers:
+
+| Aggregator | Result |
+|--------|--------|
+| `topk<N>` | The `N` most common values of the group, as a list, most frequent first — `topk3` on a group where `3` occurs 10 times, `2` five times and `10` twice gives `[3, 2, 10]`. Ties keep the order of first appearance. `topk3`, `topk5` and `topk10` are offered in the prompt; any other `N` can be typed by hand |
+| `p<N>` | Any percentile, not just the fifteen VisiData hard-codes — `p85` and `p42` work as well as `p90`. The prompt lists `p50`, `p90`, `p95` and `p99`; the rest are typed by hand (`q3`/`q4`/`q5`/`q10` still add whole sets of quantiles at once) |
+
+A name typed by hand joins the prompt list for the rest of the session. `topk<N>` returns a real Python list, so `g@` on the resulting column displays it as JSON and `g+` expands it into rows.
 
 ### Plotting
 
@@ -1192,7 +1297,7 @@ A fuller example — a menu on a key, a filter that transforms every query resul
 
 - Plugins bundled with dbcls itself (currently just the LLM chat).
 
-`--plugin name1,name2` narrows loading to those names; `--no-plugins` disables all of them, bundled ones included. A plugin that raises is reported in the status bar and skipped — a broken extension never stops the editor from starting. Set `DBCLS_PLUGIN_DEBUG=1` to get its traceback on stderr.
+`--plugin name1,name2` narrows loading to those names; `--no-plugins` disables all of them, bundled ones included. A plugin that raises is reported in the status bar and skipped — a broken extension never stops the editor from starting. The failure and its traceback go to the log (see [Logging](#logging)); `DBCLS_PLUGIN_DEBUG=1` additionally prints the traceback to stderr, for a failure that happens before there is a log at all.
 
 ### Settings
 
@@ -1216,6 +1321,7 @@ Keys present in that section but never declared as options reach `api.settings` 
 | `api.add_pipeline_function(name, value, help_text)` | Add a function (or any value) to the namespace `{{expr}}` and `.PY` run in; `help_text` reaches the model too |
 | `api.add_llm_tool(name, description, parameters, handler, max_result_chars)` | Offer a tool to the [LLM chat](#llm-chat); load order does not matter, a tool offered before the chat is up waits for it. A no-op when the chat is not configured. `max_result_chars` caps how much text one call may hand the model (omit it to send the result whole) |
 | `api.add_help_page(title, text)` | Add a page to the in-app help (`F1`) |
+| `setup.add_engine(name, fields, factory, …)` | Add a database engine — it becomes a `--engine`, an `"engine"` in the config file and an entry in the connection form. Goes in `setup()`, not `register()`: the first connection's client is built before the editor exists. [`plugins/cassandra`](plugins/cassandra) is the worked example |
 | `api.add_filter(event, func)` | Transform data on its way through the editor (see below) |
 
 **Showing things**
@@ -1260,7 +1366,9 @@ To build a text field that behaves like the editor (selection, undo, wrap, clipb
 - PostgreSQL
 - ClickHouse
 - SQLite
-- Cassandra / ScyllaDB
+- Cassandra / ScyllaDB — as a [driver plugin](#plugins): `pip install scylla-driver` and start with `--plugin-dir ./plugins`
+
+A database not on this list is added from outside, without touching dbcls: a plugin registers its own engine with `setup.add_engine(...)`, and it is then a `--engine`, an `"engine"` in the config file and an entry in the connection form like any other. [`plugins/cassandra`](plugins/cassandra) is the worked example.
 
 
 ## Unix Socket Connections
@@ -1433,7 +1541,23 @@ Error: --lock-init-command exited with code 1: <stderr output>
 Error: --lock-init-command produced no output
 ```
 
+## Logging
+
+A terminal app has nowhere to print: stdout belongs to the screen. Set `DBCLS_LOG` to get a file instead — it is the only place a failure can be read after the fact.
+
+```bash
+export DBCLS_LOG=~/dbcls.log
+export DBCLS_LOG_LEVEL=debug      # optional; WARNING and up by default
+```
+
+With `DBCLS_LOG` unset nothing is written and no logging is configured at all, so dbcls leaves the logging of whatever imports it alone. Only dbcls' own records go to the file — the database drivers keep their own loggers.
+
 ## Password safety
+The simplest way not to have a password anywhere on disk is to not save one:
+`"ask_password": true` in a connection block (the default for a connection
+[described in the editor](#describing-a-connection-in-the-editor)) makes dbcls
+ask for it when the connection is first used and keep it in memory only.
+
 To ensure password safety, I recommend using the project [ssh-crypt](https://github.com/Sets88/ssh-crypt) to encrypt your config file. This way, you can store your password securely and use it with dbcls.
 
 Caveats:

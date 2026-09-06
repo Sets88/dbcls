@@ -12,6 +12,7 @@ from .vd_utils import SheetWithReference
 from .vd_utils import SselectSheet, SchooseSheet, ViewSheet, VarsSheet  # re-exported for dbcls.py
 from .vf_funcs import LiveFormatSheet
 from .vd_live import LiveRowsSheet  # re-exported for dbcls.py
+from . import vd_aggregators  # noqa: F401 — makes `topk<N>` / any `p<N>` resolvable as aggregator names
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 from . import vd_idle  # noqa: F401 — installs the idle-polling get_curses_timeout wrapper (asks vd_live how long it may sleep)
 from . import vd_sidebar  # noqa: F401 — installs the "b to close" hint in every sidebar title
@@ -28,6 +29,7 @@ TableSheet.guide += '''
 - `g@` to type the current column as JSON (like `@` for dates), so its cells expand with `(` / `g+` and display as real JSON.
 - `g#` to type the current column as URL: cells look unchanged, but `(` expands them into schema/domain/port/path/query/anchor, and `(` on `query` into one column per parameter.
 - `gp` to draw a plotext chart from the columns you type at the prompt: `x[,bucket],y` or `x,y1,y2,…`.
+- `+` also takes `topk<N>` (the N most common values of the group, as a list) and any `p<N>` percentile, not just the ones the prompt lists.
 - `gT` / `gzT` to save the selected rows / column values to pipeline _vars.
 - `Alt+Up` / `Alt+Down` to move the cursor 5 rows, `Alt+b` / `Alt+f` 3 columns.
 '''

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from dbcls import pipeline
-from dbcls.editor import TextBuffer
+from dbcls.editor import CommandTable, TextBuffer
 from dbcls.plugins import (
     HookBus,
     PluginAPI,
@@ -34,8 +34,9 @@ class FakeEditor:
         self.extra_help_pages = {}
         self.info_popup = MagicMock()
         self.hooks = HookBus(on_error=lambda text: self.notifications.append((text, True)))
-        self._editor_functions = {}
-        self._keybindings = {}
+        # The real shell keeps both in a CommandTable; the fake reuses it so
+        # the two cannot describe the registry differently.
+        self.commands = CommandTable()
         self.notifications = []
         self.menus = []
         self.sheets = []
@@ -49,12 +50,10 @@ class FakeEditor:
 
     # ── what PluginAPI calls ────────────────────────────────────────────────
     def add_editor_function(self, name, func, description='', keybinding=''):
-        self._editor_functions[name] = {
-            'func': func, 'description': description, 'keybinding': keybinding}
+        self.commands.add(name, func, description, keybinding)
 
     def add_keybinding(self, name, key):
-        for k in (key if isinstance(key, (list, tuple)) else [key]):
-            self._keybindings[k] = name
+        self.commands.bind(name, key)
 
     def set_status_notification(self, text, error=False, popup=True):
         self.notifications.append((text, error))
@@ -144,8 +143,8 @@ class TestDiscovery:
         ''')
         editor = FakeEditor()
         assert sorted(load(tmp_path, editor).loaded) == ['alpha', 'beta']
-        assert 'alpha_cmd' in editor._editor_functions
-        assert 'beta_cmd' in editor._editor_functions
+        assert 'alpha_cmd' in editor.commands.functions
+        assert 'beta_cmd' in editor.commands.functions
 
     def test_underscore_files_are_skipped(self, tmp_path):
         write_plugin(tmp_path, '_helper', '''
@@ -154,7 +153,7 @@ class TestDiscovery:
         ''')
         editor = FakeEditor()
         assert load(tmp_path, editor).loaded == []
-        assert editor._editor_functions == {}
+        assert editor.commands.functions == {}
 
     def test_only_restricts_which_plugins_load(self, tmp_path):
         write_plugin(tmp_path, 'alpha', 'def register(api): api.notify("alpha")')
@@ -195,7 +194,7 @@ class TestPackagePlugins:
         '''})
         editor = FakeEditor()
         assert load(tmp_path, editor).loaded == ['boxed']
-        assert 'boxed_cmd' in editor._editor_functions
+        assert 'boxed_cmd' in editor.commands.functions
 
     def test_register_in_a_plugin_submodule(self, tmp_path):
         """__init__ may import nothing on purpose, so the plugin costs nothing
@@ -354,7 +353,7 @@ class TestOptions:
         editor = FakeEditor()
         write_plugin(tmp_path, 'greet', self.GREETER)
         load(tmp_path, editor, argv=['--greet-name', 'seen'])
-        assert "'name': 'seen'" in editor._editor_functions['greet']['description']
+        assert "'name': 'seen'" in editor.commands.functions['greet']['description']
 
     def test_a_plugin_without_setup_is_fine(self, tmp_path):
         write_plugin(tmp_path, 'plain', 'def register(api): api.notify("ok")')
@@ -405,7 +404,7 @@ class TestErrorIsolation:
         ''')
         editor = FakeEditor()
         assert load(tmp_path, editor).loaded == ['bb_good']
-        assert 'good' in editor._editor_functions
+        assert 'good' in editor.commands.functions
         message, error = editor.notifications[-1]
         assert error is True and 'aa_broken' in message and 'boom' in message
 
@@ -456,7 +455,7 @@ class TestPluginAPI:
         api.add_help_page('Demo', 'demo help')
         api.add_keybinding('demo_cmd', [1, 2])
         assert editor.extra_help_pages == {'Demo': 'demo help'}
-        assert editor._keybindings == {1: 'demo_cmd', 2: 'demo_cmd'}
+        assert editor.commands.keys == {1: 'demo_cmd', 2: 'demo_cmd'}
 
     def test_settings_are_handed_over(self):
         _editor, api = self._api()
@@ -686,7 +685,7 @@ class TestPipelineCommandRegistration:
         assert any('Greets someone.' in entry for entry in pipeline.HELP_ENTRIES)
 
         host = MagicMock(vars={})
-        host.pipeline_stop_requested.return_value = False
+        host.task_stop_requested.return_value = False
         executor = pipeline.PipelineExecutor(host)
         result = asyncio.run(executor.execute('.HELLO "world"'))
         assert result.data == [{'greeting': 'hello world'}]
@@ -701,7 +700,7 @@ class TestPipelineCommandRegistration:
         pipeline.register_command('collect', '.COLLECT', collect)
 
         host = MagicMock(vars={})
-        host.pipeline_stop_requested.return_value = False
+        host.task_stop_requested.return_value = False
         executor = pipeline.PipelineExecutor(host)
         asyncio.run(executor.execute('.PY "[{\'a\': 1}]" | .COLLECT'))
         assert seen == [[{'a': 1}]]
@@ -729,7 +728,7 @@ class TestPipelineCommandRegistration:
         assert load(tmp_path, editor).loaded == ['pipecmd']
 
         host = MagicMock(vars={})
-        host.pipeline_stop_requested.return_value = False
+        host.task_stop_requested.return_value = False
         executor = pipeline.PipelineExecutor(host)
         result = asyncio.run(executor.execute('.UPPER "quiet"'))
         assert result.data == [{'value': 'QUIET'}]
@@ -739,7 +738,7 @@ class TestPipelineFunctionRegistration:
     @staticmethod
     def _executor():
         host = MagicMock(vars={})
-        host.pipeline_stop_requested.return_value = False
+        host.task_stop_requested.return_value = False
         return pipeline.PipelineExecutor(host)
 
     def test_function_is_callable_from_python_steps(self, clean_pipeline_registry):
@@ -790,6 +789,57 @@ class TestPipelineFunctionRegistration:
 
         result = asyncio.run(self._executor().execute('.PY "slug(\'a b\')"'))
         assert result.data == [{'value': 'a_b'}]
+
+
+class TestCommandRegistrySnapshot:
+    """snapshot()/restore() is what keeps one test's plugin command out of the
+    next test — the whole isolation of the pipeline suite rests on it."""
+
+    def test_restore_undoes_a_registered_command(self, clean_pipeline_registry):
+        from dbcls import pipeline
+
+        before = pipeline.REGISTRY.snapshot()
+
+        async def handler(executor, args, data):
+            return data
+
+        pipeline.register_command('tmpcmd', '.TMPCMD', handler, help_text='x')
+        assert 'tmpcmd' in pipeline.PIPELINE_COMMANDS
+        assert pipeline.is_pipeline('.TMPCMD')
+
+        pipeline.REGISTRY.restore(before)
+
+        assert 'tmpcmd' not in pipeline.PIPELINE_COMMANDS
+        assert 'tmpcmd' not in pipeline.PIPELINE_COMMAND_HINTS
+        assert not pipeline.is_pipeline('.TMPCMD')
+        assert not any('TMPCMD' in entry for entry in pipeline.HELP_ENTRIES)
+
+    def test_restore_undoes_a_registered_function(self, clean_pipeline_registry):
+        from dbcls import pipeline
+
+        before = pipeline.REGISTRY.snapshot()
+        pipeline.register_function('tmpfn', lambda: 1, help_text='x')
+        assert 'tmpfn' in pipeline.PLUGIN_FUNCTIONS
+
+        pipeline.REGISTRY.restore(before)
+
+        assert 'tmpfn' not in pipeline.PLUGIN_FUNCTIONS
+        assert 'tmpfn' not in pipeline.PLUGIN_FUNCTION_HELP
+
+    def test_restore_refills_the_containers_it_shares_with_the_module(
+            self, clean_pipeline_registry):
+        """The module-level names are live views of the registry's containers,
+        so restore() must refill them rather than swap in new objects."""
+        from dbcls import pipeline
+
+        commands, functions = pipeline.PIPELINE_COMMANDS, pipeline.PLUGIN_FUNCTIONS
+        before = pipeline.REGISTRY.snapshot()
+        pipeline.register_function('tmpfn', lambda: 1)
+        pipeline.REGISTRY.restore(before)
+
+        assert pipeline.PIPELINE_COMMANDS is commands
+        assert pipeline.PLUGIN_FUNCTIONS is functions
+        assert pipeline.REGISTRY.functions is functions
 
 
 class TestArgumentParsing:

@@ -23,6 +23,7 @@ from dbcls.editor import (
     SelectPopup,
     SHEET_PROMPT_KINDS,
 )
+from tests.fakes import make_shell
 
 ENTER = K(ord('\n'))
 ESC = K(27)
@@ -32,34 +33,7 @@ UP = K(curses.KEY_UP)
 DOWN = K(curses.KEY_DOWN)
 
 
-def make_editor():
-    """Build a minimal shell (with one stub document) without touching curses."""
-    ed = object.__new__(EditorShell)
-    ed.stdscr = MagicMock()
-    ed.stdscr.getch.return_value = -1   # so a dispatched Esc resolves as bare Esc
-    ed.renderer = MagicMock()
-    doc = MagicMock()
-    doc.buf = MagicMock()
-    doc.textarea = MagicMock(buf=doc.buf)
-    doc.search = MagicMock(active=False)
-    ed.documents = [doc]
-    ed.active = 0
-    ed._overlays = []
-    ed.popup = MagicMock(active=False)
-    ed.info_popup = MagicMock(active=False)
-    ed.running_popup = MagicMock(active=False)
-    ed.input_bar = MagicMock(active=False)
-    ed._ui_request = None
-    ed._pipeline_info_live = False
-    ed._pipeline_stop_requested = False
-    ed._prefix_pending = False
-    ed._debug_mode = False
-    ed._status_notification = None
-    ed._needs_redraw = False
-    ed._keybindings = {}
-    ed._editor_functions = {}
-    ed.REMAPED_KEYS = {}  # instance attr shadows the shared class-level dict
-    return ed
+make_editor = make_shell
 
 
 def type_keys(widget, text):
@@ -539,20 +513,29 @@ class TestRequestUserInput:
         else:
             raise AssertionError('expected RuntimeError on main-thread call')
 
+    # The ask() question reads keys through StatusPrompt, which is where the
+    # blocking status-bar questions live; mocking its read is what stands in
+    # for the user here.
+    def _answers(self, ed, *keys):
+        ed.prompt_line.read_key = MagicMock(
+            side_effect=keys if len(keys) > 1 else None,
+            return_value=keys[0] if len(keys) == 1 else None)
+        return ed.prompt_line.read_key
+
     def test_ask_yes_resolves_true(self):
         ed = make_editor()
-        ed._read_answer = MagicMock(return_value=ord('y'))
+        read = self._answers(ed, ord('y'))
         th, results = _submit_request(ed, {'kind': 'ask', 'title': 'Sure?'})
         ed._open_ui_request(ed._ui_request)
         th.join(timeout=2)
-        ed._read_answer.assert_called_once_with(
-            'Sure? (y/Enter = yes, n = no, Esc = cancel): ')
+        read.assert_called_once_with(
+            'Sure? (y/Enter = yes, n = no, Esc = cancel): ', resolve=True)
         assert results == [True]
 
     def test_ask_enter_resolves_true(self):
         # Enter is the second way to say yes.
         ed = make_editor()
-        ed._read_answer = MagicMock(return_value=ord('\n'))
+        self._answers(ed, ord('\n'))
         th, results = _submit_request(ed, {'kind': 'ask', 'title': 'Sure?'})
         ed._open_ui_request(ed._ui_request)
         th.join(timeout=2)
@@ -560,7 +543,7 @@ class TestRequestUserInput:
 
     def test_ask_no_resolves_false(self):
         ed = make_editor()
-        ed._read_answer = MagicMock(return_value=ord('n'))
+        self._answers(ed, ord('n'))
         th, results = _submit_request(ed, {'kind': 'ask', 'title': 'Sure?'})
         ed._open_ui_request(ed._ui_request)
         th.join(timeout=2)
@@ -569,27 +552,28 @@ class TestRequestUserInput:
     def test_ask_ignores_unknown_keys(self):
         # Anything but y/Enter/n/Esc leaves the question up.
         ed = make_editor()
-        ed._read_answer = MagicMock(side_effect=[ord('x'), ord(' '), ord('n')])
+        read = self._answers(ed, ord('x'), ord(' '), ord('n'))
         th, results = _submit_request(ed, {'kind': 'ask', 'title': 'Sure?'})
         ed._open_ui_request(ed._ui_request)
         th.join(timeout=2)
-        assert ed._read_answer.call_count == 3
+        assert read.call_count == 3
         assert results == [False]
 
     def test_ask_esc_resolves_none(self):
         # Esc is "cancelled" (None) — distinct from a plain "no" (False).
         ed = make_editor()
-        ed._read_answer = MagicMock(return_value=27)
+        self._answers(ed, 27)
         th, results = _submit_request(ed, {'kind': 'ask', 'title': 'Sure?'})
         ed._open_ui_request(ed._ui_request)
         th.join(timeout=2)
         assert results == [None]
 
+
     def test_input_opens_input_bar(self):
         ed = make_editor()
         th, results = _submit_request(ed, {'kind': 'input', 'title': 'Name'})
         ed._open_ui_request(ed._ui_request)
-        ed.input_bar.open.assert_called_once_with('Name', '', [])
+        ed.input_bar.open.assert_called_once_with('Name', '', [], mask=False)
         ed._resolve_ui_request('x')
         th.join(timeout=2)
         assert results == ['x']
@@ -599,7 +583,7 @@ class TestRequestUserInput:
         th, results = _submit_request(
             ed, {'kind': 'input', 'title': 'Age', 'default': '18'})
         ed._open_ui_request(ed._ui_request)
-        ed.input_bar.open.assert_called_once_with('Age', '18', [])
+        ed.input_bar.open.assert_called_once_with('Age', '18', [], mask=False)
         ed._resolve_ui_request('18')
         th.join(timeout=2)
         assert results == ['18']
@@ -609,7 +593,7 @@ class TestRequestUserInput:
         th, results = _submit_request(
             ed, {'kind': 'input', 'title': 'Path', 'items': ['/a', '/b']})
         ed._open_ui_request(ed._ui_request)
-        ed.input_bar.open.assert_called_once_with('Path', '', ['/a', '/b'])
+        ed.input_bar.open.assert_called_once_with('Path', '', ['/a', '/b'], mask=False)
         ed._resolve_ui_request('/a')
         th.join(timeout=2)
         assert results == ['/a']
@@ -797,32 +781,32 @@ class TestWarnAndLiveInfo:
         ed = make_editor()
         ed.info_popup.active = True
         ed.info_popup.handle_key.return_value = 'close'
-        ed._pipeline_info_live = True
+        ed._task_info_live = True
         ed._dispatch('\x1b')
-        assert ed._pipeline_stop_requested is True
-        assert ed._pipeline_info_live is False
+        assert ed._task_stop_requested is True
+        assert ed._task_info_live is False
         ed.info_popup.close.assert_called_once()
 
     def test_live_info_backspace_hides_without_stop(self):
         ed = make_editor()
         ed.info_popup.active = True
         ed.info_popup.handle_key.return_value = 'close'
-        ed._pipeline_info_live = True
+        ed._task_info_live = True
         ed._dispatch('\x7f')
-        assert ed._pipeline_stop_requested is False
+        assert ed._task_stop_requested is False
         ed.info_popup.close.assert_called_once()
         # ... and the next info() call shows the popup again.
-        ed.show_pipeline_info('again')
+        ed.show_task_info('again')
         ed.info_popup.open.assert_called_with('Info', {'main': 'again'})
-        assert ed._pipeline_info_live is True
+        assert ed._task_info_live is True
 
-    def test_reset_pipeline_info_clears_stop_request(self):
+    def test_reset_task_info_clears_stop_request(self):
         ed = make_editor()
-        ed._pipeline_stop_requested = True
-        ed._pipeline_info_live = True
-        ed.reset_pipeline_info()
-        assert ed.pipeline_stop_requested() is False
-        assert ed._pipeline_info_live is False
+        ed._task_stop_requested = True
+        ed._task_info_live = True
+        ed.reset_task_info()
+        assert ed.task_stop_requested() is False
+        assert ed._task_info_live is False
 
 
 class TestRunningPopupHiddenDuringPrompt:
@@ -858,6 +842,61 @@ class TestRunningPopupHiddenDuringPrompt:
         assert ed._running_popup_to_draw() is ed.running_popup
 
 
+class TestFileWatching:
+    """Whether a document wants to be asked about its file is the document's
+    own state — the shell only asks."""
+
+    def _doc(self, tmp_path):
+        path = tmp_path / 'x.sql'
+        path.write_text('SELECT 1\n')
+        doc = object.__new__(Editor)
+        doc._file_change_dismissed = False
+        doc._file_check_counter = 0
+        doc.buf = MagicMock()
+        doc.buf.filepath = str(path)
+        doc.buf.file_changed_on_disk.return_value = True
+        return doc
+
+    def _tick(self, doc, times=None):
+        """Run the checking tick *times* times (a full period by default)."""
+        answers = [doc.file_change_pending()
+                   for _ in range(times or Editor.FILE_CHECK_TICKS)]
+        return answers
+
+    def test_nothing_is_asked_before_a_full_period(self, tmp_path):
+        doc = self._doc(tmp_path)
+        assert not any(self._tick(doc, Editor.FILE_CHECK_TICKS - 1))
+        doc.buf.file_changed_on_disk.assert_not_called()
+
+    def test_the_file_is_checked_once_a_period(self, tmp_path):
+        doc = self._doc(tmp_path)
+        assert self._tick(doc)[-1] is True
+        assert doc.buf.file_changed_on_disk.call_count == 1
+
+    def test_an_unchanged_file_asks_nothing(self, tmp_path):
+        doc = self._doc(tmp_path)
+        doc.buf.file_changed_on_disk.return_value = False
+        assert not any(self._tick(doc))
+
+    def test_a_document_with_no_file_is_never_checked(self, tmp_path):
+        doc = self._doc(tmp_path)
+        doc.buf.filepath = ''
+        assert not any(self._tick(doc))
+        doc.buf.file_changed_on_disk.assert_not_called()
+
+    def test_a_dismissed_change_stops_the_question(self, tmp_path):
+        doc = self._doc(tmp_path)
+        doc.dismiss_file_change()
+        assert not any(self._tick(doc))
+
+    def test_watching_again_brings_the_question_back(self, tmp_path):
+        doc = self._doc(tmp_path)
+        doc.dismiss_file_change()
+        self._tick(doc)
+        doc.watch_file_again()
+        assert self._tick(doc)[-1] is True
+
+
 class TestConfirmFileChange:
     """The external-change prompt must not be dismissed by a stray keystroke:
     it pops up while the user is typing, so it loops until r/w/Esc."""
@@ -867,39 +906,91 @@ class TestConfirmFileChange:
         ed.buf.readonly = readonly
         ed.buf.filepath = '/tmp/x.sql'
         ed.doc.lexer = MagicMock()
-        ed.doc._file_change_dismissed = False
         return ed
 
     def test_unrelated_key_keeps_asking(self):
         ed = self._editor()
-        ed._read_answer = MagicMock(side_effect=[ord('x'), ord(' '), ord('r')])
+        ed.prompt_line.read_key = MagicMock(side_effect=[ord('x'), ord(' '), ord('r')])
         ed._confirm_file_change()
-        assert ed._read_answer.call_count == 3
+        assert ed.prompt_line.read_key.call_count == 3
         ed.buf.load.assert_called_once_with('/tmp/x.sql')
-        assert ed.doc._file_change_dismissed is False
+        ed.doc.watch_file_again.assert_called_once()
+        ed.doc.dismiss_file_change.assert_not_called()
 
     def test_write_saves_buffer(self):
         ed = self._editor()
-        ed._read_answer = MagicMock(return_value=ord('w'))
+        ed.prompt_line.read_key = MagicMock(return_value=ord('w'))
         ed._confirm_file_change()
         ed.buf.save.assert_called_once()
-        assert ed.doc._file_change_dismissed is False
+        ed.doc.watch_file_again.assert_called_once()
+        ed.doc.dismiss_file_change.assert_not_called()
 
     def test_esc_dismisses(self):
         ed = self._editor()
-        ed._read_answer = MagicMock(return_value=27)
+        ed.prompt_line.read_key = MagicMock(return_value=27)
         ed._confirm_file_change()
         ed.buf.load.assert_not_called()
         ed.buf.save.assert_not_called()
-        assert ed.doc._file_change_dismissed is True
+        ed.doc.dismiss_file_change.assert_called_once()
 
     def test_write_ignored_in_readonly_mode(self):
         ed = self._editor(readonly=True)
-        ed._read_answer = MagicMock(side_effect=[ord('w'), 27])
+        ed.prompt_line.read_key = MagicMock(side_effect=[ord('w'), 27])
         ed._confirm_file_change()
         ed.buf.save.assert_not_called()
-        assert ed.doc._file_change_dismissed is True
-        assert '(w)rite' not in ed._read_answer.call_args.args[0]
+        ed.doc.dismiss_file_change.assert_called_once()
+        assert '(w)rite' not in ed.prompt_line.read_key.call_args.args[0]
+
+
+class TestStatusPromptLine:
+    """The line prompt (`Save as:`, `Save connections to:`).  It is the
+    editor's own InputBar, so everything typed into it is edited the way it is
+    everywhere else."""
+
+    def _editor(self, keys):
+        ed = make_editor()
+        ed.colors = MagicMock()
+        ed.input_bar = InputBar()           # the real widget, not the stub
+        ed._draw_frame = MagicMock()
+        ed.request_redraw = MagicMock()
+        ed.stdscr.get_wch = MagicMock(side_effect=keys)
+        return ed
+
+    def test_a_default_is_returned_by_enter_alone(self):
+        ed = self._editor(['\n'])
+        assert ed._prompt('Save to: ', default='/tmp/conf.json') == '/tmp/conf.json'
+
+    def test_a_default_can_be_edited(self):
+        ed = self._editor(['x', '\n'])
+        assert ed._prompt('Save to: ', default='/tmp/a') == '/tmp/ax'
+
+    def test_esc_returns_nothing(self):
+        ed = self._editor([chr(27)])
+        assert ed._prompt('Save to: ', default='/tmp/a') == ''
+
+    def test_without_a_default_the_line_starts_empty(self):
+        ed = self._editor(['a', '\n'])
+        assert ed._prompt('Name: ') == 'a'
+
+    def test_ctrl_u_clears_the_offered_path(self):
+        # Retyping a path over the offered one is the common case (the config
+        # may have come from a pipe that cannot be written back to), and it
+        # used to append instead of replacing.
+        ed = self._editor(['\x15'] + list('/tmp/conf') + ['\n'])
+        assert ed._prompt('Save to: ', default='/dev/fd/63') == '/tmp/conf'
+
+    def test_the_line_can_be_edited_from_both_ends(self):
+        ed = self._editor([chr(1), 'x', chr(5), 'y', '\n'])   # ^A … ^E
+        assert ed._prompt('Save to: ', default='ab') == 'xaby'
+
+    def test_a_key_read_as_a_code_is_not_typed_into_the_line(self):
+        ed = self._editor([curses.KEY_MOUSE, curses.KEY_BACKSPACE, '\n'])
+        assert ed._prompt('Save to: ', default='ab') == 'a'
+
+    def test_the_bar_is_closed_afterwards(self):
+        ed = self._editor(['\n'])
+        ed._prompt('Save to: ', default='/tmp/conf')
+        assert ed.input_bar.active is False
 
 
 class TestStatusNotification:

@@ -43,66 +43,60 @@ visidata_mock.Column = MagicMock()
 visidata_mock.ColumnItem = MagicMock()
 visidata_mock.ItemColumn = MagicMock()
 visidata_mock.TypedExceptionWrapper = MagicMock()
-visidata_mock.asyncthread = MagicMock()
+# asyncthread runs the function in a background thread; as a MagicMock it
+# would swallow the decorated function entirely, so the double runs it inline —
+# what a test wants, and it is what visidata does when threading is off.
+visidata_mock.asyncthread = lambda func: func
+
+
+class _AttrDict(dict):
+    """visidata.AttrDict: a dict whose keys are also attributes."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+visidata_mock.AttrDict = _AttrDict
 visidata_mock.ENTER = MagicMock()
-visidata_mock.AttrDict = MagicMock()
 visidata_mock.deduceType = MagicMock()
 visidata_mock.Progress = MagicMock()
 
 # Mock external dependencies before any dbcls modules are imported
-sys.modules['kaa'] = MagicMock()
-sys.modules['kaa.cui.main'] = MagicMock()
-sys.modules['kaa.ui.msgbox'] = MagicMock()
-sys.modules['kaa.ui.selectlist'] = MagicMock()
-sys.modules['kaa.addon'] = MagicMock()
-sys.modules['kaa.cui.editor'] = MagicMock()
-sys.modules['kaa.cui.keydef'] = MagicMock()
-sys.modules['kaa.filetype.default.defaultmode'] = MagicMock()
-sys.modules['kaa.options'] = MagicMock()
-sys.modules['kaa.syntax_highlight'] = MagicMock()
-sys.modules['kaa.theme'] = MagicMock()
 aiomysql_mock = MagicMock()
 aiomysql_mock.InterfaceError = type('InterfaceError', (Exception,), {})
 aiomysql_mock.MySQLError = type('MySQLError', (Exception,), {})
 sys.modules['aiomysql'] = aiomysql_mock
 sys.modules['visidata'] = visidata_mock
 sys.modules['visidata.color'] = MagicMock()
+# vd_aggregators reaches into this submodule for PercentileAggregator, which
+# visidata does not re-export at the top level
+sys.modules['visidata.aggregators'] = MagicMock()
 sys.modules['plotext'] = MagicMock()
-sys.modules['curses'] = MagicMock()
-sys.modules['curses_ex'] = MagicMock()
-sys.modules['kaadbg'] = MagicMock()
+
+# curses: a MagicMock with the few values that are read as numbers rather than
+# just passed back to curses.  Without them ColorManager's `curses.COLORS >= 256`
+# raises instead of picking a palette.
+curses_mock = MagicMock()
+curses_mock.COLORS = 256
+curses_mock.COLOR_PAIRS = 256
+sys.modules['curses'] = curses_mock
 
 
 @pytest.fixture
 def clean_pipeline_registry():
-    """Command and function registration is global — put the module back as it
-    was.  Any test that registers a plugin command or function needs this."""
-    from dbcls import pipeline
-    handlers = dict(pipeline._COMMAND_HANDLERS)
-    commands = list(pipeline.PIPELINE_COMMANDS)
-    hints = dict(pipeline.PIPELINE_COMMAND_HINTS)
-    raw = set(pipeline._RAW_DATA_COMMANDS)
-    help_entries = list(pipeline.HELP_ENTRIES)
-    cmd_re = pipeline._PIPELINE_CMD_RE
-    functions = dict(pipeline.PLUGIN_FUNCTIONS)
-    command_help = dict(pipeline.PLUGIN_COMMAND_HELP)
-    function_help = dict(pipeline.PLUGIN_FUNCTION_HELP)
+    """Command and function registration is process-global — put the registry
+    back as it was.  Any test that registers a plugin command or function
+    needs this."""
+    from dbcls.pipeline import REGISTRY
+    state = REGISTRY.snapshot()
     yield
-    pipeline.PLUGIN_FUNCTIONS.clear()
-    pipeline.PLUGIN_FUNCTIONS.update(functions)
-    pipeline.PLUGIN_COMMAND_HELP.clear()
-    pipeline.PLUGIN_COMMAND_HELP.update(command_help)
-    pipeline.PLUGIN_FUNCTION_HELP.clear()
-    pipeline.PLUGIN_FUNCTION_HELP.update(function_help)
-    pipeline._COMMAND_HANDLERS.clear()
-    pipeline._COMMAND_HANDLERS.update(handlers)
-    pipeline.PIPELINE_COMMANDS[:] = commands
-    pipeline.PIPELINE_COMMAND_HINTS.clear()
-    pipeline.PIPELINE_COMMAND_HINTS.update(hints)
-    pipeline._RAW_DATA_COMMANDS.clear()
-    pipeline._RAW_DATA_COMMANDS.update(raw)
-    pipeline.HELP_ENTRIES[:] = help_entries
-    pipeline._PIPELINE_CMD_RE = cmd_re
+    REGISTRY.restore(state)
 
 
 @pytest.fixture(scope="session")
@@ -162,39 +156,3 @@ def sqlite_db_path(test_db_dir):
     conn.close()
 
     return db_path
-
-
-@pytest.fixture
-def mock_document():
-    """Create a mock document for testing tokenizer functionality"""
-    class MockDocument:
-        def __init__(self, text=""):
-            self.buf = text
-            self.marks = {}
-            self.highlights = []
-
-        def gettext(self, start, end):
-            return self.buf[start:end]
-
-        def gettol(self, pos):
-            """Get the position of the start of the line containing pos"""
-            line_start = self.buf.rfind('\n', 0, pos)
-            if line_start == -1:
-                return 0
-            return line_start + 1
-
-        def geteol(self, pos):
-            """Get the position of the end of the line containing pos"""
-            line_end = self.buf.find('\n', pos)
-            if line_end == -1:
-                return len(self.buf)
-            return line_end
-
-        def getline(self, pos):
-            """Get the line containing pos"""
-            line_start = self.gettol(pos)
-            line_end = self.geteol(pos)
-            line_content = self.buf[line_start:line_end]
-            return line_start, line_content
-
-    return MockDocument

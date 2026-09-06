@@ -19,11 +19,15 @@ def get_requirements():
 
 setup(
     name='dbcls',
-    version='1.4.0',
+    version='1.4.1',
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',
-    packages=find_packages(exclude=("tests", "tests.*")),
+    # plugins/ holds drivers that are not part of dbcls itself (Cassandra) —
+    # they are loaded with --plugin-dir, not installed.  find_packages() does
+    # not descend into a directory without an __init__.py anyway; the exclude
+    # is what keeps that true if one is ever added.
+    packages=find_packages(exclude=("tests", "tests.*", "plugins", "plugins.*")),
     description='dbcls is a versatile client that supports various databases',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
@@ -32,9 +36,6 @@ setup(
     zip_safe=False,
     platforms='any',
     install_requires=get_requirements(),
-    extras_require={
-        'cassandra': ['scylla-driver==3.29.9'],
-    },
     python_requires='>=3.9',
     url="https://github.com/Sets88/dbcls",
     entry_points={

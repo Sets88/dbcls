@@ -6,3 +6,7 @@ include dbcls/llm/pipeline_reference.md
 # that one only keeps them out of the wheel.  They ship without conftest.py or
 # the dev requirements anyway, so nobody could run them from the tarball.
 prune tests
+
+# Drivers that are not part of dbcls: they are loaded from a checkout with
+# --plugin-dir, and the wheel would have no way to load them anyway.
+prune plugins

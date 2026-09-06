@@ -1,7 +1,7 @@
 import argparse
 import asyncio
+import copy
 from contextlib import contextmanager
-from dataclasses import dataclass
 import threading
 import json
 import sys
@@ -24,9 +24,23 @@ from .clients.base import Result
 from .vd_modules import (
     DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet, VarsSheet,
     LiveRowsSheet)
-from .clients.sqlite3 import Sqlite3Client
+from .clients import DEFAULT_ENGINE, engine_names
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_CONNECTION_ID,
+    ConnectionConfig,
+    as_bool,
+    attach_password_provider,
+    connection_in_config,
+    make_client,
+    parse_connections,
+    resolve_config_path,
+    resolve_editor_file,
+    save_connections_to_config,
+)
 from .clients.base import ClientClass
 from .autocomplete import AutoComplete
+from . import log
 from .editor import Editor, EditorShell, Fn, K, key_alt, PopupItem, draw_box
 from .editor import find_fold_blocks, is_fold_end, is_fold_start
 from .pipeline import is_pipeline
@@ -35,7 +49,12 @@ from .pipeline import PipelineExecutor
 from .pipeline import PipelineStepError
 from .pipeline import PipelineCancelled
 from .pipeline import HELP_ENTRIES
+from .connection_form import ConnectionForm
 from .plugins import HookBus, PluginManager, resolve_plugin_names, resolve_plugin_paths
+from .prompts import PromptKind
+
+
+logger = log.get_logger(__name__)
 from .utils import beautify_sql
 
 
@@ -58,19 +77,35 @@ class DbFn(str, enum.Enum):
     TOGGLE_COMPRESSION = 'toggle_compression'
     BEAUTIFY        = 'beautify'
     NEW_TAB         = 'new_tab'
+    EDIT_CONNECTION  = 'edit_connection'
+    SAVE_CONNECTIONS = 'save_connections'
+    FORGET_PASSWORDS = 'forget_passwords'
 
 
-logging.basicConfig(level=logging.ERROR)
 
 
 class Task:
+    """One coroutine handed to the loop thread, cancellable from the main one.
+
+    `run()` happens on the loop thread, so between `submit()` and it there is a
+    window in which `self.task` does not exist yet — and Esc on the running
+    popup can land right there.  A cancel arriving then is remembered and
+    applied the moment the asyncio task is created, instead of raising.
+    """
+
     def __init__(self, coro, loop):
         self.coro = coro
         self.loop = loop
         self.task = None
+        self._cancel_requested = False
 
     def cancel(self):
-        self.loop.call_soon_threadsafe(self.task.cancel)
+        # Set before reading self.task: if the read still sees None, run() has
+        # not assigned yet and will therefore see this flag when it checks.
+        self._cancel_requested = True
+        task = self.task
+        if task is not None:
+            self.loop.call_soon_threadsafe(task.cancel)
 
     def is_done(self):
         if self.task is None:
@@ -83,34 +118,35 @@ class Task:
 
     async def run(self):
         self.task = asyncio.create_task(self.coro)
+        if self._cancel_requested:
+            # Cancelled while it was still only submitted.
+            self.task.cancel()
         return self.task
 
 
 class AsyncLoopThread(threading.Thread):
+    """The thread every database coroutine runs on.
+
+    One event loop, kept running for the life of the app so the main (curses)
+    thread can hand it work at any moment through :meth:`submit`.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.current_running_task = None
         self.loop = None
-
-    async def _run(self):
-        self.loop = asyncio.get_event_loop()
-        # Keep the event loop alive so run_coroutine_threadsafe() can
-        # submit coroutines from the main thread at any time.
-        while True:
-            await asyncio.sleep(0.1)
+        # Raised once self.loop is usable.  submit() may be called from the main
+        # thread before this thread has got that far — it waits here rather than
+        # handing run_coroutine_threadsafe a None loop.
+        self._loop_ready = threading.Event()
 
     def run(self):
-        asyncio.run(self._run())
-
-    def is_done(self):
-        if not self.current_running_task:
-            return True
-        if self.current_running_task.done():
-            self.current_running_task = None
-            return True
-        return False
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self._loop_ready.set()
+        self.loop.run_forever()
 
     def submit(self, coro: Coroutine):
+        self._loop_ready.wait()
         task = Task(coro, self.loop)
         asyncio.run_coroutine_threadsafe(task.run(), loop=self.loop)
         return task
@@ -286,9 +322,9 @@ DB_HELP_DATABASE = """\
       line, keywords upper-cased. Pipelines and dot-commands are left
       untouched; `Ctrl+Z` undoes the reformat
   `Alt+T`
-      Browse tables
+      Browse tables (also the `▤` button in the filename bar)
   `Alt+E`
-      Browse databases
+      Browse databases (also the `⛁` button in the filename bar)
   `Alt+S`
       Browse currently open VisiData sheets
       (to keep sheets open, quit visidata with `Ctrl+q` instead of `q`)
@@ -303,11 +339,49 @@ DB_HELP_DATABASE = """\
       as a key code of its own; a click on a tab switches to it too
   `Ctrl+X ↓`
       Pick a tab from a list (also `Switch to tab…` in the palette)
-  `New tab…` / `Close tab` (command palette)
-      Open another tab on any configured connection, or close the
-      current one (closing the last one quits).  A tab is named after
-      its connection, so a second tab on the same one is `mysql01#2`;
-      each has a database connection of its own
+  `Ctrl+N`
+      Open the `New tab…` menu
+  `+` (left of line 1)
+      Opens the `New tab…` menu — the same one `Ctrl+N` and the palette have
+  `New tab…` (`Ctrl+N`) / `Close tab` (command palette, or the `+` button)
+      Open another tab — on a connection that is already open, or on a
+      new one described right there — or close the current one, which
+      lets its connection go with it (closing the last tab quits).  A
+      tab is named after its connection, so a second tab on the same
+      one is `mysql01#2`; each has a database connection of its own
+  `+ New connection…` (in `New tab…`) / `Edit connection` (palette)
+      A connection is a tab: describe a database in a form — engine,
+      host, user, password, the file its tab opens — and it opens one.
+      `Edit connection` opens the same form on the connection of the
+      tab on screen.  Under the line at the bottom are the things the
+      form can do, `Enter` on a row does it: `Ok` takes the settings
+      and opens the tab (`Alt+Enter`) — editing an open connection
+      hands them to its tab instead, which then talks to that database
+      and opens the `.sql` file named there.  `Test connection` checks
+      that it connects (`^T`, with the password typed in the form:
+      there is nowhere to ask for one while the form is up),
+      `Delete connection` removes it and closes its tab after a
+      confirmation, `Cancel` leaves (`Esc`).  Changing the `id`
+      renames the connection rather than making a copy.  Closing a tab
+      lets its connection go too; the form writes nothing to disk, so
+      a connection lives until dbcls exits unless it is saved
+  `Save connections to config…` (command palette)
+      Write every connection to a config file — the file it makes is
+      one dbcls could be started from to get these tabs back.  The
+      path is asked for in the input bar, offering the config dbcls
+      started from — the one given to `--config`, or `~/.dbcls.json`,
+      which is also what it reads when started with neither a config
+      nor a connection on the command line
+      (`^U` clears it, `↑` walks earlier answers).  The file
+      is written whole: a file that is already there is asked about and
+      then overwritten, not added to.  What it is written into is the
+      config dbcls was given (`fold`, the lock options, a plugin's
+      section).  `Ctrl+Q` offers the same before quitting
+  `Forget connection passwords` (command palette)
+      With `"ask_password": true` a connection keeps no password in
+      the config file: it is asked for when the connection is first
+      used and remembered until dbcls exits.  This drops what was
+      remembered, so the next query asks again
   `.CONN "tab"` (in a pipeline)
       Run the following steps against the connection of the named tab
       (`mysql01`, `mysql01#2`, …), without changing the connection of the
@@ -363,6 +437,12 @@ Columns & sorting
       Frequency table for this column
   `Shift+c`
       Column configuration
+  `+` / `z+`
+      Add an aggregator to this column (shown on frequency and pivot
+      sheets) / show it in the status line right away.  Besides the
+      ones the prompt lists, it accepts `topk<N>` — the N most common
+      values of the group, as a list, e.g. `topk3` → `[3, 2, 10]` —
+      and any `p<N>` percentile, e.g. `p85`
   `=`
       Add an expression column
 
@@ -455,208 +535,6 @@ Expression helpers
 
   Example: `=ts_to_dt_utc(created_ts)`
 """
-
-
-def _cassandra_available() -> bool:
-    try:
-        import cassandra  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-# ─── Connections ──────────────────────────────────────────────────────────────
-
-#: Id of the connection built from the command line / the flat (pre-tabs) config
-#: keys.  A config that names no connection of its own gets exactly this one.
-DEFAULT_CONNECTION_ID = 'default'
-
-#: Engine used when none is given, as it always has been.
-DEFAULT_ENGINE = 'sqlite3'
-
-#: The flat top-level config keys that describe a connection.  They are the
-#: pre-tabs format and still work: they configure the `default` connection.
-_FLAT_CONFIG_KEYS = ('host', 'port', 'username', 'password', 'dbname', 'engine',
-                     'filepath', 'unix_socket')
-
-#: argparse dests that describe a connection; any of them being set means the
-#: user asked for a `default` connection on the command line (or through the
-#: matching DBCLS_* environment variable).
-_CLI_CONNECTION_ARGS = ('host', 'unix_socket', 'user', 'password', 'port',
-                        'engine', 'dbname', 'dbfilepath')
-
-
-def as_bool(value, default: bool = False) -> bool:
-    """Read a flag that may arrive as a bool (argparse) or as a string (a
-    DBCLS_* environment variable, a JSON config value)."""
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.strip().lower() in ('1', 'true', 'yes', 'on')
-    return bool(value)
-
-
-def _first(*values, default=''):
-    """The first truthy value — how the command line has always won over the
-    config file, and the config file over a connection block's own key."""
-    for value in values:
-        if value:
-            return value
-    return default
-
-
-@dataclass
-class ConnectionConfig:
-    """One named database connection: everything needed to build its client and
-    to open its tab.
-
-    ``dbfilepath`` is the SQLite database file (``--filepath``/``-f``);
-    ``filename`` is the *.sql* file the connection's tab opens.  The two used to
-    be one key: a connection block still accepts ``filepath`` as a legacy alias
-    for ``dbfilepath``, which is what the flat top-level config means by it."""
-
-    id: str
-    engine: str = ''
-    host: str = ''
-    port: str = ''
-    username: str = ''
-    password: str = ''
-    dbname: str = ''
-    unix_socket: Optional[str] = None
-    dbfilepath: str = ''
-    filename: Optional[str] = None
-    compress: bool = True
-    #: Per-connection overrides of the global options; None means "use the global".
-    fold: Optional[bool] = None
-    readonly: Optional[bool] = None
-
-    @classmethod
-    def from_dict(cls, conn_id: str, data: dict) -> 'ConnectionConfig':
-        return cls(
-            id=conn_id,
-            engine=data.get('engine', ''),
-            host=data.get('host', ''),
-            port=str(data.get('port', '') or ''),
-            username=data.get('username', ''),
-            password=data.get('password', ''),
-            dbname=data.get('dbname', ''),
-            unix_socket=data.get('unix_socket', None),
-            # 'filepath' is the legacy spelling of the database file.
-            dbfilepath=data.get('dbfilepath', data.get('filepath', '')),
-            filename=data.get('filename', None),
-            compress=as_bool(data.get('compress', True), True),
-            fold=None if data.get('fold') is None else as_bool(data.get('fold')),
-            readonly=None if data.get('readonly') is None else as_bool(data.get('readonly')),
-        )
-
-    def get_title(self) -> str:
-        """Short label for the tab bar and error messages."""
-        return self.id
-
-
-def make_client(config: ConnectionConfig) -> ClientClass:
-    """Build the DB client for *config*.
-
-    The driver imports are deliberately lazy: a dbcls that only ever talks to
-    SQLite must not need aiomysql installed."""
-    engine = config.engine or DEFAULT_ENGINE
-
-    if engine == 'clickhouse':
-        from .clients.clickhouse import ClickhouseClient
-        return ClickhouseClient(config.host, config.username, config.password,
-                                config.dbname, port=config.port, compress=config.compress)
-    if engine == 'mysql':
-        from .clients.mysql import MysqlClient
-        return MysqlClient(config.host, config.username, config.password, config.dbname,
-                           port=config.port, unix_socket=config.unix_socket)
-    if engine == 'postgres':
-        from .clients.postgres import PostgresClient
-        return PostgresClient(config.host, config.username, config.password, config.dbname,
-                              port=config.port, unix_socket=config.unix_socket)
-    if engine == 'sqlite3':
-        return Sqlite3Client(config.dbfilepath)
-    if engine == 'cassandra':
-        if not _cassandra_available():
-            raise RuntimeError(
-                "cassandra-driver is not installed. Install it with: pip install 'dbcls[cassandra]'")
-        from .clients.cassandra import CassandraClient
-        return CassandraClient(config.host, config.username, config.password, config.dbname,
-                               port=config.port, unix_socket=config.unix_socket)
-
-    raise ValueError(f'Invalid engine specified: {engine}')
-
-
-def resolve_editor_file(path: Optional[str]):
-    """Turn what the user pointed the editor at into ``(filepath, directory)``.
-
-    A directory opens its first file and makes the whole directory browsable
-    with Ctrl+G; a file makes its parent directory browsable."""
-    if not path:
-        return None, None
-    if os.path.isdir(path):
-        directory = os.path.abspath(path)
-        files = sorted(
-            f for f in os.listdir(directory)
-            if os.path.isfile(os.path.join(directory, f))
-        )
-        return (os.path.join(directory, files[0]) if files else None), directory
-    return path, os.path.abspath(os.path.dirname(path))
-
-
-def _cli_connection_given(args: argparse.Namespace) -> bool:
-    return any(getattr(args, name, None) for name in _CLI_CONNECTION_ARGS)
-
-
-def _default_connection(config: dict, args: argparse.Namespace,
-                        block: Optional[ConnectionConfig] = None) -> ConnectionConfig:
-    """Build the `default` connection, layering command line over the flat
-    config keys over the ``connections['default']`` block (if there is one)."""
-    block = block or ConnectionConfig(id=DEFAULT_CONNECTION_ID)
-    host = args.host
-    if host == '127.0.0.1':  # argparse default — treat as "not set"
-        host = ''
-    return ConnectionConfig(
-        id=DEFAULT_CONNECTION_ID,
-        engine=_first(args.engine, config.get('engine'), block.engine),
-        host=_first(host, config.get('host'), block.host),
-        port=_first(args.port, config.get('port'), block.port),
-        username=_first(args.user, config.get('username'), block.username),
-        password=_first(args.password, config.get('password'), block.password),
-        dbname=_first(args.dbname, config.get('dbname'), block.dbname),
-        unix_socket=_first(args.unix_socket, config.get('unix_socket'),
-                           block.unix_socket, default=None),
-        dbfilepath=_first(args.dbfilepath, config.get('filepath'), block.dbfilepath),
-        filename=block.filename,
-        # --no-compress forces it off; otherwise the block decides.
-        compress=as_bool(args.compress, True) and block.compress,
-        fold=block.fold,
-        readonly=block.readonly,
-    )
-
-
-def parse_connections(config: dict, args: argparse.Namespace) -> List[ConnectionConfig]:
-    """The connections to open, in the order their tabs appear.
-
-    A config's ``"connections"`` object names them.  The command line and the
-    flat top-level config keys describe one more, ``default`` — the whole of the
-    pre-tabs configuration, which is why a config that names no connections at
-    all still yields exactly one."""
-    connections = [
-        ConnectionConfig.from_dict(conn_id, data or {})
-        for conn_id, data in (config.get('connections') or {}).items()
-    ]
-    flat_given = any(config.get(key) for key in _FLAT_CONFIG_KEYS)
-
-    if connections and not flat_given and not _cli_connection_given(args):
-        return connections
-
-    for i, block in enumerate(connections):
-        if block.id == DEFAULT_CONNECTION_ID:
-            # Named `default` as well: the command line overrides its fields.
-            connections[i] = _default_connection(config, args, block)
-            return connections
-
-    return [_default_connection(config, args)] + connections
 
 
 class LockScreen:
@@ -921,6 +799,36 @@ class DbEditorTab(Editor):
     def lock_screen(self) -> Optional[LockScreen]:
         return self.shell.lock_screen
 
+    def apply_connection(self, config: ConnectionConfig) -> Optional[str]:
+        """Take *config* as this tab's connection, edits and all.  Returns what
+        could not be done, for the caller to report — nothing, normally.
+
+        The tab is the connection, so a change to one is a change to the other:
+        the tab talks to the database the form now describes, and opens the
+        ``.sql`` file it names.  A new client is built for it — the old one may
+        be pointed at another host entirely — and the autocomplete goes with it.
+
+        The file is only swapped in when there is nothing to lose: a buffer with
+        unsaved changes keeps what it holds."""
+        self.connection = config
+        self.client = self.shell.make_connection_client(config)
+        self.autocomplete = AutoComplete(self.client)
+        self.set_status_name(self.client.get_title())
+        self.set_words(keywords=self.client.all_commands,
+                       functions=self.client.all_functions)
+
+        filepath, directory = resolve_editor_file(config.filename)
+        if not filepath or os.path.abspath(filepath) == os.path.abspath(self.buf.filepath or ''):
+            return None
+        if self.buf.dirty:
+            return f'{self.tab_id} has unsaved changes — {filepath} was not opened'
+        self.buf.load(filepath)
+        self.lexer.invalidate(0)
+        self._file_change_dismissed = False
+        if directory:
+            self._directory = directory
+        return None
+
     def get_client(self, name: str) -> ClientClass:
         """The client `.CONN` switches to — the pipeline host hook.
 
@@ -941,7 +849,7 @@ class DbEditorTab(Editor):
             if config is None:
                 raise ValueError(
                     f'Unknown connection {name!r} (available: {self.shell.known_connections()})')
-            self._conn_clients[name] = make_client(config)
+            self._conn_clients[name] = self.shell.make_connection_client(config)
         return self._conn_clients[name]
 
     def _db_toggle_compression(self):
@@ -1026,6 +934,20 @@ class DbEditorTab(Editor):
         finally:
             self._fix_curses_after_visidata()
 
+    def _show_in_visidata(self, make_sheet) -> None:
+        """Open a sheet in VisiData, reporting a failure to the user.
+
+        *make_sheet* is a callable rather than a sheet because building one is
+        itself part of what can fail — a browser sheet queries the database on
+        the way up — and that error belongs in the same popup as one raised by
+        the session.  It runs inside the handover for the same reason."""
+        try:
+            with self._visidata_session():
+                self._vd_run(make_sheet())
+        except Exception as exc:
+            self.info_popup.open('Error', {'main': str(exc)})
+            self.set_status_notification(str(exc), error=True, popup=False)
+
     #: Pipeline sheet-handover kind → the VisiData sheet class that implements
     #: it; they all share run_sheet_prompt's handover and differ only in what
     #: their Enter/q commands do (see vd_modules.vd_utils).  'sselect',
@@ -1034,11 +956,11 @@ class DbEditorTab(Editor):
     #: shows.  'view' (.VIEW) and 'vars' (.VARS) give no answer back: the first
     #: only shows rows, the second edits self.vars in place.
     _PICKER_SHEETS = {
-        'sselect': SselectSheet,
-        'schoose': SchooseSheet,
-        'view': ViewSheet,
-        'vars': VarsSheet,
-        'watch': LiveRowsSheet,
+        PromptKind.SSELECT: SselectSheet,
+        PromptKind.SCHOOSE: SchooseSheet,
+        PromptKind.VIEW: ViewSheet,
+        PromptKind.VARS: VarsSheet,
+        PromptKind.WATCH: LiveRowsSheet,
     }
 
     def _run_picker_sheet(self, sheet) -> Optional[list]:
@@ -1286,26 +1208,16 @@ class DbEditorTab(Editor):
         self.open_running_popup(task, start, on_done)
 
     def get_sheets(self) -> 'List[str]':
-        """Return names of currently open VisiData sheets. Override to provide actual data."""
+        """The names of the VisiData sheets currently on the stack."""
         return [f'{x.name} <{x.__class__.__name__}>' for x in visidata.vd.sheets]
 
     def open_sheet(self, sheet_index: str) -> None:
-        """Open VisiData on the given sheet. Override to provide actual behaviour."""
-        try:
-            with self._visidata_session():
-                self._vd_run(visidata.vd.sheets[sheet_index])
-        except Exception as exc:
-            self.info_popup.open('Error', {'main': str(exc)})
-            self.set_status_notification(str(exc), error=True, popup=False)
+        """Open VisiData on one of the sheets get_sheets() listed."""
+        self._show_in_visidata(lambda: visidata.vd.sheets[sheet_index])
 
     def create_new_sheet(self) -> None:
-        """Open a new empty VisiData sheet. Override to provide actual behaviour."""
-        try:
-            with self._visidata_session():
-                self._vd_run(visidata.vd.newSheet('unnamed', 1))
-        except Exception as exc:
-            self.info_popup.open('Error', {'main': str(exc)})
-            self.set_status_notification(str(exc), error=True, popup=False)
+        """Open a new empty VisiData sheet."""
+        self._show_in_visidata(lambda: visidata.vd.newSheet('unnamed', 1))
 
     def add_pipeline_sheet(self, name, rows) -> None:
         """Pipeline host hook for the .SHEET command: build the VisiData sheet
@@ -1337,23 +1249,14 @@ class DbEditorTab(Editor):
         self.popup.open(items, filter_text='', on_select=on_select, title='Open VisiData sheet')
 
     def _db_show_tables(self):
-        try:
-            with self._visidata_session():
-                self._vd_run(TablesSheet(
-                    client=SyncClient(self.asyncloop_thread, self.client),
-                    db=getattr(self.client, 'dbname', None),
-                ))
-        except Exception as exc:
-            self.info_popup.open('Error', {'main': str(exc)})
-            self.set_status_notification(str(exc), error=True, popup=False)
+        self._show_in_visidata(lambda: TablesSheet(
+            client=SyncClient(self.asyncloop_thread, self.client),
+            db=getattr(self.client, 'dbname', None),
+        ))
 
     def _db_show_databases(self):
-        try:
-            with self._visidata_session():
-                self._vd_run(DataBaseSheet(client=SyncClient(self.asyncloop_thread, self.client)))
-        except Exception as exc:
-            self.info_popup.open('Error', {'main': str(exc)})
-            self.set_status_notification(str(exc), error=True, popup=False)
+        self._show_in_visidata(lambda: DataBaseSheet(
+            client=SyncClient(self.asyncloop_thread, self.client)))
 
 
 class DbEditor(EditorShell):
@@ -1369,6 +1272,8 @@ class DbEditor(EditorShell):
         client: Optional[ClientClass] = None,
         autocomplete: Optional[AutoComplete] = None,
         connections: Optional[List[ConnectionConfig]] = None,
+        config_path: str = '',
+        config_data: Optional[dict] = None,
         remap_config: str = None,
         lock_init_command: Optional[str] = None,
         lock_timeout: Optional[float] = None,
@@ -1390,6 +1295,17 @@ class DbEditor(EditorShell):
         #: id -> ConnectionConfig for every configured connection, whether or
         #: not it has a tab open: `.CONN` and "New tab…" pick from here.
         self.connections: dict = {c.id: c for c in (connections or [])}
+        #: Connections described or changed in this session (the connection
+        #: form) that no config file knows about yet — what
+        #: "Save connections to config…" writes, and what Ctrl+Q offers to save.
+        self.unsaved_connections: dict = {}
+        #: The config file dbcls was started with — where a save is offered.
+        self.config_path = config_path or ''
+        #: And what was in it.  A save to a path that does not exist yet builds
+        #: on this, so everything the config held but the form knows nothing
+        #: about — fold, the lock options, a plugin's section — is carried over
+        #: instead of being dropped.
+        self.config_data: dict = copy.deepcopy(config_data) if config_data else {}
         self.default_fold = fold
         self.default_readonly = readonly
 
@@ -1442,7 +1358,13 @@ class DbEditor(EditorShell):
                 tab_file, tab_dir = filepath, directory
             else:
                 tab_file, tab_dir = resolve_editor_file(config.filename)
-            tab_client = client if index == 0 and client is not None else make_client(config)
+            if index == 0 and client is not None:
+                # The client main() already built — it has no way of asking for
+                # a password, so give it one now.
+                tab_client = attach_password_provider(
+                    client, config, self.ask_connection_password)
+            else:
+                tab_client = self.make_connection_client(config)
             tab_autocomplete = (autocomplete if index == 0 and autocomplete is not None
                                 else AutoComplete(tab_client))
             self.add_document(DbEditorTab(
@@ -1474,6 +1396,164 @@ class DbEditor(EditorShell):
             suffix += 1
         return f'{conn_id}#{suffix}'
 
+    def available_engines(self) -> List[str]:
+        """The engines a connection can be described with, for the form's
+        picker — the built-in ones plus whatever a driver plugin registered,
+        and only those whose driver is installed: the rule `--engine`
+        follows."""
+        return engine_names()
+
+    def make_connection_client(self, config: ConnectionConfig) -> ClientClass:
+        """A client for *config*, able to ask the user for its password."""
+        return make_client(config, password_asker=self.ask_connection_password)
+
+    def ask_connection_password(self, config: ConnectionConfig) -> str:
+        """The password of an ``ask_password`` connection, asked for once.
+
+        Called from the connection's own thread the first time it connects (see
+        :meth:`ClientClass.password`).  The answer is kept on the connection,
+        so every tab and every `.CONN` client sharing it are covered by the one
+        question; `Forget connection passwords` clears it again.  A dismissed
+        prompt (Esc) is not remembered: the query fails to authenticate and the
+        next one asks again."""
+        if config.runtime_password is not None:
+            return config.runtime_password
+        if threading.current_thread() is threading.main_thread():
+            # request_user_input() blocks until the main loop answers, which is
+            # this very thread.  Nothing in dbcls connects from here, so say
+            # what happened instead of deadlocking.
+            self.set_status_notification(
+                f'Cannot ask for the password of {config.id!r} here', error=True)
+            return ''
+        answer = self.request_user_input({
+            'kind': 'input',
+            'title': f'Password for {config.id}',
+            'mask': True,
+        })
+        if answer is None:
+            return ''
+        config.runtime_password = answer
+        return answer
+
+    def forget_connection_passwords(self) -> None:
+        """Drop every password given at a prompt, so the next connection asks
+        again — what to do after typing one wrong."""
+        forgotten = [config.id for config in self.connections.values()
+                     if config.runtime_password is not None]
+        for config in self.connections.values():
+            config.runtime_password = None
+        if forgotten:
+            self.set_status_notification('Forgot the password of ' + ', '.join(forgotten))
+        else:
+            self.set_status_notification('No passwords to forget')
+
+    def tabs_on_connection(self, conn_id: str) -> List[DbEditorTab]:
+        """The open tabs running on connection *conn_id*."""
+        return [tab for tab in self.documents
+                if isinstance(tab, DbEditorTab) and tab.conn_id == conn_id]
+
+    def add_connection(self, config: ConnectionConfig) -> None:
+        """Register a connection described in this session.
+
+        It is usable at once — a tab, `New tab…`, `.CONN` — but the config file
+        does not know about it until it is saved."""
+        self.connections[config.id] = config
+        self.unsaved_connections[config.id] = config
+
+    def rename_connection(self, old_id: str, config: ConnectionConfig) -> None:
+        """Replace connection *old_id* with *config*, which carries a new name.
+
+        The old name goes away everywhere: out of the registry, and out of the
+        config file on the next save — the file is written from the connections
+        dbcls has, so a name nothing is called any more is not in it.  Tabs
+        already open on it follow the rename, so the tab bar keeps saying which
+        connection they are on.
+
+        The renamed connection stays where it was in the registry rather than
+        moving to the end: that order is the order the config file is written
+        in, and renaming one connection is no reason to reshuffle the file."""
+        tabs = self.tabs_on_connection(old_id)
+        self.unsaved_connections.pop(old_id, None)
+        if old_id in self.connections:
+            self.connections = {
+                (config.id if conn_id == old_id else conn_id):
+                (config if conn_id == old_id else conn)
+                for conn_id, conn in self.connections.items()
+            }
+            self.unsaved_connections[config.id] = config
+        else:
+            self.add_connection(config)
+        for tab in tabs:
+            suffix = tab.tab_id[len(old_id):]   # the '#2' of a second tab on it
+            tab.tab_id = self.unique_tab_id(config.id + suffix)
+            tab.apply_connection(config)
+        self._sync_tab_bar()
+
+    def apply_connection(self, config: ConnectionConfig) -> List[str]:
+        """Register *config* and hand it to the tabs running on it, so an edit
+        reaches the tab it is about — the database it talks to and the file it
+        has open.  Returns what a tab could not take (an unsaved buffer keeps
+        the file it holds), for the caller to put on screen."""
+        self.add_connection(config)
+        problems = [tab.apply_connection(config)
+                    for tab in self.tabs_on_connection(config.id)]
+        self._sync_tab_bar()
+        return [problem for problem in problems if problem]
+
+    def delete_connection(self, conn_id: str) -> bool:
+        """Forget connection *conn_id*: its tabs close and it is removed from
+        the config file it came from.  False when there was no such connection.
+
+        The file is rewritten from the connections that are left, so the delete
+        reaches it the same way a save does.  A connection and its tab are the
+        same thing, so deleting one closes the other — closing the last tab of
+        all quits, as it always has."""
+        if conn_id not in self.connections:
+            return False
+        del self.connections[conn_id]
+        self.unsaved_connections.pop(conn_id, None)
+        path = self.config_path
+        message = f'Deleted connection {conn_id}'
+        if path and connection_in_config(path, conn_id):
+            try:
+                save_connections_to_config(path, self.connections.values(),
+                                           base=self.config_data)
+                message = f'Deleted {conn_id} from {path}'
+            except (OSError, ValueError) as exc:
+                message = f'Deleted {conn_id}, but could not update {path}: {exc}'
+                self.set_status_notification(message, error=True)
+                self.close_connection_tabs(conn_id)
+                return True
+        self.close_connection_tabs(conn_id)
+        self.set_status_notification(message)
+        return True
+
+    def close_connection_tabs(self, conn_id: str) -> None:
+        """Close every tab running on *conn_id* (the connection itself is
+        already gone from the registry, so nothing reopens on it)."""
+        while True:
+            tabs = self.tabs_on_connection(conn_id)
+            if not tabs:
+                return
+            if not self.close_document(self.documents.index(tabs[0])):
+                return          # the user cancelled at the file's save prompt
+
+    def on_document_closed(self, document) -> None:
+        """A tab is gone: so is its connection, unless another tab is still on
+        it.  A connection *is* a tab — one that was described in this session
+        leaves with the last of its tabs; one that a config file describes stays
+        in the file and comes back with the next dbcls."""
+        connection = getattr(document, 'connection', None)
+        if connection is None or self.tabs_on_connection(connection.id):
+            return
+        if self.connections.pop(connection.id, None) is None:
+            return              # already deleted — this is delete_connection's own close
+        self.unsaved_connections.pop(connection.id, None)
+        path = self.config_path
+        if path and connection_in_config(path, connection.id):
+            self.set_status_notification(
+                f'Closed {connection.id} — it stays in {path}')
+
     def open_connection_tab(self, conn_id: str) -> Optional[DbEditorTab]:
         """Open a new tab on the configured connection *conn_id* and show it.
 
@@ -1485,7 +1565,13 @@ class DbEditor(EditorShell):
             self.set_status_notification(f'Unknown connection {conn_id!r}', error=True)
             return None
         tab_file, tab_dir = resolve_editor_file(config.filename)
-        client = make_client(config)
+        try:
+            client = self.make_connection_client(config)
+        except Exception as exc:
+            # An engine with no driver installed, a name make_client does not
+            # know: the command must say so, not take the editor down with it.
+            self.set_status_notification(str(exc), error=True)
+            return None
         tab = self.add_document(DbEditorTab(
             self, client=client, autocomplete=AutoComplete(client), connection=config,
             tab_id=self.unique_tab_id(conn_id),
@@ -1536,19 +1622,137 @@ class DbEditor(EditorShell):
         self.add_keybinding(DbFn.SHOW_VD_SHEETS, key_alt(ord('s')))              # Alt+S
         self.add_editor_function(DbFn.BEAUTIFY, run('_db_beautify'), 'Beautify SQL', '^B')
         self.add_keybinding(DbFn.BEAUTIFY, K(ord('\x02')))                       # Ctrl+B
-        self.add_editor_function(DbFn.NEW_TAB, self._db_new_tab, 'New tab…')
+        # A connection is a tab, so there is one command for both: "New tab…"
+        # either opens a tab on a connection that is already open or describes
+        # a new one, which then opens a tab of its own.  Ctrl+N is its key —
+        # the editor's own autocomplete used to sit there, and the one worth
+        # having is the context-aware Shift+Tab one.
+        self.add_editor_function(DbFn.NEW_TAB, self._db_new_tab, 'New tab…', '^N')
+        self.add_keybinding(DbFn.NEW_TAB, K(ord('\x0e')))                        # Ctrl+N
+        self.add_editor_function(DbFn.EDIT_CONNECTION, self._db_edit_connection,
+                                 'Edit connection')
+        self.add_editor_function(DbFn.SAVE_CONNECTIONS, self._db_save_connections,
+                                 'Save connections to config…')
+        self.add_editor_function(DbFn.FORGET_PASSWORDS, self.forget_connection_passwords,
+                                 'Forget connection passwords')
+        # The three commands that had nowhere to be seen: "New tab…" lived in
+        # the palette alone, and Alt+E/Alt+T only in the help.  A click names
+        # the key in the status bar, straight from the registration above.
+        self.add_bar_button('+', DbFn.NEW_TAB, gutter=True)
+        self.add_bar_button('⛁', DbFn.SHOW_DATABASES)
+        self.add_bar_button('▤', DbFn.SHOW_TABLES)
+
+    #: The entry that opens the connection form instead of picking a connection
+    #: that is already open — how a new database gets into a running dbcls.
+    _NEW_CONNECTION_ITEM = '\x00new-connection'
 
     def _db_new_tab(self) -> None:
-        """Open another tab, on a connection picked from the config."""
-        if not self.connections:
-            self.set_status_notification('No connections configured', error=True)
-            return
+        """Open a tab: on a connection that is already open, or on a new one
+        described in the form."""
         items = [
-            PopupItem(insert=conn_id, label=conn_id, weight=0,
+            PopupItem(insert=self._NEW_CONNECTION_ITEM, label='+ New connection…',
+                      weight=0, hint='describe another database'),
+        ]
+        items += [
+            PopupItem(insert=conn_id, label=conn_id, weight=1,
                       hint=config.engine or DEFAULT_ENGINE)
             for conn_id, config in self.connections.items()
         ]
-        self.show_menu('New tab on connection', items, on_select=self.open_connection_tab)
+
+        def chosen(value: str) -> None:
+            if value == self._NEW_CONNECTION_ITEM:
+                self._db_new_connection()
+            else:
+                self.open_connection_tab(value)
+
+        self.show_menu('New tab on connection', items, on_select=chosen)
+
+    # ── Connections described in the editor ───────────────────────────────────
+
+    def _db_new_connection(self) -> None:
+        """Open the form on a blank connection."""
+        self.push_overlay(ConnectionForm(self))
+
+    def _db_edit_connection(self) -> None:
+        """Open the form on the connection of the tab on screen.
+
+        No list to pick from: the tab *is* the connection, so the one being
+        looked at is the one to edit."""
+        config = self.connections.get(self.doc.conn_id) if isinstance(self.doc, DbEditorTab) else None
+        if config is None:
+            self.set_status_notification('This tab has no connection to edit', error=True)
+            return
+        self.push_overlay(ConnectionForm(self, connection=config))
+
+    def default_config_path(self) -> str:
+        """Where a save is offered: the config dbcls was started with, or the
+        conventional file when it was started without one."""
+        return self.config_path or DEFAULT_CONFIG_PATH
+
+    def _db_save_connections(self) -> None:
+        """Write the connections to a config file — every one of them.
+
+        Not just the ones described in this session: what is saved is the set of
+        connections dbcls has, so the file it writes is one it could be started
+        from and get the same tabs back."""
+        if not self.connections:
+            self.set_status_notification('No connections to save')
+            return
+        self.save_connections(self.connections.values())
+
+    def save_connections(self, connections) -> bool:
+        """Ask for a path and write *connections* there.  False when the user
+        escaped the prompt, said no to overwriting, or the file could not be
+        written."""
+        connections = list(connections)
+        path = self._prompt('Save connections to', default=self.default_config_path())
+        path = path.strip()
+        if not path:
+            self.set_status_notification('Not saved', error=True)
+            return False
+        if os.path.exists(os.path.expanduser(path)):
+            # Say what writing to a file that is already there does: it is
+            # replaced, not added to.
+            if not self._confirm(f'{path} exists — overwrite it? (y/n): '):
+                self.set_status_notification(f'Not saved to {path}', error=True)
+                return False
+        try:
+            written = save_connections_to_config(path, connections,
+                                                 base=self.config_data)
+        except (OSError, ValueError) as exc:
+            # A popup, not just the status bar: this can come up on the way out
+            # of dbcls, where a line that is about to disappear is no way to
+            # learn that nothing was saved.
+            message = f'Could not save to {path}: {exc}'
+            self.info_popup.open('Error', {'main': message})
+            self.set_status_notification(message, error=True, popup=False)
+            return False
+        for conn in connections:
+            self.unsaved_connections.pop(conn.id, None)
+        self.config_path = written
+        names = ', '.join(conn.id for conn in connections)
+        if len(names) > 60:
+            names = f'{len(connections)} connections'
+        self.set_status_notification(f'Saved {names} to {written}')
+        return True
+
+    def _confirm_quit(self) -> bool:
+        """Offer to save the connections this session changed or described.
+
+        It covers both — a connection that is in no file yet and one that is,
+        but not as it is now — so the question says "unsaved", not "new"."""
+        if not self.unsaved_connections:
+            return True
+        names = ', '.join(self.unsaved_connections)
+        answer = self._confirm_3way(
+            f'Unsaved connections: {names}. Save? (y)es / (n)o / (c)ancel: ')
+        if answer == 'cancel':
+            return False
+        if answer == 'no':
+            return True
+        # Saving writes them all — the unsaved ones are only what the question
+        # was about.
+        return self.save_connections(self.connections.values())
 
     def apply_keys_remap(self, remap_str: str):
         if not remap_str:
@@ -1556,7 +1760,7 @@ class DbEditor(EditorShell):
         try:
             for pair in remap_str.split(','):
                 key, seq = pair.split(':')
-                self.REMAPED_KEYS[int(key)] = int(seq)
+                self.keys.add_remap(int(key), int(seq))
         except Exception:
             print('Invalid key remap string in DBCLS_KEY_REMAP')
 
@@ -1616,14 +1820,27 @@ class DbEditor(EditorShell):
         return pages
 
 
-def env_override(args: argparse.Namespace):
-    try:
-        env_override = {x: y for x, y in os.environ.items() if x.startswith('DBCLS_')}
+def env_override(args: argparse.Namespace, parser: argparse.ArgumentParser):
+    """Fill in ``DBCLS_<DEST>`` for every option the user did *not* give.
 
-        for key, value in env_override.items():
-            arg_key = key[len('DBCLS_'):].lower()
-            if hasattr(args, arg_key) and value:
-                setattr(args, arg_key, value)
+    The command line wins over the environment, which is the order the plugin
+    settings follow too (see :mod:`dbcls.plugins`).  "Not given" is decided by
+    comparing what argparse produced against the option's own default: an
+    explicit flag moves the value off it, a missing one leaves it there.  An
+    option passed with exactly its default value is indistinguishable from an
+    absent one — and needs no protecting, since overriding it changes nothing
+    the user asked for.
+    """
+    try:
+        for key, value in os.environ.items():
+            if not key.startswith('DBCLS_') or not value:
+                continue
+            dest = key[len('DBCLS_'):].lower()
+            if not hasattr(args, dest):
+                continue
+            if getattr(args, dest) != parser.get_default(dest):
+                continue   # given on the command line — that is the answer
+            setattr(args, dest, value)
     except Exception:
         print('Error processing environment variable overrides')
 
@@ -1648,7 +1865,7 @@ def discover_plugins() -> PluginManager:
     pre_parser = argparse.ArgumentParser(add_help=False)
     plugin_arguments(pre_parser)
     pre_args, _unknown = pre_parser.parse_known_args()
-    env_override(pre_args)
+    env_override(pre_args, pre_parser)
     enabled = pre_args.plugins
     if isinstance(enabled, str):
         enabled = enabled.strip().lower() not in ('0', 'false', 'no', 'off')
@@ -1662,6 +1879,11 @@ def discover_plugins() -> PluginManager:
 
 
 def main():
+    # Before anything else that might want to report a failure, and before
+    # curses takes the screen: the log is the only place a message can go once
+    # it has.  Off unless DBCLS_LOG names a file — see dbcls.log.
+    log.configure()
+    logger.debug('starting')
     plugins = discover_plugins()
 
     parser = argparse.ArgumentParser(description='DB connection tool')
@@ -1672,9 +1894,11 @@ def main():
     parser.add_argument('--user', '-u', dest='user', help='specify user name', required=False)
     parser.add_argument('--password', '-p', dest='password', default='', help='specify raw password')
     parser.add_argument('--port', '-P', dest='port', default='', help='specify port')
-    parser.add_argument('--engine', '-E', dest='engine', help='specify db engine', required=False,
-        choices=['clickhouse', 'mysql', 'postgres', 'sqlite3']
-            + (['cassandra'] if _cassandra_available() else []))
+    # Its choices are filled in below, once the plugins have had their setup()
+    # — a driver plugin registers its engine there, and it has to be as valid a
+    # --engine as any built-in one.
+    engine_arg = parser.add_argument('--engine', '-E', dest='engine',
+        help='specify db engine', required=False)
     parser.add_argument('--dbname', '-d', dest='dbname', help='specify db name', required=False)
     parser.add_argument('--filepath', '-f', dest='dbfilepath', help='specify db filepath', required=False)
     parser.add_argument('--no-compress', dest='compress', action='store_false', default=True,
@@ -1694,19 +1918,40 @@ def main():
         help='shell command to verify a lock session (receives the code via stdin, must output the original secret)')
     plugin_arguments(parser)
     # Every plugin declares its own options here — the core knows none of them.
+    # A driver plugin also registers its engine here, which is why --engine
+    # cannot know what it accepts until this has run.
     plugins.add_arguments(parser)
+    engine_arg.choices = engine_names()
 
     args = parser.parse_args()
-    env_override(args)
+    env_override(args, parser)
 
     # --fold is a bool from argparse, but DBCLS_FOLD arrives as a string
     fold = as_bool(args.fold)
     readonly = as_bool(args.readonly)
     config = {}
 
+    # --config, or ~/.dbcls.json when nothing on the command line says otherwise.
+    # The answer goes back into args.config because that is what the editor is
+    # told it was started with — what `Save connections to config…` offers to
+    # write back to.
+    explicit_config = bool(args.config)
+    args.config = resolve_config_path(args)
+
     if args.config:
-        with open(args.config) as f:
-            config = json.load(f)
+        try:
+            with open(args.config) as f:
+                config = json.load(f)
+        except (OSError, ValueError) as exc:
+            # A file dbcls picked up on its own must not stop it from starting;
+            # one the user named must, or the settings they asked for would go
+            # missing without a word.
+            if explicit_config:
+                print(f'Error: could not read {args.config}: {exc}', file=sys.stderr)
+                sys.exit(1)
+            print(f'Warning: ignoring {args.config}: {exc}', file=sys.stderr)
+            args.config = ''
+            config = {}
 
         # Config fills in anything not provided on the command line.
         fold = fold or as_bool(config.get('fold'))
@@ -1750,6 +1995,7 @@ def main():
         curses.wrapper(lambda stdscr: DbEditor(
                 stdscr, editor_filepath, directory=editor_directory, client=client,
                 autocomplete=autocomplete, connections=connections,
+                config_path=args.config, config_data=config,
                 remap_config=args.key_remap,
                 lock_init_command=args.lock_init_command,
                 lock_timeout=args.lock_timeout,

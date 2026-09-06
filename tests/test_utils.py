@@ -144,3 +144,41 @@ class TestSyncClient:
         finally:
             # Restore original method
             sync_client._run_coro = original_run_coro
+
+
+class TestTopKValues:
+    """The counting behind the `topk<N>` visidata aggregators."""
+
+    def test_most_common_first(self):
+        from dbcls.utils import top_k_values
+
+        values = [3] * 10 + [2] * 5 + [10] * 2 + [7]
+        assert top_k_values(values, 3) == [3, 2, 10]
+
+    def test_ties_keep_first_appearance(self):
+        from dbcls.utils import top_k_values
+
+        assert top_k_values(['b', 'a', 'a', 'b', 'c'], 2) == ['b', 'a']
+
+    def test_k_larger_than_the_number_of_distinct_values(self):
+        from dbcls.utils import top_k_values
+
+        assert top_k_values([1, 1, 2], 10) == [1, 2]
+
+    def test_no_values(self):
+        from dbcls.utils import top_k_values
+
+        assert top_k_values([], 3) == []
+
+    def test_a_generator_is_accepted(self):
+        from dbcls.utils import top_k_values
+
+        assert top_k_values((v for v in [1, 1, 2]), 1) == [1]
+
+    def test_unhashable_values(self):
+        """A JSON-typed (`g@`) column holds dicts and lists, which Counter
+        cannot hash; they are counted by repr and returned as themselves."""
+        from dbcls.utils import top_k_values
+
+        values = [{'a': 1}, {'a': 1}, ['x'], {'b': 2}, ['x'], ['x']]
+        assert top_k_values(values, 2) == [['x'], {'a': 1}]

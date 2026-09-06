@@ -14,45 +14,21 @@ from dbcls.editor import (
     key_alt,
     key_pfx,
 )
+from tests.fakes import make_shell
 
 CTRL_X = '\x18'
 ENTER = '\n'
 SHIFT_TAB = 353  # curses.KEY_BTAB
 
 
-def make_editor():
-    """Build a minimal shell (with one stub document) without touching curses."""
-    ed = object.__new__(EditorShell)
-    ed.stdscr = MagicMock()
-    ed.renderer = MagicMock()
-    doc = MagicMock()
-    doc.buf = MagicMock()
-    doc.textarea = MagicMock(buf=doc.buf)
-    doc.search = MagicMock(active=False)
-    ed.documents = [doc]
-    ed.active = 0
-    ed._overlays = []
-    ed.popup = MagicMock(active=False)
-    ed.info_popup = MagicMock(active=False)
-    ed.running_popup = MagicMock(active=False)
-    ed.input_bar = MagicMock(active=False)
-    ed._ui_request = None
-    ed._prefix_pending = False
-    ed._debug_mode = False
-    ed._status_notification = None
-    ed._keybindings = {}
-    ed._editor_functions = {}
-    ed.REMAPED_KEYS = {}  # instance attr shadows the shared class-level dict
-    return ed
+make_editor = make_shell
 
 
 def bind(ed, name, key):
     """Bind `name` to `key` and return the list its invocations are recorded in."""
     calls = []
-    ed._editor_functions[name] = {
-        'func': lambda: calls.append(name), 'description': '', 'keybinding': '',
-    }
-    ed._keybindings[key] = name
+    ed.commands.add(name, lambda: calls.append(name))
+    ed.commands.bind(name, key)
     return calls
 
 
@@ -67,16 +43,16 @@ class TestRemap:
         # Tab (36) remapped to Shift+Tab (1412) — the README swap example
         ed = make_editor()
         calls = bind(ed, 'show_prediction', K(SHIFT_TAB))
-        ed.REMAPED_KEYS[K(ord('\t'))] = K(SHIFT_TAB)
+        ed.keys.remap_table[K(ord('\t'))] = K(SHIFT_TAB)
         ed._dispatch('\t')
         assert calls == ['show_prediction']
 
     def test_remap_to_prefix_trigger_arms_prefix(self):
         # A key remapped to Ctrl+X must start a prefix sequence
         ed = make_editor()
-        ed.REMAPED_KEYS[K(SHIFT_TAB)] = KEY_PREFIX_TRIGGER
+        ed.keys.remap_table[K(SHIFT_TAB)] = KEY_PREFIX_TRIGGER
         ed._dispatch(SHIFT_TAB)
-        assert ed._prefix_pending is True
+        assert ed.keys.prefix_pending is True
 
 
 class TestOverlays:
@@ -220,7 +196,7 @@ class TestTmuxPrefix:
         ed = make_editor()
         calls = bind(ed, 'trigger_action', KEY_PREFIX_TRIGGER)
         ed._dispatch(CTRL_X)
-        assert ed._prefix_pending is True
+        assert ed.keys.prefix_pending is True
         assert calls == []
         ed.stdscr.timeout.assert_called_with(1000)
 
@@ -235,13 +211,13 @@ class TestTmuxPrefix:
         ed._dispatch(ENTER)
         assert combo_calls == ['combo']
         assert enter_calls == []
-        assert ed._prefix_pending is False
+        assert ed.keys.prefix_pending is False
 
     def test_remapped_prefix_combo(self):
         # --key-remap "42:457": Ctrl+X Enter acts as Alt+R
         ed = make_editor()
         calls = bind(ed, 'run_query', key_alt(ord('r')))
-        ed.REMAPED_KEYS[key_pfx(ord(ENTER))] = key_alt(ord('r'))
+        ed.keys.remap_table[key_pfx(ord(ENTER))] = key_alt(ord('r'))
         ed._dispatch(CTRL_X)
         ed._dispatch(ENTER)
         assert calls == ['run_query']
@@ -262,7 +238,7 @@ class TestTmuxPrefix:
         ed = make_editor()
         calls = bind(ed, 'newline', K(ord(ENTER)))
         ed._dispatch(CTRL_X)
-        assert ed._prefix_pending is True
-        ed._prefix_pending = False  # what run() does on timeout
+        assert ed.keys.prefix_pending is True
+        ed.keys.prefix_pending = False  # what run() does on timeout
         ed._dispatch(ENTER)
         assert calls == ['newline']

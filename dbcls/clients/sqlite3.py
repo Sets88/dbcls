@@ -2,8 +2,8 @@ import sqlite3
 import asyncio
 from typing import Optional
 
+from ..utils import sql_literal
 from .base import (
-    CommandParams,
     ClientClass,
     Result,
 )
@@ -13,16 +13,25 @@ class Sqlite3Client(ClientClass):
     ENGINE = 'Sqlite3'
     SUPPORTS_EDITING = True
 
-    def __init__(self, filename):
+    # A SQLite connection is a file handle opened per query (or one kept for an
+    # in-memory database), so there is nothing to reconnect to and no connect()
+    # for the base class to call.
+    RECONNECT_ERROR = None
+    DB_ERROR = sqlite3.DatabaseError
+
+    def __init__(self, filename=None):
+        # A SQLite connection is a file name and nothing else, but the base
+        # __init__ still runs: it is what sets up the password plumbing and the
+        # host/port/connection attributes the rest of the app reads off any
+        # client.  They stay empty here — there is no server to describe.
+        super().__init__(dbname=filename or ':memory:')
         if not filename:
             # No file path → keep everything in a single in-memory database.
             # A persistent connection is required because a fresh `:memory:`
             # connection per statement would start from an empty DB each time.
-            self.dbname = ':memory:'
             self.in_memory = True
             self._conn = self.get_connection()
         else:
-            self.dbname = filename
             self.in_memory = False
             self._conn = None
 
@@ -36,12 +45,14 @@ class Sqlite3Client(ClientClass):
         return conn
 
     async def get_table_columns(self, table_name: str, database: str = None):
-        result = await self.execute(f"PRAGMA table_info({table_name})")
+        result = await self._execute(f'PRAGMA table_info({self.quote_ident(table_name)})')
         return [f"{row['name']}" for row in result.data]
 
     async def get_tables(self, database=None) -> Result:
-        return await self.execute(
-            "SELECT name AS 'table', '%s' AS database FROM sqlite_master WHERE type='table';" % self.dbname
+        return await self._execute(
+            "SELECT name AS 'table', "
+            f"{sql_literal(self.dbname)} AS database "
+            "FROM sqlite_master WHERE type='table';"
         )
 
     def get_table_ref(self, table: str, database: Optional[str] = None) -> str:
@@ -49,31 +60,20 @@ class Sqlite3Client(ClientClass):
         return self.quote_ident(table)
 
     async def get_primary_key(self, table: str, database: Optional[str] = None) -> list:
-        result = await self.execute(f"PRAGMA table_info({self.quote_ident(table)})")
+        result = await self._execute(f"PRAGMA table_info({self.quote_ident(table)})")
         # pk is the 1-based position of the column in the primary key, 0 if not part of it;
         # a table without a declared PK returns [] (implicit rowid is not in SELECT *)
         rows = sorted((row for row in result.data if row['pk'] > 0), key=lambda x: x['pk'])
         return [row['name'] for row in rows]
 
-    def get_sample_data_sql(self,
-        table: str,
-        database: Optional[str] = None,
-    ):
-        return f"SELECT * FROM `{table}`"
-
-    def get_limit_sql(self, limit: int, offset: int = 0):
-        return f'LIMIT {offset},{limit}'
-
     async def get_databases(self) -> Result:
         return Result([{'database': self.dbname}], 0)
 
     async def get_schema(self, table, database=None) -> Result:
-        return await self.execute(
-            f"SELECT sql AS schema FROM sqlite_master WHERE type='table' AND name='{table}';"
+        return await self._execute(
+            "SELECT sql AS schema FROM sqlite_master "
+            f"WHERE type='table' AND name={sql_literal(table)};"
         )
-
-    async def command_schema(self, command: CommandParams):
-        return await self.get_schema(command.params)
 
     def _execute_sync(self, sql) -> Result:
         conn = self.get_connection()
@@ -89,15 +89,9 @@ class Sqlite3Client(ClientClass):
 
         return Result(data, rowcount)
 
-    def is_db_error_exception(self, exc: Exception) -> bool:
-        return isinstance(exc, sqlite3.DatabaseError)
-
-    async def execute(self, sql) -> Result:
-        result = await self.if_command_process(sql)
-
-        if result:
-            return result
-
+    async def _run_query(self, sql) -> Result:
+        # sqlite3 is a blocking library: the query goes to a thread so the
+        # worker loop stays free to deliver a cancellation.
         return await asyncio.to_thread(self._execute_sync, sql)
 
     def get_title(self) -> str:

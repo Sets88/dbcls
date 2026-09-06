@@ -32,9 +32,9 @@ KEY_TAB = K(ord('\t'))
 KEY_SHIFT_TAB = K(353)          # curses.KEY_BTAB
 KEY_SEND = (key_alt(ord('\n')), key_alt(ord('\r')))
 KEY_APPLY = (key_ctrl('t'),)    # take the result into the document
-#: ^N is the editor's autocomplete key, but these bindings only live while the
-#: window is up — the overlay takes every keystroke — and the chat's fields have
-#: no autocomplete of their own, so the letter is free to mean "new" here.
+#: ^N is the editor's "New tab…" key, but these bindings only live while the
+#: window is up — the overlay takes every keystroke — and there are no tabs to
+#: open from inside the chat, so the letter is free to mean "new" here.
 KEY_RESET = (key_ctrl('n'),)
 
 SPINNER = '|/-\\'

@@ -7,9 +7,9 @@ from typing import Optional
 import clickhouse_connect
 
 from .base import (
-    CommandParams,
     ClientClass,
-    Result
+    Result,
+    ShowCommandsMixin,
 )
 
 
@@ -23,12 +23,16 @@ logger = logging.getLogger(__name__)
 PROGRESS_INTERVAL = 0.05
 
 
-class ClickhouseClient(ClientClass):
+class ClickhouseClient(ShowCommandsMixin, ClientClass):
     ENGINE = 'Clickhouse'
 
     SUPPORTS_COMPRESSION = True
 
     SUPPORTS_QUERY_CANCEL = True
+
+    DEFAULT_PORT = '8123'
+    RECONNECT_ERROR = clickhouse_connect.driver.exceptions.OperationalError
+    DB_ERROR = clickhouse_connect.driver.exceptions.ClickHouseError
 
     SQL_COMMANDS =['TABLES', 'DATABASES', 'USE', 'SHOW', 'CLUSTERS']
 
@@ -40,58 +44,15 @@ class ClickhouseClient(ClientClass):
     ]
 
     def __init__(self, host, username, password, dbname, port='8123', compress=True):
-        super().__init__(host, username, password, dbname, port)
+        super().__init__(host, username, password, dbname or 'default', port)
         self.compress = compress
         # query_id of the statement currently in flight — what request_cancel
         # kills.  Written by the worker loop, read by the UI thread.
         self._query_id: Optional[str] = None
 
-        if not dbname:
-            self.dbname = 'default'
-        if not port:
-            self.port = '8123'
-
     async def get_table_columns(self, table_name: str, database: str = None):
-        db_name = database or self.dbname
-        result = await self._execute(f"DESCRIBE {db_name}.{table_name}")
+        result = await self._execute(f'DESCRIBE {self.get_table_ref(table_name, database or self.dbname)}')
         return [f"{row['name']}" for row in result.data]
-
-    async def get_tables(self, database: Optional[str] = None) -> Result:
-        if not database:
-            database = self.dbname
-        result = await self._execute('SHOW TABLES IN %s' % database)
-
-        if result.data:
-            result.data = [{'table': next(iter(x.values())), 'database': database} for x in result.data]
-        return result
-
-    async def get_databases(self) -> Result:
-        result = await self._execute('SHOW DATABASES')
-        if result.data:
-            result.data = [{'database': x['name']} for x in result.data]
-        return result
-
-    async def get_schema(self, table: str, database: Optional[str] = None) -> Result:
-        if not database:
-            database = self.dbname
-
-        result = await self.execute('SHOW CREATE TABLE `%s`.`%s`' % (database, table))
-
-        if result and result.data:
-            result.data = [{'schema': list(x.values())[-1]} for x in result.data]
-        return result
-
-    def get_sample_data_sql(self,
-        table: str,
-        database: Optional[str] = None,
-    ):
-        return f"SELECT * FROM `{database}`.`{table}`"
-
-    def get_limit_sql(self, limit: int, offset: int = 0):
-        return f'LIMIT {offset},{limit}'
-
-    async def command_schema(self, command: CommandParams):
-        return await self.get_schema(command.params)
 
     async def connect(self):
         self.connection = await clickhouse_connect.get_async_client(
@@ -116,13 +77,7 @@ class ClickhouseClient(ClientClass):
         self.connection = None
         return await super().change_database(database)
 
-    async def _execute(self, sql):
-        return await self._execute_with_reconnect(
-            lambda: self._stream_query(sql),
-            clickhouse_connect.driver.exceptions.OperationalError
-        )
-
-    async def _stream_query(self, sql: str) -> Result:
+    async def _run_query(self, sql: str) -> Result:
         """Read the result block by block instead of in one blocking gulp.
 
         clickhouse_connect's async client is a thread-pool wrapper: a plain
@@ -230,13 +185,3 @@ class ClickhouseClient(ClientClass):
             # failed KILL only means the query runs to its natural end.
             logger.warning('KILL QUERY %s failed', query_id, exc_info=True)
 
-    def is_db_error_exception(self, exc: Exception) -> bool:
-        return isinstance(exc, clickhouse_connect.driver.exceptions.ClickHouseError)
-
-    async def execute(self, sql) -> Result:
-        result = await self.if_command_process(sql)
-
-        if result:
-            return result
-
-        return await self._execute(sql)

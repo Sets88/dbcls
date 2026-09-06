@@ -3,16 +3,21 @@ from typing import Optional
 import aiomysql
 from aiomysql import InterfaceError, MySQLError
 
+from ..utils import sql_literal
 from .base import (
-    CommandParams,
     ClientClass,
     Result,
+    ShowCommandsMixin,
 )
 
 
-class MysqlClient(ClientClass):
+class MysqlClient(ShowCommandsMixin, ClientClass):
     ENGINE = 'MySQL'
     SUPPORTS_EDITING = True
+
+    DEFAULT_PORT = '3306'
+    RECONNECT_ERROR = InterfaceError
+    DB_ERROR = MySQLError
 
     SQL_COMMANDS = [
         'TABLES', 'DATABASES', 'USE', 'SHOW', 'PROCESSLIST', 'DEFAULT', 'KEY', 'PRIMARY', 'CHARACTER',
@@ -24,14 +29,6 @@ class MysqlClient(ClientClass):
         'CAST', 'JSON_KEYS', 'JSON_CONTAINS'
     ]
 
-    def __init__(
-        self, host: str, username: str, password: str, dbname: str,
-        port: Optional[str] = None, unix_socket: Optional[str] = None
-    ):
-        super().__init__(host, username, password, dbname, port, unix_socket)
-        if not port:
-            self.port = '3306'
-
     async def connect(self):
         params = {
             'user': self.username,
@@ -39,8 +36,12 @@ class MysqlClient(ClientClass):
             'autocommit': True
         }
 
-        if self.password:
-            params['password'] = self.password
+        # Read once: with a connection that asks for its password, every read
+        # of the attribute is a question put to the user (see
+        # ClientClass.password).
+        password = self.password
+        if password:
+            params['password'] = password
 
         if not self.unix_socket:
             params['host'] = self.host
@@ -56,47 +57,21 @@ class MysqlClient(ClientClass):
 
     async def get_table_columns(self, table_name: str, database: str = None):
         db_name = database or self.dbname
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_name = '{table_name}'
-            AND table_schema = '{db_name}'
+            WHERE table_name = {sql_literal(table_name)}
+            AND table_schema = {sql_literal(db_name)}
             ORDER BY ordinal_position
         """)
 
         return [f"{row['COLUMN_NAME']}" for row in result.data]
 
-    async def get_tables(self, database: Optional[str] = None) -> Result:
-        if not database:
-            database = self.dbname
-
-        result = await self.execute('SHOW TABLES IN %s' % database)
-
-        if result.data:
-            result.data = [{'table': next(iter(x.values())), 'database': database} for x in result.data]
-        return result
-
-    async def get_databases(self) -> Result:
-        result = await self.execute('SHOW DATABASES')
-        if result.data:
-            result.data = [{'database': next(iter(x.values()))} for x in result.data]
-        return result
-
-    async def get_schema(self, table: str, database: Optional[str] = None) -> Result:
-        if not database:
-            database = self.dbname
-
-        result = await self.execute('SHOW CREATE TABLE `%s`.`%s`' % (database, table))
-
-        if result and result.data:
-            result.data = [{'schema': list(x.values())[-1]} for x in result.data]
-        return result
-
     async def get_primary_key(self, table: str, database: Optional[str] = None) -> list:
         if not database:
             database = self.dbname
 
-        result = await self.execute(
+        result = await self._execute(
             f"SHOW KEYS FROM {self.get_table_ref(table, database)} WHERE Key_name = 'PRIMARY'"
         )
         if not result.data:
@@ -104,32 +79,9 @@ class MysqlClient(ClientClass):
         rows = sorted(result.data, key=lambda x: x['Seq_in_index'])
         return [row['Column_name'] for row in rows]
 
-    def get_sample_data_sql(self,
-        table: str,
-        database: Optional[str] = None,
-    ):
-        return f"SELECT * FROM `{database}`.`{table}`"
+    async def _run_query(self, sql) -> Result:
+        async with self.connection.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(sql)
+            data = await cur.fetchall()
 
-    def get_limit_sql(self, limit: int, offset: int = 0):
-        return f'LIMIT {offset},{limit}'
-
-    async def command_schema(self, command: CommandParams):
-        return await self.get_schema(command.params)
-
-    def is_db_error_exception(self, exc: Exception) -> bool:
-        return isinstance(exc, MySQLError)
-
-    async def execute(self, sql) -> Result:
-        result = await self.if_command_process(sql)
-
-        if result:
-            return result
-
-        async def run_query():
-            async with self.connection.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute(sql)
-                data = await cur.fetchall()
-
-                return Result(data, cur.rowcount)
-
-        return await self._execute_with_reconnect(run_query, InterfaceError)
+            return Result(data, cur.rowcount)

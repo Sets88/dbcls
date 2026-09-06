@@ -15,9 +15,12 @@ import pytest
 from dbcls.dbcls import (
     ConnectionConfig,
     DbEditor,
+    DbFn,
     DEFAULT_CONNECTION_ID,
+    env_override,
     make_client,
     parse_connections,
+    resolve_config_path,
 )
 from dbcls.clients.base import Result
 from dbcls.editor import K, TabBar, key_csi, key_pfx
@@ -26,9 +29,70 @@ from dbcls.editor import K, TabBar, key_csi, key_pfx
 def cli(**overrides):
     """An argparse namespace with the connection options at their defaults."""
     args = dict(host='', unix_socket=None, user=None, password='', port='',
-                engine=None, dbname=None, dbfilepath=None, compress=True)
+                engine=None, dbname=None, dbfilepath=None, compress=True,
+                config='')
     args.update(overrides)
     return argparse.Namespace(**args)
+
+
+# ── DBCLS_* environment variables ─────────────────────────────────────────────
+
+class TestEnvOverride:
+    """The command line beats the environment; the environment beats nothing."""
+
+    @staticmethod
+    def _parser():
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--host', dest='host', default='')
+        parser.add_argument('--user', dest='user', default=None)
+        parser.add_argument('--no-plugins', dest='plugins',
+                            action='store_false', default=True)
+        return parser
+
+    def test_env_fills_in_an_option_that_was_not_given(self, monkeypatch):
+        monkeypatch.setenv('DBCLS_HOST', 'from-env')
+        parser = self._parser()
+        args = parser.parse_args([])
+
+        env_override(args, parser)
+
+        assert args.host == 'from-env'
+
+    def test_an_explicit_flag_wins_over_the_environment(self, monkeypatch):
+        monkeypatch.setenv('DBCLS_HOST', 'from-env')
+        parser = self._parser()
+        args = parser.parse_args(['--host', 'from-cli'])
+
+        env_override(args, parser)
+
+        assert args.host == 'from-cli'
+
+    def test_a_store_false_flag_is_not_undone_by_the_environment(self, monkeypatch):
+        monkeypatch.setenv('DBCLS_PLUGINS', '1')
+        parser = self._parser()
+        args = parser.parse_args(['--no-plugins'])
+
+        env_override(args, parser)
+
+        assert args.plugins is False
+
+    def test_an_empty_variable_is_ignored(self, monkeypatch):
+        monkeypatch.setenv('DBCLS_USER', '')
+        parser = self._parser()
+        args = parser.parse_args([])
+
+        env_override(args, parser)
+
+        assert args.user is None
+
+    def test_a_variable_with_no_matching_option_is_ignored(self, monkeypatch):
+        monkeypatch.setenv('DBCLS_NOT_AN_OPTION', 'x')
+        parser = self._parser()
+        args = parser.parse_args([])
+
+        env_override(args, parser)
+
+        assert not hasattr(args, 'not_an_option')
 
 
 # ── The connection registry ───────────────────────────────────────────────────
@@ -85,6 +149,16 @@ class TestParseConnections:
         config = {'connections': {'mysql01': {'engine': 'mysql'}}}
         assert [c.id for c in parse_connections(config, cli())] == ['mysql01']
 
+    def test_ask_password_is_read_from_a_block(self):
+        config = {'connections': {'mysql01': {'engine': 'mysql', 'ask_password': True}}}
+        (conn,) = parse_connections(config, cli())
+        assert conn.ask_password is True and conn.password == ''
+
+    def test_ask_password_works_in_a_flat_config_too(self):
+        config = {'engine': 'mysql', 'host': 'h', 'ask_password': '1'}
+        (conn,) = parse_connections(config, cli())
+        assert conn.ask_password is True
+
     def test_per_connection_flags_override_the_global_ones(self):
         config = {'connections': {'a': {'engine': 'sqlite3', 'readonly': '1'},
                                   'b': {'engine': 'sqlite3'}}}
@@ -94,6 +168,43 @@ class TestParseConnections:
     def test_no_compress_reaches_the_default_connection(self):
         (conn,) = parse_connections({'engine': 'clickhouse'}, cli(compress=False))
         assert conn.compress is False
+
+
+class TestResolveConfigPath:
+    """Which config file dbcls starts from when it was not told one."""
+
+    @staticmethod
+    def _home(tmp_path, monkeypatch, write=True):
+        monkeypatch.setenv('HOME', str(tmp_path))
+        path = tmp_path / '.dbcls.json'
+        if write:
+            path.write_text('{"connections": {"a": {"engine": "sqlite3"}}}')
+        return str(path)
+
+    def test_the_default_file_is_read_when_nothing_was_asked_for(self, tmp_path, monkeypatch):
+        path = self._home(tmp_path, monkeypatch)
+        assert resolve_config_path(cli()) == path
+
+    def test_no_default_file_means_no_config(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch, write=False)
+        assert resolve_config_path(cli()) == ''
+
+    def test_an_explicit_config_wins(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        assert resolve_config_path(cli(config='other.json')) == 'other.json'
+
+    def test_a_connection_on_the_command_line_leaves_the_file_unread(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        assert resolve_config_path(cli(host='db.example.com')) == ''
+
+    def test_a_database_file_counts_as_a_connection(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch)
+        assert resolve_config_path(cli(dbfilepath='x.sqlite')) == ''
+
+    def test_an_editor_file_is_not_a_connection(self, tmp_path, monkeypatch):
+        # The positional .sql file says nothing about which database to open.
+        path = self._home(tmp_path, monkeypatch)
+        assert resolve_config_path(cli(filepath='query.sql')) == path
 
 
 class TestMakeClient:
@@ -195,17 +306,27 @@ class TestTabs:
     def test_tab_keys_are_bound(self):
         ed = make_shell('one', 'two')
         for key in (key_csi('[', '1', ';', '6', 'C'), key_pfx(curses.KEY_RIGHT)):
-            assert ed._keybindings[key] == 'next_tab'
+            assert ed.commands.keys[key] == 'next_tab'
         for key in (key_csi('[', '1', ';', '6', 'D'), key_pfx(curses.KEY_LEFT)):
-            assert ed._keybindings[key] == 'prev_tab'
-        assert ed._keybindings[key_pfx(curses.KEY_DOWN)] == 'switch_tab'
+            assert ed.commands.keys[key] == 'prev_tab'
+        assert ed.commands.keys[key_pfx(curses.KEY_DOWN)] == 'switch_tab'
+
+    def test_ctrl_n_is_bound_to_new_tab(self):
+        ed = make_shell('one', 'two')
+        assert ed.commands.keys[K(ord('\x0e'))] == DbFn.NEW_TAB
+
+    def test_ctrl_n_opens_the_new_tab_menu(self):
+        ed = make_shell('one', 'two')
+        ed.commands.run_key(K(ord('\x0e')))
+        assert ed.popup.active
+        assert [item.label for item in ed.popup.items][1:] == ['one', 'two']
 
     def test_select_word_keeps_its_terminfo_codes(self):
         # Ctrl+Shift+arrow also arrives as kLFT6/kRIT6 on some terminals; those
         # stay with select-word-left/right (see the binding comment).
         ed = make_shell('one')
-        assert ed._keybindings[K(600)] == 'sel_word_left'
-        assert ed._keybindings[K(601)] == 'sel_word_right'
+        assert ed.commands.keys[K(600)] == 'sel_word_left'
+        assert ed.commands.keys[K(601)] == 'sel_word_right'
 
     def test_tabs_keep_their_own_text_and_cursor(self):
         ed = make_shell('one', 'two')
@@ -220,7 +341,7 @@ class TestTabs:
     def test_commands_act_on_the_visible_tab(self):
         ed = make_shell('one', 'two')
         ed._cmd_next_tab()
-        ed._editor_functions['newline']['func']()
+        ed.commands.run('newline')
         assert len(ed.documents[1].buf.lines) == 2
         assert len(ed.documents[0].buf.lines) == 1
 
@@ -288,6 +409,122 @@ class TestTabs:
         assert ed.renderer.status_name == ed.doc.status_name
 
 
+# ── The clickable buttons ─────────────────────────────────────────────────────
+
+class TestBarButtons:
+    """`+` left of line 1, and the two icons in the filename bar's right corner
+    — each one a click away from the command its keybinding runs."""
+
+    @staticmethod
+    def _span(ed, command):
+        """Where *command*'s button was drawn, as (x, y)."""
+        for drawn in ed.renderer._drawn_buttons:
+            if drawn.button.command == command:
+                return drawn.x, drawn.y
+        raise AssertionError(f'{command} was not drawn')
+
+    def test_the_plus_sits_left_of_line_one(self):
+        ed = make_shell('one')
+        ed._draw_frame()
+        assert self._span(ed, DbFn.NEW_TAB) == (0, ed.view.top)
+
+    def test_the_plus_moves_below_the_tab_bar(self):
+        ed = make_shell('one', 'two')
+        ed._draw_frame()
+        assert self._span(ed, DbFn.NEW_TAB) == (0, TabBar.HEIGHT)
+
+    def test_clicking_the_plus_opens_the_new_tab_menu(self):
+        ed = make_shell('one', 'two')
+        ed._draw_frame()
+        ed._handle_click(*self._span(ed, DbFn.NEW_TAB))
+        assert ed.popup.active
+        assert [item.label for item in ed.popup.items][1:] == ['one', 'two']
+
+    def test_the_plus_does_not_swallow_the_rest_of_the_gutter(self):
+        ed = make_shell('one')
+        ed._draw_frame()
+        ed.buf.lines = ['select 1', 'select 2']
+        ed._handle_click(2, ed.view.top + 1)     # gutter of line 2
+        assert ed.buf.cursor_row == 1
+
+    @pytest.mark.parametrize('command', [DbFn.SHOW_DATABASES, DbFn.SHOW_TABLES])
+    def test_clicking_an_icon_runs_its_command(self, command, monkeypatch):
+        ed = make_shell('one')
+        ed._draw_frame()
+        x, y = self._span(ed, command)
+        assert y == 24 - 2                      # the filename bar
+        calls = []
+        # The real ones hand a sheet to VisiData, which has no screen here.
+        for method in ('_db_show_databases', '_db_show_tables'):
+            monkeypatch.setattr(ed.doc, method, lambda m=method: calls.append(m))
+        ed._handle_click(x, y)
+        assert calls == [f'_db_show_{"databases" if command == DbFn.SHOW_DATABASES else "tables"}']
+
+    def test_clicking_a_button_blinks_it_and_shows_its_hint(self, monkeypatch):
+        """The command itself may show nothing for a second — the click has to
+        be answered before it runs."""
+        ed = make_shell('one')
+        ed._draw_frame()
+        flashed = []
+        monkeypatch.setattr(ed.renderer, 'flash_button',
+                            lambda drawn: flashed.append(drawn.button.command))
+        monkeypatch.setattr(ed.doc, '_db_show_tables', lambda: None)
+
+        ed._handle_click(*self._span(ed, DbFn.SHOW_TABLES))
+
+        assert flashed == [DbFn.SHOW_TABLES]
+        assert ed.renderer.status_notification == 'Browse tables  Alt+T'
+
+    @pytest.mark.parametrize('command, hint', [
+        (DbFn.SHOW_TABLES, 'Browse tables  Alt+T'),
+        (DbFn.SHOW_DATABASES, 'Browse databases  Alt+E'),
+        (DbFn.NEW_TAB, 'New tab…  ^N'),
+    ])
+    def test_every_button_names_the_key_that_does_the_same(self, command, hint, monkeypatch):
+        """The hint comes from the command's own registration, so a button
+        cannot end up quieter than its neighbours."""
+        ed = make_shell('one')
+        ed._draw_frame()
+        # The real browse commands hand a sheet to VisiData, which has no
+        # screen here; "New tab…" only opens a popup, so it may run as it is.
+        for method in ('_db_show_databases', '_db_show_tables'):
+            monkeypatch.setattr(ed.doc, method, lambda: None)
+
+        ed._handle_click(*self._span(ed, command))
+
+        assert ed.renderer.status_notification == hint
+
+    def test_the_blink_inverts_the_icon_and_puts_it_back(self):
+        ed = make_shell('one')
+        ed._draw_frame()
+        drawn = next(d for d in ed.renderer._drawn_buttons
+                     if d.button.command == DbFn.SHOW_TABLES)
+        ed.stdscr.addstr.reset_mock()
+        curses.napms.reset_mock()
+
+        ed.renderer.flash_button(drawn)
+
+        painted = [call.args[3] for call in ed.stdscr.addstr.call_args_list
+                   if call.args[:3] == (drawn.y, drawn.x, drawn.button.icon)]
+        assert len(painted) == 2
+        assert painted[0] != painted[1]     # inverted, then as it was before
+        assert painted[1] == drawn.attr
+        assert curses.napms.called
+
+    def test_the_icons_keep_out_of_a_long_filename_s_way(self):
+        ed = make_shell('one')
+        ed.buf.filepath = '/tmp/' + 'x' * 100 + '.sql'
+        ed._draw_frame()
+        assert not [drawn for drawn in ed.renderer._drawn_buttons
+                    if drawn.button.command in (DbFn.SHOW_TABLES, DbFn.SHOW_DATABASES)]
+
+    def test_a_popup_takes_the_buttons_clicks_with_it(self):
+        ed = make_shell('one')
+        ed._cmd_command_palette()
+        ed._draw_frame()
+        assert ed.renderer._drawn_buttons == []
+
+
 class TestGetClient:
     """`.CONN` names a tab, and runs on that tab's own connection."""
 
@@ -309,13 +546,25 @@ class TestGetClient:
         # …and from the suffixed tab, its own name is its own client
         assert second.get_client('two#2') is second.client
 
-    def test_a_connection_without_a_tab_gets_a_client_of_this_tab_s_own(self):
+    def test_a_closed_tab_takes_its_connection_with_it(self):
+        # A connection is a tab: close the tab and the name is gone, so `.CONN`
+        # says so instead of quietly opening a connection of its own.
         ed = make_shell('one', 'two')
         ed.close_document(1)                            # no tab on 'two' now
+        assert 'two' not in ed.connections
+        with pytest.raises(ValueError, match='Unknown connection'):
+            ed.documents[0].get_client('two')
+
+    def test_a_connection_with_no_tab_of_its_own_still_works(self):
+        # Nothing in dbcls leaves one behind any more, but a plugin may add one
+        # to the registry without opening a tab; `.CONN` still reaches it.
+        ed = make_shell('one')
+        ed.connections['spare'] = ConnectionConfig(id='spare', engine='sqlite3',
+                                                   dbfilepath=':memory:')
         tab = ed.documents[0]
-        other = tab.get_client('two')
+        other = tab.get_client('spare')
         assert other is not tab.client
-        assert tab.get_client('two') is other           # built once, then kept
+        assert tab.get_client('spare') is other        # built once, then kept
 
     def test_an_unknown_name_lists_what_can_be_named(self):
         ed = make_shell('one', 'two')

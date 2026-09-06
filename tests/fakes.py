@@ -74,3 +74,48 @@ def real_curses_error(monkeypatch):
     """`except curses.error` needs a real exception class; the mocked module
     has a MagicMock there.  Applies to every test in a module importing it."""
     monkeypatch.setattr(curses, 'error', type('error', (Exception,), {}), raising=False)
+
+
+def make_shell(stdscr=None, document=None):
+    """An :class:`~dbcls.editor.EditorShell` built the way the app builds one.
+
+    The tests used to raise a shell with ``object.__new__`` and then set the
+    twenty-odd attributes each of them happened to touch, which made the class's
+    attribute layout part of the test contract: moving one field into a
+    collaborator broke a hundred tests that never meant to say anything about
+    where it lived.  Going through the real constructor keeps that private.
+
+    curses is a MagicMock for the whole suite (see conftest), so the constructor
+    draws nothing and touches no terminal.  *document* replaces the stub tab —
+    pass a real :class:`~dbcls.editor.Editor` to exercise a document too.
+    """
+    from unittest.mock import MagicMock
+
+    from dbcls.editor import EditorShell
+
+    if stdscr is None:
+        stdscr = MagicMock()
+        stdscr.getmaxyx.return_value = (24, 80)
+        # A dispatched Esc must resolve as a bare Esc, not as the start of an
+        # escape sequence.
+        stdscr.getch.return_value = -1
+
+    shell = EditorShell(stdscr)
+    shell.renderer = MagicMock()
+
+    if document is None:
+        document = MagicMock()
+        document.buf = MagicMock()
+        document.textarea = MagicMock(buf=document.buf)
+        document.search = MagicMock(active=False)
+    shell.documents = [document]
+    shell.active = 0
+
+    # Widgets a test asserts against, as doubles that report "not active" until
+    # a test opens them.
+    shell.popup = MagicMock(active=False)
+    shell.info_popup = MagicMock(active=False)
+    shell.running_popup = MagicMock(active=False)
+    shell.input_bar = MagicMock(active=False)
+
+    return shell

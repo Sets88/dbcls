@@ -16,6 +16,19 @@ exists, with those options already resolved.
         api.add_keybinding('greet', key_alt(ord('9')))
         api.add_pipeline_function('greeting', lambda: f'hi {who}')
 
+A plugin may also bring a database engine dbcls has never heard of.  That one
+belongs in ``setup``, not in ``register``: the first connection's client is
+built before the editor exists, so an engine registered any later is not one
+``--engine`` or the config file can name.
+
+    def setup(setup):
+        setup.add_engine('duckdb', ('dbfilepath',), open_duckdb,
+                         required=('dbfilepath',), probe='tables')
+
+The Cassandra driver in ``plugins/cassandra`` is exactly this, and is the
+worked example to copy: a :class:`dbcls.clients.base.ClientClass` subclass and
+one ``setup.add_engine`` call.
+
 Settings come from the command line, from ``DBCLS_<DEST>`` environment
 variables, and from a section named after the plugin in the JSON config file —
 in that order.  The keys in :attr:`PluginAPI.settings` have the plugin's own
@@ -45,7 +58,7 @@ import sys
 import traceback
 from typing import Callable, Dict, List, Optional, Sequence
 
-from . import pipeline
+from . import clients, log, pipeline
 
 #: Entry-point group installed packages advertise their plugins in.
 ENTRY_POINT_GROUP = 'dbcls.plugins'
@@ -55,6 +68,9 @@ ENTRY_POINT_GROUP = 'dbcls.plugins'
 BUILTIN_PLUGINS = (
     ('llm', 'dbcls.llm.plugin'),
 )
+
+
+logger = log.get_logger(__name__)
 
 
 class PluginError(Exception):
@@ -132,6 +148,19 @@ class PluginSetup:
         """
         action = self._parser.add_argument(*args, **kwargs)
         self.dests.append(action.dest)
+
+    def add_engine(self, name: str, fields, factory, **kwargs):
+        """Teach dbcls a database it does not ship with — see
+        :func:`dbcls.clients.register_engine` for every argument.
+
+        This is where a driver plugin belongs.  The first connection's client
+        is built before the editor exists, and ``--engine`` has to know what it
+        accepts before the command line is parsed: both happen after this phase
+        and before :func:`register`, so an engine added here is a first-class
+        one — valid as ``--engine``, as a config file's ``"engine"``, in the
+        connection form's picker and in ``.CONN``.
+        """
+        return clients.register_engine(name, fields, factory, **kwargs)
 
 
 # ─── Phase 2: the running editor ──────────────────────────────────────────────
@@ -279,6 +308,20 @@ class PluginAPI:
             pending = self.editor.pending_llm_tools = []
         pending.append(tool)
 
+    def add_engine(self, name: str, fields, factory, **kwargs):
+        """Register a database engine from the running editor — see
+        :func:`dbcls.clients.register_engine`.
+
+        A driver plugin normally registers in ``setup()``
+        (:meth:`PluginSetup.add_engine`) instead: by the time this runs, the
+        command line has been parsed and the configured connections have their
+        clients, so an engine added here reaches only what is opened
+        afterwards — the connection form, `New tab…`, a connection the user
+        edits.  ``--engine`` will not accept its name, and a connection in the
+        config file naming it has already failed to open.
+        """
+        return clients.register_engine(name, fields, factory, **kwargs)
+
     def add_help_page(self, title: str, text: str) -> None:
         """Add a page to the in-app help (F1 / Alt+H)."""
         self.editor.extra_help_pages[title] = text
@@ -364,7 +407,10 @@ def deliver_pending_llm_tools(editor, registry) -> int:
     for tool in pending:
         try:
             _add_llm_tool(registry, tool)
-        except Exception:
+        except Exception as exc:
+            # The plugin that offered it returned long ago; there is nobody to
+            # report to but the log.
+            _log_error(f'llm tool {getattr(tool, "name", tool)!r}', exc)
             continue
         delivered += 1
     editor.pending_llm_tools = []
@@ -387,7 +433,8 @@ def _entry_point_plugins() -> List[tuple]:
     """(name, loader) for every installed package advertising a dbcls plugin."""
     try:
         entry_points = importlib.metadata.entry_points()
-    except Exception:
+    except Exception as exc:
+        _log_error('reading the dbcls.plugins entry points', exc)
         return []
     # Python 3.10+ has select(); 3.9 returns a dict of groups.
     if hasattr(entry_points, 'select'):
@@ -625,8 +672,13 @@ class PluginManager:
 
 
 def _log_error(what: str, exc: Exception) -> None:
-    """Keep the traceback for DBCLS_PLUGIN_DEBUG=1; the status bar only has
-    room for the message."""
+    """Record a plugin failure the status bar has no room to explain.
+
+    It goes to the log (see :mod:`dbcls.log`), which is where a failure has to
+    end up in a curses app; DBCLS_PLUGIN_DEBUG=1 additionally prints the
+    traceback to stderr, for the case where the app never gets far enough to
+    have opened a log at all."""
+    logger.warning('%s failed: %s', what, exc, exc_info=True)
     if os.environ.get('DBCLS_PLUGIN_DEBUG'):
         sys.stderr.write(f'--- dbcls {what} failed ---\n')
         traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)

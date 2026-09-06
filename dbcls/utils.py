@@ -1,5 +1,6 @@
 import re
 import json
+import collections
 import datetime
 
 import sqlparse
@@ -64,6 +65,31 @@ def sql_literal(v) -> str:
         text = json.dumps(v, ensure_ascii=False, default=str).replace("'", "''")
         return f"'{text}'"
     return str(v)
+
+
+def top_k_values(values, k):
+    """The *k* most common of *values*, most frequent first.
+
+    Backs the `topk<N>` visidata aggregators (see vd_modules/vd_aggregators.py).
+    Ties keep the order of first appearance, which is what Counter.most_common
+    already does.  It lives here rather than in vd_aggregators so it can be
+    tested without visidata, like the rest of this module.
+    """
+    values = list(values)  # may be a generator, and the fallback re-reads it
+    try:
+        counts = collections.Counter(values)
+    except TypeError:
+        # unhashable cells -- a JSON-typed (`g@`) column holds dicts and lists.
+        # Count by repr and keep the first original value seen for each key.
+        originals = {}
+        counts = collections.Counter()
+        for value in values:
+            key = repr(value)
+            originals.setdefault(key, value)
+            counts[key] += 1
+        return [originals[key] for key, _ in counts.most_common(k)]
+
+    return [value for value, _ in counts.most_common(k)]
 
 
 def _collapse_blank_lines(statement) -> str:

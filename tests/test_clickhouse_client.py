@@ -108,7 +108,7 @@ class TestStreamQuery:
             FakeStream([[(1, 'a'), (2, 'b')], [(3, 'c')]], ('id', 'name'))
         )
 
-        result = await client._stream_query('SELECT id, name FROM t')
+        result = await client._run_query('SELECT id, name FROM t')
 
         assert result.data == [
             {'id': 1, 'name': 'a'},
@@ -124,7 +124,7 @@ class TestStreamQuery:
             FakeStream([], ('id',), summary={'result_rows': 7})
         )
 
-        result = await client._stream_query('INSERT INTO t VALUES')
+        result = await client._run_query('INSERT INTO t VALUES')
 
         assert result.data == []
         assert result.rowcount == 7
@@ -135,7 +135,7 @@ class TestStreamQuery:
         connection = FakeConnection(FakeStream([[(1,)]], ('id',)))
         client.connection = connection
 
-        await client._stream_query('SELECT 1')
+        await client._run_query('SELECT 1')
 
         assert connection.settings['query_id'].startswith('dbcls-')
         # Cleared once the query is over: there is nothing left to kill.
@@ -148,7 +148,7 @@ class TestStreamQuery:
         reported = []
         client.on_progress = reported.append
 
-        await client._stream_query('SELECT id FROM t')
+        await client._run_query('SELECT id FROM t')
 
         assert reported[-1] == 2
 
@@ -162,7 +162,7 @@ class TestStreamQuery:
         client = make_client()
         client.connection = FakeConnection(stream)
 
-        task = asyncio.ensure_future(client._stream_query('SELECT id FROM t'))
+        task = asyncio.ensure_future(client._run_query('SELECT id FROM t'))
         # Let the reader through the first block and into the blocked read.
         assert await await_for(lambda: stream.blocks_read == 1)
 
@@ -186,7 +186,7 @@ class TestStreamQuery:
         client = make_client()
         client.connection = FakeConnection(stream)
 
-        task = asyncio.ensure_future(client._stream_query('SELECT id FROM t'))
+        task = asyncio.ensure_future(client._run_query('SELECT id FROM t'))
         assert await await_for(lambda: client._query_id is not None)
 
         query_id = client._query_id

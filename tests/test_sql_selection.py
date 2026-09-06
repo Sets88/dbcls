@@ -11,7 +11,13 @@ from types import SimpleNamespace
 import pytest
 
 from dbcls.dbcls import get_sql_rows
-from dbcls.pipeline import scan_line_triple_state, scan_line_code_and_triple
+from dbcls.pipeline import scan_line_code_and_triple
+
+
+def scan_line_triple_state(line, active):
+    """The end-of-line triple-quote state alone — the half of
+    scan_line_code_and_triple() these cases are about."""
+    return scan_line_code_and_triple(line, active)[1]
 
 
 def _buf(text, row, col=0):

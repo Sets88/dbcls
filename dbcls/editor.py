@@ -16,6 +16,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Union
 
+from .prompts import SHEET_KINDS, PromptKind
+
 @dataclass
 class PopupItem:
     """A single item in a SelectPopup list."""
@@ -29,13 +31,10 @@ class PopupItem:
 MAX_UNDO = 200
 TAB_SIZE = 4
 
-#: request_user_input() kinds that are answered in an external viewer rather
-#: than by an editor widget — see Editor.run_sheet_prompt().  'view' (.VIEW)
-#: only shows rows and has no answer to give back, 'watch' (.WATCH) is the same
-#: but keeps re-reading them, and 'vars' (.VARS) writes the edited variables
-#: back itself; all are handled here because they need the very same terminal
-#: handover as the row pickers.
-SHEET_PROMPT_KINDS = ('sselect', 'schoose', 'view', 'vars', 'watch')
+#: Re-exported so that code holding an editor keeps reaching the viewer kinds
+#: by the name it always did; the vocabulary itself lives in dbcls.prompts,
+#: which the pipeline and the DB tab import too.
+SHEET_PROMPT_KINDS = SHEET_KINDS
 
 # ─── Key code bitfield ────────────────────────────────────────────────────────
 # Layout (LSB-first):
@@ -130,6 +129,54 @@ WORD_RIGHT_KEYS = (
 KEY_PREFIX_TRIGGER = K(ord('\x18'))  # Ctrl+X
 
 
+# ─── Word boundaries ──────────────────────────────────────────────────────────
+# Where a word starts and ends is one rule, and both editable things in this
+# module obey it: the document (TextBuffer, scanning one of its lines) and the
+# one-line input bars (LineInputBar, scanning its query).  They used to carry a
+# copy of each scan apiece, which is how "a word is letters, digits and _" came
+# to be written six times.
+
+def is_word_char(ch: str) -> bool:
+    """Whether *ch* belongs to a word for the purposes of word movement."""
+    return ch.isalnum() or ch == '_'
+
+
+def word_start_left(line: str, col: int) -> int:
+    """Where Ctrl+Left from *col* lands: past any run of non-word characters
+    immediately behind the cursor, then past the word before them."""
+    col -= 1
+    while col > 0 and not is_word_char(line[col - 1]):
+        col -= 1
+    while col > 0 and is_word_char(line[col - 1]):
+        col -= 1
+    return max(0, col)
+
+
+def word_end_right(line: str, col: int) -> int:
+    """Where Ctrl+Right from *col* lands: past any run of non-word characters
+    ahead of the cursor, then past the word after them."""
+    while col < len(line) and not is_word_char(line[col]):
+        col += 1
+    while col < len(line) and is_word_char(line[col]):
+        col += 1
+    return col
+
+
+def token_start_before(line: str, col: int) -> int:
+    """Where Alt+Backspace at *col* deletes back to: the run of word characters
+    behind the cursor, or — when the cursor sits after punctuation or spaces —
+    that run of non-word characters instead.  Deleting one kind at a time is
+    what keeps `foo(bar` from vanishing in a single keystroke."""
+    start = col
+    if start > 0 and is_word_char(line[start - 1]):
+        while start > 0 and is_word_char(line[start - 1]):
+            start -= 1
+    else:
+        while start > 0 and not is_word_char(line[start - 1]):
+            start -= 1
+    return start
+
+
 # ─── Function name enum ───────────────────────────────────────────────────────
 class Fn(str, enum.Enum):
     """Named editor functions. Values are the string keys used in the function registry.
@@ -169,7 +216,6 @@ class Fn(str, enum.Enum):
     SAVE_AS          = 'save_as'
     TOGGLE_READONLY  = 'toggle_readonly'
     SEARCH           = 'search'
-    AUTOCOMPLETE     = 'autocomplete'
     QUIT             = 'quit'
     HELP             = 'help'
     TOGGLE_WRAP      = 'toggle_wrap'
@@ -277,8 +323,6 @@ Search
       Close search bar
 
 Other
-  `Ctrl+N`
-      Base autocomplete (words from the current file)
   `Ctrl+X <key>`
       Tmux-style prefix: the next key within 1 second forms a remappable
       combination (see the Key remapping help page)
@@ -387,7 +431,6 @@ class ColorManager:
             white      = 15             # bright white
             orange     = 208            # orange        — functions
             dark_yel   = 136            # dark yellow   — numbers
-            blue_bg    = 19             # dark blue     — line number bg
         else:
             gray_bg    = curses.COLOR_WHITE
             mark_bg    = curses.COLOR_GREEN
@@ -395,7 +438,6 @@ class ColorManager:
             white      = curses.COLOR_WHITE
             orange     = curses.COLOR_YELLOW
             dark_yel   = curses.COLOR_YELLOW
-            blue_bg    = curses.COLOR_BLUE
 
         db = -1  # default background
 
@@ -406,45 +448,40 @@ class ColorManager:
             return n
         p.n = 1
 
+        # The syntax colours: one foreground per token type, and the same eight
+        # again on each of the three highlighted backgrounds.  Only the plain
+        # ones are ever named by the drawing code — a highlighted line asks for
+        # its variant through sel_pair_for()/mark_pair_for()/cursor_pair_for(),
+        # so the variants live in those lookups instead of in 24 more
+        # attributes that nothing but the lookups ever read.
+        syntax = (
+            ('normal',   white),
+            ('keyword',  curses.COLOR_RED),
+            ('type_',    curses.COLOR_YELLOW),   # types — yellow
+            ('func',     orange),                # functions — orange
+            ('string',   curses.COLOR_GREEN),    # strings — green
+            ('comment',  curses.COLOR_CYAN),     # comments — cyan
+            ('number',   dark_yel),              # numbers — dark yellow
+            ('operator', white),
+        )
+
         # Normal syntax pairs (fg on default bg)
-        self.normal   = p(white,               db)
-        self.keyword  = p(curses.COLOR_RED,    db)
-        self.type_    = p(curses.COLOR_YELLOW, db)   # types — yellow
-        self.func     = p(orange,              db)   # functions — orange
-        self.string   = p(curses.COLOR_GREEN,  db)   # strings — green
-        self.comment  = p(curses.COLOR_CYAN,   db)   # comments — cyan
-        self.number   = p(dark_yel,            db)   # numbers — dark yellow
-        self.operator = p(white,               db)
+        for name, fg in syntax:
+            setattr(self, name, p(fg, db))
 
-        # Selection pairs (same fg, gray bg)
-        self.sel_normal   = p(white,               gray_bg)
-        self.sel_keyword  = p(curses.COLOR_RED,    gray_bg)
-        self.sel_type_    = p(curses.COLOR_YELLOW, gray_bg)
-        self.sel_func     = p(orange,              gray_bg)
-        self.sel_string   = p(curses.COLOR_GREEN,  gray_bg)
-        self.sel_comment  = p(curses.COLOR_CYAN,   gray_bg)
-        self.sel_number   = p(dark_yel,            gray_bg)
-        self.sel_operator = p(white,               gray_bg)
+        # …and the same eight on the selection, marked-line and cursor-line
+        # backgrounds, each as a plain-pair → variant-pair lookup.
+        def variants(bg):
+            return {getattr(self, name): p(fg, bg) for name, fg in syntax}
 
-        # Marked-line pairs (same fg, dark-green bg)
-        self.mark_normal   = p(white,               mark_bg)
-        self.mark_keyword  = p(curses.COLOR_RED,    mark_bg)
-        self.mark_type_    = p(curses.COLOR_YELLOW, mark_bg)
-        self.mark_func     = p(orange,              mark_bg)
-        self.mark_string   = p(curses.COLOR_GREEN,  mark_bg)
-        self.mark_comment  = p(curses.COLOR_CYAN,   mark_bg)
-        self.mark_number   = p(dark_yel,            mark_bg)
-        self.mark_operator = p(white,               mark_bg)
-
-        # Cursor-line pairs (same fg, dark-gray bg)
-        self.cursor_normal   = p(white,              cursor_bg)
-        self.cursor_keyword  = p(curses.COLOR_RED,   cursor_bg)
-        self.cursor_type_    = p(curses.COLOR_YELLOW, cursor_bg)
-        self.cursor_func     = p(orange,             cursor_bg)
-        self.cursor_string   = p(curses.COLOR_GREEN, cursor_bg)
-        self.cursor_comment  = p(curses.COLOR_CYAN,  cursor_bg)
-        self.cursor_number   = p(dark_yel,           cursor_bg)
-        self.cursor_operator = p(white,              cursor_bg)
+        self._sel_map = variants(gray_bg)
+        self._mark_map = variants(mark_bg)
+        self._cursor_map = variants(cursor_bg)
+        # The fallbacks those lookups return for a pair that is not a syntax
+        # colour at all (the line-number gutter drawn over a selected line).
+        self.sel_normal = self._sel_map[self.normal]
+        self.mark_normal = self._mark_map[self.normal]
+        self.cursor_normal = self._cursor_map[self.normal]
 
         # UI pairs
         self.line_num     = p(white,               curses.COLOR_BLUE)
@@ -460,37 +497,6 @@ class ColorManager:
         self.popup_code_inline    = p(curses.COLOR_YELLOW, curses.COLOR_BLUE)   # inline `code`
         self.popup_code_block     = p(curses.COLOR_WHITE,  curses.COLOR_BLACK)  # ```block```
         self.popup_link           = p(curses.COLOR_CYAN,   curses.COLOR_BLUE)   # -->>Link<<--
-
-        self._sel_map = {
-            self.normal:   self.sel_normal,
-            self.keyword:  self.sel_keyword,
-            self.type_:    self.sel_type_,
-            self.func:     self.sel_func,
-            self.string:   self.sel_string,
-            self.comment:  self.sel_comment,
-            self.number:   self.sel_number,
-            self.operator: self.sel_operator,
-        }
-        self._mark_map = {
-            self.normal:   self.mark_normal,
-            self.keyword:  self.mark_keyword,
-            self.type_:    self.mark_type_,
-            self.func:     self.mark_func,
-            self.string:   self.mark_string,
-            self.comment:  self.mark_comment,
-            self.number:   self.mark_number,
-            self.operator: self.mark_operator,
-        }
-        self._cursor_map = {
-            self.normal:   self.cursor_normal,
-            self.keyword:  self.cursor_keyword,
-            self.type_:    self.cursor_type_,
-            self.func:     self.cursor_func,
-            self.string:   self.cursor_string,
-            self.comment:  self.cursor_comment,
-            self.number:   self.cursor_number,
-            self.operator: self.cursor_operator,
-        }
 
     def attr(self, pair_id: int) -> int:
         return curses.color_pair(pair_id)
@@ -1065,12 +1071,7 @@ class TextBuffer:
             r = self.prev_visible_row(r - 1)
             c = len(self.lines[r])
         else:
-            line = self.lines[r]
-            c -= 1
-            while c > 0 and not line[c-1].isalnum() and line[c-1] != '_':
-                c -= 1
-            while c > 0 and (line[c-1].isalnum() or line[c-1] == '_'):
-                c -= 1
+            c = word_start_left(self.lines[r], c)
         self.move_cursor(r, c, extend)
 
     def move_word_right(self, extend=False):
@@ -1082,10 +1083,7 @@ class TextBuffer:
                 return
             c = 0
         else:
-            while c < len(line) and not (line[c].isalnum() or line[c] == '_'):
-                c += 1
-            while c < len(line) and (line[c].isalnum() or line[c] == '_'):
-                c += 1
+            c = word_end_right(line, c)
         self.move_cursor(r, c, extend)
 
     # ── Text mutations ────────────────────────────────────────────────────────
@@ -1189,12 +1187,9 @@ class TextBuffer:
         r, c = self.cursor_row, self.cursor_col
         line = self.lines[r]
         end = c
-        if end < len(line) and (line[end].isalnum() or line[end] == '_'):
-            while end < len(line) and (line[end].isalnum() or line[end] == '_'):
-                end += 1
-        else:
-            while end < len(line) and not (line[end].isalnum() or line[end] == '_'):
-                end += 1
+        wanted = is_word_char(line[end]) if end < len(line) else False
+        while end < len(line) and is_word_char(line[end]) == wanted:
+            end += 1
         if end > c:
             self._push_undo('delete_word')
             self.lines[r] = line[:c] + line[end:]
@@ -1217,13 +1212,7 @@ class TextBuffer:
             self.dirty = True
             return
         line = self.lines[r]
-        start = c
-        if start > 0 and (line[start - 1].isalnum() or line[start - 1] == '_'):
-            while start > 0 and (line[start - 1].isalnum() or line[start - 1] == '_'):
-                start -= 1
-        else:
-            while start > 0 and not (line[start - 1].isalnum() or line[start - 1] == '_'):
-                start -= 1
+        start = token_start_before(line, c)
         if start < c:
             self._push_undo('delete_word')
             self.lines[r] = line[:start] + line[c:]
@@ -1249,12 +1238,12 @@ class TextBuffer:
         r, c = self.cursor_row, self.cursor_col
         line = self.lines[r]
         start = c
-        while start > 0 and (line[start-1].isalnum() or line[start-1] == '_'):
+        while start > 0 and is_word_char(line[start - 1]):
             start -= 1
         # Also consume a lone '.' that is a command prefix (e.g. "| .RUN"), but
         # not a schema separator (e.g. "table.column" where '.' is preceded by alnum).
         if start > 0 and line[start - 1] == '.' and (
-            start < 2 or not (line[start - 2].isalnum() or line[start - 2] == '_')
+            start < 2 or not is_word_char(line[start - 2])
         ):
             start -= 1
         if start < c:
@@ -1268,24 +1257,9 @@ class TextBuffer:
         r, c = self.cursor_row, self.cursor_col
         line = self.lines[r]
         start = c
-        while start > 0 and (line[start-1].isalnum() or line[start-1] == '_'):
+        while start > 0 and is_word_char(line[start - 1]):
             start -= 1
         return line[start:c]
-
-    def document_words(self):
-        words = set()
-        for line in self.lines:
-            tok = ''
-            for ch in line:
-                if ch.isalnum() or ch == '_':
-                    tok += ch
-                else:
-                    if len(tok) >= 3:
-                        words.add(tok)
-                    tok = ''
-            if len(tok) >= 3:
-                words.add(tok)
-        return words
 
 
 # ─── Clipboard ────────────────────────────────────────────────────────────────
@@ -1379,27 +1353,28 @@ class LineInputBar:
         self.prompt = ''
         self.cursor = 0   # position within query
         self.clipboard = clipboard
+        #: Draw the line as asterisks — a password prompt.  Only what is drawn
+        #: changes; the query itself is edited like any other line.
+        self.mask = False
 
-    def open(self, prompt: str = '', text: str = ''):
+    def open(self, prompt: str = '', text: str = '', mask: bool = False):
         self.active = True
         self.query = text
         self.prompt = prompt
         self.cursor = len(text)
+        self.mask = mask
+
+    def shown_query(self) -> str:
+        """The query as it may be shown: asterisks for a masked line."""
+        return '*' * len(self.query) if self.mask else self.query
 
     def close(self):
         self.active = False
 
     def _word_start_before_cursor(self) -> int:
-        """Start of the token before the cursor: word chars, or (if before
-        non-word) non-word chars — same rule as TextBuffer.kill_word_backward."""
-        q, start = self.query, self.cursor
-        if start > 0 and (q[start - 1].isalnum() or q[start - 1] == '_'):
-            while start > 0 and (q[start - 1].isalnum() or q[start - 1] == '_'):
-                start -= 1
-        else:
-            while start > 0 and not (q[start - 1].isalnum() or q[start - 1] == '_'):
-                start -= 1
-        return start
+        """Start of the token before the cursor — the same rule the document
+        deletes back to (see :func:`token_start_before`)."""
+        return token_start_before(self.query, self.cursor)
 
     def _paste(self) -> bool:
         """Insert the clipboard at the cursor; True if the query text changed.
@@ -1420,9 +1395,15 @@ class LineInputBar:
         self.cursor = c + len(text)
         return True
 
-    def _edit_key(self, key) -> bool:
+    def _edit_key(self, key, is_text: bool = True) -> bool:
         """Apply a text-editing/movement key to the query; True if the query
-        text changed.  key is in the bitfield format produced by Editor._encode_key."""
+        text changed.  key is in the bitfield format produced by Editor._encode_key.
+
+        *is_text* says whether the key came from a character the user typed.
+        Pass False for anything read as a curses constant and it will not be
+        inserted as text — the editing and movement keys are still handled, and
+        they must be: KEY_BACKSPACE (263) and friends are codes that look
+        perfectly printable (see :meth:`TextArea.insert_printable`)."""
         c = self.cursor
         if key == K(curses.KEY_LEFT):
             self.cursor = max(0, c - 1)
@@ -1437,21 +1418,10 @@ class LineInputBar:
             self.cursor = len(self.query)
             return False
         if key in WORD_LEFT_KEYS:   # Alt+Left / Ctrl+Left / Alt+b
-            q = self.query
-            c -= 1
-            while c > 0 and not (q[c - 1].isalnum() or q[c - 1] == '_'):
-                c -= 1
-            while c > 0 and (q[c - 1].isalnum() or q[c - 1] == '_'):
-                c -= 1
-            self.cursor = max(0, c)
+            self.cursor = word_start_left(self.query, c)
             return False
         if key in WORD_RIGHT_KEYS:  # Alt+Right / Ctrl+Right / Alt+f
-            q = self.query
-            while c < len(q) and not (q[c].isalnum() or q[c] == '_'):
-                c += 1
-            while c < len(q) and (q[c].isalnum() or q[c] == '_'):
-                c += 1
-            self.cursor = c
+            self.cursor = word_end_right(self.query, c)
             return False
         if key in (K(curses.KEY_BACKSPACE), K(ord('\x7f')), K(ord('\b'))):
             if c > 0:
@@ -1479,7 +1449,7 @@ class LineInputBar:
             return False
         if key == K(ord('\x16')):  # Ctrl+V — paste the clipboard at the cursor
             return self._paste()
-        if key_flags(key) == 0:
+        if is_text and key_flags(key) == 0:
             base = key_base(key)
             if base >= 32 and chr(base).isprintable():
                 self.query = self.query[:c] + chr(base) + self.query[c:]
@@ -1570,12 +1540,16 @@ class InputBar(LineInputBar):
         self._draft = ''      # the typed line — also the popup's filter
         self._picked = False  # the line currently holds an entry off the list
 
-    def open(self, prompt: str = '', text: str = '', items=()):
+    def open(self, prompt: str = '', text: str = '', items=(), mask: bool = False):
         """*items* are merged into the prompt's history bucket as older
-        entries, so the caller can offer values the user never typed."""
-        if items:
+        entries, so the caller can offer values the user never typed.
+
+        *mask* makes it a password prompt: the line is drawn as asterisks and
+        stays out of the history, which would otherwise offer it back — in
+        plain text — at the next prompt of the same title."""
+        if items and not mask:
             self.history.extend(prompt, items)
-        super().open(prompt, text)
+        super().open(prompt, text, mask=mask)
         self.history_popup.close()
         self._draft = text
         self._picked = False
@@ -1639,7 +1613,7 @@ class InputBar(LineInputBar):
 
     def display(self) -> str:
         """The bar text as drawn."""
-        return f' {self.prompt}: {self.query}'
+        return f' {self.prompt}: {self.shown_query()}'
 
     def cursor_x(self) -> int:
         """Screen column of the cursor within the drawn bar."""
@@ -1654,10 +1628,13 @@ class InputBar(LineInputBar):
                 return None
             return 'cancel'
         if key in (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))):
-            self.history.add(self.prompt, self.query)
+            if not self.mask:   # a password is never remembered
+                self.history.add(self.prompt, self.query)
             self.history_popup.close()
             return 'submit'
         if key in self.HISTORY_KEYS:
+            if self.mask:       # nothing to walk: masked lines are not recorded
+                return None
             self._history_nav(key)
             return None
         if self._edit_key(key):
@@ -3457,29 +3434,36 @@ class TextArea:
 
     # ── Movement commands ────────────────────────────────────────────────────
 
-    def move_up(self):
+    # Every movement takes *extend*: with it the selection grows to the new
+    # position instead of being dropped.  The sel_* commands below are that
+    # same movement with the flag set — they are separate names because the
+    # keybinding table binds by name, not because they do anything else.
+
+    def move_up(self, extend: bool = False):
         if self.view.wrap:
-            self.view.move_up_wrap()
+            self.view.move_up_wrap(extend=extend)
         else:
-            self.buf.move_up()
+            self.buf.move_up(extend=extend)
 
-    def move_down(self):
+    def move_down(self, extend: bool = False):
         if self.view.wrap:
-            self.view.move_down_wrap()
+            self.view.move_down_wrap(extend=extend)
         else:
-            self.buf.move_down()
+            self.buf.move_down(extend=extend)
 
-    def move_left(self):
-        self.buf.move_left()
+    def move_left(self, extend: bool = False):
+        self.buf.move_left(extend=extend)
 
-    def move_right(self):
-        self.buf.move_right()
+    def move_right(self, extend: bool = False):
+        self.buf.move_right(extend=extend)
 
-    def move_home(self):
-        self.buf.move_cursor(self.buf.cursor_row, 0)
+    def move_home(self, extend: bool = False):
+        self.buf.move_cursor(self.buf.cursor_row, 0, extend_selection=extend)
 
-    def move_end(self):
-        self.buf.move_cursor(self.buf.cursor_row, len(self.buf.lines[self.buf.cursor_row]))
+    def move_end(self, extend: bool = False):
+        self.buf.move_cursor(self.buf.cursor_row,
+                             len(self.buf.lines[self.buf.cursor_row]),
+                             extend_selection=extend)
 
     def move_up_5(self):
         self._move_rows(-5)
@@ -3487,11 +3471,11 @@ class TextArea:
     def move_down_5(self):
         self._move_rows(5)
 
-    def page_up(self):
-        self._move_rows(-self.view.page_rows)
+    def page_up(self, extend: bool = False):
+        self._move_rows(-self.view.page_rows, extend=extend)
 
-    def page_down(self):
-        self._move_rows(self.view.page_rows)
+    def page_down(self, extend: bool = False):
+        self._move_rows(self.view.page_rows, extend=extend)
 
     def file_start(self):
         self.buf.move_cursor(0, 0)
@@ -3500,11 +3484,11 @@ class TextArea:
         last = len(self.buf.lines) - 1
         self.buf.move_cursor(last, len(self.buf.lines[last]))
 
-    def word_left(self):
-        self.buf.move_word_left()
+    def word_left(self, extend: bool = False):
+        self.buf.move_word_left(extend=extend)
 
-    def word_right(self):
-        self.buf.move_word_right()
+    def word_right(self, extend: bool = False):
+        self.buf.move_word_right(extend=extend)
 
     def _move_rows(self, delta: int, extend: bool = False):
         """Move *delta* visible rows, keeping the preferred column.
@@ -3526,41 +3510,34 @@ class TextArea:
     # ── Selection movement commands ──────────────────────────────────────────
 
     def sel_move_up(self):
-        if self.view.wrap:
-            self.view.move_up_wrap(extend=True)
-        else:
-            self.buf.move_up(extend=True)
+        self.move_up(extend=True)
 
     def sel_move_down(self):
-        if self.view.wrap:
-            self.view.move_down_wrap(extend=True)
-        else:
-            self.buf.move_down(extend=True)
+        self.move_down(extend=True)
 
     def sel_move_left(self):
-        self.buf.move_left(extend=True)
+        self.move_left(extend=True)
 
     def sel_move_right(self):
-        self.buf.move_right(extend=True)
+        self.move_right(extend=True)
 
     def sel_move_home(self):
-        self.buf.move_cursor(self.buf.cursor_row, 0, extend_selection=True)
+        self.move_home(extend=True)
 
     def sel_move_end(self):
-        self.buf.move_cursor(self.buf.cursor_row,
-                             len(self.buf.lines[self.buf.cursor_row]), extend_selection=True)
+        self.move_end(extend=True)
 
     def sel_page_up(self):
-        self._move_rows(-self.view.page_rows, extend=True)
+        self.page_up(extend=True)
 
     def sel_page_down(self):
-        self._move_rows(self.view.page_rows, extend=True)
+        self.page_down(extend=True)
 
     def sel_word_left(self):
-        self.buf.move_word_left(extend=True)
+        self.word_left(extend=True)
 
     def sel_word_right(self):
-        self.buf.move_word_right(extend=True)
+        self.word_right(extend=True)
 
     def select_all(self):
         self.buf.select_all()
@@ -3634,6 +3611,42 @@ class TextArea:
 
 
 # ─── Renderer ─────────────────────────────────────────────────────────────────
+@dataclass
+class BarButton:
+    """A one-cell mark on a bar that runs a command when it is clicked.
+
+    It is how a command that has no visible place on screen gets one — the
+    editor knows nothing about what it does, only the name to hand back to
+    :meth:`CommandRegistry.run`, so button and keybinding run the very same
+    code.
+
+    *icon* must be a single-cell character: nothing here measures character
+    widths, so a double-width emoji would push the rest of the bar along."""
+
+    icon: str
+    command: str
+    hint: str = ''
+
+
+@dataclass
+class DrawnButton:
+    """A :class:`BarButton` as it was actually painted this frame — what a click
+    maps back through, and what a flash repaints.
+
+    The icon and the attribute it was drawn with are kept because the button has
+    to be put back the way it was found: nothing else on screen knows what a
+    given cell of a bar looked like once the frame has moved on."""
+
+    y: int
+    x: int
+    attr: int
+    button: BarButton
+
+    @property
+    def end(self) -> int:
+        return self.x + len(self.button.icon)
+
+
 class TabBar:
     """The one-row strip of open tabs drawn above the text area.
 
@@ -3741,6 +3754,14 @@ class Renderer:
         self.input_pending = False  # a prompt is waiting for the user
         # Rows taken above the text area — 1 while a tab bar is on screen.
         self.top_offset = 0
+        #: Clickable marks, filled in by the shell (see add_bar_button).  The
+        #: gutter one sits left of line 1; the rest go in the right corner of
+        #: the filename bar.
+        self.gutter_button: Optional[BarButton] = None
+        self.bar_buttons: List[BarButton] = []
+        #: Every button actually drawn last frame — what button_at() maps a
+        #: click back through.
+        self._drawn_buttons: List[DrawnButton] = []
         self.resize()
 
     @property
@@ -3805,6 +3826,9 @@ class Renderer:
         tab_bar: Optional['TabBar'] = None,
     ):
         self.stdscr.erase()
+        # Nothing is clickable until it has been drawn this frame — an overlay
+        # or a search bar covering a button takes its clicks with it.
+        self._drawn_buttons = []
 
         # A full-screen overlay (the lock screen, the LLM chat) hides everything
         # else.  An overlay with a text field tells us where its cursor is; one
@@ -3827,6 +3851,7 @@ class Renderer:
         if tab_bar is not None:
             tab_bar.draw(self.stdscr, self.colors, self._width)
         self.view.draw()
+        self._draw_gutter_button()
         if search and search.active:
             self._draw_search_bar(search)
         elif input_bar and input_bar.active:
@@ -3839,6 +3864,11 @@ class Renderer:
             running_popup.draw(self.stdscr, self._height, self._width)
         if info_popup and info_popup.active:
             info_popup.draw(self.stdscr, self.colors, self._height, self._width)
+        if ((popup and popup.active) or (running_popup and running_popup.active)
+                or (info_popup and info_popup.active)):
+            # A popup is answering a question: a button under it must not run a
+            # command out from underneath it.
+            self._drawn_buttons = []
         self._draw_status_bar(search)
         try:
             curses.curs_set(1)
@@ -3905,8 +3935,76 @@ class Renderer:
         filepath = os.path.basename(buf.filepath) if buf.filepath else '[No Name]'
         dirty = '*' if buf.dirty else ''
         ro = ' [RO]' if buf.readonly else ''
-        bar = f' {filepath}{dirty}{ro} '.ljust(W)[:W]
+        name = f' {filepath}{dirty}{ro} '
+        bar = name.ljust(W)[:W]
         self._safe_addstr(y, 0, bar, curses.color_pair(colors.status_bar))
+        self._draw_bar_buttons(y, len(name))
+
+    #: Cells between two buttons on the filename bar, so a click cannot land on
+    #: the wrong one by a column.
+    BUTTON_GAP = 2
+
+    def _draw_bar_buttons(self, y: int, keep_free: int) -> None:
+        """The buttons in the right corner of the filename bar.
+
+        *keep_free* is how much of the bar the filename already claims: with a
+        narrow terminal the buttons are dropped rather than drawn over it."""
+        if not self.bar_buttons:
+            return
+        attr = curses.color_pair(self.colors.status_bar) | curses.A_BOLD
+        width = sum(len(b.icon) for b in self.bar_buttons) \
+            + self.BUTTON_GAP * (len(self.bar_buttons) - 1) + 2
+        x = self._width - width
+        if x < keep_free:
+            return
+        x += 1  # a space between the last icon and the right edge, and before the first
+        for button in self.bar_buttons:
+            self._safe_addstr(y, x, button.icon, attr)
+            self._drawn_buttons.append(DrawnButton(y, x, attr, button))
+            x += len(button.icon) + self.BUTTON_GAP
+
+    def _draw_gutter_button(self) -> None:
+        """The button left of line 1 — drawn over the gutter, so after the view.
+
+        Column 0 of the first text row is blank for any line number the gutter
+        can hold, and is where the folded-block marker goes; the button wins
+        that cell on the top row alone."""
+        button = self.gutter_button
+        if button is None or self.view is None or self.view.gutter <= 0:
+            return
+        y = self.view.top
+        attr = curses.color_pair(self.colors.line_num) | curses.A_BOLD
+        self._safe_addstr(y, 0, button.icon, attr)
+        self._drawn_buttons.append(DrawnButton(y, 0, attr, button))
+
+    def button_at(self, mx: int, my: int) -> Optional[DrawnButton]:
+        """The button a click landed on, or None."""
+        for drawn in self._drawn_buttons:
+            if my == drawn.y and drawn.x <= mx < drawn.end:
+                return drawn
+        return None
+
+    #: How long a clicked button stays inverted, in milliseconds.
+    FLASH_MS = 80
+
+    def flash_button(self, drawn: DrawnButton, ms: Optional[int] = None) -> None:
+        """Blink a button that was just clicked.
+
+        A click has nothing else to show for itself: the command it runs may
+        open nothing at all, or spend a second in the database before it does,
+        and until then the user cannot tell a hit from a miss."""
+        icon = drawn.button.icon
+        self._safe_addstr(drawn.y, drawn.x, icon, drawn.attr | curses.A_REVERSE)
+        self._refresh()
+        curses.napms(self.FLASH_MS if ms is None else ms)
+        self._safe_addstr(drawn.y, drawn.x, icon, drawn.attr)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        try:
+            self.stdscr.refresh()
+        except curses.error:
+            pass
 
     def _draw_status_bar(self, search: Optional['SearchBar'] = None):
         y = self._height - 1
@@ -3968,14 +4066,13 @@ class Editor:
         self.search = SearchBar(shell.clipboard)
         #: Name shown on the left of the status bar (the connection, for a DB tab).
         self.status_name: Optional[str] = None
-        self._ac_words: List[PopupItem] = []
+        # Watching this document's file on disk — see file_change_pending().
         self._file_change_dismissed: bool = False
         self._file_check_counter: int = 0
         # >>> ... <<< block folding (Ctrl+P); _fold_key caches the buffer
         # version the hidden-row set was computed for.
         self.fold_enabled = fold
         self._fold_key = None
-        self._init_ac_words([], [], [])
 
         self._directory: Optional[str] = directory
 
@@ -4003,26 +4100,10 @@ class Editor:
 
     # ── Word sets ─────────────────────────────────────────────────────────────
 
-    def _init_ac_words(
-        self,
-        keywords: Optional[List[str]] = None,
-        types: Optional[List[str]] = None,
-        functions: Optional[List[str]] = None
-    ) -> None:
-        entries, seen = [], set()
-        for words, kind in ((keywords, 'keyword'), (types, 'type'), (functions, 'function')):
-            for w in words or ():
-                wu = w.upper()
-                if wu not in seen:
-                    entries.append(PopupItem(insert=wu, label=f'{wu}  ({kind})', weight=0))
-                    seen.add(wu)
-        self._ac_words = entries
-
     def set_words(self, keywords=None, types=None, functions=None) -> None:
-        """Update syntax highlighting and autocomplete word sets.
+        """Update the syntax highlighting word sets.
         Each argument, if given, replaces the corresponding set entirely."""
         self.lexer.set_words(keywords=keywords, types=types, functions=functions)
-        self._init_ac_words(self.lexer._keywords, self.lexer._types, self.lexer._functions)
 
     # ── The document, as plugins see it ──────────────────────────────────────
 
@@ -4076,6 +4157,42 @@ class Editor:
     def on_before_draw(self) -> None:
         """Called before every redraw, after each keypress.
         Override in a subclass to add custom behaviour."""
+
+    # ── The file on disk ─────────────────────────────────────────────────────
+    # Whether this document's file has been changed by something else is the
+    # document's own business; the shell only asks, and owns the question it
+    # then puts on screen.
+
+    #: Main-loop ticks between two checks — ~1 s at the loop's 50 ms timeout.
+    #: Checking every tick would stat the file twenty times a second for no
+    #: gain; the counter is per-document because a tab is only checked while it
+    #: is the one on screen, and a shared one would make a tab just switched to
+    #: wait out somebody else's turn.
+    FILE_CHECK_TICKS = 20
+
+    def file_change_pending(self) -> bool:
+        """Whether the user should be asked about this document's file now.
+
+        Counts the tick, so it is meant to be called once per main-loop pass.
+        False while there is no file, while the answer has been dismissed, and
+        on every tick that is not a checking one."""
+        self._file_check_counter += 1
+        if self._file_check_counter < self.FILE_CHECK_TICKS:
+            return False
+        self._file_check_counter = 0
+        if self._file_change_dismissed or not self.buf.filepath:
+            return False
+        return self.buf.file_changed_on_disk()
+
+    def dismiss_file_change(self) -> None:
+        """Stop asking about the change the user has just been shown."""
+        self._file_change_dismissed = True
+
+    def watch_file_again(self) -> None:
+        """Ask about the next change — the document was saved, reloaded, opened
+        from elsewhere, or brought back on screen after time in the background,
+        so whatever was dismissed no longer describes what is on disk."""
+        self._file_change_dismissed = False
 
     def toggle_fold(self) -> bool:
         """Turn ``>>>`` … ``<<<`` block folding on or off; returns the new state."""
@@ -4168,14 +4285,14 @@ class Editor:
     def request_user_input(self, request: dict) -> Any:
         return self.shell.request_user_input(request)
 
-    def reset_pipeline_info(self) -> None:
-        self.shell.reset_pipeline_info()
+    def reset_task_info(self) -> None:
+        self.shell.reset_task_info()
 
-    def show_pipeline_info(self, text: str) -> None:
-        self.shell.show_pipeline_info(text)
+    def show_task_info(self, text: str) -> None:
+        self.shell.show_task_info(text)
 
-    def pipeline_stop_requested(self) -> bool:
-        return self.shell.pipeline_stop_requested()
+    def task_stop_requested(self) -> bool:
+        return self.shell.task_stop_requested()
 
     def run_sheet_prompt(self, kind: str, title: str, rows: list,
                          extra: Optional[dict] = None) -> Optional[list]:
@@ -4212,6 +4329,316 @@ class QueryRun:
     on_cancel: Optional[Callable] = None
 
 
+class CommandTable:
+    """The editor's commands, and the keys that reach them.
+
+    Two registries that only ever move together: a name → callable map (what
+    the command palette lists and a plugin adds to) and a key code → name map
+    (what a keypress goes through).  Keeping them apart is deliberate — one
+    command may answer to several keys, and a command with no key at all is
+    still reachable from the palette.
+
+    A command is registered once, at start-up, and resolves the document it
+    acts on when it runs; see :meth:`EditorShell._run_on_textarea`.
+    """
+
+    def __init__(self) -> None:
+        #: name → {'func', 'description', 'keybinding'}
+        self.functions: dict = {}
+        #: encoded key code → command name
+        self.keys: dict = {}
+
+    def add(self, name, func: Callable[[], None], description: str = '',
+            keybinding: str = '') -> None:
+        """Register *func* under *name*.
+
+        *description* is what the command palette shows — a command without one
+        is reachable by key only, which is how the editing keys stay out of the
+        palette.  *keybinding* is the human spelling of its shortcut (``'^S'``),
+        shown beside the description; it is documentation, not a binding, and
+        :meth:`bind` is what actually makes a key work."""
+        self.functions[name] = {
+            'func': func, 'description': description, 'keybinding': keybinding}
+
+    def bind(self, name, key: Union[int, List[int]]) -> None:
+        """Make *key* run *name*.  *key* is a code already in bitfield format
+        (use :func:`K`, :func:`key_alt`, …) or a list of them."""
+        if isinstance(key, (list, tuple)):
+            for one in key:
+                self.bind(name, one)
+            return
+        self.keys[key] = name
+
+    def run(self, name) -> bool:
+        """Run the command called *name*; False when there is no such command."""
+        entry = self.functions.get(name)
+        if entry is None:
+            return False
+        entry['func']()
+        return True
+
+    def run_key(self, key: int) -> bool:
+        """Run whatever *key* is bound to; False when it is bound to nothing —
+        which is what makes it a character to be typed instead."""
+        name = self.keys.get(key)
+        return False if name is None else self.run(name)
+
+    def hint_for(self, name) -> str:
+        """What a command says for itself on one line: what the palette calls
+        it, and the key that runs it ('Browse tables  Alt+T').
+
+        A bar button with no hint of its own borrows this, so the two cannot
+        drift apart — which is exactly what `+` did while its neighbours named
+        their keys."""
+        entry = self.functions.get(name)
+        if entry is None or not entry['description']:
+            return ''
+        keybinding = entry['keybinding']
+        return f"{entry['description']}  {keybinding}" if keybinding else entry['description']
+
+    def palette_items(self) -> 'List[PopupItem]':
+        """The described commands, as popup rows sorted by what they say."""
+        items = []
+        for name, entry in self.functions.items():
+            description = entry['description']
+            if not description:
+                continue
+            label = description
+            if entry['keybinding']:
+                label += f"  [{entry['keybinding']}]"
+            items.append(PopupItem(insert=name, label=label, weight=0))
+        items.sort(key=lambda item: item.label)
+        return items
+
+    def bindings_text(self) -> str:
+        """Every binding as raw key codes — what the remapping help page needs,
+        since --key-remap is written in exactly those numbers."""
+        by_name: dict = {}
+        for key, name in self.keys.items():
+            by_name.setdefault(name, []).append(key)
+        lines = ['Keybindings (key codes)']
+        for name, keys in sorted(by_name.items()):
+            keys_str = ', '.join(str(k) for k in sorted(keys))
+            lines.append(f'  {name.ljust(24)}{keys_str}')
+        return '\n'.join(lines)
+
+
+class StatusPrompt:
+    """The one-line questions asked on the status bar.
+
+    Every one of them blocks: the editor stops and waits for a real answer,
+    rather than letting the next tick of the main loop go by.  That is on
+    purpose — these interrupt whatever the user was typing (a file changed
+    under them, a buffer is about to be closed unsaved), and an answer given
+    by a stray keystroke would be worse than a pause.
+
+    Because they block, they read keys themselves instead of going through
+    :meth:`EditorShell._dispatch`.  Three of them used to do that separately,
+    each decoding a slightly different amount — one only normalised, one also
+    resolved escape sequences, one did the lot — so an arrow key meant
+    something different depending on which question was on screen.  Here there
+    is one :meth:`read_key`, and every question is built on it.
+    """
+
+    YES = (ord('y'), ord('Y'), 'y', 'Y')
+    NO = (ord('n'), ord('N'), 'n', 'N')
+    ESC = 27
+
+    def __init__(self, stdscr: curses.window, colors: 'ColorManager',
+                 keys: 'KeyCodec') -> None:
+        self.stdscr = stdscr
+        self.colors = colors
+        self.keys = keys
+
+    def draw(self, message: str, color: int, extra: str = '') -> None:
+        """Draw a one-line prompt in the status bar, cursor after it."""
+        H, W = self.stdscr.getmaxyx()
+        y = H - 1
+        bar = (message + extra)[:W].ljust(W)
+        try:
+            self.stdscr.addstr(y, 0, bar, curses.color_pair(color))
+            self.stdscr.move(y, min(len(message) + len(extra), W - 1))
+            self.stdscr.refresh()
+        except curses.error:
+            pass
+
+    def read_key(self, message: str, resolve: bool = False):
+        """Draw *message* and block until a key is pressed; return it.
+
+        With *resolve*, an Esc is followed up so that an arrow key or an Alt
+        combo does not read as a bare Esc — which a question offering Esc as
+        "cancel" would otherwise take as the answer."""
+        self.draw(message, self.colors.status_warn)
+        while True:
+            try:
+                key = get_wch(self.stdscr)
+            except curses.error:
+                continue
+            key = self.keys.normalize(key)
+            if key == -1:
+                continue
+            return self.keys.resolve(key) if resolve else key
+
+    def confirm(self, message: str) -> bool:
+        """A y/n question answered by the first keypress: only 'y' means yes."""
+        return self.read_key(message) in self.YES
+
+    def confirm_3way(self, message: str) -> str:
+        """A y/n/cancel question: 'yes', 'no', or 'cancel' for anything else."""
+        key = self.read_key(message)
+        if key in self.YES:
+            return 'yes'
+        if key in self.NO:
+            return 'no'
+        return 'cancel'
+
+    def yes_no_or_cancel(self, message: str) -> Optional[bool]:
+        """A y/n question that waits for a real answer.
+
+        'y'/Enter → True, 'n' → False, Esc → None; any other key redraws the
+        question and keeps waiting.  This is what a task's ``ask()`` uses: a
+        keystroke meant for the editor must not silently answer it."""
+        enter = (curses.KEY_ENTER, ord('\n'), ord('\r'))
+        while True:
+            key = self.read_key(message, resolve=True)
+            if key in self.YES or key in enter:
+                return True
+            if key in self.NO:
+                return False
+            if key == self.ESC:
+                return None
+
+
+class KeyCodec:
+    """Turns what curses hands over into the bitfield code the app binds to.
+
+    Four steps, always in this order:
+
+    ``normalize``
+        get_wch() returns a ``str`` for every character, control characters
+        included; a single-character one becomes its ordinal so the rest of the
+        chain compares ints throughout.
+    ``resolve``
+        an Esc is followed up — Alt combos and CSI sequences arrive as several
+        reads and are packed into one value here.
+    ``encode``
+        that value moves into the bitfield described at the top of this module.
+    ``remap``
+        the user's ``--key-remap`` table has the last word.
+
+    It also owns the tmux-style prefix: :meth:`arm_prefix` after the trigger
+    key, and the next key comes back with ``KEY_PREFIX_BIT`` set.
+
+    The remap table belongs to the instance.  It used to be a mutable class
+    attribute on :class:`EditorShell`, so ``self.REMAPED_KEYS[k] = v`` wrote
+    into a dict shared by every shell in the process and outlived the one that
+    set it — visible in the tests, which had to shadow it by hand.
+    """
+
+    #: How long to wait for the rest of an escape sequence.
+    ESCAPE_TIMEOUT_MS = 30
+    #: How long the tmux-style prefix stays armed waiting for its second key.
+    PREFIX_TIMEOUT_MS = 1000
+
+    def __init__(self, stdscr, idle_timeout_ms: int = 50) -> None:
+        self.stdscr = stdscr
+        self.idle_timeout_ms = idle_timeout_ms
+        #: raw code → the code it is treated as (--key-remap / DBCLS_KEY_REMAP)
+        self.remap_table: dict = {}
+        #: Whether the prefix trigger was the last key seen.
+        self.prefix_pending = False
+
+    # ── The chain ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def normalize(key):
+        """A one-character ``str`` becomes its ordinal; everything else passes
+        through (curses constants already arrive as ints)."""
+        if isinstance(key, str) and len(key) == 1:
+            return ord(key)
+        return key
+
+    def resolve(self, key):
+        """Follow an Esc up with whatever else the terminal has waiting.
+
+        Subsequent bytes are read with getch() and packed eight bits per byte
+        into one integer, stopping at an alphabetic terminator (the
+        conventional CSI final byte) or at the timeout.  No special case for
+        ``[``: the same loop handles a simple Alt combo and a CSI sequence.
+        Returns ``('alt', packed)``, or plain 27 for a bare Esc."""
+        if key != 27:
+            return key
+
+        packed = 0
+        self.stdscr.timeout(self.ESCAPE_TIMEOUT_MS)
+        try:
+            while True:
+                b = self.stdscr.getch()
+                if b == -1:
+                    break
+                packed = (packed << 8) | b
+                if chr(b).isalpha():
+                    break
+        finally:
+            self.stdscr.timeout(self.idle_timeout_ms)
+
+        if packed == 0:
+            return 27  # bare ESC
+        return ('alt', packed)
+
+    @staticmethod
+    def encode(key) -> int:
+        """Move a resolved key (an int, or the ``('alt', packed)`` tuple) into
+        the bitfield.
+
+        Bit layout (LSB-first):
+          bit 0  KEY_ESC_BIT    — Alt/Esc prefix
+          bit 1  KEY_PREFIX_BIT — tmux-style prefix (KEY_PREFIX_TRIGGER)
+          bit 2+ the key value, shifted left by 2
+        """
+        if isinstance(key, tuple):
+            _tag, val = key   # tag is always 'alt'
+            return (val << 2) | KEY_ESC_BIT
+        # Plain int: curses constant, ASCII code, bare ESC (27), etc.
+        return key << 2
+
+    def remap(self, key: int) -> int:
+        """The code *key* is bound as, after the user's remap table."""
+        return self.remap_table.get(key, key)
+
+    def decode(self, key) -> int:
+        """normalize → resolve → encode → remap, for a key that is not a mouse
+        event (those are read out of curses before this and re-enter as plain
+        movement keys or as KEY_MOUSE)."""
+        return self.remap(self.encode(self.resolve(self.normalize(key))))
+
+    # ── The tmux-style prefix ────────────────────────────────────────────────
+
+    def arm_prefix(self) -> None:
+        """The trigger was pressed: wait longer than a tick for its partner."""
+        self.prefix_pending = True
+        self.stdscr.timeout(self.PREFIX_TIMEOUT_MS)
+
+    def disarm_prefix(self) -> None:
+        """Nothing came (or it has now been consumed): back to the loop's own
+        tick rate."""
+        self.prefix_pending = False
+        self.stdscr.timeout(self.idle_timeout_ms)
+
+    def take_prefix(self, key: int) -> int:
+        """*key* arrived while the prefix was armed: tag it and disarm.
+
+        The prefix bit is kept even when the combination is remapped, so a
+        prefixed key can never collide with the unprefixed one; remapping runs
+        again afterwards so that a prefixed code can itself be remapped."""
+        self.disarm_prefix()
+        return self.remap(key | KEY_PREFIX_BIT)
+
+    def add_remap(self, raw: int, treated_as: int) -> None:
+        """Treat the key code *raw* as *treated_as* from now on."""
+        self.remap_table[raw] = treated_as
+
+
 class EditorShell:
     """The screen: everything drawn around a document, and the loop that drives it.
 
@@ -4220,12 +4647,13 @@ class EditorShell:
     tabs.  Commands are registered once and always act on :attr:`doc`, the
     document currently on screen."""
 
-    REMAPED_KEYS = {}
+    #: Main-loop tick, in milliseconds — how often run() wakes with no key.
+    TICK_MS = 50
 
     def __init__(self, stdscr: curses.window):
         self.stdscr = stdscr
         stdscr.keypad(True)
-        stdscr.timeout(50)
+        stdscr.timeout(self.TICK_MS)
         curses.curs_set(1)
         curses.mousemask(0xffffffff)
 
@@ -4237,13 +4665,17 @@ class EditorShell:
         self.running_popup = RunningPopup()
         self.info_popup = InfoPopup(self.clipboard)
         self.input_bar = InputBar(self.clipboard)
-        # Live-pipeline info popup state (driven by the pipeline `info()` helper).
-        self._pipeline_info_live = False
-        # Esc on a live info popup asks the pipeline to stop at its next step.
-        self._pipeline_stop_requested = False
-        # Pending worker-thread prompt (pipeline choose()/select()/sselect()/
-        # input()/ask()); see request_user_input().
+        # A long-running task has something on screen right now (see
+        # show_task_info); Esc on that popup asks it to stop at its next step.
+        self._task_info_live = False
+        self._task_stop_requested = False
+        # Pending worker-thread prompt — see request_user_input() and
+        # dbcls.prompts.PromptKind.
         self._ui_request: Optional[dict] = None
+        #: Everything between a keypress and the code a command is bound to.
+        self.keys = KeyCodec(stdscr, idle_timeout_ms=self.TICK_MS)
+        #: The blocking one-line questions asked on the status bar.
+        self.prompt_line = StatusPrompt(stdscr, self.colors, self.keys)
         self.renderer = Renderer(stdscr, self.colors)
         self.tab_bar = TabBar()
         #: Open documents, in tab order, and the index of the visible one.
@@ -4252,11 +4684,9 @@ class EditorShell:
         self.running = True
         self._needs_redraw = True
         self._debug_mode = False
-        self._prefix_pending = False
         self._status_notification: Optional[str] = None
-        self._keybindings: dict = {}
+        self.commands = CommandTable()
         self._current_run: Optional[QueryRun] = None
-        self._editor_functions: dict = {}
         # Extra help pages contributed by plugins (title -> text); linked from
         # the help TOC by show_help().
         self.extra_help_pages: dict = {}
@@ -4294,7 +4724,7 @@ class EditorShell:
         self.active = index
         self.renderer.set_view(self.doc.view)
         # The file may well have changed while this tab was in the background.
-        self.doc._file_change_dismissed = False
+        self.doc.watch_file_again()
         self._sync_tab_bar()
         self.request_redraw()
 
@@ -4313,12 +4743,17 @@ class EditorShell:
         if len(self.documents) == 1:
             self.running = False
             return True
-        self.documents.pop(index)
+        closed = self.documents.pop(index)
         self.active = min(index, len(self.documents) - 1)
         self.renderer.set_view(self.doc.view)
         self._sync_tab_bar()
+        self.on_document_closed(closed)
         self.request_redraw()
         return True
+
+    def on_document_closed(self, document) -> None:
+        """A tab has just been taken off the bar.  Nothing to do for a plain
+        editor; :class:`dbcls.dbcls.DbEditor` lets the connection go with it."""
 
     def _cmd_next_tab(self):
         self.switch_to(self.active + 1)
@@ -4527,32 +4962,37 @@ class EditorShell:
                                      on_done=on_done, on_cancel=on_cancel)
         self.running_popup.open(task, start, on_cancel)
 
-    # ── Live pipeline info popup (driven from the pipeline `info()` helper) ──────
+    # ── What a long-running task says while it runs, and how it is asked to stop ─
+    #
+    # The shell knows only "a task is running and has something to report".  In
+    # dbcls that task is always a pipeline, reporting through its `info()`
+    # helper and stopping between steps — but nothing here needs to know that,
+    # and a plugin driving its own long job gets the same three methods.
 
-    def reset_pipeline_info(self) -> None:
-        """Reset live-info / stop-request state at the start of a pipeline run."""
-        self._pipeline_info_live = False
-        self._pipeline_stop_requested = False
+    def reset_task_info(self) -> None:
+        """Clear the live-info and stop-request state before a task starts."""
+        self._task_info_live = False
+        self._task_stop_requested = False
 
-    def pipeline_stop_requested(self) -> bool:
-        """Pipeline host hook: True once the user asked the running pipeline to
-        stop (Esc on a live info() popup); the executor checks it between steps."""
-        return self._pipeline_stop_requested
+    def task_stop_requested(self) -> bool:
+        """True once the user has asked the running task to stop (Esc on a live
+        info popup).  The task is expected to check this between steps — this
+        is a request, not a cancellation: the work done so far is kept."""
+        return self._task_stop_requested
 
-    def show_pipeline_info(self, text: str) -> None:
+    def show_task_info(self, text: str) -> None:
         """Show/refresh the info popup over the running overlay without halting
-        execution.  Esc on the popup asks the pipeline to stop (see
-        pipeline_stop_requested); Backspace (or any other closing key) just
-        hides it — the next info() call shows it again.
+        the task.  Esc on the popup asks it to stop (see
+        :meth:`task_stop_requested`); Backspace — or any other closing key —
+        only hides the popup, and the next call shows it again.
 
-        The popup is *not* closed automatically when the pipeline finishes — it
-        stays open until the user dismisses it (handled where the info popup
-        intercepts input)."""
+        It is *not* closed when the task finishes: it stays until the user
+        dismisses it (handled where the info popup intercepts input)."""
         self.info_popup.open('Info', {'main': text})
-        self._pipeline_info_live = True
+        self._task_info_live = True
         self.request_redraw()
 
-    # ── Worker-thread user prompts (pipeline choose()/select()/sselect()/input()/ask()) ──
+    # ── Prompts a worker thread puts to the user (see dbcls.prompts) ─────────
 
     def request_user_input(self, request: dict) -> Any:
         """Show an interactive prompt and block until the user answers.
@@ -4569,7 +5009,8 @@ class EditorShell:
         ``'warn'`` need only the title.  Optional ``default`` pre-fills the
         prompt: the option label to highlight (choose), the labels to pre-mark
         (select) or the initial text (input).  ``'input'`` also takes optional
-        ``items`` — strings offered in its history list.
+        ``items`` — strings offered in its history list — and ``mask``, which
+        turns it into a password prompt: asterisks on screen and no history.
 
         Returns the chosen string (choose), the list of marked strings
         (select), the list of picked row dicts (sselect/schoose/watch), the
@@ -4596,25 +5037,26 @@ class EditorShell:
         """Open the widget for a pending worker-thread prompt (main loop tick)."""
         req['opened'] = True
         kind = req['kind']
-        if kind in ('choose', 'select'):
+        if kind in (PromptKind.CHOOSE, PromptKind.SELECT):
             items = [PopupItem(insert=o, label=o) for o in req.get('options') or []]
-            self.popup.open(items, title=req['title'], multi=(kind == 'select'),
+            self.popup.open(items, title=req['title'],
+                            multi=(kind == PromptKind.SELECT),
                             default=req.get('default'))
-        elif kind == 'input':
+        elif kind == PromptKind.INPUT:
             self.input_bar.open(req['title'], req.get('default') or '',
-                                req.get('items') or [])
-        elif kind == 'warn':
+                                req.get('items') or [], mask=bool(req.get('mask')))
+        elif kind == PromptKind.WARN:
             # warn(): an info popup the pipeline waits on.  Closing it resolves
             # the request in the info-popup dispatch branch (Esc → None).
             self.info_popup.open('Warning', {'main': req['title']})
-            self._pipeline_info_live = False
-        elif kind == 'ask':
+            self._task_info_live = False
+        elif kind == PromptKind.ASK:
             # Single-keypress y/n prompt — blocks the loop until the user gives
             # a real answer, so a stray keystroke can neither answer "no" nor
             # dismiss it.  Esc means "cancelled" (None), distinct from "no".
             self._resolve_ui_request(
-                self._read_pipeline_ask(f"{req['title']} (y/Enter = yes, n = no, Esc = cancel): "))
-        elif kind in SHEET_PROMPT_KINDS:
+                self._read_yes_no(f"{req['title']} (y/Enter = yes, n = no, Esc = cancel): "))
+        elif kind in SHEET_KINDS:
             # Row prompts shown in an external viewer (VisiData in DbEditor).
             # Synchronous like 'ask': the viewer owns the terminal on the main
             # loop while the worker thread waits for the answer.
@@ -4717,18 +5159,33 @@ class EditorShell:
         return self.doc.insert_text(text)
 
     def add_editor_function(self, name: str, func: Callable[[], None], description: str = '', keybinding: str = '') -> None:
-        self._editor_functions[name] = {'func': func, 'description': description, 'keybinding': keybinding}
+        self.commands.add(name, func, description, keybinding)
 
     def add_keybinding(self, name: str, key: Union[int, List[int]]) -> None:
         """Register a keyboard shortcut.
 
         key  – an int key code already in bitfield format (use K(), key_alt(), etc.)
                or a list/tuple of such ints."""
-        if isinstance(key, (list, tuple)):
-            for k in key:
-                self.add_keybinding(name, k)
-            return
-        self._keybindings[key] = name
+        self.commands.bind(name, key)
+
+    def add_bar_button(self, icon: str, command: str, hint: str = '',
+                       gutter: bool = False) -> None:
+        """Put *icon* on screen as a clickable way to run *command*.
+
+        With *gutter* it goes left of line 1 (one such button; a later one
+        replaces it), otherwise into the right corner of the filename bar, in
+        the order the buttons were added.  A shell that registers none looks
+        exactly as it did before — which is why the plain editor has no
+        buttons and the DB one has three.
+
+        The status bar says what the click did the moment it lands: the
+        command's own palette text and key ('Browse tables  Alt+T'), or *hint*
+        where a button wants to say something else.  Keep it to one line."""
+        button = BarButton(icon=icon, command=command, hint=hint)
+        if gutter:
+            self.renderer.gutter_button = button
+        else:
+            self.renderer.bar_buttons.append(button)
 
     def _run_on_textarea(self, method: str) -> None:
         """Run one of :data:`TEXT_EDIT_BINDINGS` on the active tab's text area."""
@@ -4747,7 +5204,6 @@ class EditorShell:
         add(Fn.SAVE_AS,         self._save_file_as,             'Save As')
         add(Fn.TOGGLE_READONLY, self._toggle_readonly,          'Toggle read-only mode')
         add(Fn.SEARCH,          self._cmd_search,               'Search',                 '^F')
-        add(Fn.AUTOCOMPLETE,    self._cmd_autocomplete,         'Base autocomplete',      '^N')
         add(Fn.QUIT,            self._quit,                     'Quit',                   '^Q')
         add(Fn.HELP,            self.show_help,                 'Show help',              'F1 / Alt+H')
         add(Fn.RESIZE,          self._cmd_resize,               'Handle terminal resize')
@@ -4766,7 +5222,6 @@ class EditorShell:
         add(Fn.OPEN_FILE,       K(ord('\x07')))
         add(Fn.SAVE,            K(ord('\x13')))
         add(Fn.SEARCH,          K(ord('\x06')))
-        add(Fn.AUTOCOMPLETE,    K(ord('\x0e')))
         add(Fn.QUIT,            K(ord('\x11')))
         add(Fn.HELP,            [K(curses.KEY_F1), key_alt(ord('h'))])
         add(Fn.RESIZE,          K(curses.KEY_RESIZE))
@@ -4798,11 +5253,10 @@ class EditorShell:
                 key = -1
 
             if key == -1:
-                if self._prefix_pending:
+                if self.keys.prefix_pending:
                     # Prefix timeout — nothing is bound to the bare trigger,
-                    # just disarm the prefix
-                    self._prefix_pending = False
-                    self.stdscr.timeout(50)
+                    # so just disarm it.
+                    self.keys.disarm_prefix()
                 else:
                     self._dispatch_pre_hook(-1)
             else:
@@ -4835,10 +5289,8 @@ class EditorShell:
                     run.on_done()
                 self._needs_redraw = True
 
-            self.doc._file_check_counter += 1
-            if self.doc._file_check_counter >= 20:  # ~1 s at 50 ms timeout
-                self.doc._file_check_counter = 0
-                self._check_external_file_change()
+            if self._may_ask_about_the_file() and self.doc.file_change_pending():
+                self._confirm_file_change()
                 self._needs_redraw = True
 
             if DEBUG_PARAMS['PAUSE_REQUESTED'].is_set():
@@ -4876,59 +5328,13 @@ class EditorShell:
             tab_bar=self._tab_bar_to_draw(),
         )
 
-    @staticmethod
-    def _normalize_key(key):
-        """get_wch() returns str for ALL char input, including control chars.
-        Convert single-char control/non-printable strings to int so the rest
-        of the dispatch code (which compares against ord() integers) works."""
-        if isinstance(key, str) and len(key) == 1:
-            o = ord(key)
-            return o
-        return key
-
-    def _resolve_key(self, key):
-        """If key is ESC (27), read subsequent bytes with getch and pack them
-        8 bits per byte into a single integer.  Stops on an alpha terminator
-        (the conventional CSI final byte) or a 30 ms timeout.  No special-casing
-        for '[' — the loop handles simple Alt combos and CSI sequences uniformly.
-        Returns ('alt', packed) or plain 27 for a bare ESC."""
-        if key != 27:
-            return key
-
-        packed = 0
-        self.stdscr.timeout(30)
-        try:
-            while True:
-                b = self.stdscr.getch()
-                if b == -1:
-                    break
-                packed = (packed << 8) | b
-                if chr(b).isalpha():
-                    break
-        finally:
-            self.stdscr.timeout(50)
-
-        if packed == 0:
-            return 27  # bare ESC
-
-        return ('alt', packed)
-
-    @staticmethod
-    def _encode_key(key) -> int:
-        """Convert a raw resolved key (int or ('alt', packed) tuple) into the bitfield format.
-
-        Bit layout (LSB-first):
-          bit 0  KEY_ESC_BIT    — Alt/ESC prefix
-          bit 1  KEY_PREFIX_BIT — tmux-style prefix (KEY_PREFIX_TRIGGER)
-          bit 2+ key value shifted left by 2
-        """
-        if isinstance(key, tuple):
-            _tag, val = key   # tag is always 'alt'
-            return (val << 2) | KEY_ESC_BIT
-        # Plain int: curses constant, ASCII code, bare ESC (27), etc.
-        return key << 2
-
     def _dispatch(self, key):
+        """One keypress, from what curses returned to whoever acts on it.
+
+        Four stages, and each may end the journey: the mouse is turned into
+        something the rest can understand, the key is decoded, whatever owns the
+        screen right now is offered it, and what is left reaches the document.
+        """
         # get_wch() hands back a str for text the user actually typed and an int
         # for everything else.  That is the only thing telling the two apart —
         # curses constants sit inside the printable Unicode range (KEY_MOUSE is
@@ -4936,52 +5342,67 @@ class EditorShell:
         # strength of looking printable.  See _handle_printable.
         self._key_is_text = isinstance(key, str) and len(key) == 1
 
-        key = self._normalize_key(key)
+        key = self.keys.normalize(key)
         if key == curses.KEY_MOUSE:
-            BUTTON5_PRESSED = 134217728
-            try:
-                _, mx, my, _, bstate = curses.getmouse()
-            except curses.error as exc:
-                self.set_status_notification('KEY_MOUSE but getmouse() failed — ' + str(exc))
+            key = self._dispatch_mouse()
+            if key is None:
                 return
-            # The wheel becomes Up/Down here, before anything else sees the
-            # event: whoever handles keys next — the lock screen, an overlay,
-            # the editor — should get a movement key, never the raw KEY_MOUSE.
-            if bstate & curses.BUTTON4_PRESSED:
-                key = curses.KEY_UP
-            elif bstate & BUTTON5_PRESSED:
-                key = curses.KEY_DOWN
-            else:
-                # Clicks keep going through the pre-hook as KEY_MOUSE: while the
-                # lock screen is up they are swallowed there; while unlocked this
-                # counts as activity (resets the inactivity timer).
-                if self._dispatch_pre_hook(self._encode_key(key)):
-                    return
-                if bstate & curses.BUTTON1_PRESSED or bstate & curses.BUTTON1_CLICKED:
-                    self._handle_click(mx, my)
-                return
-        key = self._resolve_key(key)
-        key = self._encode_key(key)
-        key = self._override_remaped_keys(key)
+
+        key = self.keys.remap(self.keys.encode(self.keys.resolve(key)))
 
         if self._dispatch_pre_hook(key):
             return
 
         # tmux-style prefix handling (KEY_PREFIX_TRIGGER)
-        if self._prefix_pending:
-            self._prefix_pending = False
-            self.stdscr.timeout(50)
-            # always keep the prefix bit so combos never collide with
-            # unprefixed keys; remap so pfx codes can be bound via remapping
-            key = self._override_remaped_keys(key | KEY_PREFIX_BIT)
+        if self.keys.prefix_pending:
+            key = self.keys.take_prefix(key)
         elif key == KEY_PREFIX_TRIGGER:
-            self._prefix_pending = True
-            self.stdscr.timeout(1000)
+            self.keys.arm_prefix()
             return
 
+        self._before_key(key)
+        if key == K(ord('\x04')):  # Ctrl+D — toggle the debug key display
+            self._toggle_debug_mode()
+            return
+
+        if self._dispatch_to_modal(key):
+            return
+
+        self._handle_normal_key(key)
+
+    def _dispatch_mouse(self):
+        """Turn the pending mouse event into a key, or handle it here.
+
+        Returns the key the rest of the dispatch should carry on with, or None
+        when the event was dealt with (a click, or a mouse report curses could
+        not read)."""
+        BUTTON5_PRESSED = 134217728
+        try:
+            _, mx, my, _, bstate = curses.getmouse()
+        except curses.error as exc:
+            self.set_status_notification('KEY_MOUSE but getmouse() failed — ' + str(exc))
+            return None
+        # The wheel becomes Up/Down here, before anything else sees the event:
+        # whoever handles keys next — the lock screen, an overlay, the editor —
+        # should get a movement key, never the raw KEY_MOUSE.
+        if bstate & curses.BUTTON4_PRESSED:
+            return curses.KEY_UP
+        if bstate & BUTTON5_PRESSED:
+            return curses.KEY_DOWN
+        # Clicks keep going through the pre-hook as KEY_MOUSE: while the lock
+        # screen is up they are swallowed there; while unlocked this counts as
+        # activity (resets the inactivity timer).
+        if self._dispatch_pre_hook(self.keys.encode(curses.KEY_MOUSE)):
+            return None
+        if bstate & curses.BUTTON1_PRESSED or bstate & curses.BUTTON1_CLICKED:
+            self._handle_click(mx, my)
+        return None
+
+    def _before_key(self, key: int) -> None:
+        """Housekeeping every key does before anyone acts on it."""
         # An active info popup swallows this key (it is the key that closes it),
         # so it must not also wipe the notification underneath — otherwise the
-        # error message/color is gone before it was ever seen.
+        # error message/colour is gone before it was ever seen.
         if self._status_notification is not None and not self.info_popup.active:
             self._status_notification = None
             self.renderer.status_notification = None
@@ -4989,80 +5410,99 @@ class EditorShell:
         if self._debug_mode:
             flags = ('ALT ' if key_is_alt(key) else '') + ('PFX ' if key_is_pfx(key) else '')
             self.renderer.debug_text = f'key={key} raw={flags}{key_base(key)}'
-        if key == K(ord('\x04')):  # Ctrl+D — toggle debug key display
-            self._debug_mode = not self._debug_mode
-            self.renderer.debug_text = 'DEBUG ON — press keys to see codes' if self._debug_mode else ''
-            return
-        # Info popup mode — checked before the running popup so that a live
-        # pipeline info()/warn() popup can be dismissed without cancelling the task.
-        if self.info_popup.active:
-            if self.info_popup.handle_key(key) == 'close':
-                self.info_popup.close()
-                req = self._ui_request
-                if req is not None and req['opened'] and req['kind'] == 'warn':
-                    # warn() popup: Esc aborts the pipeline (resolved as None),
-                    # any other closing key resumes it.
-                    self._resolve_ui_request(None if key == K(27) else True)
-                elif self._pipeline_info_live:
-                    # Live info() popup: Esc asks the pipeline to stop at its
-                    # next step; any other closing key (Backspace, …) just hides
-                    # the popup — the next info() call reopens it.
-                    self._pipeline_info_live = False
-                    if key == K(27):
-                        self._pipeline_stop_requested = True
-            return
 
-        # Worker-thread prompt mode — checked before the running popup so that
-        # pipeline choose()/select()/input() prompts receive keys while a
-        # task is running.
+    def _toggle_debug_mode(self) -> None:
+        self._debug_mode = not self._debug_mode
+        self.renderer.debug_text = (
+            'DEBUG ON — press keys to see codes' if self._debug_mode else '')
+
+    # ── Who gets the key ──────────────────────────────────────────────────────
+
+    def _dispatch_to_modal(self, key: int) -> bool:
+        """Offer *key* to whatever is over the document; True if it took it.
+
+        The order is the point of this method, and it is not arbitrary:
+
+        1. the **info popup**, before the running overlay, so a live ``info()``
+           or ``warn()`` popup can be dismissed without cancelling the run;
+        2. a **pending worker-thread prompt**, before it too, so a running task
+           can still ask the user something;
+        3. the **running overlay**, which swallows everything but Esc;
+        4. the **select popup** (autocomplete, menus) and
+        5. the **search bar**, which are ordinary editor widgets.
+
+        Each has its own idea of what its handle_key() returns, so this reads as
+        five branches rather than one loop; what they share is only that an
+        active one consumes the key.
+        """
+        if self.info_popup.active:
+            self._key_to_info_popup(key)
+            return True
+
         if self._ui_request is not None and self._ui_request['opened']:
             self._handle_ui_request_key(key)
-            return
+            return True
 
-        # Running popup mode — only ESC passes through, all other keys are swallowed
         if self.running_popup.active:
             self.running_popup.handle_key(key)
-            return
+            return True
 
-        # Popup mode
         if self.popup.active:
-            action = self.popup.handle_key(key)
-            if action == 'insert':
-                word = self.popup.selected_word()
-                if word:
-                    if self.popup._on_select:
-                        on_select = self.popup._on_select
-                        self.popup.close()
-                        on_select(word)
-                    else:
-                        self.buf.delete_word_before_cursor()
-                        self.buf.insert_text(word)
-                        self.popup.close()
-                else:
-                    self.popup.close()
-            elif action == 'cancel':
-                self.popup.close()
-            return
+            self._key_to_popup(key)
+            return True
 
-        # Search mode
         if self.search.active:
-            action = self.search.handle_key(key, self.buf)
-            if action == 'close':
+            if self.search.handle_key(key, self.buf) == 'close':
                 self.search.close()
+            return True
+
+        return False
+
+    def _key_to_info_popup(self, key: int) -> None:
+        """The info popup is up; *key* is very likely the one closing it."""
+        if self.info_popup.handle_key(key) != 'close':
             return
+        self.info_popup.close()
+        req = self._ui_request
+        if req is not None and req['opened'] and req['kind'] == PromptKind.WARN:
+            # warn(): an info popup the task waits on.  Esc aborts it (resolved
+            # as None), any other closing key lets it carry on.
+            self._resolve_ui_request(None if key == K(27) else True)
+        elif self._task_info_live:
+            # A live info() popup: Esc asks the task to stop at its next step;
+            # any other closing key (Backspace, …) only hides the popup, and
+            # the next info() call brings it back.
+            self._task_info_live = False
+            if key == K(27):
+                self._task_stop_requested = True
 
-        self._handle_normal_key(key)
-
-    def _override_remaped_keys(self, key) -> int:
-        if key in self.REMAPED_KEYS:
-            return self.REMAPED_KEYS[key]
-        return key
+    def _key_to_popup(self, key: int) -> None:
+        """The select popup is up: a menu with its own on_select, or plain
+        autocomplete, which replaces the word before the cursor itself."""
+        action = self.popup.handle_key(key)
+        if action == 'cancel':
+            self.popup.close()
+            return
+        if action != 'insert':
+            return
+        word = self.popup.selected_word()
+        if not word:
+            self.popup.close()
+            return
+        on_select = self.popup._on_select
+        if on_select is not None:
+            self.popup.close()
+            on_select(word)
+            return
+        self.buf.delete_word_before_cursor()
+        self.buf.insert_text(word)
+        self.popup.close()
 
     # ── Mouse handling ────────────────────────────────────────────────────────
 
     def _handle_click(self, mx, my):
         """Route a click: to the overlay on top if it wants one, else to the tab
-        bar, else to the document."""
+        bar, else to a bar button, else to the document."""
         overlay = self.active_overlay()
         if overlay is not None:
             handler = getattr(overlay, 'handle_click', None)
@@ -5073,6 +5513,25 @@ class EditorShell:
             index = self.tab_bar.hit(mx, my)
             if index is not None:
                 self.switch_to(index)
+                return
+        # Before the document: the gutter button sits on a cell a click would
+        # otherwise spend on moving the cursor to the start of line 1.
+        drawn = self.renderer.button_at(mx, my)
+        if drawn is not None:
+            # Resolved here rather than when the button was added: a plugin may
+            # well register its button before the command it runs.
+            hint = drawn.button.hint or self.commands.hint_for(drawn.button.command)
+            if hint:
+                # Painted here rather than left to the frame at the end of this
+                # tick: the command in between may take a while in the database,
+                # and the point of both hint and blink is to answer the click at
+                # once.  Set before the command runs, so a message of its own —
+                # an error, a row count — replaces it rather than the other way
+                # round.
+                self.set_status_notification(hint, popup=False)
+                self._draw_frame()
+            self.renderer.flash_button(drawn)
+            if self.commands.run(drawn.button.command):
                 return
         self._handle_mouse_click(mx, my)
 
@@ -5085,37 +5544,9 @@ class EditorShell:
     def _cmd_search(self):
         self.search.open()
 
-    def _cmd_autocomplete(self):
-        if self.popup.active:
-            self.popup.close()
-        else:
-            items = list(self.doc._ac_words)
-            seen = {item.insert for item in items}
-            for w in self.buf.document_words():
-                wu = w.upper()
-                if wu not in seen:
-                    items.append(PopupItem(insert=wu, label=f'{wu}  (word)', weight=0))
-                    seen.add(wu)
-            self.popup.open(items, filter_text=self.buf.word_at_cursor(), title='Autocomplete')
-
     def _cmd_command_palette(self):
-        items = []
-        for name, entry in self._editor_functions.items():
-            description = entry['description']
-            if not description:
-                continue
-            label = description
-            if entry['keybinding']:
-                label += f"  [{entry['keybinding']}]"
-            items.append(PopupItem(insert=name, label=label, weight=0))
-        items.sort(key=lambda item: item.label)
-
-        def on_select(func_name):
-            entry = self._editor_functions.get(func_name)
-            if entry:
-                entry['func']()
-
-        self.popup.open(items, filter_text='', on_select=on_select, title='Commands')
+        self.popup.open(self.commands.palette_items(), filter_text='',
+                        on_select=self.commands.run, title='Commands')
 
     def _cmd_toggle_fold(self):
         self.set_status_notification(
@@ -5132,13 +5563,8 @@ class EditorShell:
     # ── Key dispatch ──────────────────────────────────────────────────────────
 
     def _handle_normal_key(self, key):
-        name = self._keybindings.get(key)
-        if name is not None:
-            entry = self._editor_functions.get(name)
-            if entry is not None:
-                entry['func']()
-                return
-        self._handle_printable(key)
+        if not self.commands.run_key(key):
+            self._handle_printable(key)
 
     def _save_file(self):
         if self.buf.readonly:
@@ -5149,23 +5575,23 @@ class EditorShell:
                 if not self._confirm('File changed on disk. Overwrite? (y/n): '):
                     return
             self.buf.save()
-            self.doc._file_change_dismissed = False
+            self.doc.watch_file_again()
             self.set_status_notification(f'Saved {self.buf.filepath}')
         else:
-            path = self._prompt('Save as: ')
+            path = self._prompt('Save as')
             if path:
                 self.buf.save(path)
-                self.doc._file_change_dismissed = False
+                self.doc.watch_file_again()
                 self.set_status_notification(f'Saved {path}')
 
     def _save_file_as(self):
         if self.buf.readonly:
             self.set_status_notification('Read-only mode — saving is disabled', error=True)
             return
-        path = self._prompt('Save as: ', default=self.buf.filepath or '')
+        path = self._prompt('Save as', default=self.buf.filepath or '')
         if path:
             self.buf.save(path)
-            self.doc._file_change_dismissed = False
+            self.doc.watch_file_again()
             self.set_status_notification(f'Saved {path}')
 
     def _toggle_readonly(self):
@@ -5187,15 +5613,7 @@ class EditorShell:
         return {'main': '-->>Editor<<--', 'Editor': EDITOR_HELP}
 
     def _keybindings_text(self) -> str:
-        """Return a formatted list of all registered keybindings (key codes)."""
-        by_name: dict = {}
-        for key, name in self._keybindings.items():
-            by_name.setdefault(name, []).append(key)
-        lines = ['Keybindings (key codes)']
-        for name, keys in sorted(by_name.items()):
-            keys_str = ', '.join(str(k) for k in sorted(keys))
-            lines.append(f'  {name.ljust(24)}{keys_str}')
-        return '\n'.join(lines)
+        return self.commands.bindings_text()
 
     def _prompt_save_before_close(self) -> str:
         """Prompt to save unsaved changes before closing/switching the current file.
@@ -5243,7 +5661,7 @@ class EditorShell:
                     return
             self.buf.load(new_path)
             self.lexer.invalidate(0)
-            self.doc._file_change_dismissed = False
+            self.doc.watch_file_again()
 
         self.popup.open(items, filter_text='', on_select=on_select, title='Open File')
 
@@ -5262,116 +5680,99 @@ class EditorShell:
                 self._save_file()
                 if self.buf.dirty:  # save was cancelled (e.g. no filepath and prompt escaped)
                     return
+        if not self._confirm_quit():
+            return
         self.running = False
 
-    def _check_external_file_change(self):
-        # Deferred while a full-screen overlay (lock screen) is up: the prompt
-        # reads keys directly, bypassing _dispatch_pre_hook, so it must never
-        # appear over the lock.
-        if (self.doc._file_change_dismissed
-                or not self.buf.filepath
-                or self.running_popup.active
-                or self.popup.active
-                or self._get_overlay() is not None):
-            return
-        if self.buf.file_changed_on_disk():
-            self._confirm_file_change()
+    def _confirm_quit(self) -> bool:
+        """Anything else to ask about before quitting?  False keeps the editor
+        open.  Asked after the per-tab save prompts, so the files come first;
+        the plain editor has nothing of its own to ask (see
+        :meth:`dbcls.dbcls.DbEditor._confirm_quit`)."""
+        return True
+
+    def _may_ask_about_the_file(self) -> bool:
+        """Whether now is a moment to interrupt with the file-changed question.
+
+        Not while anything else owns the screen — and a full-screen overlay
+        (the lock screen) most of all: the question reads keys directly,
+        bypassing _dispatch_pre_hook, so it must never appear over the lock."""
+        return not (self.running_popup.active
+                    or self.popup.active
+                    or self._get_overlay() is not None)
 
     def _draw_status_prompt(self, message: str, color: int, extra: str = '') -> None:
-        """Draw a one-line prompt in the status bar and put the cursor after it."""
-        H, W = self.stdscr.getmaxyx()
-        y = H - 1
-        bar = (message + extra)[:W].ljust(W)
-        try:
-            self.stdscr.addstr(y, 0, bar, curses.color_pair(color))
-            self.stdscr.move(y, min(len(message) + len(extra), W - 1))
-            self.stdscr.refresh()
-        except curses.error:
-            pass
-
-    def _read_answer(self, message: str):
-        """Draw a warning prompt and block until a key is pressed; return the
-        normalized key."""
-        self._draw_status_prompt(message, self.colors.status_warn)
-        while True:
-            try:
-                key = get_wch(self.stdscr)
-            except curses.error:
-                continue
-            key = self._normalize_key(key)
-            if key != -1:
-                return key
+        self.prompt_line.draw(message, color, extra)
 
     def _confirm_file_change(self):
-        """Prompt user when the file was modified externally.  Unlike the other
-        status-bar questions this one loops until a real answer is given: it can
-        pop up in the middle of typing, and a stray keystroke must not dismiss
-        it."""
+        """Ask about a file that changed on disk.
+
+        It loops until a real answer: unlike the other status-bar questions it
+        can appear in the middle of typing, and a stray keystroke must not
+        dismiss it."""
         write = '' if self.buf.readonly else ' / (w)rite'
         message = f'File changed on disk. (r)eload{write} / Esc=dismiss: '
         while True:
-            key = self._read_answer(message)
+            key = self.prompt_line.read_key(message)
             if key in (ord('r'), ord('R'), 'r', 'R'):
                 self.buf.load(self.buf.filepath)
                 self.lexer.invalidate(0)
-                self.doc._file_change_dismissed = False
+                self.doc.watch_file_again()
                 return
             if key in (ord('w'), ord('W'), 'w', 'W') and not self.buf.readonly:
                 self.buf.save()
-                self.doc._file_change_dismissed = False
+                self.doc.watch_file_again()
                 return
-            if key == 27:
-                self.doc._file_change_dismissed = True
+            if key == StatusPrompt.ESC:
+                self.doc.dismiss_file_change()
                 return
 
     def _confirm_3way(self, message: str) -> str:
-        """Show a y/n/c question; return 'yes', 'no', or 'cancel' on first keypress."""
-        key = self._read_answer(message)
-        if key in (ord('y'), ord('Y'), 'y', 'Y'):
-            return 'yes'
-        if key in (ord('n'), ord('N'), 'n', 'N'):
-            return 'no'
-        return 'cancel'
+        return self.prompt_line.confirm_3way(message)
 
     def _confirm(self, message: str) -> bool:
-        """Show a y/n question; return True immediately on 'y'/'Y', False on anything else."""
-        return self._read_answer(message) in (ord('y'), ord('Y'), 'y', 'Y')
+        return self.prompt_line.confirm(message)
 
-    def _read_pipeline_ask(self, message: str) -> Optional[bool]:
-        """Show the pipeline ask() question and loop until a real answer.
+    def _read_yes_no(self, message: str) -> Optional[bool]:
+        return self.prompt_line.yes_no_or_cancel(message)
 
-        'y'/Enter → True, 'n' → False, Esc → None (cancel the pipeline); any
-        other key redraws the question and keeps waiting.  Escape sequences
-        (arrows, Alt combos) are resolved so they don't read as a bare Esc."""
-        while True:
-            key = self._resolve_key(self._read_answer(message))
-            if key in (ord('y'), ord('Y'), curses.KEY_ENTER, ord('\n'), ord('\r')):
-                return True
-            if key in (ord('n'), ord('N')):
-                return False
-            if key == 27:
-                return None
+    def _prompt(self, message: str, default: str = '', items=()) -> str:
+        """Ask for a line of text and block until it is answered; '' if the
+        prompt was dismissed with Esc.
 
-    def _prompt(self, message: str) -> str:
-        """Show a prompt in the status bar and read a line of input."""
-        result = ''
-        while True:
-            self._draw_status_prompt(message, self.colors.status_bar, extra=result)
-            try:
-                key = get_wch(self.stdscr)
-            except curses.error:
-                continue
-            key = self._normalize_key(key)
-            if key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
-                return result
-            if key == 27:
-                return ''
-            if key in (curses.KEY_BACKSPACE, ord('\x7f'), ord('\b')):
-                result = result[:-1]
-            elif isinstance(key, str) and key.isprintable():
-                result += key
-            elif isinstance(key, int) and key >= 32 and chr(key).isprintable():
-                result += chr(key)
+        The line is the editor's own :class:`InputBar` — the widget the pipeline
+        prompts use — so a path offered here can be edited the way anything else
+        is: word jumps, Home/End, Ctrl+U to clear it, Ctrl+V to paste, and ↑ for
+        what was entered at this prompt before.  *default* pre-fills it, ready
+        to be taken with Enter; *items* are offered in its history."""
+        bar = self.input_bar
+        bar.open(message, default, items)
+        try:
+            while True:
+                self._draw_frame()
+                try:
+                    key = get_wch(self.stdscr)
+                except curses.error:
+                    continue
+                if key == -1:
+                    continue
+                self._key_is_text = isinstance(key, str) and len(key) == 1
+                key = self.keys.normalize(key)
+                if key == curses.KEY_MOUSE:
+                    continue            # nothing here to click on
+                if key == curses.KEY_RESIZE:
+                    self.renderer.resize()
+                    continue
+                key = self.keys.remap(
+                    self.keys.encode(self.keys.resolve(key)))
+                action = bar.handle_key(key)
+                if action == 'submit':
+                    return bar.query
+                if action == 'cancel':
+                    return ''
+        finally:
+            bar.close()
+            self.request_redraw()
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

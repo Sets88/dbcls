@@ -230,6 +230,49 @@ class TestLineInputPaste:
 
 # ── SearchBar shares the same editing keys ────────────────────────────────────
 
+class TestMaskedInput:
+    """A password prompt: asterisks on screen, and nothing kept afterwards."""
+
+    def _bar(self, text=''):
+        bar = InputBar()
+        bar.open('Password', mask=True)
+        type_keys(bar, text)
+        return bar
+
+    def test_the_line_is_drawn_as_asterisks(self):
+        bar = self._bar('hunter2')
+        assert bar.query == 'hunter2'
+        assert bar.display() == ' Password: *******'
+
+    def test_editing_works_on_the_real_text(self):
+        bar = self._bar('hunter2')
+        bar.handle_key(BACKSPACE)
+        bar.handle_key(HOME)
+        type_keys(bar, 'X')
+        assert bar.query == 'Xhunter'
+
+    def test_the_cursor_follows_the_masked_line(self):
+        bar = self._bar('abc')
+        assert bar.cursor_x() == len(' Password: ') + 3
+
+    def test_a_password_is_not_remembered(self):
+        bar = self._bar('hunter2')
+        bar.handle_key(K(ord('\n')))
+        assert bar.history.entries('Password') == []
+
+    def test_up_does_not_open_a_history_list(self):
+        bar = self._bar('hunter2')
+        bar.handle_key(K(curses.KEY_UP))
+        assert bar.history_popup.active is False
+        assert bar.query == 'hunter2'
+
+    def test_an_ordinary_prompt_is_unmasked(self):
+        bar = InputBar()
+        bar.open('Name')
+        type_keys(bar, 'abc')
+        assert bar.display() == ' Name: abc'
+
+
 class TestSearchBarEditing:
     def test_arrows_do_not_change_query(self):
         bar = SearchBar()

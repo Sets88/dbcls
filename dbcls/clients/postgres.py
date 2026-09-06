@@ -1,4 +1,3 @@
-import re
 import os
 import tempfile
 from typing import Optional
@@ -7,25 +6,20 @@ import aiopg
 from psycopg2 import InterfaceError, DatabaseError
 from psycopg2.extras import RealDictCursor
 
+from ..utils import sql_literal
 from .base import (
-    CommandParams,
     ClientClass,
     Result,
 )
-
 
 
 class PostgresClient(ClientClass):
     ENGINE = 'PostgreSQL'
     SUPPORTS_EDITING = True
 
-    def __init__(
-        self, host: str, username: str, password: str, dbname: str,
-        port: str = '5432', unix_socket: Optional[str] = None
-    ):
-        super().__init__(host, username, password, dbname, port, unix_socket=unix_socket)
-        if not port:
-            self.port = '5432'
+    DEFAULT_PORT = '5432'
+    RECONNECT_ERROR = InterfaceError
+    DB_ERROR = DatabaseError
 
     async def connect(self):
         host = self.host
@@ -57,10 +51,10 @@ class PostgresClient(ClientClass):
         return await super().change_database(database)
 
     async def get_table_columns(self, table_name: str, database: str = None):
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_name = '{table_name}'
+            WHERE table_name = {sql_literal(table_name)}
             AND table_schema = 'public'
             ORDER BY ordinal_position
         """)
@@ -71,14 +65,15 @@ class PostgresClient(ClientClass):
             raise Exception("Cross-database queries are not supported")
         # Postgres doesn't support cross-database queries
         sql = (
-            f"SELECT table_name AS table, '{database}' AS database FROM information_schema.tables "
+            f"SELECT table_name AS table, {sql_literal(database)} AS database "
+            "FROM information_schema.tables "
             "WHERE table_schema='public' AND table_type='BASE TABLE';"
         )
-        return await self.execute(sql)
+        return await self._execute(sql)
 
     async def get_databases(self) -> Result:
         sql = "SELECT datname AS database FROM pg_database;"
-        return await self.execute(sql)
+        return await self._execute(sql)
 
     def quote_ident(self, name: str) -> str:
         name = name.replace('"', '""')
@@ -94,33 +89,31 @@ class PostgresClient(ClientClass):
         # tables the current user owns or has a privilege other than SELECT
         # on, so a read-only role would never see the primary key there.
         # pg_catalog isn't subject to that restriction.
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT a.attname AS column_name
             FROM pg_catalog.pg_index i
             JOIN pg_catalog.pg_attribute a
                 ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-            WHERE i.indrelid = '{table}'::regclass
+            WHERE i.indrelid = {sql_literal(table)}::regclass
                 AND i.indisprimary
             ORDER BY array_position(i.indkey, a.attnum)
         """)
         return [row['column_name'] for row in result.data]
 
-    def get_sample_data_sql(self,
-        table: str,
-        database: Optional[str] = None,
-    ):
+    def get_sample_data_sql(self, table: str, database: Optional[str] = None) -> str:
         if database and database != self.dbname:
             raise Exception("Cross-database queries are not supported")
-        return f"SELECT * FROM \"{table}\""
+        return f'SELECT * FROM {self.get_table_ref(table, database)}'
 
-    def get_limit_sql(self, limit: int, offset: int = 0):
+    def get_limit_sql(self, limit: int, offset: int = 0) -> str:
+        # Standard SQL, not the base class's MySQL comma form.
         return f'LIMIT {limit} OFFSET {offset}'
 
     async def get_schema(self, table_name: str, database: Optional[str] = None) -> Result:
         if database and database != self.dbname:
             raise Exception("Cross-database queries are not supported")
         # Columns
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT
                 a.attname AS column_name,
                 pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
@@ -134,7 +127,7 @@ class PostgresClient(ClientClass):
             LEFT JOIN
                 pg_catalog.pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
             WHERE
-                a.attrelid = '{table_name}'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+                a.attrelid = {sql_literal(table_name)}::regclass AND a.attnum > 0 AND NOT a.attisdropped
             ORDER BY
                 a.attnum;
         """)
@@ -142,31 +135,31 @@ class PostgresClient(ClientClass):
         columns = result.data
 
         # Constraints
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT
                 pg_catalog.pg_get_constraintdef(con.oid, true) as condef
             FROM
                 pg_catalog.pg_constraint con
             WHERE
-                con.conrelid = '{table_name}'::regclass;
+                con.conrelid = {sql_literal(table_name)}::regclass;
         """)
 
         constraints = result.data
 
         # Partitioning
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT
                 partstrat,
                  pg_catalog.pg_get_partkeydef(pt.partrelid) as partition_key
             FROM
                 pg_catalog.pg_partitioned_table pt
             WHERE
-                pt.partrelid = '{table_name}'::regclass;
+                pt.partrelid = {sql_literal(table_name)}::regclass;
         """)
         partition_info = result.data[0] if result.data else None
 
         # Partitions
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT
                 c.relname AS partition_name,
                 pg_get_expr(c.relpartbound, c.oid) AS partition_expr
@@ -175,7 +168,7 @@ class PostgresClient(ClientClass):
             JOIN
                 pg_inherits i ON c.oid = i.inhrelid
             WHERE
-                i.inhparent = '{table_name}'::regclass
+                i.inhparent = {sql_literal(table_name)}::regclass
             ORDER BY
                 c.relname;
         """)
@@ -183,25 +176,25 @@ class PostgresClient(ClientClass):
         partitions = result.data
 
         # Indexes
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT
                 indexname,
                 indexdef
             FROM
                 pg_catalog.pg_indexes
             WHERE
-                tablename = '{table_name.split('.')[-1]}';
+                tablename = {sql_literal(table_name.split('.')[-1])};
         """)
 
         indexes = result.data
 
         # Child tables
-        result = await self.execute(f"""
+        result = await self._execute(f"""
             SELECT c.relname AS child_table
             FROM pg_inherits
             JOIN pg_class c ON pg_inherits.inhrelid = c.oid
             JOIN pg_class p ON pg_inherits.inhparent = p.oid
-            WHERE p.relname = '{table_name.split('.')[-1]}'
+            WHERE p.relname = {sql_literal(table_name.split('.')[-1])}
         """)
 
         child_tables = result.data
@@ -252,28 +245,13 @@ class PostgresClient(ClientClass):
 
         return Result(data=[{'schema': create_table_query}], rowcount=1)
 
-    async def command_schema(self, command: CommandParams):
-        table_name = command.params
-        return await self.get_schema(table_name)
+    async def _run_query(self, sql) -> Result:
+        async with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
+            await cur.execute(sql)
+            result = Result(rowcount=cur.rowcount)
+            # INSERT/UPDATE/DELETE produce no result set and fetchall()
+            # would raise "no results to fetch"
+            if cur.description is not None:
+                result.data = await cur.fetchall()
 
-    def is_db_error_exception(self, exc: Exception) -> bool:
-        return isinstance(exc, DatabaseError)
-
-    async def execute(self, sql) -> Result:
-        result = await self.if_command_process(sql)
-
-        if result:
             return result
-
-        async def run_query():
-            async with self.connection.cursor(cursor_factory=RealDictCursor) as cur:
-                await cur.execute(sql)
-                result = Result(rowcount=cur.rowcount)
-                # INSERT/UPDATE/DELETE produce no result set and fetchall()
-                # would raise "no results to fetch"
-                if cur.description is not None:
-                    result.data = await cur.fetchall()
-
-                return result
-
-        return await self._execute_with_reconnect(run_query, InterfaceError)

@@ -51,6 +51,7 @@ class TestCommandRegex:
 class MockClient(ClientClass):
     """Mock client implementation for testing the abstract base class"""
     ENGINE = "MockDB"
+    DB_ERROR = Exception
 
     async def get_databases(self) -> Result:
         return Result([{"database": "test_db"}], 1)
@@ -61,12 +62,8 @@ class MockClient(ClientClass):
     async def get_table_columns(self, table_name: str, database: str = None) -> Result:
         return Result([{"column1": "value1"}, {"column2": "value2"}], 2)
 
-    async def execute(self, sql) -> Result:
+    async def _run_query(self, sql) -> Result:
         return Result([{"result": "test_result"}], 1)
-
-    def is_db_error_exception(self, exc: Exception) -> bool:
-        """Mock implementation to simulate database error checking"""
-        return isinstance(exc, Exception)
 
 
 class TestClientClass:
@@ -82,9 +79,9 @@ class TestClientClass:
     def test_report_progress_without_a_hook_is_a_no_op(self, client):
         client.report_progress(7)   # nobody listening — must not raise
 
-    def test_report_progress_works_on_a_client_that_skips_the_base_init(self):
-        # Sqlite3Client and friends build their own state instead of calling
-        # ClientClass.__init__, so the hook has to default at class level.
+    def test_report_progress_without_the_base_init_is_still_safe(self):
+        # on_progress defaults at class level, so report_progress() cannot blow
+        # up on a half-built client (a driver failing inside its own __init__).
         skipped = MockClient.__new__(MockClient)
         skipped.report_progress(7)
 
