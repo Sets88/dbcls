@@ -10,6 +10,11 @@ of anyone importing the package normally.
 """
 from typing import Any
 
+# Standard library only, and imported for its side effect: it silences the
+# ``lastResort`` handler, so a warning from any dbcls module can never reach
+# stderr — the screen — on its own.  See :mod:`dbcls.log`.
+from . import log  # noqa: F401
+
 __all__ = ['main']
 
 

@@ -539,6 +539,29 @@ class TestBarButtons:
         assert not [drawn for drawn in ed.renderer._drawn_buttons
                     if drawn.button.command in (DbFn.SHOW_TABLES, DbFn.SHOW_DATABASES)]
 
+    def test_an_icon_is_hit_a_column_past_itself_too(self, monkeypatch):
+        """One cell is a hard target, and a terminal that draws ⛁ double-width
+        puts half of it a column further right than this knows about."""
+        ed = make_shell('one')
+        ed._draw_frame()
+        x, y = self._span(ed, DbFn.SHOW_DATABASES)
+        calls = []
+        monkeypatch.setattr(ed.doc, '_db_show_databases', lambda: calls.append('db'))
+        monkeypatch.setattr(ed.doc, '_db_show_tables', lambda: calls.append('tables'))
+
+        ed._handle_click(x + 1, y)
+
+        assert calls == ['db']
+
+    def test_the_column_before_the_next_icon_belongs_to_neither(self):
+        """The gap is not all forgiveness: a click cannot land on the wrong
+        button by a column."""
+        ed = make_shell('one')
+        ed._draw_frame()
+        db_x, y = self._span(ed, DbFn.SHOW_DATABASES)
+        tables_x, _ = self._span(ed, DbFn.SHOW_TABLES)
+        assert ed.renderer.button_at(tables_x - 1, y) is None
+
     def test_a_popup_takes_the_buttons_clicks_with_it(self):
         ed = make_shell('one')
         ed._cmd_command_palette()

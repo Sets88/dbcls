@@ -38,6 +38,14 @@ async def await_for(predicate, timeout=2.0):
     return predicate()
 
 
+class FakeQueryResult:
+    """What clickhouse_connect hands back from query(): KILL QUERY answers with
+    a row per query it is killing, and with none at all when it matched none."""
+
+    def __init__(self, rows):
+        self.result_rows = rows
+
+
 class FakeStream:
     """Stand-in for clickhouse_connect's StreamContext.
 
@@ -204,8 +212,12 @@ class TestRequestCancel:
         killed = []
 
         class FakeKillClient:
-            def command(self, cmd, parameters=None):
+            def query(self, cmd, parameters=None):
                 killed.append((cmd, parameters))
+                return FakeQueryResult([['dbcls-42', 'waiting']])
+
+            def command(self, cmd, parameters=None, settings=None):
+                raise AssertionError('the query was killed; nothing to replace')
 
             def close(self):
                 killed.append('closed')
@@ -241,3 +253,89 @@ class TestRequestCancel:
         client._query_id = 'dbcls-42'
 
         client.request_cancel()  # the run is already being torn down
+
+    def test_falls_back_to_replacing_the_query_without_privileges(self, monkeypatch):
+        """A user with no grant on system.processes cannot KILL — but can still
+        stop their own query by re-sending its query_id."""
+        commands = []
+
+        class FakeKillClient:
+            def query(self, cmd, parameters=None):
+                commands.append((cmd, parameters, None))
+                raise RuntimeError(
+                    "Code: 497. DB::Exception: mnikitenko: Not enough privileges. "
+                    "To execute this query, it's necessary to have the grant "
+                    "SELECT(query_id, user, query) ON system.processes. (ACCESS_DENIED)"
+                )
+
+            def command(self, cmd, parameters=None, settings=None):
+                commands.append((cmd, parameters, settings))
+
+            def close(self):
+                commands.append('closed')
+
+        monkeypatch.setattr(
+            clickhouse_connect, 'get_client', lambda **kwargs: FakeKillClient()
+        )
+        client = make_client()
+        client._query_id = 'dbcls-42'
+
+        client.request_cancel()
+
+        assert wait_for(lambda: 'closed' in commands)
+        cmd, _, settings = commands[1]
+        assert 'KILL' not in cmd
+        assert settings == {'query_id': 'dbcls-42', 'replace_running_query': 1}
+
+    def test_a_kill_that_matches_nothing_falls_back_too(self, monkeypatch):
+        """KILL QUERY is allowed but sees no row — a row policy on
+        system.processes, or the query not registered yet.  It succeeds, kills
+        nothing, and the cancel used to be a silent no-op."""
+        commands = []
+
+        class FakeKillClient:
+            def query(self, cmd, parameters=None):
+                commands.append((cmd, parameters, None))
+                return FakeQueryResult([])
+
+            def command(self, cmd, parameters=None, settings=None):
+                commands.append((cmd, parameters, settings))
+
+            def close(self):
+                commands.append('closed')
+
+        monkeypatch.setattr(
+            clickhouse_connect, 'get_client', lambda **kwargs: FakeKillClient()
+        )
+        client = make_client()
+        client._query_id = 'dbcls-42'
+
+        client.request_cancel()
+
+        assert wait_for(lambda: 'closed' in commands)
+        cmd, _, settings = commands[1]
+        assert 'KILL' not in cmd
+        assert settings == {'query_id': 'dbcls-42', 'replace_running_query': 1}
+
+    def test_the_connection_is_closed_when_both_ways_fail(self, monkeypatch):
+        closed = []
+
+        class FakeKillClient:
+            def query(self, cmd, parameters=None):
+                raise RuntimeError('nope')
+
+            def command(self, cmd, parameters=None, settings=None):
+                raise RuntimeError('nope')
+
+            def close(self):
+                closed.append(True)
+
+        monkeypatch.setattr(
+            clickhouse_connect, 'get_client', lambda **kwargs: FakeKillClient()
+        )
+        client = make_client()
+        client._query_id = 'dbcls-42'
+
+        client.request_cancel()
+
+        assert wait_for(lambda: closed)

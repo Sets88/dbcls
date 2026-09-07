@@ -133,6 +133,9 @@ class TestTextVsSpecialKeys:
 #: would always win.
 BUTTON1_PRESSED = 0x0002
 BUTTON1_CLICKED = 0x0004
+BUTTON1_DOUBLE_CLICKED = 0x0008
+BUTTON1_TRIPLE_CLICKED = 0x0010
+BUTTON1_RELEASED = 0x0001
 BUTTON4_PRESSED = 0x80000
 BUTTON5_PRESSED = 0x8000000
 
@@ -189,6 +192,25 @@ class TestMouse:
         ed.doc.view = MagicMock()
         self._mouse(ed, BUTTON1_PRESSED)
         ed.doc.view.click_to_cursor.assert_called_once_with(10, 5)
+
+    @pytest.mark.parametrize('bstate', [BUTTON1_DOUBLE_CLICKED,
+                                        BUTTON1_TRIPLE_CLICKED])
+    def test_clicking_twice_in_a_row_still_counts_as_a_click(self, bstate):
+        """ncurses hands two clicks inside its mouse interval over as one
+        DOUBLE_CLICKED event with neither the press nor the click bit set — the
+        second click on a button must not vanish because of it."""
+        ed = make_editor()
+        ed.doc.view = MagicMock()
+        self._mouse(ed, bstate)
+        ed.doc.view.click_to_cursor.assert_called_once_with(10, 5)
+
+    def test_letting_the_button_go_is_not_a_click_of_its_own(self):
+        """The press already did the work; the release that follows it must not
+        do it a second time."""
+        ed = make_editor()
+        ed.doc.view = MagicMock()
+        self._mouse(ed, BUTTON1_RELEASED)
+        ed.doc.view.click_to_cursor.assert_not_called()
 
 
 class TestTmuxPrefix:

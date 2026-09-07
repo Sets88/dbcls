@@ -3635,16 +3635,23 @@ class DrawnButton:
 
     The icon and the attribute it was drawn with are kept because the button has
     to be put back the way it was found: nothing else on screen knows what a
-    given cell of a bar looked like once the frame has moved on."""
+    given cell of a bar looked like once the frame has moved on.
+
+    *pad* widens what counts as a hit past the icon itself.  A one-cell target
+    is a hard thing to hit with a mouse, and an icon a terminal decides to draw
+    double-width (⛁ and ▤ are both East Asian *ambiguous*) puts its own right
+    half a column past where this thinks it ends — so the click that lands
+    there has to count too."""
 
     y: int
     x: int
     attr: int
     button: BarButton
+    pad: int = 0
 
     @property
     def end(self) -> int:
-        return self.x + len(self.button.icon)
+        return self.x + len(self.button.icon) + self.pad
 
 
 class TabBar:
@@ -3960,7 +3967,11 @@ class Renderer:
         x += 1  # a space between the last icon and the right edge, and before the first
         for button in self.bar_buttons:
             self._safe_addstr(y, x, button.icon, attr)
-            self._drawn_buttons.append(DrawnButton(y, x, attr, button))
+            # All of the gap but the last column counts as the button: one dead
+            # column is enough to keep a click off its neighbour, and the rest
+            # of it is forgiveness the icon needs (see DrawnButton.pad).
+            self._drawn_buttons.append(
+                DrawnButton(y, x, attr, button, self.BUTTON_GAP - 1))
             x += len(button.icon) + self.BUTTON_GAP
 
     def _draw_gutter_button(self) -> None:
@@ -5377,6 +5388,14 @@ class EditorShell:
         when the event was dealt with (a click, or a mouse report curses could
         not read)."""
         BUTTON5_PRESSED = 134217728
+        # Clicks that fall inside the ncurses mouse interval (166 ms by
+        # default) are resolved into a single event: two of them arrive as
+        # DOUBLE_CLICKED, three as TRIPLE, and neither of those carries the
+        # press or the click bit.  Without them a button clicked twice in a row
+        # answers neither click — the second one is not late, it is gone — and
+        # only a click somewhere else, far enough apart in time to stay an
+        # event of its own, makes the same button work again.
+        BUTTON1_MULTI_CLICKED = 0x8 | 0x10   # DOUBLE_CLICKED | TRIPLE_CLICKED
         try:
             _, mx, my, _, bstate = curses.getmouse()
         except curses.error as exc:
@@ -5394,7 +5413,8 @@ class EditorShell:
         # activity (resets the inactivity timer).
         if self._dispatch_pre_hook(self.keys.encode(curses.KEY_MOUSE)):
             return None
-        if bstate & curses.BUTTON1_PRESSED or bstate & curses.BUTTON1_CLICKED:
+        if (bstate & curses.BUTTON1_PRESSED or bstate & curses.BUTTON1_CLICKED
+                or bstate & BUTTON1_MULTI_CLICKED):
             self._handle_click(mx, my)
         return None
 

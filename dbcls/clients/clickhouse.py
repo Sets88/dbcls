@@ -174,14 +174,60 @@ class ClickhouseClient(ShowCommandsMixin, ClientClass):
                 compress=False,
             )
             try:
-                client.command(
-                    'KILL QUERY WHERE query_id = {query_id:String}',
-                    parameters={'query_id': query_id},
-                )
+                if not self._kill_it(client, query_id):
+                    self._replace_query(client, query_id)
             finally:
                 client.close()
         except Exception:
             # Nothing to report to: the run is already being torn down, and a
-            # failed KILL only means the query runs to its natural end.
-            logger.warning('KILL QUERY %s failed', query_id, exc_info=True)
+            # failed cancel only means the query runs to its natural end.
+            logger.warning('cancelling query %s failed', query_id, exc_info=True)
+
+    @staticmethod
+    def _kill_it(client, query_id: str) -> bool:
+        """`KILL QUERY`, and whether it actually killed anything.
+
+        Two ways for it not to.  It can be refused outright: KILL QUERY reads
+        system.processes, and a plain user is often not granted it
+        (ACCESS_DENIED, code 497).  Or it can succeed and match nothing —
+        `WHERE query_id = …` sees no row the caller may not read, which is what
+        a row policy on system.processes does, so cancelling would be a silent
+        no-op.  Both mean the same thing here: being unable to *see* the query
+        must not stop you from stopping your own.
+
+        The reasons are logged at WARNING, not INFO: with the log at its default
+        level, a cancel that quietly did nothing would leave no trace at all."""
+        try:
+            killed = client.query(
+                'KILL QUERY WHERE query_id = {query_id:String}',
+                parameters={'query_id': query_id},
+            )
+        except Exception as exc:
+            logger.warning(
+                'KILL QUERY %s refused (%s) — replacing the query instead',
+                query_id, exc,
+            )
+            return False
+
+        if not getattr(killed, 'result_rows', None):
+            logger.warning(
+                'KILL QUERY %s matched nothing — replacing the query instead',
+                query_id,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _replace_query(client, query_id: str) -> None:
+        """Stop the query the way a user without system.processes still can.
+
+        ClickHouse cancels a running query when a new one arrives under the
+        same query_id from the same user with ``replace_running_query`` on —
+        no privilege beyond running the query itself.  So the cheapest possible
+        statement is sent wearing the doomed query's id, and the server does
+        the killing."""
+        client.command(
+            'SELECT 1',
+            settings={'query_id': query_id, 'replace_running_query': 1},
+        )
 
