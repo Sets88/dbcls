@@ -8,6 +8,8 @@ from typing import Any, List, NamedTuple, Optional, Sequence, Tuple
 from visidata import VisiData, BaseSheet
 from visidata.color import colors as _vd_colors, rgb_to_xterm256 as _rgb_to_xterm256
 
+from .vd_completion import Completer
+
 
 _ANSI_RE = re.compile(r'\x1b\[([0-9;]*)m')
 
@@ -45,6 +47,32 @@ class PlotSpec(NamedTuple):
     x_col: Any
     bucket_col: Optional[Any]
     y_cols: List[Any]
+
+
+class CompletePlotColumn(Completer):
+    """Tab completer for the `gp` prompt: completes the name after the last
+    comma with the columns of the sheet being charted.
+
+    The prompt takes a comma-separated list, so the comma is the only word
+    boundary -- a column name may well contain spaces.  The space after a
+    comma and a leading BUCKET_MARKER are kept as they were typed; `*` says
+    what the column is *for*, not which column it is.
+    """
+
+    def split(self, val):
+        start = val.rfind(',') + 1
+        word = val[start:]
+        # keep what only separates the name from the comma before it
+        lead = len(word) - len(word.lstrip())
+        if word[lead:].startswith(BUCKET_MARKER):
+            lead += len(BUCKET_MARKER)
+        start += lead
+        return start, val[start:]
+
+
+def plot_column_names(sheet) -> List[str]:
+    """The columns `gp` can chart: the ones the sheet is showing."""
+    return [c.name for c in (getattr(sheet, 'visibleCols', None) or sheet.columns)]
 
 
 def parse_plot_columns(text: str) -> List[str]:
@@ -383,7 +411,8 @@ def plot_sheet(vd, sheet):
     refreshes, so setting it for a chart would repartition the merge.
     """
     answer = vd.input('plot columns (x[,bucket],y): ',
-                      value=default_plot_columns(sheet), type='plotcols')
+                      value=default_plot_columns(sheet), type='plotcols',
+                      completer=CompletePlotColumn(plot_column_names(sheet)))
     names = parse_plot_columns(answer)
     if not names:
         return

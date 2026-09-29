@@ -1,3 +1,4 @@
+import re
 import time
 import threading
 
@@ -5,6 +6,7 @@ from visidata import VisiData, TableSheet, Column, ColumnItem
 from visidata import vd, asyncthread, ENTER, AttrDict, deduceType, Progress
 
 from ..utils import SqlExpr
+from .vd_completion import Completer  # importing it also installs the prompt patches
 
 
 @VisiData.api
@@ -98,16 +100,53 @@ def add_columns_from_row(row, sheet):
         sheet.addColumn(ColumnItem(name, type=deduceType(value)))
 
 
+_PLAIN_IDENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+_IDENT_TAIL = re.compile(r'[A-Za-z0-9_$]*$')
+_IDENT_QUOTES = ('"', '`')
+
+
+class CompleteSqlColumn(Completer):
+    """Tab completer for the `E` (edit SQL) prompt: completes the identifier
+    before the cursor with column names.
+
+    A name that isn't a plain identifier, or a word started with an
+    identifier quote, is inserted through the client's quote_ident()."""
+
+    def __init__(self, names, quote_ident):
+        super().__init__(names)
+        self.quote_ident = quote_ident
+
+    def split(self, val):
+        start = _IDENT_TAIL.search(val).start()
+        partial = val[start:]
+        if start and val[start - 1] in _IDENT_QUOTES:
+            quote = val[start - 1]
+            # an odd count means this quote opens an identifier
+            # rather than closes the previous one
+            if val[:start].count(quote) % 2:
+                start -= 1
+        # the quote is part of what gets replaced, never of what is matched
+        return start, partial
+
+    def insert(self, val, start, name):
+        # only an opening quote can be sitting at start: everything else the
+        # word can begin with is an identifier character
+        if val[start:start + 1] in _IDENT_QUOTES or not _PLAIN_IDENT.fullmatch(name):
+            name = self.quote_ident(name)
+        return val[:start] + name
+
+
 class TableSampleDataSheet(TableSheet):
     guide = '''# Sample data
 Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cursor approaches the bottom.
 
-- `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); the sheet reloads with the new query.
+- `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); the sheet reloads with the new query.  In the prompt `Tab` / `Shift+Tab` complete column names; the matches are listed in a menu above the prompt, the one in the line highlighted.
 - `Ctrl+C` to stop the chunked loader.
 '''
     rowtype = 'tables'
     CHUNK_SIZE = 500
     CUSTOM_SQL = None
+    _known_columns = None
 
     def get_sample_base_sql(self, table: str, db: str):
         if self.CUSTOM_SQL:
@@ -117,6 +156,27 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
     def update_current_sql(self, sql: str):
         self.CUSTOM_SQL = sql
         self.reload()
+
+    def sql_completions(self) -> list:
+        """Names the `E` prompt completes: the columns of the sheet plus the
+        ones seen before -- a custom `SELECT a, b` must not hide the rest --
+        and the table itself.  With nothing loaded yet (empty table, failed
+        query) the table columns are asked from the database once."""
+        known = self._known_columns or []
+        known = list(dict.fromkeys(known + [col.name for col in self.columns]))
+        if not known:
+            names = self.client.get_table_columns(self.table, self.db)
+            # SyncClient returns a Result on timeout/cancel instead of a list
+            if isinstance(names, list):
+                known = list(names)
+        self._known_columns = known
+        return known + [self.table]
+
+    def edit_sql(self):
+        completer = CompleteSqlColumn(self.sql_completions(), self.client.quote_ident)
+        sql = vd.input('current sql: ', value=self.get_sample_base_sql(self.table, self.db),
+                       completer=completer)
+        self.update_current_sql(sql)
 
     def handle_empty_table(self):
         raise Exception('No data found')
@@ -200,9 +260,10 @@ Changes are collected locally and only executed after confirmation.
 - `zd` or `Bksp` to set the current cell to NULL.
 - `zE` to set the current cell to a raw SQL expression (e.g. `NOW()`), emitted unquoted in the generated SQL.
 - `gE` to do the same for all selected rows in the current column.
+- Inside a JSON (`g@`) or URL (`g#`) cell, the values that cannot be expanded further are edited: `e` on a column expanded with `(`, or `z Enter` into the value and edit there (`e` on `key` renames, `a` / `d` add / delete) -- the change is pending as an edit of the whole cell.
 - `a` to add a new row (green until committed).
 - `d` / `gd` to mark the current / selected rows for deletion (red until committed).
-- `E` to edit the underlying SQL (add WHERE / ORDER BY, ...).
+- `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); `Tab` / `Shift+Tab` complete column names, listed in a menu above the prompt.
 - `Ctrl+S` to review the INSERT/UPDATE/DELETE statements before executing them.
 
 Editing and deleting existing rows requires the table to have a primary key; without one only `a` (adding rows) works.
@@ -456,7 +517,7 @@ The CREATE TABLE statement for _{sheet.table}_ (reconstructed from the system ca
 
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(f\'table_options__{cursorRow["database"]}__{cursorRow["table"]}\', client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
-TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.update_current_sql(input("current sql: ", value=sheet.get_sample_base_sql(sheet.table, sheet.db)))', 'Edit current sql')
+TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.edit_sql()', 'Edit current sql (Tab completes column names)')
 # iterload's chunked loader is designed to idle forever (see the comment in
 # iterload), so leaving the sheet via `q` must explicitly stop it -- otherwise
 # it keeps calling the shared client in the background and starves/blocks

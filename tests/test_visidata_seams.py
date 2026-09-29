@@ -126,7 +126,251 @@ class TestTheWrappedFunctionsStillLookLikeThis:
 
             # patch_expand_col() replaced it outright, so it must be ours.
             assert ExpandedColumn.calcValue.__module__ == 'dbcls.vd_modules.vd_types'
+            assert ExpandedColumn.setValue.__module__ == 'dbcls.vd_modules.vd_types'
+            # stock declares readonly as a method (always truthy); ours is a property
+            assert isinstance(ExpandedColumn.__dict__['readonly'], property)
         ''')
+
+
+# An EditTableSheet with one row and a `g@` column, built without a database:
+# the rows are set directly, the client only builds the SQL.
+_JSON_EDIT_SHEET = '''
+import dbcls.vd_modules  # noqa: F401
+from visidata import vd, ColumnItem, AttrDict, ExpectedException
+from visidata.features.expand_cols import ExpandedColumn
+from dbcls.clients.sqlite3 import Sqlite3Client
+from dbcls.vd_modules.vd_db_browser import EditTableSheet
+from dbcls.vd_modules.vd_json import ensure_json_leaf, json_owner
+from dbcls.vd_modules.vd_types import jsontype, urltype
+
+def make(value, pk=('id',), type=jsontype):
+    sheet = EditTableSheet('t', client=Sqlite3Client(None), table='t', db=None)
+    sheet.pk_columns = list(pk)
+    sheet.columns = []
+    sheet.addColumn(ColumnItem('id'))
+    col = ColumnItem('j', type=type)
+    sheet.addColumn(col)
+    sheet.rows = [AttrDict(id=1, j=value)]
+    return sheet, col, sheet.rows[0]
+
+def opened(sheet):
+    sheet.reload()
+    vd.sync()
+    return sheet
+
+def sqls(sheet):
+    return [s.sql for s in sheet.pending_statements()]
+
+def refused(col, row):
+    try:
+        ensure_json_leaf(col, row)
+    except ExpectedException:
+        return True
+    return False
+'''
+
+
+class TestJsonEditing:
+    """Edits inside a JSON cell, on visidata's own sheets, end up as an UPDATE
+    of the whole cell; objects and arrays are not typed over."""
+
+    def test_z_enter_opens_the_stock_sheets_writing_back_at_any_depth(self):
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+source = {'a': 1, 'b': {'c': 2}, 'l': [{'x': 1}, {'x': 2}], 't': ['p']}  # jsonb: a dict
+sheet, col, row = make(source)
+top = opened(vd.openCellAltered(sheet, col, row))
+assert type(top).__name__ == 'SheetDict', type(top)
+assert top.rows == ['a', 'b', 'l', 't']
+
+top.column('value').setValue('a', 5)
+top.column('key').setValue('a', 'aa')                  # rename, order kept
+top.deleteBy(lambda key: key == 't')                   # gone from the dict too
+inner = opened(top.openRow('b'))
+assert json_owner(inner) is not None
+inner.column('value').setValue('c', 'x')
+items = opened(top.openRow('l'))
+assert type(items).__name__ == 'ListOfDictSheet', type(items)
+items.column('x').setValue(items.rows[1], 20)
+
+assert source == {'a': 1, 'b': {'c': 2}, 'l': [{'x': 1}, {'x': 2}], 't': ['p']}, source
+assert sqls(sheet) == [
+    """UPDATE `t` SET `j` = '{"aa": 5, "b": {"c": "x"}, "l": [{"x": 1}, {"x": 20}]}' WHERE `id` = 1"""
+], sqls(sheet)
+''')
+
+    def test_keys_and_elements_can_be_added(self):
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+sheet, col, row = make('{"a": 1, "b": 2, "t": ["p"], "l": [{"x": 1}]}')
+top = opened(vd.openCellAltered(sheet, col, row))
+vd.input = lambda *args, **kwargs: 'new'
+top.cursorRowIndex = 0
+top.addRows([top.newRow()], index=0)
+vd.sync()
+assert top.rows[:3] == ['a', 'new', 'b'], top.rows
+tags = opened(top.openRow('t'))
+tags.addRows([tags.newRow()])
+vd.sync()
+dicts = opened(top.openRow('l'))
+dicts.addRows([dicts.newRow()])
+vd.sync()
+assert sqls(sheet) == [
+    """UPDATE `t` SET `j` = '{"a": 1, "new": null, "b": 2, "t": ["p", null], "l": [{"x": 1}, {}]}' WHERE `id` = 1"""
+], sqls(sheet)
+''')
+
+    def test_only_what_cannot_be_expanded_is_edited_as_text(self):
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+sheet, col, row = make('{"a": 1, "b": {"c": 2}}')
+assert not refused(col, row)                           # the g@ cell: text, json.loads again
+
+b = ExpandedColumn('j.b', origCol=col, expr='b')
+sheet.addColumn(b)
+c = ExpandedColumn('j.b.c', origCol=b, expr='c')
+sheet.addColumn(c)
+assert not b.readonly and not c.readonly
+assert refused(b, row) and not refused(c, row)
+
+top = opened(vd.openCellAltered(sheet, col, row))
+assert refused(top.column('value'), 'b') and not refused(top.column('value'), 'a')
+assert not refused(top.column('key'), 'b')             # renaming is fine
+''')
+
+    def test_expanded_columns_write_the_whole_cell(self):
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+sheet, col, row = make('{"a": 1, "b": {"c": 2}}')
+b = ExpandedColumn('j.b', origCol=col, expr='b')
+sheet.addColumn(b)
+c = ExpandedColumn('j.b.c', origCol=b, expr='c')
+sheet.addColumn(c)
+c.setValue(row, 7)
+assert c.getValue(row) == 7
+assert row.j == '{"a": 1, "b": {"c": 2}}'
+assert sqls(sheet) == [
+    """UPDATE `t` SET `j` = '{"a": 1, "b": {"c": 7}}' WHERE `id` = 1"""
+], sqls(sheet)
+''')
+
+    def test_undo_puts_the_cell_and_the_working_copy_back(self):
+        """The stock undo, plus what vd_json adds where it falls short: each
+        change undone as vd.undo does it, then one more edit, which must not
+        bring any of them back."""
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+undos = []
+vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+
+def undone(change):
+    undos.clear()
+    change()
+    vd.sync()
+    for f, a, k in reversed(list(undos)):
+        f(*a, **k)
+    vd.sync()
+
+text = '{"a": 1, "b": {"c": 2}, "t": ["p", "q"], "l": [{"x": 1}, {"x": 2}]}'
+sheet, col, row = make(text)
+top = opened(vd.openCellAltered(sheet, col, row))
+inner = opened(top.openRow('b'))
+tags = opened(top.openRow('t'))
+dicts = opened(top.openRow('l'))
+vd.input = lambda *args, **kwargs: 'new'
+
+undone(lambda: inner.column('value').setValues(['c'], 3))
+undone(lambda: top.column('key').setValues(['a'], 'aa'))
+undone(lambda: top.deleteBy(lambda key: key in ('a', 'b')))
+undone(lambda: top.addRows([top.newRow()], index=0))
+undone(lambda: tags.deleteBy(lambda tag: tag == 'p'))
+undone(lambda: tags.addRows([tags.newRow()]))
+undone(lambda: dicts.deleteBy(lambda item: item['x'] == 1))
+assert col.getValue(row) == text and sqls(sheet) == [], sqls(sheet)
+assert top.source == {'a': 1, 'b': {'c': 2}, 't': ['p', 'q'], 'l': [{'x': 1}, {'x': 2}]}, top.source
+assert top.rows == ['a', 'b', 't', 'l'], top.rows
+assert top.source['b'] is inner.source and tags.rows is tags.source and dicts.rows is dicts.source
+
+tags.columns[0].setValues([tags.rows[1]], 'z')
+assert sqls(sheet) == [
+    """UPDATE `t` SET `j` = '{"a": 1, "b": {"c": 2}, "t": ["p", "z"], "l": [{"x": 1}, {"x": 2}]}' WHERE `id` = 1"""
+], sqls(sheet)
+''')
+
+    def test_undo_brings_a_cleared_url_part_back(self):
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+undos = []
+vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+url = 'https://example.com/a?q=1#top'
+sheet, col, row = make(url, type=urltype)
+top = opened(vd.openCellAltered(sheet, col, row))
+top.deleteBy(lambda key: key == 'anchor')
+assert top.source['anchor'] is None
+for f, a, k in reversed(undos):
+    f(*a, **k)
+assert top.source['anchor'] == 'top' and 'anchor' in top.rows
+assert col.getValue(row) == url and sqls(sheet) == [], sqls(sheet)
+''')
+
+    def test_without_a_primary_key_the_copy_is_not_written_back(self):
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+sheet, col, row = make('{"a": 1}', pk=())
+top = opened(vd.openCellAltered(sheet, col, row))
+assert json_owner(top) is None
+top.column('value').setValue('a', 2)
+assert sqls(sheet) == [] and row.j == '{"a": 1}'
+''')
+
+    def test_url_parts_expanded_with_parens_are_edited_in_the_url_text(self):
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+url = 'https://user:pw@EXAMPLE.com:8080/a?q=hello+world&x=%7E1#top'
+sheet, col, row = make(url, type=urltype)
+assert not refused(col, row)                           # the g# cell: text, as before
+query = ExpandedColumn('j.query', origCol=col, expr='query')
+sheet.addColumn(query)
+q = ExpandedColumn('j.query.q', origCol=query, expr='q')
+sheet.addColumn(q)
+port = ExpandedColumn('j.port', origCol=col, expr='port')
+sheet.addColumn(port)
+assert not query.readonly and refused(query, row)      # the query dict: expand it
+q.setValue(row, 'bye')
+port.setValue(row, 9090)
+assert row.j == url
+assert sqls(sheet) == [
+    "UPDATE `t` SET `j` = 'https://user:pw@EXAMPLE.com:9090/a?q=bye&x=%7E1#top' WHERE `id` = 1"
+], sqls(sheet)
+''')
+
+    def test_z_enter_on_a_url_keeps_its_parts_and_edits_the_query(self):
+        run_with_real_visidata(_JSON_EDIT_SHEET + '''
+sheet, col, row = make('https://example.com/a?q=1&flag&x=2#top', type=urltype)
+top = opened(vd.openCellAltered(sheet, col, row))
+assert top.rows == ['schema', 'domain', 'port', 'path', 'query', 'anchor'], top.rows
+for refused_edit in (lambda: top.column('key').setValue('path', 'p'), top.newRow):
+    try:
+        refused_edit()
+    except ExpectedException:
+        pass
+    else:
+        raise AssertionError('changed the parts of a URL')
+top.column('value').setValue('path', '/b')
+top.deleteBy(lambda key: key == 'anchor')              # cleared, not removed
+query = opened(top.openRow('query'))
+query.column('key').setValue('q', 'query')             # renamed in place
+query.deleteBy(lambda key: key == 'flag')
+assert sqls(sheet) == [
+    "UPDATE `t` SET `j` = 'https://example.com/b?query=1&x=2' WHERE `id` = 1"
+], sqls(sheet)
+''')
+
+    def test_the_stock_sheets_are_patched(self):
+        run_with_real_visidata('''
+import visidata
+import dbcls.vd_modules  # noqa: F401
+from visidata import BaseSheet, Column, ListOfDictSheet, PythonSheet, SheetDict, TableSheet
+
+for cls, name in [(BaseSheet, 'setModified'), (TableSheet, 'editCell'), (Column, 'setValues'),
+                  (SheetDict, 'reload'), (SheetDict, 'commitDeleteRow'), (SheetDict, 'newRow'),
+                  (ListOfDictSheet, 'newRow'), (visidata.pyobj.ListOfPyobjSheet, 'newRow'),
+                  (ListOfDictSheet, 'deleteBy'), (visidata.pyobj.ListOfPyobjSheet, 'deleteBy'),
+                  (visidata.pyobj.ListOfPyobjSheet, 'loader'), (PythonSheet, 'draw')]:
+    assert getattr(cls, name).__module__ == 'dbcls.vd_modules.vd_json', (cls, name)
+''')
 
 
 class TestTheSheetsBuild:
@@ -152,6 +396,118 @@ class TestTheSheetsBuild:
             names = {t.name for t in vd.typemap.values()} | set(vd.typemap)
             assert 'jsontype' in names or any(
                 getattr(t, '__name__', '') == 'jsontype' for t in vd.typemap), names
+        ''')
+
+
+class TestTheEditSqlPrompt:
+    """`E` on the table browser prompts with CompleteSqlColumn; VisiData's
+    InputWidget decides what text it is given and what its answer replaces."""
+
+    def test_e_opens_the_completing_prompt_on_both_sheets(self):
+        run_with_real_visidata('''
+            import dbcls.vd_modules  # noqa: F401
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet, TableSampleDataSheet
+
+            for cls in (TableSampleDataSheet, EditTableSheet):
+                sheet = cls('t', client=None, db='d', table='t')
+                assert 'sheet.edit_sql()' in sheet.getCommand('edit-sql').execstr
+        ''')
+
+    def test_tab_completes_the_word_before_the_cursor_and_keeps_the_rest(self):
+        run_with_real_visidata('''
+            import inspect
+            from visidata import InputWidget
+            from dbcls.vd_modules.vd_completion import _orig_completion
+            from dbcls.vd_modules.vd_db_browser import CompleteSqlColumn
+
+            assert InputWidget._dbcls_completion_wrapped, 'completion wrapper missing'
+            params = list(inspect.signature(_orig_completion).parameters)
+            assert params == ['self', 'v', 'i', 'state_incr'], params
+
+            completer = CompleteSqlColumn(['id', 'idx', 'name'], lambda n: n)
+            w = InputWidget(value='', completer=completer)
+            text = 'SELECT * FROM t WHERE i ORDER BY 1'
+            cursor = text.index(' ORDER')
+
+            v, i = w.completion(text, cursor, 1)
+            assert v == 'SELECT * FROM t WHERE id ORDER BY 1', v
+            v, i = w.completion(v, i, 1)
+            assert v == 'SELECT * FROM t WHERE idx ORDER BY 1', v
+            assert v[:i].endswith('idx'), (v, i)
+            # Shift+Tab walks back through the same candidates, tail intact
+            v, i = w.completion(v, i, -1)
+            assert v == 'SELECT * FROM t WHERE id ORDER BY 1', v
+        ''')
+
+    def test_completing_at_the_end_still_leaves_the_cursor_at_the_end(self):
+        run_with_real_visidata('''
+            from visidata import InputWidget
+            from dbcls.vd_modules.vd_db_browser import CompleteSqlColumn
+
+            w = InputWidget(value='', completer=CompleteSqlColumn(['name'], lambda n: n))
+            v, i = w.completion('WHERE na', 8, 1)
+            assert (v, i) == ('WHERE name', 10), (v, i)
+            # no match: text and cursor stay put
+            w = InputWidget(value='', completer=CompleteSqlColumn(['name'], lambda n: n))
+            v, i = w.completion('WHERE zz AND 1', 8, 1)
+            assert (v, i) == ('WHERE zz AND 1', 8), (v, i)
+        ''')
+
+
+class TestTheCompletionMenu:
+    """The menu above the prompt is drawn from InputWidget's own completion
+    state, in the colors VisiData draws its command palette with."""
+
+    def test_the_draw_wrapper_is_on_and_calls_the_original_as_it_is(self):
+        run_with_real_visidata('''
+            import inspect
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import InputWidget
+            from dbcls.vd_modules.vd_completion import _orig_draw
+
+            assert InputWidget.draw.__module__ == 'dbcls.vd_modules.vd_completion'
+            params = list(inspect.signature(_orig_draw).parameters)
+            # the wrapper passes scr positionally and hands the rest through
+            assert params[:2] == ['self', 'scr'], params
+        ''')
+
+    def test_what_it_borrows_from_the_command_palette_is_all_there(self):
+        run_with_real_visidata('''
+            import inspect
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import clipdraw, colors, vd  # noqa: F401
+
+            assert isinstance(vd.options.disp_cmdpal_max, int)
+            for name in ('color_cmdpalette', 'color_menu_spec'):
+                assert colors.get_color(name).colorname, name
+
+            params = list(inspect.signature(vd.drawBox).parameters)
+            assert params[:6] == ['scr', 'x', 'y', 'w', 'h', 'cattr'], params
+        ''')
+
+    def test_the_menu_highlights_the_name_tab_put_in_the_line(self):
+        run_with_real_visidata('''
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import InputWidget
+            from dbcls.vd_modules.vd_completion import menu_state
+            from dbcls.vd_modules.vd_db_browser import CompleteSqlColumn
+
+            completer = CompleteSqlColumn(['id', 'idx', 'ident'], lambda n: n)
+            w = InputWidget(value='', completer=completer)
+            w.value, w.current_i = 'SELECT * FROM t WHERE i', 23
+
+            # half-typed word: the matches, nothing highlighted yet
+            assert menu_state(w) == (['id', 'idx', 'ident'], None), menu_state(w)
+
+            for expected in ('id', 'idx', 'ident'):
+                w.value, w.current_i = w.completion(w.value, w.current_i, +1)
+                matches, current = menu_state(w)
+                assert w.value.endswith(expected), w.value
+                assert matches[current] == expected, (matches, current, expected)
+
+            # any ordinary key ends the cycle, and with it the menu
+            w.handle_key('x', None)
+            assert menu_state(w) is None, menu_state(w)
         ''')
 
 

@@ -52,6 +52,7 @@ from .pipeline import HELP_ENTRIES
 from .connection_form import ConnectionForm
 from .plugins import HookBus, PluginManager, resolve_plugin_names, resolve_plugin_paths
 from .prompts import PromptKind
+from .syntax import DEFAULT_SYNTAX, syntax_names
 
 
 logger = log.get_logger(__name__)
@@ -484,9 +485,11 @@ DB-specific extensions
       them into schema/domain/port/path/query/anchor, `(` on `query` into
       one column per parameter
   `gp`
-      Plot chart from the prompted columns (`x[,bucket],y` or `x,y1,y2,…`)
+      Plot chart from the prompted columns (`x[,bucket],y` or `x,y1,y2,…`);
+      `Tab` / `Shift+Tab` complete column names
   `E`
-      Edit sample-data SQL (table browser only)
+      Edit sample-data SQL (table browser only); `Tab` / `Shift+Tab`
+      complete column names
   `z+Enter`
       Open current cell as a sheet (references, JSON, …)
   `^`
@@ -743,6 +746,7 @@ class DbEditorTab(Editor):
         directory=None,
         fold: bool = False,
         readonly: bool = False,
+        syntax: str = DEFAULT_SYNTAX,
     ):
         self.connection = connection
         #: What this tab is called on the tab bar.  It is the connection's id,
@@ -761,11 +765,23 @@ class DbEditorTab(Editor):
         # Clients this tab's pipelines reached with .CONN, by connection id.
         self._conn_clients: dict = {}
 
-        super().__init__(shell, filepath, directory=directory, readonly=readonly, fold=fold)
+        super().__init__(shell, filepath, directory=directory, readonly=readonly, fold=fold,
+                         syntax=syntax)
 
         if self.client:
             self.set_status_name(self.client.get_title())
-            self.set_words(keywords=self.client.all_commands, functions=self.client.all_functions)
+            self._apply_engine_words()
+
+    def _apply_engine_words(self) -> None:
+        """Hand the highlighter the engine's commands and functions.  Only
+        the SQL syntax uses them; any other ignores them."""
+        if self.client:
+            self.set_words(keywords=self.client.all_commands,
+                           functions=self.client.all_functions)
+
+    def set_syntax(self, name: str) -> None:
+        super().set_syntax(name)
+        self._apply_engine_words()
 
     # ── Identity ──────────────────────────────────────────────────────────────
 
@@ -814,8 +830,7 @@ class DbEditorTab(Editor):
         self.client = self.shell.make_connection_client(config)
         self.autocomplete = AutoComplete(self.client)
         self.set_status_name(self.client.get_title())
-        self.set_words(keywords=self.client.all_commands,
-                       functions=self.client.all_functions)
+        self._apply_engine_words()
 
         filepath, directory = resolve_editor_file(config.filename)
         if not filepath or os.path.abspath(filepath) == os.path.abspath(self.buf.filepath or ''):
@@ -1281,6 +1296,7 @@ class DbEditor(EditorShell):
         fold: bool = False,
         readonly: bool = False,
         plugins: Optional[PluginManager] = None,
+        syntax: str = DEFAULT_SYNTAX,
     ):
         visidata.vd.addGlobals(dbeditor=self)
         # VisiData's pristine idle threshold, captured before anything of ours
@@ -1308,6 +1324,9 @@ class DbEditor(EditorShell):
         self.config_data: dict = copy.deepcopy(config_data) if config_data else {}
         self.default_fold = fold
         self.default_readonly = readonly
+        #: What every tab is highlighted as (--syntax); `Set syntax…` changes
+        #: one tab at a time.
+        self.default_syntax = syntax
 
         self.lock_screen: Optional[LockScreen] = None
         if lock_init_command and lock_timeout is not None and lock_check_command:
@@ -1350,7 +1369,8 @@ class DbEditor(EditorShell):
         if not self.connections:
             self.add_document(DbEditorTab(
                 self, client=client, autocomplete=autocomplete, filepath=filepath,
-                directory=directory, fold=fold, readonly=readonly))
+                directory=directory, fold=fold, readonly=readonly,
+                syntax=self.default_syntax))
             return
 
         for index, config in enumerate(self.connections.values()):
@@ -1372,7 +1392,8 @@ class DbEditor(EditorShell):
                 tab_id=self.unique_tab_id(config.id),
                 filepath=tab_file, directory=tab_dir,
                 fold=config.fold if config.fold is not None else fold,
-                readonly=config.readonly if config.readonly is not None else readonly))
+                readonly=config.readonly if config.readonly is not None else readonly,
+                syntax=self.default_syntax))
 
     def known_connections(self) -> str:
         """What `.CONN` accepts, for an error message: the open tabs first (they
@@ -1577,7 +1598,8 @@ class DbEditor(EditorShell):
             tab_id=self.unique_tab_id(conn_id),
             filepath=tab_file, directory=tab_dir,
             fold=config.fold if config.fold is not None else self.default_fold,
-            readonly=config.readonly if config.readonly is not None else self.default_readonly))
+            readonly=config.readonly if config.readonly is not None else self.default_readonly,
+            syntax=self.default_syntax))
         self.switch_to(len(self.documents) - 1)
         self.set_status_notification(f'Opened tab {tab.tab_id} on {conn_id}')
         return tab
@@ -1915,6 +1937,10 @@ def main():
         help='start with >>> ... <<< block folding enabled (same as pressing Ctrl+P)')
     parser.add_argument('--readonly', '-R', dest='readonly', action='store_true', default=False,
         help='open the editor in read-only mode (document cannot be modified or saved)')
+    # Its choices, like --engine's, wait for the plugins: one may bring a syntax.
+    syntax_arg = parser.add_argument('--syntax', dest='syntax', default=None,
+        help=f'highlight the editor as this syntax (default: {DEFAULT_SYNTAX}); anything but'
+             ' sql leaves out the database engine\'s keywords')
     parser.add_argument('--lock-init-command', dest='lock_init_command', default=None,
         help='shell command to initialise a lock session (receives secret via stdin, outputs code)')
     parser.add_argument('--lock-timeout', dest='lock_timeout', type=float, default=None,
@@ -1927,6 +1953,7 @@ def main():
     # cannot know what it accepts until this has run.
     plugins.add_arguments(parser)
     engine_arg.choices = engine_names()
+    syntax_arg.choices = syntax_names()
 
     args = parser.parse_args()
     env_override(args, parser)
@@ -1963,6 +1990,7 @@ def main():
         readonly = readonly or as_bool(config.get('readonly'))
         args.lock_init_command = args.lock_init_command or config.get('lock_init_command', None)
         args.lock_check_command = args.lock_check_command or config.get('lock_check_command', None)
+        args.syntax = args.syntax or config.get('syntax', '')
         if args.lock_timeout is None:
             args.lock_timeout = config.get('lock_timeout', None)
 
@@ -1979,6 +2007,14 @@ def main():
             print(f'Error: --lock-timeout must be a number, got {args.lock_timeout!r}',
                   file=sys.stderr)
             sys.exit(1)
+
+    # argparse checked --syntax against the choices, but DBCLS_SYNTAX and the
+    # config file bypass it.
+    args.syntax = args.syntax or DEFAULT_SYNTAX
+    if args.syntax not in syntax_names():
+        print(f'Error: unknown syntax {args.syntax!r} (known: {", ".join(syntax_names())})',
+              file=sys.stderr)
+        sys.exit(1)
 
     connections = parse_connections(config, args)
 
@@ -2008,6 +2044,7 @@ def main():
                 fold=fold,
                 readonly=readonly,
                 plugins=plugins,
+                syntax=args.syntax,
             ).run()
         )
     except RuntimeError as e:

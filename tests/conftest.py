@@ -99,6 +99,19 @@ def clean_pipeline_registry():
     REGISTRY.restore(state)
 
 
+@pytest.fixture
+def clean_syntax_registry():
+    """Syntax and embedded-syntax registration is process-global too — put
+    both back as they were."""
+    from dbcls import syntax
+    syntaxes, embedded = dict(syntax.SYNTAXES), dict(syntax.EMBEDDED)
+    yield
+    syntax.SYNTAXES.clear()
+    syntax.SYNTAXES.update(syntaxes)
+    syntax.EMBEDDED.clear()
+    syntax.EMBEDDED.update(embedded)
+
+
 @pytest.fixture(scope="session")
 def test_db_dir():
     """Create a temporary directory for test databases"""

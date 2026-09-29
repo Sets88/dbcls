@@ -26,9 +26,9 @@ TableSheet.guide += '''
 - `zf` to prettify the current cell on a live-updating sheet (best in a split pane).
 - `z Enter` to open the rows referenced in the current cell.
 - `g+` to expand a list cell vertically on a new sheet.
-- `g@` to type the current column as JSON (like `@` for dates), so its cells expand with `(` / `g+` and display as real JSON.
-- `g#` to type the current column as URL: cells look unchanged, but `(` expands them into schema/domain/port/path/query/anchor, and `(` on `query` into one column per parameter.
-- `gp` to draw a plotext chart from the columns you type at the prompt: `x[,bucket],y` or `x,y1,y2,…`.
+- `g@` to type the current column as JSON (like `@` for dates), so its cells expand with `(` / `g+` and display as real JSON.  The cell itself is edited as text (parsed again with `json.loads`); inside it only what cannot be expanded further (a string, number, bool, null): `e` on a column expanded with `(`, or `z Enter` to open the object / array (`Enter` goes deeper, `e` on `key` renames, `a` / `d` add / delete).  Each change rewrites the whole JSON cell.
+- `g#` to type the current column as URL: cells look unchanged, but `(` expands them into schema/domain/port/path/query/anchor, and `(` on `query` into one column per parameter.  The parts are edited like JSON's (`e` on an expanded column, `z Enter`); only the changed part is replaced in the URL text.
+- `gp` to draw a plotext chart from the columns you type at the prompt: `x[,bucket],y` or `x,y1,y2,…` (`Tab` completes column names).
 - `+` also takes `topk<N>` (the N most common values of the group, as a list) and any `p<N>` percentile, not just the ones the prompt lists.
 - `gT` / `gzT` to save the selected rows / column values to pipeline _vars.
 - `Alt+Up` / `Alt+Down` to move the cursor 5 rows, `Alt+b` / `Alt+f` 3 columns.

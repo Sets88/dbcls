@@ -13,6 +13,8 @@ from visidata import ListOfDictSheet
 from visidata import ReturnValue
 from visidata import vd
 
+from .vd_json import is_json_cell
+
 
 class RowPicker:
     """The Enter / g Enter contract of every sheet that hands rows back to a
@@ -260,8 +262,10 @@ def openCellAltered(vd, sheet, col, row, rowidx=None):
     cell = col.getValue(row)
     if isinstance(cell, BaseSheet):
         return cell
-    else:
-        return TableSheet.openCell(sheet, col, row, rowidx)
+    if is_json_cell(col, row):
+        # an editable sheet that writes back into this cell, not a copy
+        return vd.openJsonCell(sheet, col, row, rowidx)
+    return TableSheet.openCell(sheet, col, row, rowidx)
 
 
 @VisiData.api

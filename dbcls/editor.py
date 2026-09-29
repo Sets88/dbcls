@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 from .prompts import SHEET_KINDS, PromptKind
+from .syntax import (DEFAULT_SYNTAX, EMBED_PREFIX, Highlighter, Token,  # noqa: F401
+                     make_highlighter, syntax_names)
+from .syntax.sql import SqlHighlighter
 
 @dataclass
 class PopupItem:
@@ -236,6 +239,7 @@ class Fn(str, enum.Enum):
     PREV_TAB         = 'prev_tab'
     SWITCH_TAB       = 'switch_tab'
     CLOSE_TAB        = 'close_tab'
+    SET_SYNTAX       = 'set_syntax'
 
 
 EDITOR_HELP = """\
@@ -302,6 +306,9 @@ File
       Open file / browse directory files
   `Toggle read-only mode` (command palette only)
       Block/allow editing and saving (shows `[RO]` next to the file name)
+  `Set syntax…` (command palette only)
+      Highlight the tab as another syntax (`sql`, `python`, a plugin's);
+      `--syntax` / `"syntax"` in the config set it for every tab
   `Ctrl+Q`
       Quit
 
@@ -431,6 +438,7 @@ class ColorManager:
             white      = 15             # bright white
             orange     = 208            # orange        — functions
             dark_yel   = 136            # dark yellow   — numbers
+            embed_bg   = 17             # dark navy     — embedded code (.PY "…")
         else:
             gray_bg    = curses.COLOR_WHITE
             mark_bg    = curses.COLOR_GREEN
@@ -438,6 +446,7 @@ class ColorManager:
             white      = curses.COLOR_WHITE
             orange     = curses.COLOR_YELLOW
             dark_yel   = curses.COLOR_YELLOW
+            embed_bg   = curses.COLOR_BLUE
 
         db = -1  # default background
 
@@ -482,6 +491,13 @@ class ColorManager:
         self.sel_normal = self._sel_map[self.normal]
         self.mark_normal = self._mark_map[self.normal]
         self.cursor_normal = self._cursor_map[self.normal]
+        # …and on the background of an embedded block (the Python of a .PY
+        # step).  Selection, a marked line and the cursor line still win over
+        # it: an embedded pair has the same variants as its plain one.
+        self._embed_map = variants(embed_bg)
+        for plain, embedded in self._embed_map.items():
+            for lookup in (self._sel_map, self._mark_map, self._cursor_map):
+                lookup[embedded] = lookup[plain]
 
         # UI pairs
         self.line_num     = p(white,               curses.COLOR_BLUE)
@@ -510,261 +526,14 @@ class ColorManager:
     def cursor_pair_for(self, pair_id: int) -> int:
         return self._cursor_map.get(pair_id, self.cursor_normal)
 
+    def embed_pair_for(self, pair_id: int) -> int:
+        return self._embed_map.get(pair_id, self._embed_map[self.normal])
+
 
 # ─── Lexer ────────────────────────────────────────────────────────────────────
-Token = Tuple[int, int, str]  # (start_col, end_col, type_str)
-
-class Lexer:
-    OPERATORS = set('+-*/=<>!|&~@#%^')
-
-    def __init__(self):
-        self._cache = {}  # line_idx -> (line_text, tokens, comment_open_after)
-        self._block_comment_state = {}  # line_idx -> comment_open_before
-        self._keywords  = []
-        self._types     = []
-        self._functions = []
-        self._multi_keywords = {}  # first_word -> set of full multi-word keywords
-
-    def set_words(self, keywords=None, types=None, functions=None):
-        """Replace one or more word sets used for highlighting and autocomplete.
-        Each argument, if given, must be an iterable of strings (case-insensitive)."""
-        if keywords is not None:
-            kw_upper = [w.upper() for w in keywords]
-            self._keywords = frozenset(w for w in kw_upper if ' ' not in w)
-            self._multi_keywords = {}
-            for w in kw_upper:
-                if ' ' in w:
-                    first = w.split()[0]
-                    self._multi_keywords.setdefault(first, set()).add(w)
-        if types     is not None: self._types     = frozenset(w.upper() for w in types)
-        if functions is not None: self._functions = frozenset(w.upper() for w in functions)
-        self._cache.clear()
-        self._block_comment_state.clear()
-
-    def invalidate(self, from_line: int):
-        keys = [k for k in self._cache if k >= from_line]
-        for k in keys:
-            del self._cache[k]
-        keys2 = [k for k in self._block_comment_state if k >= from_line]
-        for k in keys2:
-            del self._block_comment_state[k]
-
-    def get_block_comment_before(self, line_idx: int, lines: List[str]) -> bool:
-        if line_idx == 0:
-            return False
-        if line_idx - 1 in self._block_comment_state:
-            return self._block_comment_state[line_idx - 1]
-        # recompute from last known good state
-        start = 0
-        for i in range(line_idx - 1, -1, -1):
-            if i in self._block_comment_state:
-                start = i + 1
-                break
-        state = self._block_comment_state.get(start - 1, False) if start > 0 else False
-        for i in range(start, line_idx):
-            _, _, state = self._tokenize_line(lines[i], state)
-            self._block_comment_state[i] = state
-        return state
-
-    def get_tokens(self, line_idx: int, lines: List[str]) -> List[Token]:
-        line = lines[line_idx] if line_idx < len(lines) else ''
-        bc_before = self.get_block_comment_before(line_idx, lines)
-        if line_idx in self._cache:
-            cached_line, cached_tokens, _ = self._cache[line_idx]
-            if cached_line == line:
-                return cached_tokens
-        tokens, _, bc_after = self._tokenize_line(line, bc_before)
-        self._cache[line_idx] = (line, tokens, bc_after)
-        self._block_comment_state[line_idx] = bc_after
-        return tokens
-
-    def _tokenize_line(self, line: str, block_state):
-        """Tokenise one editor line.
-
-        *block_state* encodes any block state carried over from the previous line:
-
-        * ``False`` / ``None`` — normal mode (no open block)
-        * ``True``             — inside a ``/* … */`` block comment (legacy value)
-        * ``'/*'``             — inside a ``/* … */`` block comment
-        * ``'\"\"\"'``         — inside a ``\"\"\"…\"\"\"`` triple-quoted string
-        * ``"'''"``            — inside a ``'''…'''`` triple-quoted string
-
-        Returns ``(tokens, block_state, block_state)`` where the last two values
-        are the state *after* this line (kept as a tuple for backward compat with
-        callers that unpack three values).
-        """
-        tokens = []
-        pos = 0
-        n = len(line)
-
-        def push(start, end, ttype):
-            if end > start:
-                tokens.append((start, end, ttype))
-
-        def push_string_content(start, end):
-            """Emit line[start:end] as 'string', breaking at {{…}} placeholders."""
-            seg = start
-            p = start
-            while p < end:
-                if line[p:p + 2] == '{{':
-                    close_pos = line.find('}}', p + 2)
-                    if close_pos != -1 and close_pos + 2 <= end:
-                        push(seg, p, 'string')
-                        push(p, close_pos + 2, 'type')
-                        p = close_pos + 2
-                        seg = p
-                        continue
-                p += 1
-            push(seg, end, 'string')
-
-        while pos < n:
-            # ── Continuation of a block state from the previous line ──────
-            if block_state in (True, '/*'):
-                end_pos = line.find('*/', pos)
-                if end_pos == -1:
-                    push(pos, n, 'comment')
-                    pos = n
-                else:
-                    push(pos, end_pos + 2, 'comment')
-                    pos = end_pos + 2
-                    block_state = False
-                continue
-
-            if block_state in ('"""', "'''"):
-                close_pos = line.find(block_state, pos)
-                if close_pos == -1:
-                    push_string_content(pos, n)
-                    pos = n
-                else:
-                    push_string_content(pos, close_pos + 3)
-                    pos = close_pos + 3
-                    block_state = False
-                continue
-
-            # ── Line comments: -- (SQL), # (MySQL/shell style) ────────────
-            if line[pos:pos+3] == '-- ' or line[pos] == '#':
-                push(pos, n, 'comment')
-                pos = n
-                continue
-
-            # ── Block comment start ───────────────────────────────────────
-            if line[pos:pos+2] == '/*':
-                block_state = '/*'
-                pos += 2
-                continue
-
-            # ── Triple-quoted strings (must be checked before single-quote)
-            # Supported: """…""" and '''…''' — content is taken verbatim.
-            if line[pos] in ('"', "'") and line[pos:pos + 3] == line[pos] * 3:
-                triple = line[pos] * 3
-                str_start = pos
-                pos += 3
-                close_pos = line.find(triple, pos)
-                if close_pos == -1:
-                    # String runs past end of line → multi-line
-                    push_string_content(str_start, n)
-                    block_state = triple
-                    pos = n
-                else:
-                    push_string_content(str_start, close_pos + 3)
-                    pos = close_pos + 3
-                continue
-
-            # ── Single-quoted string literals ─────────────────────────────
-            # With {{…}} template-placeholder highlighting.
-            if line[pos] in ('"', "'", '`'):
-                quote = line[pos]
-                str_start = pos
-                pos += 1
-                seg_start = str_start  # start of current 'string' segment
-                while pos < n:
-                    if line[pos] == '\\' and pos + 1 < n:
-                        pos += 2
-                    elif line[pos] == quote:
-                        pos += 1
-                        break
-                    elif line[pos:pos+2] == '{{' and line.find('}}', pos+2) != -1:
-                        # Emit the string segment before the placeholder
-                        push(seg_start, pos, 'string')
-                        tmpl_start = pos
-                        close = line.find('}}', pos + 2)
-                        pos = close + 2
-                        # Emit the {{…}} placeholder as 'type' (yellow)
-                        push(tmpl_start, pos, 'type')
-                        seg_start = pos
-                    else:
-                        pos += 1
-                # Emit any remaining string segment (includes closing quote)
-                push(seg_start, pos, 'string')
-                continue
-
-            # Numbers
-            if line[pos].isdigit() or (line[pos] == '.' and pos + 1 < n and line[pos+1].isdigit()):
-                start = pos
-                while pos < n and (line[pos].isdigit() or line[pos] in '.eE+-_xXaAbBcCdDeEfF'):
-                    pos += 1
-                push(start, pos, 'number')
-                continue
-
-            # Identifiers and keywords
-            if line[pos].isalpha() or line[pos] == '_':
-                start = pos
-                while pos < n and (line[pos].isalnum() or line[pos] == '_'):
-                    pos += 1
-                word = line[start:pos]
-                wu = word.upper()
-
-                ttype = 'normal'
-                if wu in self._multi_keywords:
-                    look = pos
-                    while look < n and line[look] in (' ', '\t'):
-                        look += 1
-                    if look < n and (line[look].isalpha() or line[look] == '_'):
-                        w2_start = look
-                        while look < n and (line[look].isalnum() or line[look] == '_'):
-                            look += 1
-                        candidate = wu + ' ' + line[w2_start:look].upper()
-                        if candidate in self._multi_keywords[wu]:
-                            pos = look
-                            ttype = 'keyword'
-
-                if ttype == 'normal':
-                    if wu in self._keywords:
-                        ttype = 'keyword'
-                    elif wu in self._types:
-                        ttype = 'type'
-                    elif wu in self._functions:
-                        ttype = 'function'
-
-                push(start, pos, ttype)
-                continue
-
-            # Dot-commands: .TABLES, .USE, .SCHEMA, .RUN, .RFILTER, etc.
-            # Allowed at the start of the line OR immediately after a pipeline
-            # separator '|' (with optional surrounding whitespace).
-            if line[pos] == '.' and pos + 1 < n and line[pos + 1].isalpha():
-                prefix = line[:pos].strip()
-                if not prefix or prefix.endswith('|'):
-                    start = pos
-                    pos += 1  # skip '.'
-                    while pos < n and (line[pos].isalnum() or line[pos] == '_'):
-                        pos += 1
-                    push(start, pos, 'function')
-                    continue
-
-            # Operators
-            if line[pos] in self.OPERATORS:
-                start = pos
-                while pos < n and line[pos] in self.OPERATORS:
-                    pos += 1
-                push(start, pos, 'operator')
-                continue
-
-            # Whitespace and punctuation — normal
-            push(pos, pos + 1, 'normal')
-            pos += 1
-
-        return tokens, block_state, block_state
+#: The highlighters live in dbcls.syntax; the SQL one keeps the name the
+#: editor's only lexer always had, for the code (and plugins) importing it.
+Lexer = SqlHighlighter
 
 
 # ─── TextBuffer ───────────────────────────────────────────────────────────────
@@ -2786,6 +2555,11 @@ class TextView:
             'number':   colors.number,
             'operator': colors.operator,
         }
+        # The same types inside an embedded block (dbcls.syntax.EMBED_PREFIX).
+        self.type_to_pair.update({
+            EMBED_PREFIX + name: colors.embed_pair_for(pair)
+            for name, pair in list(self.type_to_pair.items())
+        })
 
     def set_rect(self, top: int, left: int, height: int, width: int) -> None:
         self.top = top
@@ -3055,6 +2829,16 @@ class TextView:
         if is_cursor_line:
             self._safe_addstr(y, self.gutter, ' ' * self.text_cols,
                               curses.color_pair(colors.cursor_normal))
+        elif self.lexer is not None:
+            # A row the highlighter paints past its text — a body line of an
+            # embedded block (.PY """…"""), so the block reads as one piece.
+            fill = self.lexer.line_fill(line_idx, buf.lines)
+            if fill is not None:
+                pair_id = type_to_pair.get(fill, colors.normal)
+                if is_marked:
+                    pair_id = colors.mark_pair_for(pair_id)
+                self._safe_addstr(y, self.gutter, ' ' * self.text_cols,
+                                  curses.color_pair(pair_id))
 
         # Precompute same-row selection boundaries for fast-path correctness.
         # When the selection start AND end both fall strictly inside a token
@@ -4064,10 +3848,10 @@ class Editor:
 
     def __init__(self, shell: 'EditorShell', filepath: Optional[str] = None,
                  directory: Optional[str] = None, readonly: bool = False,
-                 fold: bool = False):
+                 fold: bool = False, syntax: str = DEFAULT_SYNTAX):
         self.shell = shell
         self.stdscr = shell.stdscr
-        self.lexer = Lexer()
+        self.lexer: Highlighter = make_highlighter(syntax)
         # The document itself is an ordinary TextArea — the same widget dialogs
         # use for their text fields, so both obey the very same editing keys.
         self.textarea = TextArea(shell.stdscr, shell.colors, self.lexer,
@@ -4115,6 +3899,21 @@ class Editor:
         """Update the syntax highlighting word sets.
         Each argument, if given, replaces the corresponding set entirely."""
         self.lexer.set_words(keywords=keywords, types=types, functions=functions)
+
+    # ── Syntax ────────────────────────────────────────────────────────────────
+
+    @property
+    def syntax(self) -> str:
+        """Name of the syntax this document is highlighted as."""
+        return self.lexer.name
+
+    def set_syntax(self, name: str) -> None:
+        """Highlight the document as syntax *name* from now on (ValueError for
+        one nobody registered)."""
+        self.lexer = make_highlighter(name)
+        self.textarea.lexer = self.lexer
+        self.view.lexer = self.lexer
+        self.request_redraw()
 
     # ── The document, as plugins see it ──────────────────────────────────────
 
@@ -4788,6 +4587,17 @@ class EditorShell:
     def _cmd_close_tab(self):
         self.close_document()
 
+    def _cmd_set_syntax(self):
+        """Pick what the tab on screen is highlighted as — for this tab only;
+        ``--syntax`` / ``"syntax"`` in the config set it for every tab."""
+        doc = self.doc
+
+        def choose(name: str) -> None:
+            doc.set_syntax(name)
+            self.set_status_notification(f'Syntax: {name}')
+
+        self.show_menu('Syntax', syntax_names(), on_select=choose, default=doc.syntax)
+
     def _sync_tab_bar(self) -> None:
         """Show the bar (and give up a screen row for it) only with tabs to show."""
         self.tab_bar.set_tabs(
@@ -5224,6 +5034,7 @@ class EditorShell:
         add(Fn.PREV_TAB,        self._cmd_prev_tab,             'Previous tab', 'Ctrl+Shift+Left / ^X Left')
         add(Fn.SWITCH_TAB,      self._cmd_switch_tab,           'Switch to tab…', '^X Down')
         add(Fn.CLOSE_TAB,       self._cmd_close_tab,            'Close tab')
+        add(Fn.SET_SYNTAX,      self._cmd_set_syntax,           'Set syntax…')
 
     def _register_default_keybindings(self):
         add = self.add_keybinding

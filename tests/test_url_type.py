@@ -8,7 +8,9 @@ parsed URL turns into on the edit sheet.
 import pytest
 
 from dbcls.utils import UrlParts, prettify, sql_literal
-from dbcls.vd_modules.vd_types import format_url_cell, parse_query, urltype
+from dbcls.vd_modules.vd_types import (
+    format_url_cell, parse_query, query_with, url_with_part, url_with_parts, urltype,
+)
 
 
 URL = 'https://user:pw@example.com:8443/a/b?x=1&y=two#frag'
@@ -145,3 +147,71 @@ class TestUrlParts:
 
     def test_str_is_the_url(self):
         assert str(UrlParts('https://example.com/', {})) == 'https://example.com/'
+
+
+class TestUrlWithPart:
+    """Editing one part of a URL (`(` / `z Enter` on a `g#` column) replaces
+    it in the text; nothing else is rebuilt from the parsed parts."""
+
+    URL = 'https://user:pw@EXAMPLE.com:8080/a/b?q=hello+world&x=%7E1&flag&x=2#top'
+
+    def test_port_keeps_user_info_and_the_case_of_the_host(self):
+        assert url_with_part(self.URL, 'port', 9090).startswith('https://user:pw@EXAMPLE.com:9090/a/b?')
+
+    def test_clearing_the_port_drops_the_colon(self):
+        assert url_with_part(self.URL, 'port', None).startswith('https://user:pw@EXAMPLE.com/a/b?')
+
+    def test_a_bad_port_is_refused(self):
+        with pytest.raises(ValueError):
+            url_with_part(self.URL, 'port', 'http')
+        with pytest.raises(ValueError):
+            url_with_part(self.URL, 'port', 70000)
+
+    def test_domain(self):
+        assert url_with_part(self.URL, 'domain', 'other.org').startswith('https://user:pw@other.org:8080/')
+
+    def test_ipv6_host_keeps_its_brackets(self):
+        assert url_with_part('http://[::1]:80/x', 'port', 81) == 'http://[::1]:81/x'
+        assert url_with_part('http://h:80/x', 'domain', '::1') == 'http://[::1]:80/x'
+
+    def test_path_schema_anchor(self):
+        assert url_with_part('http://h/x', 'path', '/y') == 'http://h/y'
+        assert url_with_part('http://h/x', 'schema', 'https') == 'https://h/x'
+        assert url_with_part('http://h/x#a', 'anchor', None) == 'http://h/x'
+
+    def test_an_unknown_part_is_refused(self):
+        with pytest.raises(ValueError):
+            url_with_part(self.URL, 'host', 'x')
+
+    def test_url_with_parts_replaces_only_what_differs(self):
+        parts = dict(urltype(self.URL))
+        parts['path'] = '/c'
+        assert str(url_with_parts(self.URL, parts)) == self.URL.replace('/a/b', '/c')
+
+
+class TestQueryWith:
+    RAW = 'q=hello+world&x=%7E1&flag&x=2'
+
+    def test_unchanged_parameters_keep_their_text(self):
+        params = parse_query(self.RAW)
+        assert query_with(self.RAW, params) == self.RAW
+
+    def test_only_the_changed_value_is_encoded(self):
+        params = parse_query(self.RAW)
+        params['x'] = ['~1', 'a b']
+        assert query_with(self.RAW, params) == 'q=hello+world&x=%7E1&flag&x=a+b'
+
+    def test_delete(self):
+        params = parse_query(self.RAW)
+        del params['flag']
+        assert query_with(self.RAW, params) == 'q=hello+world&x=%7E1&x=2'
+
+    def test_rename_stays_in_place(self):
+        assert query_with('q=1&x=2', {'query': '1', 'x': '2'}) == 'query=1&x=2'
+
+    def test_new_parameters_go_at_the_end(self):
+        assert query_with('q=1', {'q': '1', 'n': None}) == 'q=1&n='
+
+    def test_empty(self):
+        assert query_with('', {'a': 'b'}) == 'a=b'
+        assert query_with('a=b', None) == ''

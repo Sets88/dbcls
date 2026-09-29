@@ -29,6 +29,12 @@ class FakeColors:
     mark_pair_for = sel_pair_for
     cursor_pair_for = sel_pair_for
 
+    #: Offset of the embedded-block variant of a pair — see embed_pair_for().
+    EMBED_OFFSET = 100
+
+    def embed_pair_for(self, pair_id):
+        return pair_id + self.EMBED_OFFSET
+
 
 class FakeScreen:
     """Records what was drawn into a character grid."""

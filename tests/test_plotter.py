@@ -10,7 +10,8 @@ from datetime import datetime
 import pytest
 
 from dbcls.vd_modules.vd_plotter import (
-    classify_plot_columns, default_plot_columns, parse_plot_columns, plot_spec,
+    CompletePlotColumn, classify_plot_columns, default_plot_columns,
+    parse_plot_columns, plot_column_names, plot_sheet, plot_spec,
     resolve_plot_columns, strip_bucket_marker)
 
 #: What VisiData calls an untyped (anytype) column — `deduceType` only ever
@@ -218,3 +219,81 @@ class TestDefaultPlotColumns:
     def test_nothing_to_guess_gives_an_empty_prompt(self):
         sheet = FakeSheet(*cols(('name', 'str'), ('note', 'str')))
         assert default_plot_columns(sheet) == ''
+
+
+class TestCompletePlotColumn:
+    NAMES = ['ts', 'total', 'count', 'first name']
+
+    def complete(self, text, state=0, names=None):
+        return CompletePlotColumn(names or self.NAMES)(text, state)
+
+    def test_completes_the_name_after_the_last_comma(self):
+        assert self.complete('ts,cou') == 'ts,count'
+
+    def test_keeps_the_space_typed_after_the_comma(self):
+        assert self.complete('ts, cou') == 'ts, count'
+
+    def test_ignores_case_and_completes_names_with_spaces(self):
+        assert self.complete('ts,FIR') == 'ts,first name'
+
+    def test_an_empty_name_cycles_through_the_sheet_columns(self):
+        got = [self.complete('ts,', n) for n in range(len(self.NAMES))]
+        assert got == ['ts,' + name for name in self.NAMES]
+
+    def test_the_first_name_is_completed_too(self):
+        assert self.complete('t', 1) == 'total'
+
+    def test_the_bucket_marker_is_kept(self):
+        assert self.complete('ts,*to') == 'ts,*total'
+
+    def test_no_match_leaves_the_text_alone(self):
+        assert self.complete('ts,zz') == 'ts,zz'
+
+    def test_a_bucket_size_is_not_a_column(self):
+        assert self.complete('ts,60') == 'ts,60'
+
+    def test_the_menu_lists_the_same_names_tab_walks(self):
+        completer = CompletePlotColumn(self.NAMES)
+        assert completer.matches('ts,') == self.NAMES
+        assert completer.matches('ts, t') == ['ts', 'total']
+        assert completer.matches('ts,*t') == ['ts', 'total']   # past the marker
+        assert completer.matches('ts,zz') == []
+
+
+class TestPlotColumnNames:
+    def test_offers_the_visible_columns(self):
+        sheet = FakeSheet(FakeCol('ts', 'datetime'), FakeCol('cnt', 'int'),
+                          FakeCol('note', 'str', hidden=True))
+        assert plot_column_names(sheet) == ['ts', 'cnt']
+
+
+class FakeVd:
+    """The two VisiData calls plot_sheet makes; `vd` reaches it as the
+    argument @VisiData.api binds, so nothing has to be patched."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.kwargs = {}
+        self.pushed = None
+
+    def input(self, prompt, **kwargs):
+        self.kwargs = kwargs
+        return self.answer
+
+    def push(self, sheet):
+        self.pushed = sheet
+
+
+class TestPlotPrompt:
+    def test_the_prompt_completes_with_the_sheets_columns(self):
+        sheet = FakeSheet(FakeCol('ts', 'datetime'), FakeCol('cnt', 'int'),
+                          rows=[{'ts': datetime(2024, 1, 1), 'cnt': 1}])
+        # an empty answer ends plot_sheet right after the prompt, which is
+        # all this test is about (the chart itself needs a real VisiData)
+        fake_vd = FakeVd('')
+
+        plot_sheet(fake_vd, sheet)
+
+        completer = fake_vd.kwargs['completer']
+        assert isinstance(completer, CompletePlotColumn)
+        assert completer('ts,c', 0) == 'ts,cnt'

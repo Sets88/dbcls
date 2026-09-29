@@ -850,3 +850,46 @@ class TestArgumentParsing:
     def test_plugin_names_split_on_commas(self):
         assert resolve_plugin_names(' a , b ') == ['a', 'b']
         assert resolve_plugin_names(None) == []
+
+
+class TestSyntaxPlugins:
+    """A plugin brings a highlighter in setup() — so --syntax accepts it — and
+    may have its own pipeline command's argument highlighted in it."""
+
+    PLUGIN = '''
+        from dbcls.syntax import Highlighter
+
+        class Loud(Highlighter):
+            def tokenize(self, line, state):
+                return [(0, len(line), 'keyword')], state
+
+        def setup(setup):
+            setup.add_syntax('loud', Loud)
+
+        def register(api):
+            api.add_embedded_syntax('shout', 'loud')
+    '''
+
+    def test_setup_registers_the_syntax_before_the_command_line(
+            self, tmp_path, clean_syntax_registry):
+        from dbcls import syntax
+        write_plugin(tmp_path, 'loud', self.PLUGIN)
+        manager = make_manager(tmp_path)
+        manager.add_arguments(argparse.ArgumentParser())
+        assert 'loud' in syntax.syntax_names()
+
+    def test_register_embeds_it_in_a_pipeline_command(
+            self, tmp_path, clean_syntax_registry):
+        from dbcls import syntax
+        from dbcls.syntax.sql import SqlHighlighter
+        write_plugin(tmp_path, 'loud', self.PLUGIN)
+        assert load(tmp_path, FakeEditor()).loaded == ['loud']
+        assert syntax.EMBEDDED['shout'] == ('loud', 0)
+        tokens, _ = SqlHighlighter().tokenize('.SHOUT "hey"', None)
+        assert (8, 11, 'embed:keyword') in tokens
+
+    def test_api_add_syntax_from_the_running_editor(self, clean_syntax_registry):
+        from dbcls import syntax
+        from dbcls.syntax.python import PythonHighlighter
+        PluginAPI(FakeEditor(), 'x').add_syntax('py2', PythonHighlighter)
+        assert 'py2' in syntax.syntax_names()

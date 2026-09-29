@@ -26,7 +26,7 @@ DbCls is a terminal database client in which a SQL editor and [visidata](https:/
 - MySQL, PostgreSQL, ClickHouse, SQLite — and Cassandra / ScyllaDB through the driver plugin in [`plugins/cassandra`](plugins/cassandra)
 - With no connection arguments it starts on an in-memory SQLite — just open a file and type
 - Unix sockets (including ones forwarded over SSH), JSON config, inactivity screen lock
-- Plugin API: your own editor commands, pipeline commands, LLM tools and full-screen windows
+- Plugin API: your own editor commands, pipeline commands, syntax highlighters, LLM tools and full-screen windows
 
 ## Table of Contents
 
@@ -128,6 +128,7 @@ dbcls -H 127.0.0.1 -u user -p mypasswd -E mysql -d mydb mydb.sql
 | `--no-compress` | Disable compression for ClickHouse connections (can also be switched at runtime via the `Toggle connection compression` command in the command palette) |
 | `--key-remap` | Remap key codes, e.g. `"36:1412,1412:36"` to swap Tab and Shift+Tab |
 | `--fold` | Start with `>>>` ... `<<<` block folding enabled (see [Fold Blocks](#fold-blocks)) |
+| `--syntax` | What the editor highlights the text as: `sql` (the default) or `python`, plus whatever a [plugin](#plugins) added. Anything but `sql` leaves out the database engine's keywords. Also `DBCLS_SYNTAX` or `"syntax"` in the config file; `Set syntax…` in the command palette switches the tab on screen (see [Syntax Highlighting](#syntax-highlighting)) |
 | `-R, --readonly` | Open the editor in read-only mode: the document cannot be modified or saved (`[RO]` is shown next to the file name), and `Enter` runs the query under the cursor since there is no text to insert. Also `DBCLS_READONLY=1` or `"readonly": true` in the config file |
 | `--lock-init-command` | Shell command run at startup to initialise a lock session |
 | `--lock-timeout` | Seconds of inactivity before the screen locks |
@@ -430,6 +431,30 @@ The markers also work as statement separators for `Alt+Enter`:
 - with the cursor **inside the block**, the statement under the cursor is
   executed as usual.
 
+### Syntax Highlighting
+
+The editor highlights SQL by default, with the keywords and functions of the
+database the tab is connected to. `--syntax python` (or `DBCLS_SYNTAX=python`,
+or `"syntax": "python"` in the config file) highlights every tab as Python
+instead, and leaves the engine's words out; `Set syntax…` in the command
+palette (`Alt+P`) switches the tab on screen between the syntaxes on the fly.
+
+Inside SQL, the argument of every pipeline step that runs Python — `.PY`,
+`.SET_VAR` (its expression), `.SLEEP`, `.FOR`, `.WHILE` — is highlighted as
+Python on a background of its own, so a block of code reads as one piece
+among the queries around it:
+
+```sql
+.PY """
+rows = [x * 2 for x in range(3)]
+result(rows)
+""" | .SET_VAR "n" "len(data)" | .RUN "SELECT {{get_var('n')}}"
+```
+
+The pipeline helpers (`result`, `set_var`, `sselect`, …) are highlighted as
+functions there. A syntax of your own — or your plugin's pipeline command
+highlighted in one — is added by a [plugin](#plugins).
+
 ### Key Remapping
 
 You can remap any key to act as another key using integer key codes.
@@ -582,14 +607,18 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 |--------|--------|
 | `zf` | Format current cell (JSON indentation, number prettification); shown in a split pane (`Z`) it live-updates as the cursor moves. `e` on that pane tweaks the current line locally (e.g. before yanking it) — never written back to the source cell |
 | `g+` | Expand array vertically, similarly to how it's done in expand-col, but by creating new rows rather than columns |
-| `g@` | Set the type of the current column to JSON (the counterpart of visidata's `@` for dates): cells are parsed once and then display as real JSON, expand with `(` / `g+`, and can be indexed in `=` expressions. Sorting such a column is not possible — visidata reports "sort incomplete due to TypeError" |
-| `g#` | Set the type of the current column to URL. The cells keep displaying the URL unchanged, but `(` expands the column into `schema`, `domain`, `port`, `path`, `query`, `anchor`, and `(` on the resulting `query` column expands it further into one column per query parameter, by name (a parameter repeated in the URL becomes a list). Values that are not URL-shaped display as a typing error, and editing such a cell still writes the URL text back to the database |
-| `gp` | Draw a chart from the columns you type at the prompt (see [Plotting](#plotting) below) |
-| `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only) |
+| `g@` | Set the type of the current column to JSON (the counterpart of visidata's `@` for dates): cells are parsed once and then display as real JSON, expand with `(` / `g+`, and can be indexed in `=` expressions. Sorting such a column is not possible — visidata reports "sort incomplete due to TypeError". The cell itself is edited as text like any other — what is typed is parsed again with `json.loads`. Inside it, only what cannot be expanded any further — a string, number, bool or null — is edited as text; an object or array is reached, not typed over. Either `e` on a column expanded with `(`, or `z Enter` to open the object / array on visidata's own object sheets (`Enter` goes into nested ones; `e` edits a value or, on `key`, renames the key, `a` / `d` add / delete a key or element, `zd` sets null). Typed text is read as JSON (`5` a number, `"5"` a string, `{"a": 1}` an object; anything else stays a string), and each change rewrites the whole JSON cell — in the `Alt+T` edit sheet it is a pending edit that `Ctrl+S` turns into an `UPDATE`, and a row it cannot update (no primary key) opens read-only |
+| `g#` | Set the type of the current column to URL. The cells keep displaying the URL unchanged, but `(` expands the column into `schema`, `domain`, `port`, `path`, `query`, `anchor`, and `(` on the resulting `query` column expands it further into one column per query parameter, by name (a parameter repeated in the URL becomes a list). Values that are not URL-shaped display as a typing error, and editing such a cell still writes the URL text back to the database. The parts are editable too, the same way as JSON's: `e` on a column expanded with `(`, or `z Enter` to open the six parts (`d` clears one; they cannot be renamed or added) and `Enter` on `query` for its parameters (`e` on `key` renames, `a` / `d` add / delete). Only the changed part is replaced in the URL text — user info, the case of the host and the encoding of the other parameters stay as they were |
+| `gp` | Draw a chart from the columns you type at the prompt, `Tab` completes column names (see [Plotting](#plotting) below) |
+| `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only); `Tab` / `Shift+Tab` complete column names, and the matches show up in a menu above the prompt |
 | `gT` | Save current or selected rows to pipeline vars |
 | `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
 | `Alt+↑` / `Alt+↓` | Jump 5 rows up / down |
 | `Alt+←` / `Alt+→` | Jump 3 columns left / right |
+
+#### The completion menu
+
+Both prompts that complete names — `E` and `gp` — list what they are offering in a box above the prompt — where the list of aggregators opens on `+`, and in the same colors. It opens as soon as the half-typed word under the cursor matches something and is filtered by what is typed; `Tab` / `Shift+Tab` put the next match straight into the line and move the `>` marker onto it. The counter on the frame (`14/41`) counts the whole cycle, not the page: the marker stays in the middle of the box and the list scrolls past it, so what is coming next is as visible as what has just been passed and every candidate is reachable by holding `Tab` — nothing is dropped for not fitting on screen. Any other key closes the menu.
 
 ### Aggregators
 
@@ -612,7 +641,7 @@ Press `gp` on any VisiData sheet to open an inline terminal chart powered by [pl
 plot columns (x[,bucket],y): ts,action,cnt
 ```
 
-The prompt opens on the columns you charted last time on this sheet; failing that, on the sheet's key columns (`!`); failing that, on a guess — the first date/number column and the last numeric one. Anything there can be overwritten, so nothing has to be marked with `!` first. That matters on sheets where `!` is not free: on a `.WATCH` sheet key columns decide row identity between refreshes, and on a plain query result there are none at all.
+`Tab` / `Shift+Tab` in the prompt complete the name after the last comma with the sheet's own columns (an empty name cycles through all of them), with the matches listed in the [completion menu](#the-completion-menu) above the prompt. The prompt opens on the columns you charted last time on this sheet; failing that, on the sheet's key columns (`!`); failing that, on a guess — the first date/number column and the last numeric one. Anything there can be overwritten, so nothing has to be marked with `!` first. That matters on sheets where `!` is not free: on a `.WATCH` sheet key columns decide row identity between refreshes, and on a plain query result there are none at all.
 
 **Column roles:**
 
@@ -1323,6 +1352,8 @@ Keys present in that section but never declared as options reach `api.settings` 
 | `api.add_pipeline_function(name, value, help_text)` | Add a function (or any value) to the namespace `{{expr}}` and `.PY` run in; `help_text` reaches the model too |
 | `api.add_llm_tool(name, description, parameters, handler, max_result_chars)` | Offer a tool to the [LLM chat](#llm-chat); load order does not matter, a tool offered before the chat is up waits for it. A no-op when the chat is not configured. `max_result_chars` caps how much text one call may hand the model (omit it to send the result whole) |
 | `api.add_help_page(title, text)` | Add a page to the in-app help (`F1`) |
+| `setup.add_syntax(name, factory, replace)` | Add a [syntax highlighter](#syntax-highlighting): a `dbcls.syntax.Highlighter` subclass implementing `tokenize(line, state) -> (tokens, state_after)`. Registered in `setup()` it is a `--syntax` and a `"syntax"` in the config file; `api.add_syntax(...)` from `register()` only reaches `Set syntax…`. [`example_plugins/json_syntax.py`](example_plugins/json_syntax.py) is the worked example |
+| `api.add_embedded_syntax(command, syntax, arg=0)` | Highlight argument `arg` of a pipeline command in that syntax, on the embedded-code background — the way `.PY`'s argument is Python |
 | `setup.add_engine(name, fields, factory, …)` | Add a database engine — it becomes a `--engine`, an `"engine"` in the config file and an entry in the connection form. Goes in `setup()`, not `register()`: the first connection's client is built before the editor exists. [`plugins/cassandra`](plugins/cassandra) is the worked example |
 | `api.add_filter(event, func)` | Transform data on its way through the editor (see below) |
 

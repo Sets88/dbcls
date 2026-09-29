@@ -3019,25 +3019,25 @@ class TestLexerTripleQuote:
         return [(line[s:e], t) for s, e, t in toks], state_after
 
     def test_triple_double_same_line(self):
-        toks, state = self._tokens('.PY """code here"""')
+        toks, state = self._tokens('.RUN """code here"""')
         types = [t for _, t in toks if t != 'normal']
-        assert 'function' in types      # .PY
+        assert 'function' in types      # .RUN
         assert 'string' in types        # the string content
         assert state == False or not state  # closed, no open block
 
     def test_triple_single_same_line(self):
-        toks, state = self._tokens(".PY '''code here'''")
+        toks, state = self._tokens(".RUN '''code here'''")
         types = [t for _, t in toks if t != 'normal']
         assert 'string' in types
         assert not state
 
     def test_triple_quote_opens_block_state(self):
         """Opening \"\"\" without close sets block_state = '\"\"\"'."""
-        _, state = self._tokens('.PY """')
+        _, state = self._tokens('.RUN """')
         assert state == '"""'
 
     def test_triple_single_opens_block_state(self):
-        _, state = self._tokens(".PY '''")
+        _, state = self._tokens(".RUN '''")
         assert state == "'''"
 
     def test_triple_quote_continuation(self):

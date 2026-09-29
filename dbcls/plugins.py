@@ -29,6 +29,19 @@ The Cassandra driver in ``plugins/cassandra`` is exactly this, and is the
 worked example to copy: a :class:`dbcls.clients.base.ClientClass` subclass and
 one ``setup.add_engine`` call.
 
+A syntax highlighter is added the same way, in ``setup`` too, so that
+``--syntax`` and the config file's ``"syntax"`` accept it — a
+:class:`dbcls.syntax.Highlighter` subclass writing one ``tokenize`` method
+(``example_plugins/json_syntax.py`` is one).  A plugin's own pipeline command
+whose argument is code can have that argument highlighted in its language::
+
+    def setup(setup):
+        setup.add_syntax('json', JsonHighlighter)
+
+    def register(api):
+        api.add_pipeline_command('from_json', '.FROM_JSON <JSON>', from_json)
+        api.add_embedded_syntax('from_json', 'json')
+
 Settings come from the command line, from ``DBCLS_<DEST>`` environment
 variables, and from a section named after the plugin in the JSON config file —
 in that order.  The keys in :attr:`PluginAPI.settings` have the plugin's own
@@ -58,7 +71,7 @@ import sys
 import traceback
 from typing import Callable, Dict, List, Optional, Sequence
 
-from . import clients, log, pipeline
+from . import clients, log, pipeline, syntax
 
 #: Entry-point group installed packages advertise their plugins in.
 ENTRY_POINT_GROUP = 'dbcls.plugins'
@@ -161,6 +174,14 @@ class PluginSetup:
         connection form's picker and in ``.CONN``.
         """
         return clients.register_engine(name, fields, factory, **kwargs)
+
+    def add_syntax(self, name: str, factory, replace: bool = False) -> None:
+        """Add a syntax highlighter — see :func:`dbcls.syntax.register_syntax`.
+
+        Registered here, it is one ``--syntax`` and the config file's
+        ``"syntax"`` accept, as well as the `Set syntax…` command.
+        """
+        syntax.register_syntax(name, factory, replace=replace)
 
 
 # ─── Phase 2: the running editor ──────────────────────────────────────────────
@@ -321,6 +342,20 @@ class PluginAPI:
         config file naming it has already failed to open.
         """
         return clients.register_engine(name, fields, factory, **kwargs)
+
+    def add_syntax(self, name: str, factory, replace: bool = False) -> None:
+        """Add a syntax highlighter from the running editor — see
+        :func:`dbcls.syntax.register_syntax`.  It is offered by `Set syntax…`;
+        ``--syntax`` has been parsed by now, so a syntax meant to be named on
+        the command line belongs in ``setup()`` (:meth:`PluginSetup.add_syntax`).
+        """
+        syntax.register_syntax(name, factory, replace=replace)
+
+    def add_embedded_syntax(self, command: str, syntax_name: str, arg: int = 0) -> None:
+        """Highlight argument *arg* (0-based) of pipeline command *command*
+        as *syntax_name*, on the embedded-code background — the way ``.PY``'s
+        argument is Python.  See :func:`dbcls.syntax.register_embedded_syntax`."""
+        syntax.register_embedded_syntax(command, syntax_name, arg=arg)
 
     def add_help_page(self, title: str, text: str) -> None:
         """Add a page to the in-app help (F1 / Alt+H)."""
