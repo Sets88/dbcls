@@ -1,22 +1,26 @@
 """The tools the model may call to look at the database.
 
-All of them are read-only: they list databases and tables, describe a table and
-fetch a handful of sample rows.  The model is never given a way to run SQL of
-its own — what it produces is text the user reviews and applies.
+Most of them are read-only lookups: they list databases and tables, describe a
+table and fetch a handful of sample rows.  ``run_sql`` is the exception — it
+runs SQL the model wrote, so it is registered with ``executes`` and sits under
+a switch of its own (``confirm_exec``): by default the user sees the statement first and may
+edit it before it runs (see :meth:`dbcls.llm.chat.ChatWindow._approve_tool`).
+The query the model *proposes* is still only text the user reviews and applies.
 
 Everything here reuses what the editor already has: the autocomplete's cached
 structure lookups (300 s TTL, so repeated calls are free) and the client's own
 schema/sample-data statements, which already differ per engine.
 
-Two tools are not about the database.  ``get_pipeline_reference`` pulls the
+Some tools are not about the database.  ``get_pipeline_reference`` pulls the
 pipeline-language reference when the model needs one, so the reference is not
-carried in every request; ``get_vars_keys`` / ``get_var`` read the pipeline
+carried in every request, and ``get_visidata_macro_reference`` the guide to
+``.VDM`` macros, which only some pipelines need; ``get_vars_keys`` / ``get_var`` read the pipeline
 variable store, so the model can talk about what an earlier pipeline left
 behind (see :class:`VarsTools`).
 """
 from typing import Any, Dict, List, Optional
 
-from .reference import pipeline_reference
+from .reference import pipeline_reference, visidata_macro_reference
 
 #: Rows a single sample_data call may return.
 MAX_SAMPLE_ROWS = 20
@@ -26,6 +30,17 @@ MAX_VALUE_CHARS = 200
 #: Rows a single get_var call returns out of a list variable.  A variable often
 #: holds a whole result set, and the whole of one does not belong in a request.
 MAX_VAR_ROWS = 20
+#: Rows a single run_sql call hands back.  The statement itself is not
+#: rewritten — the server computes the whole result — so the model is told to
+#: limit it in the SQL.
+MAX_SQL_ROWS = 50
+
+#: Rows of a run_sql result saved with save_as that the model sees by
+#: default — the point of saving is that the rest stay out of the request.
+SAVED_PREVIEW_ROWS = 3
+
+#: The tool that runs the model's own SQL.
+RUN_SQL_TOOL = 'run_sql'
 
 
 #: Description of the `tab` argument every DB tool takes, so the model can
@@ -109,6 +124,36 @@ class DbTools:
             'rows': _shorten_rows(result.data or []),
         }
 
+    async def run_sql(self, sql: str, tab: Optional[str] = None,
+                      max_rows: Optional[int] = None,
+                      save_as: Optional[str] = None) -> Dict[str, Any]:
+        """Run *sql*; with *save_as*, keep the whole result in that pipeline
+        variable and hand the model only its shape and a few rows — a result
+        meant for the user's eyes (see show_var) has no business in the
+        request."""
+        client, _autocomplete, name = self._for(tab)
+        default = SAVED_PREVIEW_ROWS if save_as else MAX_SQL_ROWS
+        max_rows = max(1, min(int(max_rows or default), MAX_SQL_ROWS))
+        result = await client.execute(str(sql))
+        rows = result.data or []
+        answer: Dict[str, Any] = {
+            'tab': name,
+            'sql': sql,
+            'rowcount': result.rowcount,
+        }
+        if save_as:
+            key = str(save_as)
+            self.api.vars[key] = rows
+            answer['saved_as'] = key
+            answer['columns'] = list(rows[0]) if rows and isinstance(rows[0], dict) else []
+            answer['note'] = (f'All {len(rows)} rows are in the pipeline variable '
+                              f'{key!r}. show_var shows them to the user; '
+                              f'get_var reads them.')
+        answer['rows'] = _shorten_rows(rows[:max_rows])
+        if len(rows) > max_rows:
+            answer['truncated'] = f'first {max_rows} of {len(rows)} rows'
+        return answer
+
     # ── Registration ─────────────────────────────────────────────────────────
 
     def register(self, registry) -> None:
@@ -165,6 +210,47 @@ class DbTools:
                 'required': ['table'],
             },
             self.sample_data,
+        )
+        registry.add(
+            RUN_SQL_TOOL,
+            'Run one SQL statement on a tab and read its result — to check '
+            'something about the data that the other tools cannot tell you: a '
+            'count, the distinct values of a column, whether matching rows '
+            'exist, what a query you are about to propose returns. Plain SQL '
+            'only, not a pipeline expression. Keep it cheap: put a LIMIT on it '
+            'and filter on indexed columns, since the server computes the whole '
+            f'result even though at most {MAX_SQL_ROWS} rows come back. Prefer '
+            'get_table_schema and sample_data where they are enough. Never '
+            'change data or schema unless the user explicitly asked you to. '
+            'The user is usually asked first and may refuse the statement or '
+            'edit it before it runs; an edited one comes back with '
+            '"edited_by_user" and the statement that actually ran. To show '
+            'a result to the user rather than read it yourself, pass save_as: '
+            'the rows go into that pipeline variable, you get the row count, '
+            'the columns and a few rows, and show_var opens them for the user.',
+            {
+                'type': 'object',
+                'properties': {
+                    'sql': {'type': 'string', 'description': 'The SQL statement.'},
+                    'max_rows': {
+                        'type': 'integer',
+                        'description': f'Rows to return to you (1-{MAX_SQL_ROWS}); '
+                                       f'{MAX_SQL_ROWS} by default, '
+                                       f'{SAVED_PREVIEW_ROWS} with save_as.',
+                    },
+                    'save_as': {
+                        'type': 'string',
+                        'description': 'Pipeline variable to keep the whole '
+                                       'result in (replacing what it held). '
+                                       'Use it for a result the user should '
+                                       'see, then call show_var.',
+                    },
+                    'tab': TAB_ARG,
+                },
+                'required': ['sql'],
+            },
+            self.run_sql,
+            executes='sql',
         )
         register_reference_tool(registry)
 
@@ -270,6 +356,11 @@ async def get_pipeline_reference() -> str:
     return pipeline_reference()
 
 
+async def get_visidata_macro_reference() -> str:
+    """Tool handler: the guide to ``.VDM`` macros."""
+    return visidata_macro_reference()
+
+
 def register_reference_tool(registry) -> None:
     registry.add(
         'get_pipeline_reference',
@@ -280,6 +371,19 @@ def register_reference_tool(registry) -> None:
         get_pipeline_reference,
         # The whole point of this tool is a long document — do not cut it.
         max_result_chars=None,
+        # A fixed document, not the user's data: never worth asking about.
+        needs_approval=False,
+    )
+    registry.add(
+        'get_visidata_macro_reference',
+        'Read the guide to writing VisiData macros for the .VDM pipeline step — '
+        'the JSON-lines format, the commands that sort, group, select, hide or '
+        'add columns on the sheet the user lands on, and recipes. Call this '
+        'before putting a .VDM step in a pipeline.',
+        {'type': 'object', 'properties': {}},
+        get_visidata_macro_reference,
+        max_result_chars=None,
+        needs_approval=False,
     )
 
 

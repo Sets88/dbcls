@@ -1,4 +1,4 @@
-from visidata import TableSheet, IndexSheet
+from visidata import Sheet, TableSheet, IndexSheet
 from visidata import ENTER
 
 # Importing the submodules is what registers everything with visidata (via
@@ -12,10 +12,12 @@ from .vd_utils import SheetWithReference
 from .vd_utils import SselectSheet, SchooseSheet, ViewSheet, VarsSheet  # re-exported for dbcls.py
 from .vf_funcs import LiveFormatSheet
 from .vd_live import LiveRowsSheet  # re-exported for dbcls.py
+from .vd_memory import release_closed_sheets  # re-exported for dbcls.py
 from . import vd_aggregators  # noqa: F401 — makes `topk<N>` / any `p<N>` resolvable as aggregator names
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 from . import vd_idle  # noqa: F401 — installs the idle-polling get_curses_timeout wrapper (asks vd_live how long it may sleep)
 from . import vd_sidebar  # noqa: F401 — installs the "b to close" hint in every sidebar title
+from .vd_macro_sheet import MacroSheet  # VisiData's macros sheet (`gm`), which it does not re-export
 
 
 IndexSheet.guide += '''- `^` to make new sheet with reference column between two sheets'''
@@ -31,6 +33,7 @@ TableSheet.guide += '''
 - `gp` to draw a plotext chart from the columns you type at the prompt: `x[,bucket],y` or `x,y1,y2,…` (`Tab` completes column names).
 - `+` also takes `topk<N>` (the N most common values of the group, as a list) and any `p<N>` percentile, not just the ones the prompt lists.
 - `gT` / `gzT` to save the selected rows / column values to pipeline _vars.
+- `zm` to open a macro as a sheet for a pipeline's `.VDM` (stops a recording started with `m`; else the last macro); `Y` / `gY` / `Ctrl+S` there copy / save it as `jsonl`.
 - `Alt+Up` / `Alt+Down` to move the cursor 5 rows, `Alt+b` / `Alt+f` 3 columns.
 '''
 
@@ -78,6 +81,11 @@ LiveRowsSheet.addCommand('gf', 'watch-filter', 'sheet.set_filter()', 'show only 
 
 TableSheet.addCommand('gT', 'save-to-vars', 'save_rows_to_vars(sheet, selectedRows or [cursorRow])', 'Save selected rows (or current row) to _vars under a prompted name')
 TableSheet.addCommand('gzT', 'save-col-to-vars', 'save_col_values_to_vars(sheet, cursorCol, selectedRows or [cursorRow])', 'Save selected values of current column (or current cell) to _vars as a flat list')
+
+# `zm`: the macro on a sheet to edit and copy for .VDM (see vd_macro_sheet).
+# replay=False, or a `zm` that stops a recording would be recorded into it.
+Sheet.addCommand('zm', 'macro-open', 'vd.open_macro_sheet()', 'stop macro recording (if on) and open the macro as a sheet to edit and copy for .VDM', replay=False)
+MacroSheet.addCommand('zm', 'macro-open-row', 'vd.open_macro_sheet(cursorRow.rows)', 'open the macro under the cursor as a sheet to edit and copy for .VDM', replay=False)
 
 # Alt + arrow keys to move cursor faster
 TableSheet.addCommand('Alt+b', 'go-left-3', 'cursorRight(-3)')

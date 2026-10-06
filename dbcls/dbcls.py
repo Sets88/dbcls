@@ -23,7 +23,7 @@ import visidata
 from .clients.base import Result
 from .vd_modules import (
     DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet, VarsSheet,
-    LiveRowsSheet)
+    LiveRowsSheet, release_closed_sheets)
 from .clients import DEFAULT_ENGINE, engine_names
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -735,6 +735,8 @@ class DbEditorTab(Editor):
     # Sentinel insert value for the "+ Create new sheet" entry in the sheets popup.
     _NEW_SHEET = '+new'
 
+    has_sheet_viewer = True
+
     def __init__(
         self,
         shell: 'DbEditor',
@@ -942,12 +944,20 @@ class DbEditorTab(Editor):
     @contextmanager
     def _visidata_session(self):
         """Hand the terminal over to VisiData for the duration of the block and
-        restore curses state afterwards."""
+        restore curses state afterwards.
+
+        On the way out the sheets the user closed for good (deleted in `gS`)
+        are released — VisiData would otherwise keep them, and every row they
+        loaded, for the rest of the process (see vd_modules.vd_memory)."""
         self._fix_visidata_curses()
         try:
             yield
         finally:
             self._fix_curses_after_visidata()
+            try:
+                release_closed_sheets()
+            except Exception:
+                logger.exception('releasing closed VisiData sheets failed')
 
     def _show_in_visidata(self, make_sheet) -> None:
         """Open a sheet in VisiData, reporting a failure to the user.
@@ -984,11 +994,13 @@ class DbEditorTab(Editor):
         (q on the last picker sheet, gq/Ctrl+Q)."""
         with self._visidata_session():
             try:
+                self._queue_macro(getattr(sheet, 'vdm_macro', None))
                 visidata.vd.run(sheet)  # returned normally = full quit (gq/Ctrl+Q)
                 return None
             except visidata.ReturnValue as e:
                 return e.args[0] if e.args else None
             finally:
+                visidata.vd.replay_cancel()
                 # Drop every handover sheet from the stack: a stale one reached
                 # from a later VisiData session (result viewer, Ctrl+Q) would
                 # raise ReturnValue with no handler and crash the app.
@@ -1024,6 +1036,20 @@ class DbEditorTab(Editor):
             visidata.vd.run(sheet)
         except visidata.ReturnValue:
             raise StaleSheetError('This pipeline has already finished') from None
+        finally:
+            # a macro (.VDM) cut short must not replay into the next session
+            visidata.vd.replay_cancel()
+
+    @staticmethod
+    def _queue_macro(rows) -> None:
+        """Queue a pipeline .VDM macro (VisiData cmdlog rows) to replay as
+        soon as the next VisiData mainloop starts, on whatever sheet is active
+        then — the one the caller is about to show."""
+        if not rows:
+            return
+        log = visidata.CommandLogJsonl('vdm', source=None)
+        log.rows = [log.newRow(**r) for r in rows]
+        visidata.vd.replay(log)
 
     def _open_result_in_visidata(self, result) -> None:
         """Open pipeline .SHEET results and/or the query result in VisiData."""
@@ -1038,9 +1064,12 @@ class DbEditorTab(Editor):
             with self._visidata_session():
                 if has_result:
                     visidata.vd.push(visidata.PyobjSheet('result', source=result.data))
+                    # .SHEET sheets take no macro: .VDM goes to the result only
+                    self._queue_macro(result.macro)
                 self._vd_run(visidata.vd.sheets[0])
         elif has_result:
             with self._visidata_session():
+                self._queue_macro(result.macro)
                 # not visidata.vd.view(): that calls vd.run() unguarded, and a
                 # stale handover sheet left on the stack (see _vd_run) raises
                 # ReturnValue right through it and kills the app.

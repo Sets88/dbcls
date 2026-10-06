@@ -1296,7 +1296,11 @@ class InputBar(LineInputBar):
     popup's filter, so it narrows both the list and the walk to the entries
     containing every space-separated part of it; ↓ past the newest entry brings
     that typed text back.  Esc closes the list first and only cancels the
-    prompt once it is gone."""
+    prompt once it is gone.
+
+    A pre-filled default is drawn selected: until a key moves the cursor or
+    edits the line, the first typed character (or a paste) replaces it instead
+    of being appended — see :attr:`pristine`."""
 
     #: keys that walk the history instead of editing the line
     HISTORY_KEYS = (K(curses.KEY_UP), K(curses.KEY_DOWN),
@@ -1308,6 +1312,8 @@ class InputBar(LineInputBar):
         self.history_popup = SelectPopup()
         self._draft = ''      # the typed line — also the popup's filter
         self._picked = False  # the line currently holds an entry off the list
+        #: the line still holds the untouched default — typing replaces it
+        self.pristine = False
 
     def open(self, prompt: str = '', text: str = '', items=(), mask: bool = False):
         """*items* are merged into the prompt's history bucket as older
@@ -1322,13 +1328,16 @@ class InputBar(LineInputBar):
         self.history_popup.close()
         self._draft = text
         self._picked = False
+        self.pristine = bool(text)
 
     def close(self):
         super().close()
         self.history_popup.close()
         self._picked = False
+        self.pristine = False
 
     def _set_text(self, text: str) -> None:
+        self.pristine = False
         self.query = text
         self.cursor = len(text)
 
@@ -1402,10 +1411,22 @@ class InputBar(LineInputBar):
             self.history_popup.close()
             return 'submit'
         if key in self.HISTORY_KEYS:
+            self.pristine = False
             if self.mask:       # nothing to walk: masked lines are not recorded
                 return None
             self._history_nav(key)
             return None
+        if self.pristine:
+            # Try the key on an empty line: if it puts text there (a typed
+            # character, a paste) it replaces the default.  Anything else —
+            # movement, Backspace, Delete, Ctrl+U — acts on the default as usual.
+            self.pristine = False
+            saved = self.query, self.cursor
+            self.query, self.cursor = '', 0
+            if self._edit_key(key):
+                self._text_edited()
+                return None
+            self.query, self.cursor = saved
         if self._edit_key(key):
             self._text_edited()
         return None
@@ -1504,15 +1525,23 @@ class SelectPopup:
         # confirms all marked items (see checked_values()).
         self.multi = False
         self.checked: set = set()   # id(item) of every marked PopupItem
+        # Free-text mode: what is typed is also an answer of its own — it is
+        # offered as the last item (see _typed_item), so Enter on it hands the
+        # text back even when it matches none of the items.
+        self.free_text = False
+        self._typed_item: Optional[PopupItem] = None
         # label -> highlight positions for the current filter_text; the popup
         # is redrawn every frame, so avoid re-scanning labels each time
         self._match_cache: dict = {}
 
     def open(self, items: 'List[PopupItem]', filter_text: str = '',
              on_select=None, title: str = '', multi: bool = False,
-             default=None) -> None:
+             default=None, free_text: bool = False) -> None:
         """*default*: pre-selection applied once at open — in multi mode a list
-        of insert texts to pre-mark, otherwise the insert text to highlight."""
+        of insert texts to pre-mark, otherwise the insert text to highlight.
+
+        *free_text*: the user may answer with whatever they type, not only one
+        of *items* — :meth:`selected_is_typed` tells the two apart."""
         self.active = True
         self.items = list(items)
         self.filter_text = filter_text
@@ -1520,6 +1549,7 @@ class SelectPopup:
         self._title = title
         self.multi = multi
         self.checked = set()
+        self.free_text = free_text
         self._refilter()
         if default is not None:
             if multi:
@@ -1544,6 +1574,8 @@ class SelectPopup:
         self._on_select = None
         self.multi = False
         self.checked = set()
+        self.free_text = False
+        self._typed_item = None
         self._match_cache = {}
 
     def _refilter(self):
@@ -1558,8 +1590,33 @@ class SelectPopup:
             ]
         q = parts[0] if parts else ''
         self.filtered.sort(key=lambda item: (item.weight, 0 if item.label.upper().startswith(q) else 1))
+        typed = self.filter_text.strip()
+        self._typed_item = None
+        if self.free_text and typed:
+            # Last, so a typed prefix still lands on a matching item first; the
+            # one thing typed that matches nothing leaves this alone, selected.
+            self._typed_item = PopupItem(insert=typed, label=f'✎ Answer: {typed}')
+            self.filtered.append(self._typed_item)
         self.selected_idx = 0
         self.scroll_offset = 0
+
+    def selected_is_typed(self) -> bool:
+        """Free-text mode: whether the highlighted item is what was typed rather
+        than one of the items offered."""
+        return (self._typed_item is not None
+                and 0 <= self.selected_idx < len(self.filtered)
+                and self.filtered[self.selected_idx] is self._typed_item)
+
+    def typed_answer(self) -> Optional[str]:
+        """Free-text mode: what was typed, if it is the answer — highlighted,
+        or (multi mode) marked.  It is not one of self.items, so
+        checked_values() never carries it."""
+        item = self._typed_item
+        if item is None:
+            return None
+        if self.selected_is_typed() or (self.multi and id(item) in self.checked):
+            return item.insert
+        return None
 
     def _match_positions(self, label: str) -> set:
         cached = self._match_cache.get(label)
@@ -1651,7 +1708,11 @@ class SelectPopup:
         if key == K(27):  # Escape
             return 'cancel'
         elif key in (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r'))):
-            return 'insert' if self.filtered else 'cancel'
+            if self.filtered:
+                return 'insert'
+            # Free text with nothing typed yet: Enter is not an answer, and not
+            # a reason to throw the question away either.
+            return None if self.free_text else 'cancel'
         elif key == K(curses.KEY_UP):
             self._nav_up()
         elif key == K(curses.KEY_DOWN):
@@ -1754,7 +1815,8 @@ class SelectPopup:
             astr(py, px + 2, f' {self._title} '[:pw - 4], ba)
 
         # Filter line
-        filter_display = f' Filter: {self.filter_text}_'
+        prompt = ('Answer' if not self.items else 'Filter or answer') if self.free_text else 'Filter'
+        filter_display = f' {prompt}: {self.filter_text}_'
         filter_line = filter_display[:pw - 2].ljust(pw - 2)
         ach (py + 1, px,          ACS_VL, ba)
         astr(py + 1, px + 1,      filter_line, ina)
@@ -3716,7 +3778,13 @@ class Renderer:
         y = self._height - 2
         W = self._width
         bar = input_bar.display()[:W].ljust(W)
-        self._safe_addstr(y, 0, bar, curses.color_pair(self.colors.status_bar))
+        attr = curses.color_pair(self.colors.status_bar)
+        self._safe_addstr(y, 0, bar, attr)
+        if input_bar.pristine:      # the default is selected: typing replaces it
+            x = len(f' {input_bar.prompt}: ')
+            shown = input_bar.shown_query()[:max(0, W - x)]
+            if shown:
+                self._safe_addstr(y, x, shown, attr | curses.A_REVERSE)
 
     def _draw_filename_bar(self):
         y = self._height - 2
@@ -3845,6 +3913,10 @@ class Editor:
     that need the screen simply forward to that shell, so code holding a
     document (a plugin, a DB tab) never has to know which of the two owns what.
     """
+
+    #: Whether :meth:`run_sheet_prompt` actually shows anything — a plain
+    #: document has no viewer, a DB tab has VisiData.
+    has_sheet_viewer = False
 
     def __init__(self, shell: 'EditorShell', filepath: Optional[str] = None,
                  directory: Optional[str] = None, readonly: bool = False,
@@ -5575,7 +5647,8 @@ class EditorShell:
         prompts use — so a path offered here can be edited the way anything else
         is: word jumps, Home/End, Ctrl+U to clear it, Ctrl+V to paste, and ↑ for
         what was entered at this prompt before.  *default* pre-fills it, ready
-        to be taken with Enter; *items* are offered in its history."""
+        to be taken with Enter or replaced by typing over it; *items* are
+        offered in its history."""
         bar = self.input_bar
         bar.open(message, default, items)
         try:

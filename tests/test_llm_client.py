@@ -17,7 +17,9 @@ from dbcls.llm.client import (
     ToolRegistry,
     truncate_result,
 )
-from dbcls.llm.tools import MAX_VAR_ROWS, DbTools, VarsTools
+from dbcls.llm.tools import (
+    MAX_SQL_ROWS, MAX_VAR_ROWS, SAVED_PREVIEW_ROWS, DbTools, VarsTools,
+)
 
 
 class FakeResponse:
@@ -106,6 +108,117 @@ class TestConfig:
     def test_from_mapping_rejects_a_bad_number(self):
         with pytest.raises(LLMError, match='must be a number'):
             LLMConfig.from_mapping({'max_tokens': 'lots'})
+
+    @pytest.mark.parametrize('value, expected', [
+        (None, False), ('', False), (False, False), ('0', False), ('no', False),
+        (True, True), ('1', True), ('true', True), ('Yes', True), ('on', True),
+    ])
+    def test_no_confirm_tools_from_any_source(self, value, expected):
+        """argparse gives a bool, DBCLS_LLM_NO_CONFIRM_TOOLS a string."""
+        built = LLMConfig.from_mapping({'no_confirm_tools': value})
+        assert built.confirm_tools is not expected
+        assert built.confirm_exec is True
+
+    @pytest.mark.parametrize('value, expected', [
+        (None, False), ('0', False), (True, True), ('1', True), ('yes', True),
+    ])
+    def test_no_confirm_exec_from_any_source(self, value, expected):
+        built = LLMConfig.from_mapping({'no_confirm_exec': value})
+        assert built.confirm_exec is not expected
+        assert built.confirm_tools is True
+
+    def test_asking_is_on_by_default(self):
+        assert LLMConfig().confirm_tools is True
+        assert LLMConfig().confirm_exec is True
+        built = LLMConfig.from_mapping({})
+        assert (built.confirm_tools, built.confirm_exec) == (True, True)
+
+    def test_the_old_confirm_tools_key_turns_nothing_off(self):
+        assert LLMConfig.from_mapping({'confirm_tools': False}).confirm_tools is True
+
+
+class TestApproval:
+    """confirm_tools / confirm_exec: the client asks before a tool that needs
+    approval, by the switch for its kind."""
+
+    def _client(self, endpoint, confirm, answer=None, needs_approval=True,
+                executes=None, confirm_exec=True, arguments=None):
+        ran, asked = [], []
+
+        async def list_tables(**kwargs):
+            ran.append(kwargs or True)
+            return {'tables': ['users']}
+
+        async def approve(name, arguments):
+            asked.append((name, arguments))
+            return answer
+
+        tools = ToolRegistry()
+        tools.add('list_tables', 'lists tables', {'type': 'object'}, list_tables,
+                  needs_approval=needs_approval, executes=executes)
+        endpoint(tool_answer('list_tables', arguments or {}), text_answer('done'))
+        client = LLMClient(config(confirm_tools=confirm, confirm_exec=confirm_exec),
+                           tools, approve=approve)
+        appended = asyncio.run(client.run([]))
+        result = next(m for m in appended if m.get('role') == 'tool')
+        return ran, asked, result['content']
+
+    def test_off_nothing_is_asked(self, endpoint):
+        ran, asked, _ = self._client(endpoint, confirm=False, answer='Denied: no')
+        assert ran == [True] and asked == []
+
+    def test_on_an_allowed_call_runs(self, endpoint):
+        ran, asked, content = self._client(endpoint, confirm=True, answer=None)
+        assert asked == [('list_tables', {})]
+        assert ran == [True] and 'users' in content
+
+    def test_on_a_refusal_is_the_result_and_the_tool_never_runs(self, endpoint):
+        ran, _asked, content = self._client(endpoint, confirm=True,
+                                            answer='Denied: the user said no')
+        assert ran == []
+        assert content == 'Denied: the user said no'
+
+    def test_an_exempt_tool_is_never_asked_about(self, endpoint):
+        ran, asked, _ = self._client(endpoint, confirm=True, answer='Denied: no',
+                                     needs_approval=False)
+        assert ran == [True] and asked == []
+
+    def test_unknown_tools_count_as_needing_approval(self):
+        assert ToolRegistry().approval_kind('nope') == 'tools'
+
+    def test_turning_off_tool_questions_still_asks_about_exec(self, endpoint):
+        ran, asked, _ = self._client(endpoint, confirm=False, executes='sql',
+                                     answer='Denied: no')
+        assert ran == [] and asked == [('list_tables', {})]
+
+    def test_turning_off_exec_questions_leaves_the_other_tools_asked(self, endpoint):
+        ran, asked, _ = self._client(endpoint, confirm=True, confirm_exec=False,
+                                     answer='Denied: no')
+        assert ran == [] and asked == [('list_tables', {})]
+
+    def test_turning_off_exec_questions_runs_sql_unasked(self, endpoint):
+        ran, asked, _ = self._client(endpoint, confirm=True, confirm_exec=False,
+                                     executes='sql', answer='Denied: no')
+        assert ran == [True] and asked == []
+
+    def test_edited_arguments_are_what_runs_and_the_model_is_told(self, endpoint):
+        ran, _asked, content = self._client(
+            endpoint, confirm=True, executes='sql',
+            arguments={'sql': 'SELECT * FROM t'},
+            answer={'sql': 'SELECT * FROM t WHERE id = 1'})
+        assert ran == [{'sql': 'SELECT * FROM t WHERE id = 1'}]
+        result = json.loads(content)
+        assert result['edited_by_user'] is True
+        assert result['ran_with'] == {'sql': 'SELECT * FROM t WHERE id = 1'}
+        assert result['result'] == {'tables': ['users']}
+
+    def test_approval_kinds(self):
+        tools = ToolRegistry()
+        noop = AsyncMock()
+        tools.add('a', '', {}, noop)
+        tools.add('b', '', {}, noop, needs_approval=False)
+        tools.add('c', '', {}, noop, executes='sql')
+        assert [tools.approval_kind(n) for n in 'abc'] == ['tools', None, 'exec']
 
 
 class TestRequests:
@@ -456,6 +569,72 @@ class TestDbTools:
         asyncio.run(DbTools(fake_api(client)).sample_data('users', limit=10_000))
         client.get_limit_sql.assert_called_with(20)
 
+    def test_run_sql_runs_the_statement_as_written(self):
+        client = self._client()
+        ran = []
+
+        async def execute(sql):
+            ran.append(sql)
+            return MagicMock(data=[{'n': 3}], rowcount=1)
+
+        client.execute = execute
+        result = asyncio.run(DbTools(fake_api(client)).run_sql('SELECT count(*) AS n FROM t'))
+        assert ran == ['SELECT count(*) AS n FROM t']
+        assert result['rows'] == [{'n': 3}] and result['rowcount'] == 1
+        assert 'truncated' not in result
+
+    def test_run_sql_hands_back_only_the_first_rows(self):
+        client = self._client()
+
+        async def execute(sql):
+            return MagicMock(data=[{'id': i} for i in range(200)], rowcount=200)
+
+        client.execute = execute
+        tools = DbTools(fake_api(client))
+        result = asyncio.run(tools.run_sql('SELECT id FROM t', max_rows=10))
+        assert result['rows'] == [{'id': i} for i in range(10)]
+        assert result['truncated'] == 'first 10 of 200 rows'
+        result = asyncio.run(tools.run_sql('SELECT id FROM t', max_rows=10_000))
+        assert len(result['rows']) == MAX_SQL_ROWS
+
+    def test_save_as_keeps_the_whole_result_out_of_the_request(self):
+        client = self._client()
+        rows = [{'id': i, 'name': f'n{i}'} for i in range(500)]
+
+        async def execute(sql):
+            return MagicMock(data=rows, rowcount=500)
+
+        client.execute = execute
+        api = fake_api(client)
+        api.vars = {}
+        result = asyncio.run(DbTools(api).run_sql('SELECT * FROM t', save_as='big'))
+        assert api.vars['big'] == rows                      # all of it, as is
+        assert result['saved_as'] == 'big'
+        assert result['columns'] == ['id', 'name']
+        assert len(result['rows']) == SAVED_PREVIEW_ROWS     # only a glimpse
+        assert result['truncated'] == f'first {SAVED_PREVIEW_ROWS} of 500 rows'
+        assert 'show_var' in result['note']
+
+    def test_save_as_with_no_rows(self):
+        client = self._client()
+
+        async def execute(sql):
+            return MagicMock(data=[], rowcount=0)
+
+        client.execute = execute
+        api = fake_api(client)
+        api.vars = {}
+        result = asyncio.run(DbTools(api).run_sql('SELECT 1 WHERE 0', save_as='none'))
+        assert api.vars['none'] == [] and result['columns'] == []
+
+    def test_run_sql_is_under_the_exec_switch(self):
+        registry = ToolRegistry()
+        DbTools(fake_api(self._client())).register(registry)
+        assert registry.approval_kind('run_sql') == 'exec'
+        assert registry.approval_kind('sample_data') == 'tools'
+        assert registry.executes('run_sql') == 'sql'
+        assert registry.executes('sample_data') is None
+
     def test_long_values_are_shortened(self):
         client = self._client()
 
@@ -472,7 +651,7 @@ class TestDbTools:
         DbTools(fake_api(self._client())).register(registry)
         assert set(registry.names()) == {
             'list_databases', 'list_tables', 'get_table_schema', 'sample_data',
-            'get_pipeline_reference'}
+            'run_sql', 'get_pipeline_reference', 'get_visidata_macro_reference'}
         for schema in registry.schemas():
             function = schema['function']
             assert function['description']
@@ -496,9 +675,18 @@ class TestPipelineReferenceTool:
         assert len(content) > 10_000
         assert '.RFILTER' in content
 
+    def test_the_macro_guide_is_not_truncated(self, endpoint):
+        registry = self._registry()
+        endpoint(tool_answer('get_visidata_macro_reference', {}), text_answer('done'))
+        appended = asyncio.run(LLMClient(config(), registry).run([]))
+        content = [m for m in appended if m.get('role') == 'tool'][0]['content']
+        assert 'truncated' not in content
+        assert 'freq-col' in content and 'longname' in content
+
     def test_other_tools_keep_the_default_cap(self):
         registry = self._registry()
         assert registry.result_limit('get_pipeline_reference') is None
+        assert registry.result_limit('get_visidata_macro_reference') is None
         assert registry.result_limit('list_tables') == 8000
         assert registry.result_limit('unknown_tool') == 8000
 

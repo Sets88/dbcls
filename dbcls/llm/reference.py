@@ -14,13 +14,19 @@ from the registries as they stand when it is asked for.
 It is *not* sent with every request — the model asks for it through the
 ``get_pipeline_reference`` tool when it decides a pipeline is what the user
 needs, so an ordinary SQL question never pays for it.
+
+The guide to writing VisiData macros for ``.VDM`` is a second document behind
+a tool of its own (``get_visidata_macro_reference``): few pipelines need a
+macro, so the pipeline reference only points at it.
 """
 import os
-from typing import Optional
+from typing import Dict
 
 REFERENCE_FILENAME = 'pipeline_reference.md'
+MACRO_REFERENCE_FILENAME = 'visidata_macros.md'
 
-_cached: Optional[str] = None
+#: file name → its text, read once
+_cached: Dict[str, str] = {}
 
 #: Opens the plugin section.  It says twice over that these are local: a model
 #: told only "here are more commands" will happily use one in a query written
@@ -39,30 +45,36 @@ The description under each name is the plugin author's own text.
 """
 
 
-def reference_path() -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), REFERENCE_FILENAME)
+def reference_path(filename: str = REFERENCE_FILENAME) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
 def pipeline_reference() -> str:
     """The reference the model reads: the document, plus what plugins added."""
-    return _document() + _plugin_section()
+    return _document(REFERENCE_FILENAME, 'Answer with plain SQL instead of a pipeline.') \
+        + _plugin_section()
 
 
-def _document() -> str:
-    """The Markdown file, read once and kept.
+def visidata_macro_reference() -> str:
+    """The guide to writing ``.VDM`` macros."""
+    return _document(MACRO_REFERENCE_FILENAME, 'Leave .VDM out of the pipeline.')
+
+
+def _document(filename: str, fallback: str) -> str:
+    """A Markdown file beside this module, read once and kept.
 
     A missing file (a broken installation) is reported to the model as text
-    rather than raised: the chat stays usable for plain SQL.
+    rather than raised — with *fallback* telling it what to do instead — so
+    the chat stays usable.
     """
-    global _cached
-    if _cached is None:
+    if filename not in _cached:
         try:
-            with open(reference_path(), encoding='utf-8') as f:
-                _cached = f.read()
+            with open(reference_path(filename), encoding='utf-8') as f:
+                _cached[filename] = f.read()
         except OSError as exc:
-            _cached = (f'The pipeline reference is missing from this installation '
-                       f'({exc}). Answer with plain SQL instead of a pipeline.')
-    return _cached
+            _cached[filename] = (f'The reference {filename} is missing from this '
+                                 f'installation ({exc}). {fallback}')
+    return _cached[filename]
 
 
 def _plugin_section() -> str:

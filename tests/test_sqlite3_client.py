@@ -186,16 +186,16 @@ class TestSqlite3Editing:
 
     def test_get_insert_sql(self, client):
         sql = client.get_insert_sql("users", {"id": 3, "name": "O'Hara", "age": None})
-        assert sql == "INSERT INTO `users` (`id`, `name`, `age`) VALUES (3, 'O''Hara', NULL)"
+        assert sql == "INSERT INTO `users` (`id`, `name`, `age`) VALUES (3, 'O''Hara', NULL);"
 
     def test_get_update_sql(self, client):
         sql = client.get_update_sql(
             "multi_pk", {"val": "new 'quoted'"}, {"b": "key", "a": 1})
-        assert sql == "UPDATE `multi_pk` SET `val` = 'new ''quoted''' WHERE `b` = 'key' AND `a` = 1"
+        assert sql == "UPDATE `multi_pk` SET `val` = 'new ''quoted''' WHERE `b` = 'key' AND `a` = 1;"
 
     def test_get_delete_sql(self, client):
         sql = client.get_delete_sql("multi_pk", {"b": "k'ey", "a": 1})
-        assert sql == "DELETE FROM `multi_pk` WHERE `b` = 'k''ey' AND `a` = 1"
+        assert sql == "DELETE FROM `multi_pk` WHERE `b` = 'k''ey' AND `a` = 1;"
 
     @pytest.mark.asyncio
     async def test_insert_update_delete_roundtrip(self, client):

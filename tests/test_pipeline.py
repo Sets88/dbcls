@@ -1141,6 +1141,63 @@ class TestPipelineView:
         assert result.shown is True
 
 
+_MACRO = ('{"sheet": "", "col": "t", "row": "", "longname": "freq-col"}\n'
+          '\n'
+          '{"sheet": "", "col": "", "row": 0, "longname": "open-row"}')
+_MACRO_ROWS = [{'sheet': '', 'col': 't', 'row': '', 'longname': 'freq-col'},
+               {'sheet': '', 'col': '', 'row': 0, 'longname': 'open-row'}]
+
+
+@pytest.mark.asyncio
+class TestPipelineVdm:
+    async def test_the_macro_goes_with_the_final_result(self):
+        rows = [{'id': 1}]
+        exe = PipelineExecutor(_make_dbeditor(_make_client(rows)))
+        result = await exe.execute(f'.RUN "q" | .VDM """{_MACRO}"""')
+        assert result.data == rows
+        assert result.macro == _MACRO_ROWS
+
+    async def test_a_view_takes_the_macro_and_the_result_is_left_without(self):
+        rows = [{'id': 1}]
+        dbeditor = _make_dbeditor(_make_client(rows))
+        dbeditor.request_user_input = MagicMock(return_value=None)
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(f'.RUN "q" | .VDM """{_MACRO}""" | .VIEW "s" | .PY "data"')
+        dbeditor.request_user_input.assert_called_once_with(
+            {'kind': 'view', 'title': 's', 'rows': rows,
+             'extra': {'vdm_macro': _MACRO_ROWS}})
+        assert result.macro == []
+
+    async def test_sheet_does_not_take_the_macro(self):
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(f'.RUN "q" | .VDM """{_MACRO}""" | .SHEET "s"')
+        dbeditor.add_pipeline_sheet.assert_called_once_with('s', [{'id': 1}])
+        assert result.macro == _MACRO_ROWS
+
+    async def test_several_vdm_steps_add_up_and_a_new_run_starts_clean(self):
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}])))
+        result = await exe.execute(
+            '.RUN "q" | .VDM \'{"longname": "a"}\' | .VDM \'{"longname": "b"}\'')
+        assert [r['longname'] for r in result.macro] == ['a', 'b']
+        assert (await exe.execute('.RUN "q"')).macro == []
+
+    async def test_comment_lines_are_skipped_so_a_saved_vdj_goes_in_as_it_is(self):
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}])))
+        vdj = f'#!/usr/bin/env -S vd -p\n# 3.4\n{_MACRO}'
+        result = await exe.execute(f'.RUN "q" | .VDM """{vdj}"""')
+        assert result.macro == _MACRO_ROWS
+
+    async def test_bad_macros_raise(self):
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}])))
+        with pytest.raises(ValueError, match='.VDM requires'):
+            await exe.execute('.RUN "q" | .VDM')
+        with pytest.raises(ValueError, match='line 1 is not valid JSON'):
+            await exe.execute('.RUN "q" | .VDM "nope"')
+        with pytest.raises(ValueError, match='names no command'):
+            await exe.execute('.RUN "q" | .VDM \'{"sheet": ""}\'')
+
+
 @pytest.mark.asyncio
 class TestPipelineWatch:
     """.WATCH — the live counterpart of .VIEW.
@@ -1199,6 +1256,15 @@ class TestPipelineWatch:
         # the initial batch, then both steps again per refresh
         assert calls == ['one', 'two', 'one', 'two', 'one', 'two']
         assert produced == [[{'sql': 'two'}], [{'sql': 'two'}]]
+
+    async def test_a_vdm_in_the_watched_prefix_is_queued_once(self):
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        dbeditor.request_user_input = MagicMock(
+            side_effect=self._showing(refreshes=3, picked=[{'id': 1}]))
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(f'.RUN "q" | .VDM """{_MACRO}""" | .WATCH 1')
+        # three refreshes re-ran the .VDM, but its macro is still queued once
+        assert result.macro == _MACRO_ROWS
 
     async def test_defaults_to_one_second_and_the_name_watch(self):
         dbeditor = _make_dbeditor(_make_client([{'id': 1}]))

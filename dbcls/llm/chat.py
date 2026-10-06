@@ -13,9 +13,10 @@ import asyncio
 import curses
 import threading
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from ..editor import K, Lexer, PopupItem, SelectPopup, TextArea, key_alt, key_ctrl
+from ..syntax import Highlighter, Token
 from .client import LLMClient, LLMError
 from .prompt import build_context_message, build_system_prompt
 
@@ -55,6 +56,77 @@ ANSWER_TOOL = 'answer_question'
 #: result so the same turn carries on with it.
 ASK_TOOL = 'ask_user'
 
+#: What the model calls to put a pipeline variable in front of the user in
+#: VisiData — typically a result run_sql saved with save_as, so the rows reach
+#: the user without passing through the model's context.
+SHOW_TOOL = 'show_var'
+
+#: The choices of a permission prompt (see ChatWindow._approve_tool).
+ALLOW = 'Allow'
+ALLOW_FOR_CHAT = 'Allow for this chat'
+DENY = 'Deny'
+#: Offered instead of ALLOW_FOR_CHAT for a tool that runs code the model wrote
+#: (registered with ``executes`` — run_sql, a plugin's shell command): every
+#: statement is its own, and the user may want to fix one — narrow a query to
+#: an index, add a LIMIT — rather than refuse it outright.
+EDIT = 'Edit…'
+#: How much of the code the permission prompt's title shows; the whole of it
+#: is in the transcript.
+MAX_TITLE_CODE = 200
+
+#: What the model is told when it does not get what it called for.  Each one
+#: says what happened and what to do next: a model given only "denied" retries
+#: the same call, or gives up on the whole request.
+DENIED = ('Denied: the user refused permission to run {name}. Do not call it '
+          'again with the same arguments. Carry on without it — work from what '
+          'you already know, or ask the user with ask_user.')
+DISMISSED_APPROVAL = ('Denied: the user closed the permission prompt for {name} '
+                      'without allowing it. Treat it as a refusal: do not call it '
+                      'again with the same arguments, carry on without it.')
+DISMISSED_QUESTION = ('The user closed the question without answering. Do not ask '
+                      'it again. Carry on with your best assumption and say what '
+                      'you assumed, or answer with what you can.')
+#: For tool calls a cancelled run left without a result — the endpoint rejects
+#: a conversation where an assistant's tool call has no reply.
+CANCELLED = 'Cancelled: the user stopped the request before this call finished.'
+
+#: Who said an entry of the transcript → the token type it is drawn in, so the
+#: model's words and its tool calls stand apart from what the user typed.
+#: Token types, not colours: the editor owns the palette (ColorManager) and
+#: these are names it already has a colour for — cyan, orange, red.
+TRANSCRIPT_STYLES = {
+    'Assistant': 'comment',
+    'Assistant asks': 'comment',
+    'Tool': 'function',
+    'Error': 'keyword',
+}
+
+
+class TranscriptHighlighter(Highlighter):
+    """Colours the Chat pane by speaker rather than by syntax.
+
+    An entry may span several lines, and a blank line inside one looks the
+    same as the gap between two, so the text alone cannot say who wrote a
+    line.  The window hands over the answer with the text instead
+    (:meth:`set_line_types`), one token type per line — nothing is cached, a
+    line's type is a list lookup."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.line_types: List[str] = []
+
+    def set_line_types(self, line_types: List[str]) -> None:
+        self.line_types = line_types
+
+    def get_tokens(self, line_idx: int, lines: List[str]) -> List[Token]:
+        line = lines[line_idx] if line_idx < len(lines) else ''
+        kind = (self.line_types[line_idx]
+                if line_idx < len(self.line_types) else 'normal')
+        return [(0, len(line), kind)] if line and kind != 'normal' else []
+
+    def line_fill(self, line_idx: int, lines: List[str]) -> Optional[str]:
+        return None
+
 
 class ChatWindow:
     """A full-screen overlay driven by the editor loop (see
@@ -62,8 +134,10 @@ class ChatWindow:
 
     HINT = ' Alt+Enter send · ^T apply · ^N new chat · Tab pane · Esc close '
     #: Shown instead while the model is waiting on an ask_user answer.
-    HINT_ASK = ' The assistant is asking · ↑↓ pick · type to filter · Enter answer · Esc drop the request '
-    HINT_ASK_MULTI = ' The assistant is asking · ↑↓ move · Tab mark · Enter answer · Esc drop the request '
+    HINT_ASK = ' The assistant is asking · ↑↓ pick or type your own · Enter answer · Esc skip the question '
+    HINT_ASK_MULTI = ' The assistant is asking · ↑↓ move · Tab mark · type your own · Enter answer · Esc skip '
+    HINT_APPROVE = ' The assistant wants to run a tool · ↑↓ pick · Enter answer · Esc deny '
+    HINT_EDIT = ' Edit what the assistant will run · Alt+Enter run it · Esc deny '
 
     def __init__(self, api, config, tools=None):
         self.api = api
@@ -71,12 +145,16 @@ class ChatWindow:
         editor = self.editor
         self.config = config
         self.tools = tools
-        self.client = LLMClient(config, tools)
+        self.client = LLMClient(config, tools, approve=self._approve_tool)
+        #: Tools the user answered "Allow for this chat" for; forgotten with
+        #: the conversation (reset).
+        self._allowed_tools: set = set()
         self.active = False
         if tools is not None:
             self._register_result_tool(tools)
             self._register_answer_tool(tools)
             self._register_ask_tool(tools)
+            self._register_show_tool(tools)
 
         colors = editor.colors
         # A lexer of its own: the editor's caches tokens per line index, and the
@@ -87,7 +165,8 @@ class ChatWindow:
             self.result_lexer.set_words(keywords=db_client.all_commands,
                                         functions=db_client.all_functions)
 
-        self.history_area = TextArea(editor.stdscr, colors, None, gutter=0,
+        self.history_lexer = TranscriptHighlighter()
+        self.history_area = TextArea(editor.stdscr, colors, self.history_lexer, gutter=0,
                                      readonly=True, border=True, title='Chat')
         self.input_area = TextArea(editor.stdscr, colors, None, gutter=0,
                                    clipboard=editor.clipboard, border=True,
@@ -96,18 +175,31 @@ class ChatWindow:
                                     clipboard=editor.clipboard, border=True,
                                     title='Result')
         self.history_area.toggle_wrap()
+        #: Highlights the code being edited (EDIT) when it is SQL.
+        self.sql_lexer = Lexer()
+        if db_client is not None:
+            self.sql_lexer.set_words(keywords=db_client.all_commands,
+                                     functions=db_client.all_functions)
+        #: Where the user edits the code an ``executes`` tool is about to run.
+        #: Not one of the panes: built for each edit (see _open_code_edit),
+        #: drawn over the Result pane only while it is pending, and it takes
+        #: every key until it is done.
+        self.code_area: Optional[TextArea] = None
         self.panes = (self.input_area, self.result_area, self.history_area)
         self.focus = 0
 
         #: The conversation as the API sees it.
         self.messages: List[dict] = []
         #: The conversation as the user sees it, and the lock guarding it —
-        #: entries arrive from the worker thread running the request.
-        self._transcript: List[str] = []
+        #: entries arrive from the worker thread running the request.  Each is
+        #: (who, text as shown) — who decides the colour.
+        self._transcript: List[Tuple[str, str]] = []
         self._lock = threading.Lock()
         self._transcript_dirty = True
 
         self._task = None
+        # A cancelled run still unwinding (see _cancel_task).
+        self._unwinding = None
         self._started_at = 0.0
         self._status = ''
         self._error = ''
@@ -117,13 +209,18 @@ class ChatWindow:
         #: The explanation the model handed over through answer_question, for a
         #: turn that answered a question instead of proposing a query.
         self._answered: Optional[str] = None
-        #: The ask_user call waiting for an answer, or None.  Raised by the
-        #: worker thread, opened and resolved on the main one — under _lock.
+        #: The ask_user call or permission prompt waiting for an answer, or
+        #: None.  Raised by the worker thread, opened and resolved on the main
+        #: one — under _lock.
         self._question: Optional[dict] = None
         #: The list the question is answered in: the same widget the command
         #: palette and the pipeline's choose()/select() use, so marking,
         #: filtering and scrolling behave the way they do everywhere else.
         self.question_popup = SelectPopup()
+        #: 'ask' or 'approve' — what the open popup is for, for the hint bar.
+        self._question_kind = 'ask'
+        #: The pending 'edit_code' request while code_area is up, else None.
+        self._code_edit: Optional[dict] = None
         self.pane_rects: List[Tuple[int, int]] = []
 
     def _register_result_tool(self, tools) -> None:
@@ -155,6 +252,7 @@ class ChatWindow:
                 'required': ['query'],
             },
             propose_query,
+            needs_approval=False,
         )
 
     def _register_answer_tool(self, tools) -> None:
@@ -185,16 +283,15 @@ class ChatWindow:
                 'required': ['answer'],
             },
             answer_question,
+            needs_approval=False,
         )
 
     def _register_ask_tool(self, tools) -> None:
         """Let the model put a choice to the user instead of guessing at it —
         see ASK_TOOL."""
-        async def ask_user(question: str, options: Any, multi: bool = False) -> Any:
+        async def ask_user(question: str, options: Any = None, multi: bool = False) -> Any:
             labels = [str(option) for option in (options or []) if str(option).strip()]
-            if not labels:
-                return ('Error: ask_user needs at least one option. Offer the '
-                        'choices you want settled, or answer without asking.')
+            # No options is fine: the user can always type an answer of their own.
             return await self._ask_user(str(question), labels, bool(multi))
 
         tools.add(
@@ -204,8 +301,14 @@ class ChatWindow:
             'that changes the query — which of several tables is meant, which '
             'column identifies a row, whether to filter or aggregate. Offer '
             'concrete options; the answer comes back as this call\'s result and '
-            'you carry on with it. Do not use it for things you can look up '
-            'yourself, and do not ask more than you need to.',
+            'you carry on with it. The user can always type an answer of their '
+            'own instead of picking one, so for a value only they know — a '
+            'number, a date, a name — the options are suggestions and may be '
+            'left out. Do not use it '
+            'for things you can look up yourself, and do not ask more than you '
+            'need to. The result has "chosen" for a picked option, "typed" for '
+            'a typed answer, or "dismissed" when the user closed the question '
+            'without answering.',
             {
                 'type': 'object',
                 'properties': {
@@ -218,7 +321,8 @@ class ChatWindow:
                         'type': 'array',
                         'items': {'type': 'string'},
                         'description': 'The choices, short and self-explanatory. '
-                                       'At least one; two to six works best.',
+                                       'Two to six works best. May be empty '
+                                       'when the answer is a value to type.',
                     },
                     'multi': {
                         'type': 'boolean',
@@ -226,25 +330,178 @@ class ChatWindow:
                                        'options rather than exactly one.',
                     },
                 },
-                'required': ['question', 'options'],
+                'required': ['question'],
             },
             ask_user,
+            needs_approval=False,
         )
 
+    def _register_show_tool(self, tools) -> None:
+        """Let the model show the user a pipeline variable in VisiData — see
+        SHOW_TOOL."""
+        async def show_var(key: str, title: str = '') -> Any:
+            return await self._show_var(str(key), str(title or '') or str(key))
+
+        tools.add(
+            SHOW_TOOL,
+            'Show a pipeline variable to the user as a VisiData sheet, and wait '
+            'until they close it. Use it for a result the user wants to look '
+            'at — save it with run_sql\'s save_as first, so the rows go to '
+            'the user without passing through you. It returns only once the '
+            'user has closed the sheet; their reply comes as their next '
+            'message. Do not describe the rows you have not read.',
+            {
+                'type': 'object',
+                'properties': {
+                    'key': {
+                        'type': 'string',
+                        'description': 'Variable name, as save_as or '
+                                       'get_vars_keys gave it.',
+                    },
+                    'title': {
+                        'type': 'string',
+                        'description': 'Sheet title; the variable name by default.',
+                    },
+                },
+                'required': ['key'],
+            },
+            show_var,
+            # The user's own data, shown to the user: nothing to approve.
+            needs_approval=False,
+        )
+
+    async def _show_var(self, key: str, title: str) -> dict:
+        """Hand variable *key* to the main thread to show in VisiData, and
+        wait until the user has closed the sheet."""
+        store = self.api.vars or {}
+        if key not in store:
+            return {'key': key, 'error': f'No variable named {key!r} is set.',
+                    'known_keys': list(store)}
+        value = store[key]
+        request = await self._wait_for_user({
+            'kind': 'view', 'question': title, 'rows': value,
+            'options': [], 'multi': False, 'free_text': False,
+        })
+        if request.get('error'):
+            return {'key': key, 'error': f"Could not show it: {request['error']}"}
+        shown: dict = {'key': key, 'shown': True}
+        try:
+            shown['rows'] = len(value)
+        except TypeError:
+            pass
+        shown['note'] = ('The user has seen it in VisiData and closed the sheet. '
+                         'Do not repeat the rows; say briefly what was shown.')
+        return shown
+
+    def _open_view(self, request: dict) -> None:
+        """Show a show_var request in VisiData.  Blocking: VisiData owns the
+        terminal until the user closes the sheet, and only then is the call
+        waiting on it let go."""
+        self._add_transcript('Tool', f"Showing {request['question']} in VisiData")
+        try:
+            self.api.view_rows(request['question'], request['rows'])
+        except Exception as exc:    # a failed sheet must not take the chat down
+            request['error'] = f'{type(exc).__name__}: {exc}'
+        with self._lock:
+            if self._question is request:
+                self._question = None
+        request['loop'].call_soon_threadsafe(request['event'].set)
+        self.editor.request_redraw()
+
     async def _ask_user(self, question: str, options: List[str], multi: bool) -> Any:
-        """Put *question* on screen and wait for the user to answer it.
+        """Put *question* on screen and wait for the user to answer it — with
+        one of *options*, or with whatever they type instead."""
+        request = await self._wait_for_user({
+            'kind': 'ask', 'question': question, 'options': options,
+            'multi': multi, 'free_text': True,
+        })
+        if request['dismissed']:
+            return {'question': question, 'dismissed': True,
+                    'note': DISMISSED_QUESTION}
+        result = {'question': question}
+        if request['answer'] is not None or request['typed'] is None:
+            result['chosen'] = request['answer']
+        if request['typed'] is not None:
+            result['typed'] = request['typed']
+        return result
+
+    async def _approve_tool(self, name: str, arguments: dict) -> Union[None, str, dict]:
+        """Ask before *name* runs — the client calls this while confirm_tools
+        (or, for an ``executes`` tool, confirm_exec) is on.  None lets the call
+        go ahead; a string refuses it, and is what the model gets back in place
+        of the result; a dict runs it with those arguments instead."""
+        argument = self.tools.executes(name) if self.tools is not None else None
+        if argument:
+            return await self._approve_code(name, arguments, argument)
+        if name in self._allowed_tools:
+            return None
+        shown = ', '.join(f'{k}={v!r}' for k, v in arguments.items())
+        request = await self._wait_for_user({
+            'kind': 'approve', 'question': f'Allow {name}({shown})?',
+            'options': [ALLOW, ALLOW_FOR_CHAT, DENY], 'multi': False,
+            'free_text': False,
+        })
+        if request['dismissed']:
+            return DISMISSED_APPROVAL.format(name=name)
+        if request['answer'] == ALLOW_FOR_CHAT:
+            self._allowed_tools.add(name)
+            return None
+        if request['answer'] == ALLOW:
+            return None
+        return DENIED.format(name=name)
+
+    async def _approve_code(self, name: str, arguments: dict,
+                            argument: str) -> Union[None, str, dict]:
+        """The permission prompt for a tool that runs code the model wrote,
+        held in *argument*: run it, edit it first, or refuse.
+
+        There is no "for this chat" here — the next statement is a different
+        one; not being asked at all is what confirm_exec is for."""
+        code = str(arguments.get(argument, ''))
+        others = ', '.join(f'{k}={v!r}' for k, v in arguments.items() if k != argument)
+        called = f'{name}({others})' if others else name
+        title = ' '.join(code.split())
+        if len(title) > MAX_TITLE_CODE:
+            title = title[:MAX_TITLE_CODE] + '…'
+        request = await self._wait_for_user({
+            'kind': 'approve', 'question': f'Run {called}: {title}',
+            'transcript': f'Run {called}?\n{code}',
+            'options': [ALLOW, EDIT, DENY], 'multi': False,
+            'free_text': False,
+        })
+        if request['dismissed']:
+            return DISMISSED_APPROVAL.format(name=name)
+        if request['answer'] == ALLOW:
+            return None
+        if request['answer'] != EDIT:
+            return DENIED.format(name=name)
+        edit = await self._wait_for_user({
+            'kind': 'edit_code', 'question': f'Edit {argument}', 'code': code,
+            'tool': name, 'argument': argument,
+            'options': [], 'multi': False, 'free_text': False,
+        })
+        if edit['dismissed']:
+            return DENIED.format(name=name)
+        edited = (edit['typed'] or '').strip()
+        if edited == code.strip():
+            return None             # opened the editor, changed nothing
+        return dict(arguments, **{argument: edited})
+
+    async def _wait_for_user(self, request: dict) -> dict:
+        """Raise *request* for the main thread to put on screen, and wait until
+        it is answered; returns it with the answer filled in.
 
         This runs on the editor's async loop while the popup is opened and
         answered on the main thread, so the answer is handed back through the
-        loop.  It awaits rather than blocks on purpose: Esc cancels the request,
-        and a cancelled task must be able to take this call down with it.
+        loop.  It awaits rather than blocks on purpose: Esc in the window
+        cancels the request, and a cancelled task must be able to take this
+        call down with it.
         """
         answered = asyncio.Event()
-        request = {
-            'question': question, 'options': options, 'multi': multi,
+        request.update({
             'loop': asyncio.get_running_loop(), 'event': answered,
-            'answer': None, 'opened': False,
-        }
+            'answer': None, 'typed': None, 'dismissed': False, 'opened': False,
+        })
         with self._lock:
             self._question = request
         self.editor.request_redraw()
@@ -256,7 +513,7 @@ class ChatWindow:
             with self._lock:
                 if self._question is request:
                     self._question = None
-        return {'question': question, 'chosen': request['answer']}
+        return request
 
     # ── Opening and closing ──────────────────────────────────────────────────
 
@@ -268,13 +525,15 @@ class ChatWindow:
 
     def open(self, query: str = '', selection: bool = False) -> None:
         """Show the window.  *query* is what the editor has under the cursor —
-        it seeds the result pane and is given to the model as context."""
+        it seeds the result pane and is given to the model as context.
+
+        The input pane is left as it was: a half-typed question survives
+        stepping out to the editor and back."""
         if self.active:
             return
         self.active = True
         self.focus = 0
         self._error = ''
-        self.input_area.set_text('')
         self.result_area.set_text(query or '')
         self._start_conversation(query, selection)
         self.editor.push_overlay(self)
@@ -321,6 +580,7 @@ class ChatWindow:
         self._proposed = None
         self._answered = None
         self._error = ''
+        self._allowed_tools = set()
         with self._lock:
             self._transcript = []
             self._transcript_dirty = True
@@ -334,22 +594,29 @@ class ChatWindow:
         """Append to the visible transcript.  Called from the worker thread as
         well as the main one, hence the lock."""
         with self._lock:
-            self._transcript.append(f'{who}: {text}'.rstrip())
+            self._transcript.append((who, f'{who}: {text}'.rstrip()))
             self._transcript_dirty = True
 
     def _refresh_history(self) -> None:
         with self._lock:
             if not self._transcript_dirty:
                 return
-            text = '\n\n'.join(self._transcript)
+            entries = list(self._transcript)
             self._transcript_dirty = False
-        self.history_area.set_text(text)
+        line_types: List[str] = []
+        for index, (who, shown) in enumerate(entries):
+            if index:
+                line_types.append('normal')     # the blank line between entries
+            line_types.extend([TRANSCRIPT_STYLES.get(who, 'normal')]
+                              * (shown.count('\n') + 1))
+        self.history_lexer.set_line_types(line_types)
+        self.history_area.set_text('\n\n'.join(shown for _, shown in entries))
         # Show the newest exchange rather than the top of the conversation.
         self.history_area.file_end()
 
     def send(self) -> None:
         """Send what is typed in the input pane."""
-        if self._task is not None:
+        if self._busy():
             return
         question = self.input_area.text.strip()
         if not question:
@@ -372,11 +639,21 @@ class ChatWindow:
         self._task = self.editor.asyncloop_thread.submit(self._run())
 
     async def _run(self) -> List[dict]:
-        # satisfied_by: a turn that answered a question is complete without a
-        # proposal, so the client must not go and demand one.
-        return await self.client.run(self.messages, on_event=self._on_event,
-                                     require_tool=RESULT_TOOL,
-                                     satisfied_by=(ANSWER_TOOL,))
+        # The list itself, not the attribute: reset() may put a fresh one in
+        # self.messages while this run is still unwinding a cancel.
+        messages = self.messages
+        try:
+            # satisfied_by: a turn that answered a question is complete without
+            # a proposal, so the client must not go and demand one.
+            return await self.client.run(messages, on_event=self._on_event,
+                                         require_tool=RESULT_TOOL,
+                                         satisfied_by=(ANSWER_TOOL,))
+        except asyncio.CancelledError:
+            # Here, on the loop thread, rather than in _cancel_task: the run is
+            # the only one appending to the list, and once the cancel has landed
+            # it appends nothing more — so nothing can slip in after the scan.
+            self._close_dangling_tool_calls(messages)
+            raise
 
     def _on_event(self, kind: str, details: dict) -> None:
         """Progress from the worker thread: show what the model is doing."""
@@ -448,10 +725,42 @@ class ChatWindow:
             # Submitted but not started yet — nothing to cancel; the result is
             # dropped either way because we stop tracking the task here.
             pass
-        self._task = None
+        # Kept until the run has unwound: it closes its dangling tool calls on
+        # the way out, and a new question must not be appended before them.
+        self._unwinding, self._task = self._task, None
         self._status = ''
         self._discard_question()
         self._add_transcript('Error', 'Cancelled')
+
+    def _busy(self) -> bool:
+        """A request is out, or a cancelled one has not finished unwinding."""
+        if self._unwinding is not None and self._unwinding.is_done():
+            self._unwinding = None
+        return self._task is not None or self._unwinding is not None
+
+    @staticmethod
+    def _close_dangling_tool_calls(messages: List[dict]) -> None:
+        """Answer every tool call a cancelled run left without a result.
+
+        The run extends *messages* as it goes, so a cancel in the middle of a
+        call — waiting on a question, say — leaves the assistant's tool call
+        with no reply.  The endpoint refuses such a conversation outright, and
+        the model would not know the user stopped it; say so in its place."""
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.get('role') != 'assistant':
+                continue
+            answered = {m.get('tool_call_id') for m in messages[index + 1:]
+                        if m.get('role') == 'tool'}
+            for call in message.get('tool_calls') or []:
+                if call.get('id', '') not in answered:
+                    messages.append({
+                        'role': 'tool',
+                        'tool_call_id': call.get('id', ''),
+                        'name': (call.get('function') or {}).get('name', ''),
+                        'content': CANCELLED,
+                    })
+            return
 
     # ── The model's question (ask_user) ──────────────────────────────────────
 
@@ -462,48 +771,116 @@ class ChatWindow:
             if request is None or request['opened']:
                 return
             request['opened'] = True
+        if request['kind'] == 'edit_code':
+            self._open_code_edit(request)
+            return
+        if request['kind'] == 'view':
+            self._open_view(request)
+            return
         items = [PopupItem(insert=option, label=option) for option in request['options']]
         self.question_popup.open(items, title=request['question'],
-                                 multi=request['multi'])
-        self._add_transcript('Assistant asks', request['question'])
-        self._status = 'waiting for your answer'
+                                 multi=request['multi'],
+                                 free_text=request['free_text'])
+        self._question_kind = request['kind']
+        self._add_transcript('Assistant asks', request.get('transcript', request['question']))
+        self._status = ('waiting for your permission' if request['kind'] == 'approve'
+                        else 'waiting for your answer')
         self.editor.request_redraw()
 
-    def _answer_question(self, answer) -> None:
-        """Hand the user's choice back to the tool call waiting on it."""
+    def _answer_question(self, answer=None, typed: Optional[str] = None,
+                         dismissed: bool = False) -> None:
+        """Hand the user's answer back to the call waiting on it: the option(s)
+        picked, the text *typed*, or — *dismissed* — that they closed it."""
         with self._lock:
             request, self._question = self._question, None
         self.question_popup.close()
         if request is None:
             return
         request['answer'] = answer
-        shown = ', '.join(answer) if isinstance(answer, list) else str(answer)
-        self._add_transcript('You', shown or '(nothing marked)')
+        request['typed'] = typed
+        request['dismissed'] = dismissed
+        if dismissed:
+            shown = '(closed without answering)'
+        else:
+            parts = list(answer) if isinstance(answer, list) else (
+                [str(answer)] if answer is not None else [])
+            if typed is not None:
+                parts.append(typed)
+            shown = ', '.join(parts) or '(nothing marked)'
+        self._add_transcript('You', shown)
         self._status = 'thinking'
         # The waiting coroutine lives on the async loop's thread, not this one.
         request['loop'].call_soon_threadsafe(request['event'].set)
         self.editor.request_redraw()
+
+    def _open_code_edit(self, request: dict) -> None:
+        """Put the code a tool is about to run in code_area for the user to
+        change.  A fresh area each time: SQL is highlighted as SQL, anything
+        else — a shell command line — as plain text."""
+        editor = self.editor
+        lexer = self.sql_lexer if request.get('argument') == 'sql' else None
+        self.code_area = TextArea(
+            editor.stdscr, editor.colors, lexer, gutter=0,
+            clipboard=editor.clipboard, border=True,
+            title=f"{request.get('tool', '')}: {request.get('argument', '')} "
+                  f'to run — Alt+Enter runs it · Esc denies')
+        self.code_area.set_text(request['code'])
+        self._code_edit = request
+        self._status = 'waiting for your edit'
+        self.editor.request_redraw()
+
+    def _finish_code_edit(self, dismissed: bool = False) -> None:
+        """Hand the edited code — or, *dismissed*, the refusal — back to the
+        tool call waiting on it."""
+        with self._lock:
+            request, self._question = self._question, None
+        self._code_edit = None
+        if request is None:
+            return
+        text = self.code_area.text.strip()
+        request['typed'] = None if dismissed else text
+        request['dismissed'] = dismissed
+        argument = request.get('argument', 'code')
+        self._add_transcript('You', f'(refused to run the {argument})' if dismissed
+                             else f'Edited the {argument}:\n{text}')
+        self._status = 'thinking'
+        request['loop'].call_soon_threadsafe(request['event'].set)
+        self.editor.request_redraw()
+
+    def _handle_code_edit_key(self, key) -> None:
+        if key == KEY_ESC:
+            self._finish_code_edit(dismissed=True)
+        elif key in KEY_SEND:
+            if self.code_area.text.strip():
+                self._finish_code_edit()
+        else:
+            self.code_area.handle_key(key, self.editor.last_key_was_text)
 
     def _discard_question(self) -> None:
         """Drop a pending question because nothing is waiting for it any more —
         the request it belongs to was cancelled or has finished."""
         with self._lock:
             self._question = None
+        self._code_edit = None
         if self.question_popup.active:
             self.question_popup.close()
 
     def _handle_question_key(self, key) -> None:
-        action = self.question_popup.handle_key(key)
+        popup = self.question_popup
+        action = popup.handle_key(key)
         if action == 'insert':
-            self._answer_question(self.question_popup.checked_values()
-                                  if self.question_popup.multi
-                                  else self.question_popup.selected_word())
+            typed = popup.typed_answer()
+            if popup.multi:
+                self._answer_question(popup.checked_values(), typed=typed)
+            elif typed is not None:
+                self._answer_question(typed=typed)
+            else:
+                self._answer_question(popup.selected_word())
         elif action == 'cancel':
-            # Esc means here what it means everywhere else in this window while
-            # a request is running: drop it.  The conversation is kept, so the
-            # user can answer in their own words instead.
-            self._cancel_task()
-            self.editor.request_redraw()
+            # Not a cancel of the run: the model is told the question went
+            # unanswered (or the tool was refused) and carries on.  Esc again,
+            # with the popup gone, stops the request itself.
+            self._answer_question(dismissed=True)
 
     # ── Applying ─────────────────────────────────────────────────────────────
 
@@ -526,7 +903,10 @@ class ChatWindow:
 
     def handle_key(self, key) -> None:
         # A question from the model takes every key until it is answered: it is
-        # the one thing the run is blocked on.
+        # the one thing the run is blocked on.  So does the code being edited.
+        if self._code_edit is not None:
+            self._handle_code_edit_key(key)
+            return
         if self.question_popup.active:
             self._handle_question_key(key)
             return
@@ -555,6 +935,10 @@ class ChatWindow:
 
     def handle_click(self, mx: int, my: int) -> None:
         """A click focuses the pane it landed in and puts the cursor there."""
+        if self._code_edit is not None:
+            if self.code_area.view.click_to_cursor(mx, my):
+                self.editor.request_redraw()
+            return
         if self.question_popup.active:
             return
         for index, pane in enumerate(self.panes):
@@ -612,7 +996,17 @@ class ChatWindow:
             pane.focused = index == self.focus
         self.history_area.draw()
         self.input_area.draw()
-        self.result_area.draw()
+        if self._code_edit is None:
+            self.result_area.draw()
+        else:
+            # In the Result pane's place: that is where a query is expected.
+            # Instead of it, not over it — a view paints only the cells its
+            # text covers, so the query underneath would show through past
+            # the end of every line and below the last one.
+            top, rows = self.pane_rects[2]
+            self.code_area.set_rect(top, 0, rows, width)
+            self.code_area.focused = True
+            self.code_area.draw()
         self._draw_hint(stdscr, height, width)
         # Last, so the question sits over the panes; its box ends two rows
         # above the bottom, leaving the hint bar visible under it.
@@ -630,9 +1024,17 @@ class ChatWindow:
 
     def _draw_hint(self, stdscr, height: int, width: int) -> None:
         colors = self.editor.colors
-        if self.question_popup.active:
-            text = (self.HINT_ASK_MULTI if self.question_popup.multi
-                    else self.HINT_ASK)
+        if self._code_edit is not None:
+            text = self.HINT_EDIT
+            pair = colors.status_warn
+        elif self.question_popup.active:
+            popup = self.question_popup
+            if self._question_kind == 'approve':
+                text = self.HINT_APPROVE
+            elif popup.multi:
+                text = self.HINT_ASK_MULTI
+            else:
+                text = self.HINT_ASK
             # Red: the run is stopped until the user answers, and the bar is the
             # only thing on screen that says so — the same colour an error uses.
             pair = colors.status_warn
@@ -651,6 +1053,8 @@ class ChatWindow:
         """Where the terminal cursor belongs: in the focused editable pane.
         The read-only history pane shows none, and neither does a question —
         the list marks the choice itself."""
+        if self._code_edit is not None:
+            return self.code_area.cursor_screen_pos()
         if self.question_popup.active:
             return None
         pane = self.panes[self.focus]

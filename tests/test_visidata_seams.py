@@ -48,11 +48,12 @@ class TestTheModulesLoad:
         commands and the three wrappers all go on here."""
         run_with_real_visidata('''
             import dbcls.vd_modules  # noqa: F401
-            from visidata import VisiData, vd
+            from visidata import BaseSheet, VisiData, vd
 
             assert getattr(VisiData, '_dbcls_lock_wrapped', False), 'lock wrapper missing'
             assert getattr(VisiData, '_dbcls_idle_wrapped', False), 'idle wrapper missing'
             assert getattr(VisiData, '_dbcls_sidebar_wrapped', False), 'sidebar wrapper missing'
+            assert getattr(BaseSheet, '_dbcls_release_wrapped', False), 'Q wrapper missing'
         ''')
 
     def test_importing_it_twice_does_not_stack_the_wrappers(self):
@@ -194,7 +195,7 @@ items.column('x').setValue(items.rows[1], 20)
 
 assert source == {'a': 1, 'b': {'c': 2}, 'l': [{'x': 1}, {'x': 2}], 't': ['p']}, source
 assert sqls(sheet) == [
-    """UPDATE `t` SET `j` = '{"aa": 5, "b": {"c": "x"}, "l": [{"x": 1}, {"x": 20}]}' WHERE `id` = 1"""
+    """UPDATE `t` SET `j` = '{"aa": 5, "b": {"c": "x"}, "l": [{"x": 1}, {"x": 20}]}' WHERE `id` = 1;"""
 ], sqls(sheet)
 ''')
 
@@ -214,7 +215,7 @@ dicts = opened(top.openRow('l'))
 dicts.addRows([dicts.newRow()])
 vd.sync()
 assert sqls(sheet) == [
-    """UPDATE `t` SET `j` = '{"a": 1, "new": null, "b": 2, "t": ["p", null], "l": [{"x": 1}, {}]}' WHERE `id` = 1"""
+    """UPDATE `t` SET `j` = '{"a": 1, "new": null, "b": 2, "t": ["p", null], "l": [{"x": 1}, {}]}' WHERE `id` = 1;"""
 ], sqls(sheet)
 ''')
 
@@ -246,7 +247,7 @@ c.setValue(row, 7)
 assert c.getValue(row) == 7
 assert row.j == '{"a": 1, "b": {"c": 2}}'
 assert sqls(sheet) == [
-    """UPDATE `t` SET `j` = '{"a": 1, "b": {"c": 7}}' WHERE `id` = 1"""
+    """UPDATE `t` SET `j` = '{"a": 1, "b": {"c": 7}}' WHERE `id` = 1;"""
 ], sqls(sheet)
 ''')
 
@@ -288,7 +289,7 @@ assert top.source['b'] is inner.source and tags.rows is tags.source and dicts.ro
 
 tags.columns[0].setValues([tags.rows[1]], 'z')
 assert sqls(sheet) == [
-    """UPDATE `t` SET `j` = '{"a": 1, "b": {"c": 2}, "t": ["p", "z"], "l": [{"x": 1}, {"x": 2}]}' WHERE `id` = 1"""
+    """UPDATE `t` SET `j` = '{"a": 1, "b": {"c": 2}, "t": ["p", "z"], "l": [{"x": 1}, {"x": 2}]}' WHERE `id` = 1;"""
 ], sqls(sheet)
 ''')
 
@@ -332,7 +333,7 @@ q.setValue(row, 'bye')
 port.setValue(row, 9090)
 assert row.j == url
 assert sqls(sheet) == [
-    "UPDATE `t` SET `j` = 'https://user:pw@EXAMPLE.com:9090/a?q=bye&x=%7E1#top' WHERE `id` = 1"
+    "UPDATE `t` SET `j` = 'https://user:pw@EXAMPLE.com:9090/a?q=bye&x=%7E1#top' WHERE `id` = 1;"
 ], sqls(sheet)
 ''')
 
@@ -354,7 +355,7 @@ query = opened(top.openRow('query'))
 query.column('key').setValue('q', 'query')             # renamed in place
 query.deleteBy(lambda key: key == 'flag')
 assert sqls(sheet) == [
-    "UPDATE `t` SET `j` = 'https://example.com/b?query=1&x=2' WHERE `id` = 1"
+    "UPDATE `t` SET `j` = 'https://example.com/b?query=1&x=2' WHERE `id` = 1;"
 ], sqls(sheet)
 ''')
 
@@ -604,7 +605,8 @@ class TestTheAggregators:
             from visidata import vd
 
             keys = [c.key for c in vd.aggregator_choices]
-            for name in ('topk3', 'topk5', 'topk10', 'p50', 'p90', 'p95', 'p99', 'sum'):
+            for name in ('topk3', 'topk5', 'topk10', 'p20', 'p50', 'p75', 'p90', 'p95', 'p99',
+                         'sum'):
                 assert name in keys, (name, keys)
             assert 'p33' not in keys, keys
         ''')
@@ -633,4 +635,368 @@ class TestTheAggregators:
             for name in ('name', 'type', 'funcValues', 'helpstr'):
                 assert name in params, (name, params)
             assert 'funcValues' in inspect.getsource(Aggregator.aggregate)
+        ''')
+
+
+class TestPipelineMacro:
+    """.VDM hands VisiData's own replay queue the macro rows; the mainloop
+    plays them on whatever sheet is active once it starts."""
+
+    def test_a_recorded_macro_replays_on_the_active_sheet(self):
+        run_with_real_visidata('''
+            import visidata
+            from visidata import vd
+            from dbcls.dbcls import DbEditorTab
+            from dbcls.pipeline.executor import parse_vd_macro
+
+            macro = parse_vd_macro(
+                '{"sheet": "", "col": "t", "row": "", "longname": "freq-col", '
+                '"input": "", "keystrokes": "Shift+F", "comment": "", "replayable": true}\\n'
+                '{"sheet": "", "col": "", "row": 0, "longname": "open-row", '
+                '"input": "", "keystrokes": "Enter", "comment": "", "replayable": true}\\n')
+            rows = [{'id': i, 't': t} for i, t in enumerate('aabcca')]
+            vs = visidata.PyobjSheet('result', source=rows)
+            vd.push(vs)
+            DbEditorTab._queue_macro(macro)
+            assert len(vd._nextCommands) == 2
+            while vd._nextCommands:
+                vd._playNextQueuedCommand(vd.activeSheet)
+                vd.sync()
+            # freq sheet sorted by count: 'a' (3 rows) first, then its rows opened
+            assert vd.activeSheet.name == 'result_a', [s.name for s in vd.sheets]
+            assert len(vd.activeSheet.rows) == 3
+            vd.replay_cancel()
+            assert not vd._nextCommands and vd.currentReplay is None
+        ''')
+
+    def test_zm_stops_a_recording_and_opens_it_as_a_sheet_vdm_reads(self):
+        """`zm` hands the recorded commands to an editable sheet whose stock
+        Y / gY / Ctrl+S default to jsonl — the only stock format .VDM reads."""
+        run_with_real_visidata('''
+            import io
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, CommandLogJsonl, ExpectedException, Path, Sheet, TableSheet
+            from dbcls.vd_modules.vd_macro_sheet import VdmMacroSheet
+            from dbcls.pipeline.executor import parse_vd_macro
+
+            zm = TableSheet('t').getCommand('zm')
+            assert zm.longname == 'macro-open' and not zm.replayable, zm
+
+            vd.lastMacroRows = []
+            try:
+                vd.open_macro_sheet()
+                raise AssertionError('nothing recorded, yet a sheet opened')
+            except ExpectedException:     # vd.fail: the message goes to the status line
+                pass
+
+            rec = CommandLogJsonl('current_macro', rows=[])
+            rec.addRow(rec.newRow(sheet='', col='t', row='', longname='freq-col',
+                                  input='', keystrokes='Shift+F', comment='', undofuncs=[print]))
+            rec.addRow(rec.newRow(sheet='', col='', row=0, longname='open-row',
+                                  input='', keystrokes='Enter', comment=''))
+            vd.macroMode = rec
+            sheet = vd.open_macro_sheet()
+            assert vd.macroMode is None
+            assert isinstance(sheet, VdmMacroSheet) and vd.activeSheet is sheet
+            assert sheet.options.save_filetype == 'jsonl'
+            assert Sheet('other').options.save_filetype != 'jsonl'
+            assert sheet.getDefaultSaveName() == 'macro.jsonl'
+
+            sheet.rows[0].col = 'kind'          # an edit on the sheet ...
+            assert rec.rows[0].col == 't'       # ... leaves the recording alone
+
+            buf = io.StringIO()
+            vd.sync(vd.saveSheets(Path('x.jsonl', fptext=buf), sheet, confirm_overwrite=False))
+            assert 'undo' not in buf.getvalue(), buf.getvalue()
+            macro = parse_vd_macro(buf.getvalue())
+            assert [(r['longname'], r['col']) for r in macro] == [('freq-col', 'kind'), ('open-row', '')]
+
+            again = vd.open_macro_sheet()       # not recording: the last macro again
+            assert [r.longname for r in again.rows] == ['freq-col', 'open-row']
+        ''')
+
+    def test_every_command_the_llm_guide_names_exists(self):
+        """The model writes macros from dbcls/llm/visidata_macros.md; a longname
+        VisiData renamed would abort the replay at run time."""
+        run_with_real_visidata('''
+            import re
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.llm.reference import visidata_macro_reference
+
+            text = visidata_macro_reference()
+            text = text[text.index('## Commands'):]
+            named = set()
+            for row in re.findall(r"^\\| (`[a-z].*?) \\|", text, re.M):
+                named.update(re.findall(r"`([a-z][a-z0-9-]+)`", row))
+            named.update(re.findall(r\'"longname": "([a-z0-9-]+)"\', text))
+            known = set(vd.commands)
+            missing = sorted(named - known)
+            assert len(named) > 40, sorted(named)
+            assert not missing, missing
+        ''')
+
+
+class TestClosedSheetsAreReleased:
+    """VisiData keeps a sheet deleted in `gS` alive from its threads, option
+    caches and undo log; release_closed_sheets lets it go and nothing else."""
+
+    PRELUDE = '''
+        import gc, weakref
+        import visidata
+        from visidata import vd
+        from dbcls.vd_modules.vd_memory import release_closed_sheets
+
+        def opened(name):
+            vs = visidata.PyobjSheet(name, source=[{'a': i} for i in range(100)])
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            # what a big load leaves behind: a finished thread pointing at it
+            if not any(getattr(t, 'sheet', None) is vs for t in vd.threads):
+                t = visidata.threads._annotate_thread(__import__('threading').Thread())
+                t.sheet = vs
+                vd.threads.append(t)
+            vs.options.quitguard     # fills the option caches keyed by vs
+            return vs
+
+        def delete_in_gS(vs):
+            g = vd.allSheetsSheet
+            g.reload()
+            vd.push(g)
+            g.cursorRowIndex = vd.allSheets.index(vs)
+            g.execCommand('delete-row')
+            vd.sync()
+            vd.remove(g)
+    '''
+
+    def run(self, body: str):
+        # dedented apart: the prelude and a test body are indented differently,
+        # and one dedent of the two together would nest the body in the
+        # prelude's last function, where it never runs
+        run_with_real_visidata(textwrap.dedent(self.PRELUDE) + textwrap.dedent(body))
+
+    # TODO(vd-leak-gS): delete with the workaround, see dbcls/vd_modules/vd_memory.py
+    def test_a_sheet_deleted_in_gS_is_freed(self):
+        self.run('''
+            vs = opened('result')
+            ref = weakref.ref(vs)
+            vd.quit(vs)
+            delete_in_gS(vs)
+            del vs
+            gc.collect()
+            assert ref() is not None, 'VisiData no longer holds it — drop the workaround?'
+            assert release_closed_sheets() >= 1
+            assert ref() is None, gc.get_referrers(ref())
+        ''')
+
+    # TODO(vd-leak-gS): delete with the workaround, see dbcls/vd_modules/vd_memory.py
+    def test_a_later_call_scans_only_the_new_log_and_still_frees(self):
+        """The second call starts the undo scan where the first one stopped;
+        the gS delete is a new row, so the sheet is still found."""
+        self.run('''
+            first = opened('first')
+            vd.quit(first)
+            delete_in_gS(first)
+            assert release_closed_sheets() >= 1
+            vs = opened('second')
+            ref = weakref.ref(vs)
+            vd.quit(vs)
+            delete_in_gS(vs)
+            del vs, first
+            assert release_closed_sheets() >= 1
+            assert ref() is None, gc.get_referrers(ref())
+        ''')
+
+    def test_a_quit_sheet_stays_for_gU(self):
+        self.run('''
+            vs = opened('result')
+            vd.quit(vs)
+            release_closed_sheets()
+            assert vd.allSheets[-1] is vs
+            assert any(getattr(t, 'sheet', None) is vs for t in vd.threads)
+        ''')
+
+    def test_the_undo_of_a_live_sheet_survives(self):
+        self.run('''
+            keep = opened('keep')
+            keep.cursorRowIndex = 0
+            # on top of the stack, or VisiData does not log them; twice, since
+            # it never undoes a sheet's first command (it takes that one for
+            # the command that opened the sheet)
+            keep.execCommand('delete-row')
+            keep.execCommand('delete-row')
+            vd.sync()
+            assert len(keep.rows) == 98
+            gone = opened('gone')
+            gone.execCommand('sort-desc')     # an undo that holds gone's rows
+            vd.sync()
+            vd.quit(gone)
+            delete_in_gS(gone)
+            release_closed_sheets()
+            vd.push(keep)
+            vd.undo(keep)
+            vd.sync()
+            assert len(keep.rows) == 99
+        ''')
+
+    def test_Q_releases_the_closed_sheets_derived_from_it(self):
+        """A frequency table closed with `q` stays in gS and its rows point at
+        the source's rows; `Q` on the source takes it along."""
+        self.run('''
+            vd.push(vd.newSheet('base', 1))
+            vs = opened('result')
+            vs.execCommand('freq-col')
+            vd.sync()
+            freq = vd.activeSheet
+            assert freq.source is vs and freq.rows
+            vd.quit(freq)
+            vs.execCommand('quit-sheet-free')
+            vd.sync()
+            assert freq not in vd.allSheets and not freq.rows
+            ref = weakref.ref(freq)
+            del vs, freq
+            release_closed_sheets()
+            assert ref() is None
+        ''')
+
+    def test_Q_leaves_a_derived_sheet_that_is_still_open(self):
+        self.run('''
+            vd.push(vd.newSheet('base', 1))
+            vs = opened('result')
+            vs.execCommand('freq-col')
+            vd.sync()
+            freq = vd.activeSheet
+            vd.push(vs)
+            vs.execCommand('quit-sheet-free')
+            vd.sync()
+            assert freq in vd.sheets and freq in vd.allSheets and freq.rows
+        ''')
+
+    # TODO(vd-leak-Q): delete with the workaround, see dbcls/vd_modules/vd_memory.py
+    def test_a_sorted_and_selected_sheet_deleted_in_gS_is_freed(self):
+        """The undos of select and sort keep the rows — select's in a closure,
+        as (sheet, selection) pairs."""
+        self.run('''
+            vd.push(vd.newSheet('base', 1))
+            vs = opened('result')
+            for cmd in ('select-rows', 'sort-desc', 'unselect-rows'):
+                vs.execCommand(cmd)
+                vd.sync()
+            vd.quit(vs)
+            delete_in_gS(vs)
+            ref = weakref.ref(vs)
+            del vs
+            assert release_closed_sheets() >= 1
+            assert ref() is None, gc.get_referrers(ref())
+        ''')
+
+    # TODO(vd-leak-clip): delete with the workaround, see dbcls/vd_modules/vd_memory.py
+    def test_the_drawn_values_are_let_go(self):
+        """cliptext._clipstr is an lru_cache keyed by the iterchars() generator
+        it draws, which holds the value: gS drawing a result's source keeps
+        every row of it."""
+        self.run('''
+            from visidata import cliptext
+
+            class Row:
+                pass
+
+            rows = [Row() for _ in range(3)]
+            ref = weakref.ref(rows[0])
+            cliptext._clipstr(cliptext.iterchars(rows), 20)
+            del rows
+            gc.collect()
+            assert ref() is not None, 'VisiData no longer keeps it — drop the workaround?'
+            release_closed_sheets()
+            assert ref() is None
+        ''')
+
+    # TODO(vd-leak-clip): delete with the workaround, see dbcls/vd_modules/vd_memory.py
+    def test_the_measured_cell_texts_are_let_go(self):
+        """cliptext.dispwidth caches the full text of every cell whose width
+        was measured — each screen scrolled through, up to 100000 cells."""
+        self.run('''
+            from visidata import cliptext
+
+            class Text(str):    # a str weakref can follow
+                pass
+
+            text = Text('x' * 5000)
+            ref = weakref.ref(text)
+            cliptext.dispwidth(text)
+            del text
+            gc.collect()
+            assert ref() is not None, 'VisiData no longer keeps it — drop the workaround?'
+            release_closed_sheets()
+            assert ref() is None
+        ''')
+
+
+class TestEditingACopy:
+    def test_edits_made_on_a_dup_selected_copy_are_saved_and_shown_on_both(self):
+        """`"` copies the edit sheet with new Column objects, and VisiData keys
+        pending edits by Column object and keeps them per sheet: the edit
+        made on the copy used to be invisible to the original, and its Ctrl+S
+        saved nothing.  After the commit the changed rows are re-read by key,
+        in place, so the copy -- holding the same row objects -- is current."""
+        run_with_real_visidata('''
+            import asyncio, os, tempfile, threading, time
+            from copy import copy
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.clients.sqlite3 import Sqlite3Client
+            from dbcls.utils import SqlExpr
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet, PendingSqlSheet
+
+            class Sync:  # what SyncClient does, without the event-loop thread
+                def __init__(self, client):
+                    self.client = client
+                def __getattr__(self, name):
+                    attr = getattr(self.client, name)
+                    if asyncio.iscoroutinefunction(attr):
+                        return lambda *a, **k: asyncio.run(attr(*a, **k))
+                    return attr
+
+            path = os.path.join(tempfile.mkdtemp(), 't.db')
+            client = Sync(Sqlite3Client(path))
+            client.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, upd TEXT)')
+            client.execute("INSERT INTO t VALUES (1, 'a', NULL), (2, 'b', NULL), (3, 'c', NULL)")
+
+            sheet = EditTableSheet('edit_t', client=client, db=path, table='t')
+            sheet.reload()
+            for _ in range(100):
+                if len(sheet.rows) == 3:
+                    break
+                time.sleep(0.05)
+            sheet.selectRow(sheet.rows[0])
+            sheet.selectRow(sheet.rows[1])
+
+            # the stock `"` (dup-selected) execstr
+            dup = copy(sheet)
+            dup.reload = lambda vs=dup, rows=sheet.selectedRows: setattr(vs, 'rows', list(rows))
+            vd.push(dup)  # loads it through the reload above
+            col = lambda s, name: next(c for c in s.columns if c.name == name)
+
+            col(dup, 'name').setValues([dup.rows[0]], 'EDITED')
+            col(dup, 'upd').setValues([dup.rows[1]], SqlExpr("'x' || 'y'"))
+            assert col(sheet, 'name').getValue(sheet.rows[0]) == 'EDITED'
+            assert sheet.isChanged(col(sheet, 'name'), sheet.rows[0])
+            sheet.delete_row(2)
+
+            root = dup.edit_root
+            assert root is sheet
+            pending = PendingSqlSheet('p', source=root, client=client,
+                                      statements=root.pending_statements())
+            vd.push(pending)
+            thread = pending.execute_all()
+            if isinstance(thread, threading.Thread):
+                thread.join()
+
+            expected = [{'id': 1, 'name': 'EDITED', 'upd': None},
+                        {'id': 2, 'name': 'b', 'upd': 'xy'}]
+            assert client.execute('SELECT * FROM t').data == expected
+            assert [dict(r) for r in sheet.rows] == expected, sheet.rows
+            assert [dict(r) for r in dup.rows] == expected, dup.rows
+            assert not sheet._deferredMods and not sheet._deferredDels
         ''')

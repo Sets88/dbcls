@@ -25,6 +25,7 @@ _COMMAND_TABLE: List[tuple] = [
     ('sheet',   '.SHEET <NAME>',                   '_cmd_sheet'),
     ('view',    '.VIEW <NAME>',                    '_cmd_view'),
     ('watch',   '.WATCH [<INTERVAL>]',             '_cmd_watch'),
+    ('vdm',     '.VDM <VISIDATA_MACRO>',           '_cmd_vdm'),
     ('call',    '.CALL <FN_NAME>',                 '_cmd_call'),
     ('conn',    '.CONN <ID>',                      '_cmd_conn'),
 ]

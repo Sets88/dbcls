@@ -6,12 +6,16 @@ just a task object the test finishes by hand.
 """
 import asyncio
 import curses
+import json
 from unittest.mock import MagicMock
 
 import pytest
 
 from dbcls.editor import K, Lexer, TextBuffer, key_alt, key_ctrl
-from dbcls.llm.chat import ANSWER_TOOL, ASK_TOOL, RESULT_TOOL, ChatWindow
+from dbcls.llm.chat import (
+    ALLOW, ALLOW_FOR_CHAT, ANSWER_TOOL, ASK_TOOL, CANCELLED, DENY, DISMISSED_QUESTION,
+    EDIT, RESULT_TOOL, SHOW_TOOL, ChatWindow,
+)
 from dbcls.llm.client import LLMConfig, LLMError, ToolRegistry
 from dbcls.plugins import PluginAPI
 
@@ -47,7 +51,9 @@ class FakeTask:
         return self.value
 
     def cancel(self):
+        # The coroutine never ran, so there is nothing to unwind.
         self.cancelled = True
+        self.done = True
 
     # helpers for the tests
     def finish(self, value):
@@ -95,6 +101,13 @@ class FakeEditor:
         self.extra_help_pages = {}
         self.editor_functions = {}
         self.keybindings = {}
+        #: (kind, title, rows) of every VisiData sheet the chat opened.
+        self.sheets = []
+        self.has_sheet_viewer = True
+
+    def run_sheet_prompt(self, kind, title, rows, extra=None):
+        self.sheets.append((kind, title, rows))
+        return None
 
     def add_editor_function(self, name, func, description='', keybinding=''):
         self.editor_functions[name] = func
@@ -196,6 +209,15 @@ class TestOpenClose:
         chat.close()
         chat.open('SELECT 2')
         assert len(chat.messages) == before      # no second system prompt
+
+    def test_reopening_keeps_the_unsent_question(self):
+        _editor, chat = make_chat()
+        chat.open('SELECT 1')
+        for ch in 'add a lim':
+            chat.handle_key(K(ord(ch)))
+        chat.handle_key(ESC)
+        chat.open('SELECT 1')
+        assert chat.input_area.text == 'add a lim'
 
     def test_reset_starts_a_new_conversation(self):
         _editor, chat = make_chat()
@@ -370,6 +392,56 @@ class TestResetInTheWindow:
         chat.handle_key(CTRL_N)
         assert editor.asyncloop_thread.tasks[0].cancelled is True
         assert chat._task is None
+
+
+class TestTranscriptColours:
+    """The model's words, its tool calls and errors each get a colour of their
+    own in the Chat pane; what the user typed stays plain."""
+
+    def _lines(self, chat):
+        """(line, the type it is drawn in) for every line of the Chat pane."""
+        chat._refresh_history()
+        lines = chat.history_area.buf.lines
+        return list(zip(lines, chat.history_lexer.line_types))
+
+    def test_each_speaker_has_its_own_colour(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.input_area.set_text('count orders')
+        chat.send()
+        chat._on_event('tool', {'name': 'list_tables', 'arguments': {}})
+        editor.asyncloop_thread.tasks[0].finish(assistant('Here it is.\n\nDone.'))
+        chat.tick()
+        chat._fail(LLMError('boom'))
+        assert self._lines(chat) == [
+            ('You: count orders', 'normal'),
+            ('', 'normal'),
+            ('Tool: list_tables()', 'function'),
+            ('', 'normal'),
+            ('Assistant: Here it is.', 'comment'),
+            ('', 'comment'),            # a blank line inside the answer is still its
+            ('Done.', 'comment'),       # …so the line after it keeps the colour
+            ('', 'normal'),
+            ('Error: boom', 'keyword'),
+        ]
+
+    def test_the_whole_line_is_one_token(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat._on_event('tool', {'name': 'describe', 'arguments': {'table': 't'}})
+        chat._refresh_history()
+        lines = chat.history_area.buf.lines
+        line = "Tool: describe(table='t')"
+        assert lines == [line]
+        assert chat.history_lexer.get_tokens(0, lines) == [(0, len(line), 'function')]
+
+    def test_what_the_user_typed_is_left_plain(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.input_area.set_text('hi')
+        chat.send()
+        chat._refresh_history()
+        assert chat.history_lexer.get_tokens(0, chat.history_area.buf.lines) == []
 
 
 class TestFocus:
@@ -875,7 +947,7 @@ class TestAskUser:
         assert ASK_TOOL in chat.tools.names()
         schema = next(s for s in chat.tools.schemas()
                       if s['function']['name'] == ASK_TOOL)
-        assert schema['function']['parameters']['required'] == ['question', 'options']
+        assert schema['function']['parameters']['required'] == ['question']
 
     @pytest.mark.asyncio
     async def test_the_answer_comes_back_as_the_calls_result(self):
@@ -910,6 +982,34 @@ class TestAskUser:
         assert (await asyncio.wait_for(task, 1))['chosen'] == []
 
     @pytest.mark.asyncio
+    async def test_a_marked_typed_answer_survives_moving_off_it(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await ask(chat, 'Which columns?', ('id', 'name'), multi=True)
+        chat.handle_key(K(ord('i')))        # offers id, then ✎ Answer: i
+        chat.handle_key(ARROW_DOWN)
+        chat.handle_key(TAB)                # mark the typed answer
+        chat.handle_key(K(curses.KEY_UP))
+        chat.handle_key(TAB)                # ...and id
+        chat.handle_key(K(curses.KEY_UP))
+        chat.handle_key(ENTER)
+        assert await asyncio.wait_for(task, 1) == {
+            'question': 'Which columns?', 'chosen': ['id'], 'typed': 'i'}
+        assert chat._transcript[-1] == ('You', 'You: id, i')
+
+    @pytest.mark.asyncio
+    async def test_a_typed_answer_marked_and_highlighted_is_sent_once(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await ask(chat, 'Which columns?', ('id', 'name'), multi=True)
+        for ch in 'orders_2024':
+            chat.handle_key(K(ord(ch)))
+        chat.handle_key(TAB)                # the cursor stays on the last item
+        chat.handle_key(ENTER)
+        assert await asyncio.wait_for(task, 1) == {
+            'question': 'Which columns?', 'chosen': [], 'typed': 'orders_2024'}
+
+    @pytest.mark.asyncio
     async def test_typing_filters_the_list_instead_of_the_panes(self):
         _editor, chat = make_chat()
         chat.open()
@@ -932,7 +1032,9 @@ class TestAskUser:
         assert 'You: orders' in chat.history_area.text
 
     @pytest.mark.asyncio
-    async def test_esc_drops_the_request_rather_than_answering_it(self):
+    async def test_esc_tells_the_model_the_question_went_unanswered(self):
+        """Esc closes the question, not the request: the model learns the user
+        would not answer and carries on."""
         editor, chat = make_chat()
         chat.open()
         chat.input_area.set_text('which one?')
@@ -940,14 +1042,30 @@ class TestAskUser:
         running = editor.asyncloop_thread.tasks[0]
         task = await ask(chat)
         chat.handle_key(ESC)
-        assert running.cancelled
-        assert chat._task is None
+        result = await asyncio.wait_for(task, 1)
+        assert result['dismissed'] is True
+        assert result['note'] == DISMISSED_QUESTION
+        assert 'chosen' not in result
+        assert not running.cancelled
+        assert chat._task is running
         assert not chat.question_popup.active
         assert chat._question is None
-        assert chat.active is True       # the window itself stays up
         chat._refresh_history()
-        assert 'Cancelled' in chat.history_area.text
-        await drop(task)
+        assert 'closed without answering' in chat.history_area.text
+
+    @pytest.mark.asyncio
+    async def test_esc_again_in_the_chat_stops_the_request(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.input_area.set_text('which one?')
+        chat.send()
+        running = editor.asyncloop_thread.tasks[0]
+        task = await ask(chat)
+        chat.handle_key(ESC)            # the question
+        await asyncio.wait_for(task, 1)
+        chat.handle_key(ESC)            # the window: cancels the run
+        assert running.cancelled
+        assert chat._task is None
 
     @pytest.mark.asyncio
     async def test_a_cancelled_call_leaves_no_question_behind(self):
@@ -970,14 +1088,16 @@ class TestAskUser:
         await drop(pending_call)
 
     @pytest.mark.asyncio
-    async def test_a_question_with_no_options_is_refused_not_shown(self):
+    async def test_blank_options_are_dropped_not_shown(self):
         _editor, chat = make_chat()
         chat.open()
-        result = await chat.tools.call(ASK_TOOL, {'question': 'well?', 'options': []})
-        assert 'at least one option' in result
-        assert chat._question is None
+        call = asyncio.create_task(chat.tools.call(
+            ASK_TOOL, {'question': 'well?', 'options': ['', '  ', 'orders']}))
+        await asyncio.sleep(0)
         chat.tick()
-        assert not chat.question_popup.active
+        assert [item.insert for item in chat.question_popup.items] == ['orders']
+        chat.handle_key(ENTER)
+        assert (await asyncio.wait_for(call, 1))['chosen'] == 'orders'
 
     @pytest.mark.asyncio
     async def test_the_window_shows_what_it_is_waiting_for(self):
@@ -999,6 +1119,544 @@ class TestAskUser:
 
 async def _noop():
     return None
+
+
+def type_text(chat, text):
+    for ch in text:
+        chat.handle_key(K(ord(ch)))
+
+
+class TestTypedAnswers:
+    """Every ask_user question takes an answer the user types, not only the
+    options the model thought of."""
+
+    @pytest.mark.asyncio
+    async def test_a_typed_answer_comes_back_as_typed(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await ask(chat, 'How many rows?', ('10', '100'))
+        type_text(chat, '42')
+        chat.handle_key(ENTER)
+        assert await asyncio.wait_for(task, 1) == {
+            'question': 'How many rows?', 'typed': '42'}
+
+    @pytest.mark.asyncio
+    async def test_a_matching_option_is_still_picked_first(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await ask(chat, 'How many rows?', ('10', '100'))
+        type_text(chat, '10')
+        chat.handle_key(ENTER)
+        assert (await asyncio.wait_for(task, 1))['chosen'] == '10'
+
+    @pytest.mark.asyncio
+    async def test_a_question_with_no_options_takes_a_typed_answer(self):
+        _editor, chat = make_chat()
+        chat.open()
+        call = asyncio.create_task(chat.tools.call(
+            ASK_TOOL, {'question': 'Which column?'}))
+        await asyncio.sleep(0)
+        chat.tick()
+        assert chat.question_popup.active
+        chat.handle_key(ENTER)              # nothing typed: not an answer yet
+        assert chat.question_popup.active
+        type_text(chat, 'created_at')
+        chat.handle_key(ENTER)
+        assert (await asyncio.wait_for(call, 1))['typed'] == 'created_at'
+
+    @pytest.mark.asyncio
+    async def test_several_marked_plus_a_typed_one(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await ask(chat, 'Which columns?', ('id', 'name'), multi=True)
+        chat.handle_key(TAB)                # mark id
+        type_text(chat, 'total')
+        chat.handle_key(ENTER)
+        assert await asyncio.wait_for(task, 1) == {
+            'question': 'Which columns?', 'chosen': ['id'], 'typed': 'total'}
+
+    @pytest.mark.asyncio
+    async def test_the_hint_says_typing_is_welcome(self):
+        editor, chat = make_chat()
+        chat.open()
+        task = await ask(chat, 'How many?', ())
+        chat.draw(editor.stdscr, 24, 80)
+        assert 'type your own' in editor.stdscr.row(23)
+        await drop(task)
+
+
+def approve(chat, name='list_tables', arguments=None):
+    """Start a permission prompt the way the client does, and open it."""
+    async def run():
+        return await chat._approve_tool(name, arguments or {'database': 'shop'})
+
+    async def start():
+        task = asyncio.create_task(run())
+        await asyncio.sleep(0)
+        chat.tick()
+        return task
+    return start()
+
+
+def pick(chat, label):
+    """Move the open popup onto *label* and press Enter."""
+    popup = chat.question_popup
+    while popup.selected_word() != label:
+        chat.handle_key(ARROW_DOWN)
+    chat.handle_key(ENTER)
+
+
+class TestToolApproval:
+    """The user is asked before a tool runs (unless --llm-no-confirm-tools)."""
+
+    @pytest.mark.asyncio
+    async def test_allow_lets_the_call_run(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await approve(chat)
+        assert chat.question_popup.active
+        assert 'list_tables' in chat.question_popup._title
+        pick(chat, ALLOW)
+        assert await asyncio.wait_for(task, 1) is None
+
+    @pytest.mark.asyncio
+    async def test_deny_is_reported_to_the_model(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await approve(chat)
+        pick(chat, DENY)
+        refusal = await asyncio.wait_for(task, 1)
+        assert refusal.startswith('Denied:') and 'list_tables' in refusal
+
+    @pytest.mark.asyncio
+    async def test_esc_is_a_refusal_not_a_cancel(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.input_area.set_text('tables?')
+        chat.send()
+        running = editor.asyncloop_thread.tasks[0]
+        task = await approve(chat)
+        chat.handle_key(ESC)
+        refusal = await asyncio.wait_for(task, 1)
+        assert refusal.startswith('Denied:') and 'closed' in refusal
+        assert not running.cancelled
+
+    @pytest.mark.asyncio
+    async def test_allow_for_this_chat_is_not_asked_again_until_reset(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await approve(chat)
+        pick(chat, ALLOW_FOR_CHAT)
+        assert await asyncio.wait_for(task, 1) is None
+        assert await chat._approve_tool('list_tables', {}) is None   # no prompt
+        chat.reset()
+        task = await approve(chat)
+        assert chat.question_popup.active
+        await drop(task)
+
+    @pytest.mark.asyncio
+    async def test_the_hint_bar_says_a_tool_is_waiting(self):
+        editor, chat = make_chat()
+        chat.open()
+        task = await approve(chat)
+        chat.draw(editor.stdscr, 24, 80)
+        assert 'wants to run a tool' in editor.stdscr.row(23)
+        await drop(task)
+
+
+async def settle(chat):
+    """Let a waiting call raise its next request, and the main loop open it."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+    chat.tick()
+
+
+class TestSqlApproval:
+    """The prompt for a tool that runs code: Allow, Edit… or Deny."""
+
+    SQL = 'SELECT * FROM orders'
+
+    async def _prompt(self, chat):
+        async def run_sql(sql):
+            return {}
+
+        # As DbTools registers it; the prompt goes by `executes`, not the name.
+        chat.tools.add('run_sql', 'runs SQL', {'type': 'object'}, run_sql,
+                       executes='sql')
+        return await approve(chat, 'run_sql', {'sql': self.SQL})
+
+    @pytest.mark.asyncio
+    async def test_the_prompt_shows_the_sql_and_offers_an_edit(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await self._prompt(chat)
+        popup = chat.question_popup
+        assert self.SQL in popup._title
+        labels = [item.label for item in popup.items]
+        assert labels == [ALLOW, EDIT, DENY]       # no "for this chat"
+        await drop(task)
+
+    @pytest.mark.asyncio
+    async def test_allow_runs_it_as_written(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await self._prompt(chat)
+        pick(chat, ALLOW)
+        assert await asyncio.wait_for(task, 1) is None
+
+    @pytest.mark.asyncio
+    async def test_deny_refuses_it(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await self._prompt(chat)
+        pick(chat, DENY)
+        assert (await asyncio.wait_for(task, 1)).startswith('Denied:')
+
+    @pytest.mark.asyncio
+    async def test_an_edited_statement_is_what_runs(self):
+        editor, chat = make_chat()
+        chat.open()
+        task = await self._prompt(chat)
+        pick(chat, EDIT)
+        await settle(chat)
+        assert chat._code_edit is not None
+        assert chat.code_area.text == self.SQL
+        chat.handle_key(K(ord('x')))              # keys go to the SQL being edited
+        assert chat.code_area.text != self.SQL
+        assert chat.input_area.text == ''
+        chat.code_area.set_text('SELECT * FROM orders WHERE id = 1')
+        chat.handle_key(ALT_ENTER)
+        assert await asyncio.wait_for(task, 1) == {
+            'sql': 'SELECT * FROM orders WHERE id = 1'}
+        assert chat._code_edit is None
+        assert 'WHERE id = 1' in chat._transcript[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_statement_runs_as_is(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await self._prompt(chat)
+        pick(chat, EDIT)
+        await settle(chat)
+        chat.handle_key(ALT_ENTER)
+        assert await asyncio.wait_for(task, 1) is None
+
+    @pytest.mark.asyncio
+    async def test_an_empty_statement_is_not_sent(self):
+        _editor, chat = make_chat()
+        chat.open()
+        task = await self._prompt(chat)
+        pick(chat, EDIT)
+        await settle(chat)
+        chat.code_area.set_text('   ')
+        chat.handle_key(ALT_ENTER)
+        assert chat._code_edit is not None
+        await drop(task)
+
+    @pytest.mark.asyncio
+    async def test_esc_in_the_editor_refuses_it(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.input_area.set_text('count?')
+        chat.send()
+        running = editor.asyncloop_thread.tasks[0]
+        task = await self._prompt(chat)
+        pick(chat, EDIT)
+        await settle(chat)
+        chat.handle_key(ESC)
+        assert (await asyncio.wait_for(task, 1)).startswith('Denied:')
+        assert chat._code_edit is None
+        assert not running.cancelled
+        assert chat.active
+
+    @pytest.mark.asyncio
+    async def test_the_editor_is_drawn_with_its_own_hint(self):
+        editor, chat = make_chat()
+        chat.open()
+        task = await self._prompt(chat)
+        pick(chat, EDIT)
+        await settle(chat)
+        chat.draw(editor.stdscr, 24, 80)
+        assert 'Alt+Enter run it' in editor.stdscr.row(23)
+        assert chat.cursor_pos() == chat.code_area.cursor_screen_pos()
+        await drop(task)
+
+    @pytest.mark.asyncio
+    async def test_the_result_pane_does_not_show_through_the_editor(self):
+        """The editor takes the Result pane's place: a longer query already
+        there must not peek out past the edited lines or below them."""
+        editor, chat = make_chat()
+        chat.open('SELECT very_long_column_name_from_the_result_pane FROM somewhere\n'
+                  'WHERE result_pane_second_line = 1\nAND result_pane_third_line = 2')
+        task = await self._prompt(chat)
+        pick(chat, EDIT)
+        await settle(chat)
+        chat.draw(editor.stdscr, 24, 80)
+        top, rows = chat.pane_rects[2]
+        pane = '\n'.join(editor.stdscr.row(y) for y in range(top, top + rows))
+        assert self.SQL in pane
+        assert 'result_pane' not in pane and 'somewhere' not in pane
+        await drop(task)
+
+    @pytest.mark.asyncio
+    async def test_any_executes_tool_gets_the_same_prompt(self):
+        """A plugin's shell tool: the argument it names is what is edited, and
+        the rest of the call is kept."""
+        _editor, chat = make_chat()
+
+        async def shell(command, cwd='.'):
+            return ''
+
+        chat.tools.add('shell', 'runs a command', {'type': 'object'}, shell,
+                       executes='command')
+        chat.open()
+        task = await approve(chat, 'shell', {'command': 'ls -la', 'cwd': '/tmp'})
+        assert 'ls -la' in chat.question_popup._title
+        assert "cwd='/tmp'" in chat.question_popup._title
+        pick(chat, EDIT)
+        await settle(chat)
+        assert chat.code_area.text == 'ls -la'
+        assert chat.code_area.lexer is None           # not highlighted as SQL
+        chat.code_area.set_text('ls')
+        chat.handle_key(ALT_ENTER)
+        assert await asyncio.wait_for(task, 1) == {'command': 'ls', 'cwd': '/tmp'}
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_run_closes_the_editor(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.input_area.set_text('count?')
+        chat.send()
+        task = await self._prompt(chat)
+        pick(chat, EDIT)
+        await settle(chat)
+        chat.handle_key(ESC)                      # refuses the edit...
+        await asyncio.wait_for(task, 1)
+        chat._open_code_edit({'code': 'x', 'argument': 'sql'})   # ...a pending one, then
+        chat.reset()                              # the run goes away
+        assert chat._code_edit is None
+
+
+class TestShowVar:
+    """show_var: a pipeline variable put in front of the user in VisiData."""
+
+    async def _show(self, chat, key, title=''):
+        task = asyncio.create_task(chat._show_var(key, title or key))
+        await settle(chat)          # the main loop opens the sheet
+        return await asyncio.wait_for(task, 1)
+
+    @pytest.mark.asyncio
+    async def test_the_variable_is_shown_and_the_model_gets_no_rows(self):
+        editor, chat = make_chat()
+        editor.vars['orders'] = [{'id': 1}, {'id': 2}]
+        chat.open()
+        result = await self._show(chat, 'orders', 'Failed orders')
+        assert editor.sheets == [('view', 'Failed orders', [{'id': 1}, {'id': 2}])]
+        assert result['shown'] is True and result['rows'] == 2
+        assert 'value' not in result
+        assert chat._question is None
+
+    @pytest.mark.asyncio
+    async def test_anything_a_variable_holds_becomes_rows(self):
+        editor, chat = make_chat()
+        editor.vars['n'] = 42
+        chat.open()
+        await self._show(chat, 'n')
+        assert editor.sheets == [('view', 'n', [{'value': 42}])]
+
+    @pytest.mark.asyncio
+    async def test_a_tab_with_no_viewer_is_an_error_not_shown(self):
+        editor, chat = make_chat()
+        editor.has_sheet_viewer = False         # a plain file tab
+        editor.vars['orders'] = [{'id': 1}]
+        chat.open()
+        result = await self._show(chat, 'orders')
+        assert editor.sheets == []
+        assert 'shown' not in result
+        assert 'no VisiData viewer' in result['error']
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_variable_is_reported_without_opening_anything(self):
+        editor, chat = make_chat()
+        editor.vars['orders'] = []
+        chat.open()
+        result = await chat._show_var('nope', 'nope')
+        assert 'nope' in result['error'] and result['known_keys'] == ['orders']
+        assert editor.sheets == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_sheet_is_reported_to_the_model(self):
+        editor, chat = make_chat()
+        editor.vars['orders'] = [{'id': 1}]
+        editor.run_sheet_prompt = MagicMock(side_effect=RuntimeError('no tty'))
+        chat.open()
+        result = await self._show(chat, 'orders')
+        assert 'no tty' in result['error']
+
+    def test_it_is_offered_and_never_asked_about(self):
+        _editor, chat = make_chat()
+        assert SHOW_TOOL in chat.tools.names()
+        assert chat.tools.approval_kind(SHOW_TOOL) is None
+
+
+class TestApprovalInAWholeTurn:
+    """The permission prompt inside the real request loop."""
+
+    async def _turn(self, monkeypatch, confirm, answer=None):
+        from .test_llm_client import FakeEndpoint, text_answer, tool_answer
+
+        editor, chat = make_chat()
+        chat.config.confirm_tools = confirm
+        ran = []
+
+        async def list_tables():
+            ran.append(True)
+            return {'tables': ['orders']}
+
+        chat.tools.add('list_tables', 'lists tables', {'type': 'object'}, list_tables)
+        chat.open()
+        endpoint = FakeEndpoint([
+            tool_answer('list_tables', {}),
+            tool_answer(RESULT_TOOL, {'query': 'SELECT 1'}, call_id='call_2'),
+            text_answer('ok'),
+        ])
+        monkeypatch.setattr('dbcls.llm.client.urllib.request.urlopen', endpoint)
+        chat.messages.append({'role': 'user', 'content': 'tables?'})
+        run = asyncio.create_task(chat._run())
+        if answer is not None:
+            for _ in range(200):
+                await asyncio.sleep(0.005)
+                chat.tick()
+                if chat.question_popup.active:
+                    break
+            assert chat.question_popup.active, 'no permission prompt opened'
+            pick(chat, answer)
+        appended = await asyncio.wait_for(run, 5)
+        result = next(m for m in appended
+                      if m.get('role') == 'tool' and m.get('name') == 'list_tables')
+        return chat, ran, result
+
+    @pytest.mark.asyncio
+    async def test_off_by_default_nothing_is_asked(self, monkeypatch):
+        chat, ran, result = await self._turn(monkeypatch, confirm=False)
+        assert ran == [True]
+        assert 'orders' in result['content']
+        assert chat._proposed == 'SELECT 1'      # propose_query never asked
+
+    @pytest.mark.asyncio
+    async def test_a_denied_call_never_runs_and_the_model_is_told(self, monkeypatch):
+        chat, ran, result = await self._turn(monkeypatch, confirm=True, answer=DENY)
+        assert ran == []
+        assert result['content'].startswith('Denied:')
+        assert chat._proposed == 'SELECT 1'      # ...and the turn went on
+
+    @pytest.mark.asyncio
+    async def test_an_allowed_call_runs(self, monkeypatch):
+        _chat, ran, result = await self._turn(monkeypatch, confirm=True, answer=ALLOW)
+        assert ran == [True]
+        assert 'orders' in result['content']
+
+
+class TestCancellingMidCall:
+    def test_unanswered_tool_calls_get_a_cancelled_result(self):
+        messages = [{'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'a', 'function': {'name': 'list_tables', 'arguments': '{}'}},
+            {'id': 'b', 'function': {'name': ASK_TOOL, 'arguments': '{}'}},
+        ]}, {'role': 'tool', 'tool_call_id': 'a', 'name': 'list_tables',
+             'content': '[]'}]
+        ChatWindow._close_dangling_tool_calls(messages)
+        assert messages[-1] == {'role': 'tool', 'tool_call_id': 'b',
+                                'name': ASK_TOOL, 'content': CANCELLED}
+        assert [m.get('tool_call_id') for m in messages
+                if m.get('role') == 'tool'] == ['a', 'b']
+
+    @pytest.mark.asyncio
+    async def test_the_run_itself_closes_the_call_it_was_cancelled_in(self, monkeypatch):
+        from .test_llm_client import FakeEndpoint, tool_answer
+
+        editor, chat = make_chat()
+        chat.open('SELECT 1')
+        endpoint = FakeEndpoint([
+            tool_answer(ASK_TOOL, {'question': 'Which?', 'options': ['a', 'b']}),
+        ])
+        monkeypatch.setattr('dbcls.llm.client.urllib.request.urlopen', endpoint)
+        chat.messages.append({'role': 'user', 'content': 'go'})
+        messages = chat.messages
+        run = asyncio.create_task(chat._run())
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            chat.tick()
+            if chat.question_popup.active:
+                break
+        assert chat.question_popup.active, 'the model asked, but nothing opened'
+        # reset() swaps in a new list while the run is still unwinding
+        chat.messages = []
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        assert messages[-1]['content'] == CANCELLED
+        assert messages[-1]['tool_call_id'] == messages[-2]['tool_calls'][0]['id']
+        assert chat.messages == []
+
+    def test_no_new_question_until_the_cancelled_run_has_unwound(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.input_area.set_text('tables?')
+        chat.send()
+        first = editor.asyncloop_thread.tasks[0]
+        first.cancel = lambda: setattr(first, 'cancelled', True)  # still unwinding
+        chat.handle_key(ESC)
+        chat.input_area.set_text('again')
+        chat.send()
+        assert len(editor.asyncloop_thread.tasks) == 1
+        first.done = True
+        chat.send()
+        assert len(editor.asyncloop_thread.tasks) == 2
+
+
+class TestShowingAResultInAWholeTurn:
+    """run_sql with save_as, then show_var: the rows reach the user and never
+    the endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_the_rows_go_to_visidata_not_to_the_model(self, monkeypatch):
+        from dbcls.llm.tools import DbTools
+        from .test_llm_client import FakeEndpoint, text_answer, tool_answer
+
+        editor, chat = make_chat()
+        chat.config.confirm_exec = False
+        rows = [{'id': i, 'secret': f'row-{i}'} for i in range(100)]
+
+        async def execute(sql):
+            return MagicMock(data=rows, rowcount=100)
+
+        editor.client.execute = execute
+        api = chat.api
+        monkeypatch.setattr(type(api), 'tab_client', lambda self, tab=None: editor.client)
+        monkeypatch.setattr(type(api), 'tab_autocomplete', lambda self, tab=None: None)
+        monkeypatch.setattr(type(api), 'tabs', property(lambda self: []))
+        DbTools(api).register(chat.tools)
+        chat.open()
+        endpoint = FakeEndpoint([
+            tool_answer('run_sql', {'sql': 'SELECT * FROM t', 'save_as': 'all_rows'}),
+            tool_answer(SHOW_TOOL, {'key': 'all_rows'}, call_id='call_2'),
+            tool_answer(ANSWER_TOOL, {'answer': 'Shown.'}, call_id='call_3'),
+            text_answer('done'),
+        ])
+        monkeypatch.setattr('dbcls.llm.client.urllib.request.urlopen', endpoint)
+        chat.messages.append({'role': 'user', 'content': 'show me t'})
+
+        run = asyncio.create_task(chat._run())
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            chat.tick()
+            if run.done():
+                break
+        await asyncio.wait_for(run, 5)
+        assert editor.sheets == [('view', 'all_rows', rows)]
+        sent = json.dumps([r['body'] for r in endpoint.requests])
+        assert 'row-0' in sent                      # the preview...
+        assert 'row-50' not in sent                 # ...but not the rest
 
 
 class TestAskUserInAWholeTurn:
@@ -1069,6 +1727,41 @@ class TestPluginWiring:
             'variables': [{'key': 'saved_ids', 'type': 'list', 'size': 1}]}
         assert (await editor.llm_tools.call('get_var', {'key': 'saved_ids'})
                 )['value'] == [{'id': 7}]
+
+    def test_the_chats_own_tools_and_the_references_are_never_asked_about(self):
+        editor = self._register()
+        tools = editor.llm_tools
+        exempt = {RESULT_TOOL, ANSWER_TOOL, ASK_TOOL, SHOW_TOOL, 'get_pipeline_reference',
+                  'get_visidata_macro_reference'}
+        for name in tools.names():
+            assert (tools.approval_kind(name) is not None) == (name not in exempt), name
+
+    def test_asking_is_on_unless_the_settings_turn_it_off(self):
+        config = self._register().llm_chat.config
+        assert (config.confirm_tools, config.confirm_exec) == (True, True)
+        config = self._register(no_confirm_tools='1').llm_chat.config
+        assert (config.confirm_tools, config.confirm_exec) == (False, True)
+        config = self._register(no_confirm_exec=True).llm_chat.config
+        assert (config.confirm_tools, config.confirm_exec) == (True, False)
+
+    def test_run_sql_is_offered_under_the_exec_switch(self):
+        tools = self._register().llm_tools
+        assert 'run_sql' in tools.names()
+        assert tools.approval_kind('run_sql') == 'exec'
+
+    @pytest.mark.parametrize('function, field', [
+        ('llm_toggle_confirm_tools', 'confirm_tools'),
+        ('llm_toggle_confirm_exec', 'confirm_exec'),
+    ])
+    def test_the_palette_toggles_each_switch_alone(self, function, field):
+        editor = self._register()
+        config = editor.llm_chat.config
+        other = 'confirm_exec' if field == 'confirm_tools' else 'confirm_tools'
+        toggle = editor.editor_functions[function]
+        toggle()
+        assert getattr(config, field) is False and getattr(config, other) is True
+        toggle()
+        assert getattr(config, field) is True
 
     def test_nothing_is_registered_without_a_configured_model(self):
         editor = self._register(model='')

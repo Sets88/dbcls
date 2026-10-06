@@ -33,7 +33,7 @@ from ..utils import top_k_values
 # Shown in the `+` chooser.  Every other `topk<N>`/`p<N>` still works when
 # typed by hand -- these are just the ones worth suggesting.
 LISTED_TOPK = (3, 5, 10)
-LISTED_PERCENTILES = ('p20', 'p75', 'p90', 'p95', 'p99')
+LISTED_PERCENTILES = ('p20', 'p50', 'p75', 'p90', 'p95', 'p99')
 
 
 def _make_topk(name, k):

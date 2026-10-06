@@ -37,7 +37,7 @@ class TestSystemPrompt:
         assert '.FOR_RUN' not in prompt
         # A few KB of instructions, not the reference: the point of the bound
         # is the order of magnitude, not the exact figure.
-        assert len(prompt) < 6000
+        assert len(prompt) < 7000
 
     def test_points_at_the_reference_tool(self):
         prompt = build_system_prompt(None)
@@ -201,14 +201,50 @@ class TestPipelineReference:
 
     def test_is_read_once_and_kept(self):
         import dbcls.llm.reference as reference
-        assert reference._document() is reference._document()
+        name = reference.REFERENCE_FILENAME
+        assert reference._document(name, '') is reference._document(name, '')
 
     def test_a_missing_file_degrades_to_a_message(self, monkeypatch):
         import dbcls.llm.reference as reference
-        monkeypatch.setattr(reference, '_cached', None)
-        monkeypatch.setattr(reference, 'reference_path', lambda: '/definitely/not/here.md')
+        monkeypatch.setattr(reference, '_cached', {})
+        monkeypatch.setattr(reference, 'reference_path', lambda name: '/definitely/not/here.md')
         text = reference.pipeline_reference()
         assert 'missing' in text and 'plain SQL' in text
+
+    def test_points_at_the_macro_guide(self):
+        assert 'get_visidata_macro_reference' in pipeline_reference()
+
+
+class TestVisidataMacroReference:
+    """The .VDM guide: a document of its own, and its examples must run."""
+
+    def _text(self):
+        from dbcls.llm.reference import visidata_macro_reference
+        return visidata_macro_reference()
+
+    def test_ships_with_the_package(self):
+        import os
+        from dbcls.llm.reference import MACRO_REFERENCE_FILENAME
+        assert os.path.exists(reference_path(MACRO_REFERENCE_FILENAME))
+
+    def test_every_example_is_a_pipeline_with_a_valid_macro(self):
+        from dbcls.pipeline.executor import parse_vd_macro
+        from dbcls.pipeline.parser import parse_pipeline
+        blocks = re.findall(r'```sql\n(.*?)```', self._text(), re.S)
+        assert len(blocks) >= 5
+        for block in blocks:
+            parse_pipeline(block)
+            macros = re.findall(r'\.VDM """(.*?)"""', block, re.S)
+            assert macros, block
+            for macro in macros:
+                assert parse_vd_macro(macro), block
+
+    def test_a_missing_file_degrades_to_a_message(self, monkeypatch):
+        import dbcls.llm.reference as reference
+        monkeypatch.setattr(reference, '_cached', {})
+        monkeypatch.setattr(reference, 'reference_path', lambda name: '/definitely/not/here.md')
+        text = reference.visidata_macro_reference()
+        assert 'missing' in text and '.VDM' in text
 
 
 class TestPluginAdditionsInTheReference:

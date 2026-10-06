@@ -1,8 +1,10 @@
+import datetime
+import decimal
 import re
 import time
 import threading
 
-from visidata import VisiData, TableSheet, Column, ColumnItem
+from visidata import VisiData, BaseSheet, TableSheet, Column, ColumnItem
 from visidata import vd, asyncthread, ENTER, AttrDict, deduceType, Progress
 
 from ..utils import SqlExpr
@@ -247,6 +249,53 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
                 offset += self.CHUNK_SIZE
 
 
+class _RowModsByName:
+    """One row's ``{col: value}`` pending edits, looked up by column *name*.
+
+    A copy of an EditTableSheet (`"` and friends) gets its own Column objects,
+    while VisiData keys pending edits by the Column object itself -- so an edit
+    made on the copy would be invisible to the original and the other way
+    round.  Both sheets show the same table, so a column name identifies the
+    cell on either one."""
+
+    def __init__(self, mods):
+        self.mods = mods
+
+    def _key(self, col):
+        if col in self.mods:
+            return col
+        return next((k for k in self.mods if k.name == col.name), None)
+
+    def __getitem__(self, col):
+        key = self._key(col)
+        if key is None:
+            raise KeyError(col)
+        return self.mods[key]
+
+    def __setitem__(self, col, value):
+        key = self._key(col)
+        if key is not None:
+            del self.mods[key]
+        self.mods[col] = value
+
+    def __contains__(self, col):
+        return self._key(col) is not None
+
+    def items(self):
+        return self.mods.items()
+
+
+class _ModsByName(dict):
+    """``_deferredMods`` (rowid -> (row, rowmods)) handing out its rowmods
+    through _RowModsByName.  VisiData reads an entry with ``[rowid]``
+    (getValue, isChanged, cellChanged) and only ever creates one fresh, so the
+    plain dict it stores stays the single place the values live."""
+
+    def __getitem__(self, rowid):
+        row, mods = super().__getitem__(rowid)
+        return row, _RowModsByName(mods)
+
+
 class EditTableSheet(TableSampleDataSheet):
     """Sample-data browsing with pending edits: `e`/`zd` mark cell changes
     (yellow), `zE`/`gE` set cell(s) to a raw (unquoted) SQL expression,
@@ -264,13 +313,48 @@ Changes are collected locally and only executed after confirmation.
 - `a` to add a new row (green until committed).
 - `d` / `gd` to mark the current / selected rows for deletion (red until committed).
 - `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); `Tab` / `Shift+Tab` complete column names, listed in a menu above the prompt.
-- `Ctrl+S` to review the INSERT/UPDATE/DELETE statements before executing them.
+- `"` to edit the selected rows on a sheet of their own: its edits are this sheet's too, `Ctrl+S` on either commits them all.
+- `Ctrl+S` to review the INSERT/UPDATE/DELETE statements before executing them.  Afterwards only the changed rows are re-read, by primary key.
 
 Editing and deleting existing rows requires the table to have a primary key; without one only `a` (adding rows) works.
 '''
     rowtype = 'rows'
     defer = True  # VisiData accumulates edits in _deferredMods/_deferredAdds
     pk_columns = None
+    _edit_root = None  # on a copy: the sheet the pending edits belong to
+
+    @property
+    def edit_root(self):
+        return self._edit_root or self
+
+    @property
+    def _deferredMods(self):
+        # shadows VisiData's lazy property (same backing attribute)
+        mods = getattr(self, '__deferredMods', None)
+        if not isinstance(mods, _ModsByName):
+            mods = _ModsByName(mods or {})
+            setattr(self, '__deferredMods', mods)
+        return mods
+
+    def __copy__(self):
+        """A copy (`"` selected rows, `z"`, a frequency drill-down) edits the
+        same table, so it shares the original's pending edits instead of
+        starting a set of its own: a change made on the copy shows on the
+        original and Ctrl+S on either sheet saves everything.  The rows are
+        the original's row objects (rowid is id(row)), so the entries match."""
+        ret = super().__copy__()
+        root = self.edit_root
+        ret._edit_root = root
+        for name in ('_deferredAdds', '_deferredMods', '_deferredDels'):
+            setattr(ret, '_' + name, getattr(root, name))
+        return ret
+
+    def preloadHook(self):
+        if self._edit_root is not None:
+            # reloading a copy must not drop the edits it shares with the root
+            BaseSheet.preloadHook(self)
+            return
+        super().preloadHook()
 
     def newRow(self):
         return AttrDict()
@@ -429,15 +513,104 @@ Editing and deleting existing rows requires the table to have a primary key; wit
         return statements
 
     def show_pending_sql(self):
-        statements = self.pending_statements()
+        # a copy shares the root's pending edits (see __copy__): the root is
+        # the sheet they are committed from, whichever one Ctrl+S was pressed on
+        root = self.edit_root
+        statements = root.pending_statements()
         if not statements:
             vd.fail('no pending changes')
         vd.push(PendingSqlSheet(
-            f'pending_sql__{self.name}',
-            source=self,
-            client=self.client,
+            f'pending_sql__{root.name}',
+            source=root,
+            client=root.client,
             statements=statements,
         ))
+
+    REFETCH_CHUNK = 100  # primary keys per SELECT when re-reading committed rows
+
+    def committed_rows(self):
+        """What a commit is about to change, taken while the pending edits are
+        still there: ``(refetch, deleted)``.  *refetch* lists ``(row, pk)`` --
+        each updated or added row with its primary key as the database will
+        have it (an edited key cell included).  It is None when some row cannot
+        be found again by its key: no primary key, or an added row whose key
+        the database generates (left empty, or a raw SQL expression)."""
+        adds, mods, dels = self.getDeferredChanges()
+        cols_by_name = {col.name: col for col in self.columns}
+        if not self.pk_columns or any(name not in cols_by_name for name in self.pk_columns):
+            return None, dels
+        refetch = []
+        for rowid, row in list(adds.items()) + [(rowid, row) for rowid, (row, _) in mods.items()]:
+            if rowid in dels:
+                continue
+            pk = {name: self._typed(cols_by_name[name], cols_by_name[name].getValue(row))
+                  for name in self.pk_columns}
+            if any(v is None or isinstance(v, SqlExpr) for v in pk.values()):
+                return None, dels
+            refetch.append((row, pk))
+        return refetch, dels
+
+    @staticmethod
+    def _pk_text(value):
+        """One key value as text both sides agree on.  The database hands back
+        its own types and the sheet's typed cell may differ: VisiData's float
+        makes 8 into 8.0, its date is a datetime where the driver gives a date,
+        a NUMERIC key comes back as Decimal."""
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, (int, float, decimal.Decimal)):
+            try:
+                return str(decimal.Decimal(str(value)).normalize())
+            except decimal.InvalidOperation:
+                return str(value)
+        if isinstance(value, datetime.datetime):
+            if value.tzinfo is None and value.time() == datetime.time():
+                return value.date().isoformat()
+            return value.isoformat()
+        if isinstance(value, (datetime.date, datetime.time)):
+            return value.isoformat()
+        return str(value)
+
+    def _pk_key(self, values):
+        return tuple(self._pk_text(values.get(name)) for name in self.pk_columns)
+
+    def refresh_committed(self, refetch, deleted) -> bool:
+        """Bring the sheet (and its copies) up to date after a commit without
+        reloading the table: deleted rows are dropped, the changed ones are
+        re-read by primary key and updated in place.  The row objects are
+        shared with the copies, so a copy shows the new values too.
+
+        False when some changed row did not come back under the key it was
+        looked up by (a trigger moved it, a key that did not match after all):
+        that row would be left stale, so the caller reloads the table."""
+        sheets = [s for s in vd.sheets
+                  if isinstance(s, EditTableSheet) and s.edit_root is self]
+        if self not in sheets:
+            sheets.append(self)
+        if deleted:
+            for sheet in sheets:
+                sheet.rows[:] = [r for r in sheet.rows if sheet.rowid(r) not in deleted]
+
+        names = {col.name for col in self.columns}
+        by_key = {}
+        for row, pk in refetch:
+            by_key.setdefault(self._pk_key(pk), []).append(row)
+        pks = [pk for _, pk in refetch]
+        found = set()
+        for start in range(0, len(pks), self.REFETCH_CHUNK):
+            sql = self.client.get_select_by_pk_sql(
+                self.table, pks[start:start + self.REFETCH_CHUNK], self.db)
+            result = self.client.execute(sql)
+            if isinstance(result.data, str) or not isinstance(result.data, list):
+                raise Exception(result.data or result.message)
+            for fresh in result.data:
+                key = self._pk_key(fresh)
+                for row in by_key.get(key, ()):
+                    # only the sheet's columns: a custom `E` query may show
+                    # fewer than the table has
+                    row.update({k: v for k, v in fresh.items() if k in names})
+                    found.add(key)
+        return found >= by_key.keys()
 
 
 class PendingSqlSheet(TableSheet):
@@ -486,10 +659,20 @@ The statements generated from the pending edits, one per row.
             row.status = 'OK'
 
         edit_sheet = self.source
+        refetch, deleted = edit_sheet.committed_rows()
+        deleted = dict(deleted)  # cleared below
         edit_sheet._deferredAdds.clear()
         edit_sheet._deferredMods.clear()
         edit_sheet._deferredDels.clear()
         vd.remove(self)
+        if refetch is not None:
+            try:
+                if edit_sheet.refresh_committed(refetch, deleted):
+                    vd.status(f'{len(self.rows)} statements executed')
+                    return
+                vd.status('some changed rows were not found by their key; reloading the table')
+            except Exception as exc:
+                vd.warning(f're-reading the changed rows failed ({exc}); reloading the table')
         # the chunked loader may still be alive; stop it so the reload
         # below doesn't run a second loader on the same sheet
         vd.cancelThread(*edit_sheet.currentThreads)

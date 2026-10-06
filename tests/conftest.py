@@ -35,7 +35,11 @@ visidata_mock.TableSheet = type('TableSheet', (_MockVDSheet,), {})
 visidata_mock.BaseSheet = type('BaseSheet', (_MockVDSheet,), {})
 visidata_mock.IndexSheet = type('IndexSheet', (_MockVDSheet,), {'guide': ''})
 visidata_mock.ListOfDictSheet = type('ListOfDictSheet', (_MockVDSheet,), {})
-visidata_mock.ReturnValue = type('ReturnValue', (BaseException,), {})
+# vd_macro_sheet subclasses it, sets a class option on the subclass and wraps
+# one of its methods with `.after`
+visidata_mock.CommandLogJsonl = type('CommandLogJsonl', (_MockVDSheet,), {
+    'options': MagicMock(), 'after': classmethod(lambda cls, func: func)})
+visidata_mock.ReturnValue =type('ReturnValue', (BaseException,), {})
 visidata_mock.VisiData = MagicMock()
 visidata_mock.VisiData.api = lambda cls: cls
 visidata_mock.PyobjSheet = MagicMock()
@@ -77,6 +81,8 @@ sys.modules['visidata.color'] = MagicMock()
 # vd_aggregators reaches into this submodule for PercentileAggregator, which
 # visidata does not re-export at the top level
 sys.modules['visidata.aggregators'] = MagicMock()
+# vd_macro_sheet: MacroSheet, which visidata does not re-export either
+sys.modules['visidata.macros'] = MagicMock()
 sys.modules['plotext'] = MagicMock()
 
 # curses: a MagicMock with the few values that are read as numbers rather than

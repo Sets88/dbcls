@@ -146,6 +146,8 @@ Plugins add options of their own — they show up in `dbcls --help` alongside th
 | `--llm-model` | Model name, e.g. `qwen2.5-coder` or `anthropic/claude-sonnet-4` |
 | `--llm-max-tokens` | Maximum tokens in a reply (default `131072`) |
 | `--llm-timeout` | Seconds to wait for a reply (default `600`) |
+| `--llm-no-confirm-tools` | Run the model's lookups without asking first; does not cover `run_sql` (see [Approving tool calls](#approving-tool-calls)) |
+| `--llm-no-confirm-exec` | Run code the model writes (`run_sql`, a plugin's shell command) without asking first |
 
 ## Configuration
 
@@ -581,7 +583,14 @@ edits — nothing is sent to the database until you confirm.
 | `a` | Add a new row (pending, shown in green) |
 | `d` / `gd` | Mark the current / selected rows for deletion (pending, shown in red) |
 | `E` | Edit the underlying SQL (add `WHERE` / `ORDER BY`, ...); the sheet reloads with the new query |
+| `"` | Open the selected rows on a sheet of their own and edit them there: the copy shares the pending edits with the edit sheet, so a change made on either shows on both and `Ctrl+S` on either commits all of them |
 | `Ctrl+S` | Review the generated `INSERT`/`UPDATE`/`DELETE` statements on a confirmation sheet; `Enter` there executes them sequentially, `q` goes back without executing |
+
+After the statements run, only the rows they touched are re-read from the database, by
+primary key, and updated in place (deleted ones are dropped) — the table is not reloaded
+from the start, and a `"` copy shows the new values too. A full reload happens only when a
+row cannot be found again by its key: the table has no primary key, or an added row left
+the key to the database (autoincrement, or a `zE` expression).
 
 For example, on a `DATE`/`DATETIME` column, pressing `zE` and typing `NOW()` produces
 `UPDATE table SET col=NOW() WHERE id=1` rather than quoting `NOW()` as a string.
@@ -613,6 +622,7 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 | `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only); `Tab` / `Shift+Tab` complete column names, and the matches show up in a menu above the prompt |
 | `gT` | Save current or selected rows to pipeline vars |
 | `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
+| `zm` | Open a macro as a sheet of its commands, for a pipeline's `.VDM`: while recording (`m`) it stops the recording — no key binding asked, nothing saved — otherwise it reopens the last macro; on the macros sheet (`gm`) it opens the one under the cursor. The commands are edited with `e`, `d`, `Shift+J` / `Shift+K`; `Y` / `gs gY` copy the current / selected ones and `Ctrl+S` saves them, and on this sheet the format offered is `jsonl` — exactly what `.VDM` reads (visidata's default `tsv`, or `json`'s array, it does not). The sheet holds copies: editing it leaves the recorded macro as it was |
 | `Alt+↑` / `Alt+↓` | Jump 5 rows up / down |
 | `Alt+←` / `Alt+→` | Jump 3 columns left / right |
 
@@ -629,7 +639,7 @@ DbCls adds two parameterised names to the ones the prompt offers:
 | Aggregator | Result |
 |--------|--------|
 | `topk<N>` | The `N` most common values of the group, as a list, most frequent first — `topk3` on a group where `3` occurs 10 times, `2` five times and `10` twice gives `[3, 2, 10]`. Ties keep the order of first appearance. `topk3`, `topk5` and `topk10` are offered in the prompt; any other `N` can be typed by hand |
-| `p<N>` | Any percentile, not just the fifteen VisiData hard-codes — `p85` and `p42` work as well as `p90`. The prompt lists `p50`, `p90`, `p95` and `p99`; the rest are typed by hand (`q3`/`q4`/`q5`/`q10` still add whole sets of quantiles at once) |
+| `p<N>` | Any percentile, not just the fifteen VisiData hard-codes — `p85` and `p42` work as well as `p90`. The prompt lists `p20`, `p50`, `p75`, `p90`, `p95` and `p99`; the rest are typed by hand (`q3`/`q4`/`q5`/`q10` still add whole sets of quantiles at once) |
 
 A name typed by hand joins the prompt list for the rest of the session. `topk<N>` returns a real Python list, so `g@` on the resulting column displays it as JSON and `g+` expands it into rows.
 
@@ -820,6 +830,7 @@ A pipeline may span several lines: keep a trailing `|` on every line except the 
 | `.SHEET NAME` | Create a VisiData sheet named `NAME` (a template) from the input rows and pass the data through unchanged. The sheet is built in the background as the step runs — it never blocks the pipeline and it survives a cancelled run; reach it mid-run with VisiData's `Shift+S` from a picker sheet, or with `Alt+S` afterwards. The whole stack opens when the pipeline finishes. |
 | `.VIEW NAME` | Like `.SHEET`, but **blocking**: the sheet is shown immediately and the pipeline waits until it is closed with `q`. Use it inside a `.WHILE` loop or a `.FN` function to see rows at the point they are produced. Closing the sheet is not an answer — it never cancels the pipeline. As the last step the rows are not opened a second time. |
 | `.WATCH [INTERVAL]` | Like `.VIEW`, but **live**: everything to the left of the step **in the same block** is re-run every `INTERVAL` seconds (default `1`) and merged into the sheet. `INTERVAL` is the only argument — the sheet is always named `watch`. It is a row picker too: `Enter` hands the row under the cursor to the next step, `g Enter` the marked ones, while `q` cancels the run. `gf` on the sheet filters what is shown by a regex on the current column. See below. |
+| `.VDM MACRO` | Replay a VisiData macro on the next sheet the pipeline shows — the next `.VIEW`, or else the final result — as soon as it opens; `.SHEET` does not take it. `MACRO` is the cmdlog in JSON lines exactly as VisiData's macro recorder saves it (a template; a `"""…"""` string suits it). The data passes through unchanged, and several `.VDM` steps add up. An empty `sheet` field means the sheet on top at that moment, so after `open-row` the next command runs on the sheet it opened; `#` lines are skipped, so a saved `.vdj` goes in as it is. To take a macro out of visidata, record it with `m` and press `zm` (see [Hotkeys](#hotkeys)). |
 | `.CONN ID` | Run every following step against the connection named `ID` (an id from the [`connections`](#multiple-connections-and-tabs) section of the config file). Data passes through unchanged, so `.CONN` can sit anywhere and be used any number of times. Only the running pipeline is switched — when it finishes the tab is still on its own connection. `ID` is a template. See [Moving data between databases](#moving-data-between-databases). |
 
 ### Moving data between databases
@@ -1166,9 +1177,11 @@ Mark users and press `Enter` to run the chosen action for them; the same list op
 
 The model is given the pipeline language reference and the engine you are connected to, and it can look at the database on its own through four read-only tools — `list_databases`, `list_tables`, `get_table_schema` and `sample_data`. Two more read the [pipeline variables](#pipelines) an earlier run left behind: `get_vars_keys` lists what is in the store with each variable's type and size, `get_var` reads one of them. So "filter by the ids I saved" is something it can act on — the same store `.SET_VAR` writes and `.VARS` shows. A long variable arrives cut to its first 20 rows with the real length alongside, so a stashed result set cannot flood the request.
 
-With [several connections open](#multiple-connections-and-tabs) the model is also told which tabs there are — name, engine, database — and which one is current, refreshed every time the chat is opened, so switching tabs between questions is enough to change what it writes for. Each of the four database tools takes an optional `tab` argument, so it can read the schema of one connection while writing a query for another, and it knows it can join them in a pipeline with [`.CONN`](#moving-data-between-databases). With a single connection nothing of this appears in the prompt.
+With [several connections open](#multiple-connections-and-tabs) the model is also told which tabs there are — name, engine, database — and which one is current, refreshed every time the chat is opened, so switching tabs between questions is enough to change what it writes for. Each of the database tools takes an optional `tab` argument, so it can read the schema of one connection while writing a query for another, and it knows it can join them in a pipeline with [`.CONN`](#moving-data-between-databases). With a single connection nothing of this appears in the prompt.
 
-It is never given a way to run SQL of its own, or to change a variable: what it writes only ever runs when you run it. When a choice is yours to make rather than its to guess, it can [ask you](#when-the-model-asks-you) and wait for the answer.
+A fifth database tool, `run_sql`, runs a statement of the model's own — to check a count, the distinct values of a column, whether matching rows exist — and hands back at most 50 rows. You see the statement before it runs and can [edit it first](#approving-tool-calls). The query it proposes only ever runs when you run it.
+
+Ask it to *show* you something — "show me last week's failed orders" — and the rows do not go through the model at all. It runs the query with `save_as`, which keeps the whole result in that pipeline variable and hands the model only the row count, the columns and three rows; then `show_var` opens the variable for you in VisiData, and the request waits until you close the sheet with `q`. The rows stay in the variable afterwards — `.GET_VAR`, `.VARS`, or the next question can pick them up. `show_var` is never asked about: it shows you your own data. When a choice is yours to make rather than its to guess, it can [ask you](#when-the-model-asks-you) and wait for the answer.
 
 ### Setup
 
@@ -1193,7 +1206,9 @@ The same settings work as `DBCLS_LLM_BASE_URL` / `DBCLS_LLM_API_KEY` / `DBCLS_LL
     "llm": {
         "base_url": "http://localhost:11434/v1",
         "model": "qwen2.5-coder",
-        "timeout": 120
+        "timeout": 120,
+        "no_confirm_tools": false,
+        "no_confirm_exec": false
     }
 }
 ```
@@ -1231,12 +1246,47 @@ The question opens as a list over the chat, the same one the command palette and
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Move through the options |
-| *any text* | Filter the list |
+| *any text* | Filter the list — and offer what you typed as an answer of your own |
 | `Tab` | Mark an option, when the question takes several answers |
 | `Enter` | Answer with the highlighted option (or every marked one) |
-| `Esc` | Drop the request instead of answering it |
+| `Esc` | Close the question without answering |
 
-Your answer goes back as the result of that tool call, so the same turn continues with it and ends with a query as usual. `Esc` cancels the request rather than answering "nothing" — the conversation is kept, so you can type the answer in your own words and send that instead.
+Your answer goes back as the result of that tool call, so the same turn continues with it and ends with a query as usual.
+
+You are never limited to the options the model offered: whatever you type also shows up as `✎ Answer: …` at the bottom of the list, and `Enter` on it sends the text as your answer (an option the text matches still comes first, so `↓` to the typed line if that is not what you meant). A question about a value only you know — how many rows, which column, a date — may come with no options at all, just the line you type into.
+
+`Esc` closes the question unanswered. The model is told you would not answer and carries on — with an assumption it states, or an answer it can give without one. To stop the request altogether, press `Esc` once more in the chat.
+
+### Approving tool calls
+
+Every tool call the model makes — listing databases and tables, reading a schema, sampling rows, reading pipeline variables, running SQL, and any tool a plugin added — is put to you first:
+
+| Choice | What happens |
+|--------|--------------|
+| `Allow` | Run this call |
+| `Allow for this chat` | Run it, and don't ask about this tool again until `Ctrl+N` |
+| `Deny` / `Esc` | Don't run it; the model is told you refused and carries on without it |
+
+Reading the pipeline and `.VDM` references, asking you a question (`ask_user`) and handing over its answer (`propose_query`, `answer_question`) are never asked about.
+
+A tool that runs code the model wrote — `run_sql`, or a plugin tool registered with `executes` (a shell command, say) — gets a prompt of its own: the title shows the code, and the choices are
+
+| Choice | What happens |
+|--------|--------------|
+| `Allow` | Run it as the model wrote it |
+| `Edit…` | Open the code in place of the Result pane. Fix it — filter on an indexed column, add a `LIMIT` — then `Alt+Enter` runs your version, and the model is told it was edited and what actually ran. `Esc` there refuses it |
+| `Deny` / `Esc` | Don't run it |
+
+There is no `Allow for this chat` for these: each statement is a different one.
+
+Two separate settings turn the questions off:
+
+| Option | Environment / `"llm"` key | Effect |
+|--------|---------------------------|--------|
+| `--llm-no-confirm-tools` | `DBCLS_LLM_NO_CONFIRM_TOOLS=1` / `"no_confirm_tools": true` | Lookups and plugin tools run without asking. Code-running tools (`run_sql`, ...) are still asked about |
+| `--llm-no-confirm-exec` | `DBCLS_LLM_NO_CONFIRM_EXEC=1` / `"no_confirm_exec": true` | Code-running tools run without asking |
+
+`Toggle asking before the model's tool calls` and `Toggle asking before the model runs code (SQL, ...)` in the command palette switch them mid-conversation.
 
 The letter shortcuts are `Ctrl` rather than `Alt` on purpose: a control code is the same whatever keyboard layout is active, while `Alt+L` on a Cyrillic layout arrives as `Alt+д` and matches nothing. `Alt+Enter` is unaffected — `Enter` is not a letter.
 
@@ -1248,7 +1298,7 @@ Models forget that call, so it is not left to good intentions: a turn that ends 
 
 Not every request is a request for a query, though. "What does this pipeline do?", "why does this fail?", "which of these two is faster?" are answered in the Chat pane through a second tool, `answer_question`, and that ends the turn just as validly: nothing is proposed, nothing is forced, and the Result pane keeps the query you were working on. Without it a model told it must always call `propose_query` answers "explain this" by handing the same query straight back, explaining nothing.
 
-Pipeline syntax is not carried in every request either. The language reference (~24 KB) sits behind a `get_pipeline_reference` tool, which the model calls when it decides a pipeline is what you want — so an ordinary SQL question never pays for it.
+Pipeline syntax is not carried in every request either. The language reference (~24 KB) sits behind a `get_pipeline_reference` tool, which the model calls when it decides a pipeline is what you want — so an ordinary SQL question never pays for it. The guide to `.VDM` macros is a second document behind `get_visidata_macro_reference`, read only when the model writes a macro.
 
 What that tool returns is the reference *plus* whatever your [plugins](#plugins) added to the language — every `add_pipeline_command` and `add_pipeline_function`, with the `help_text` its author wrote. It is built when the tool is called, so it is the language as it stands in your installation rather than the one dbcls ships, and it comes under a heading that says so: the model uses those commands where they fit, and knows the pipeline it wrote is not portable to a dbcls without your plugins.
 
@@ -1350,7 +1400,7 @@ Keys present in that section but never declared as options reach `api.settings` 
 | `api.add_keybinding(name, key)` | Bind a key (build codes with `dbcls.editor.K` / `key_alt` / `key_csi`) |
 | `api.add_pipeline_command(name, hint, handler, help_text, raw_data)` | Add a `.COMMAND`; the handler is `async def handler(executor, args, data)`. `help_text` goes to the help page *and* to the [LLM chat](#llm-chat)'s language reference |
 | `api.add_pipeline_function(name, value, help_text)` | Add a function (or any value) to the namespace `{{expr}}` and `.PY` run in; `help_text` reaches the model too |
-| `api.add_llm_tool(name, description, parameters, handler, max_result_chars)` | Offer a tool to the [LLM chat](#llm-chat); load order does not matter, a tool offered before the chat is up waits for it. A no-op when the chat is not configured. `max_result_chars` caps how much text one call may hand the model (omit it to send the result whole) |
+| `api.add_llm_tool(name, description, parameters, handler, max_result_chars, needs_approval, executes)` | Offer a tool to the [LLM chat](#llm-chat); load order does not matter, a tool offered before the chat is up waits for it. A no-op when the chat is not configured. `max_result_chars` caps how much text one call may hand the model (omit it to send the result whole). The user is asked before each call unless `--llm-no-confirm-tools` is set; pass `needs_approval=False` only for a tool that reads nothing they would want a say about. `executes='command'` names the argument holding code the tool runs (a shell command line, say): the tool is then asked about under `--llm-no-confirm-exec` instead, and the user may edit that argument before it runs |
 | `api.add_help_page(title, text)` | Add a page to the in-app help (`F1`) |
 | `setup.add_syntax(name, factory, replace)` | Add a [syntax highlighter](#syntax-highlighting): a `dbcls.syntax.Highlighter` subclass implementing `tokenize(line, state) -> (tokens, state_after)`. Registered in `setup()` it is a `--syntax` and a `"syntax"` in the config file; `api.add_syntax(...)` from `register()` only reaches `Set syntax…`. [`example_plugins/json_syntax.py`](example_plugins/json_syntax.py) is the worked example |
 | `api.add_embedded_syntax(command, syntax, arg=0)` | Highlight argument `arg` of a pipeline command in that syntax, on the embedded-code background — the way `.PY`'s argument is Python |
@@ -1364,6 +1414,7 @@ Keys present in that section but never declared as options reach `api.settings` 
 | `api.show_menu(title, items, on_select, multi, default)` | A filterable list; items are strings or `(value, label)` pairs |
 | `api.show_info(title, text)` | Scrollable text in a popup |
 | `api.show_rows(name, rows)` | Put row dicts on the VisiData sheet stack (`Alt+S`) |
+| `api.view_rows(name, rows)` | Show rows on a VisiData sheet and wait until the user closes it — what `.VIEW` does. Main thread only |
 | `api.confirm(message)` | A y/n question in the status bar |
 | `api.notify(text, error=False)` | A message in the status bar |
 | `api.push_overlay(overlay)` / `api.pop_overlay(overlay)` | A full-screen window (`draw(stdscr, H, W)`, `handle_key(key)`, optional `tick()` and `cursor_pos()`) |

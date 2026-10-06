@@ -28,7 +28,7 @@ all without leaving the editor.
 
 Commands: `.RUN` `.URUN` `.RFILTER` `.RGET` `.FOR_RUN` `.FOR` `.NOFOR` `.SLEEP`
           `.PY` `.SET_VAR` `.GET_VAR` `.VARS` `.VOID` `.SHEET` `.VIEW` `.WATCH`
-          `.CONN`
+          `.VDM` `.CONN`
 
 Example:
 ```
@@ -660,6 +660,41 @@ Example:
 ```
 """)
 
+HELP_VDM = _help_entry('vdm', """
+Replay a VisiData macro on the next sheet the pipeline shows — the next
+`.VIEW`, or else the final result — as soon as it opens. The data passes
+through unchanged.
+
+MACRO is VisiData cmdlog in JSON lines, exactly what its macro recorder saves
+(one command per line; blank lines and `#` comments are skipped — a saved
+`.vdj` goes in as it is), so a triple-quoted string is the natural way to
+write it. It is a template. Each line needs a `longname` or
+`keystrokes`; `row` / `col` put the cursor first, and an empty `sheet` means
+the sheet on top at that moment — so after `open-row` the next command runs on
+the sheet it opened.
+
+`.SHEET` does not take the macro: it stays waiting for the next `.VIEW` or the
+final result. Several `.VDM` steps before one display point add up. A macro left
+with nothing to show (the run ends on `.VIEW`, or with no rows) is dropped.
+A command that fails stops the replay, like in VisiData itself.
+
+To get a macro out of VisiData: record it with `m`, then press `zm` — the
+recording stops and its commands open on a sheet of their own, to edit (`e`,
+`d`, `Shift+J` / `Shift+K`). `Y` / `gs gY` copy the current / selected commands,
+`Ctrl+S` saves them; on that sheet the format offered is `jsonl`, what `.VDM`
+reads. `zm` when not recording reopens the last macro; on the macros sheet
+(`gm`) it opens the one under the cursor.
+
+Example — open the frequency table of `asset_type` and drill into the most
+frequent value:
+```
+.RUN "SELECT * FROM Asset" | .VDM '''
+{"sheet": "", "col": "asset_type", "row": "", "longname": "freq-col"}
+{"sheet": "", "col": "", "row": 0, "longname": "open-row"}
+'''
+```
+""")
+
 HELP_WATCH = _help_entry('watch', """
 Show the input rows on a **live** sheet: everything to the left of `.WATCH`
 **in the same block** is re-run every INTERVAL seconds (default 1) and merged
@@ -852,5 +887,6 @@ HELP_ENTRIES: List[str] = [
     HELP_SHEET,
     HELP_VIEW,
     HELP_WATCH,
+    HELP_VDM,
     HELP_PY_FUNCTIONS,
 ]

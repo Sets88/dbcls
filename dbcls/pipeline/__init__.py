@@ -153,6 +153,16 @@ Pipeline commands
     (! to hide those instead, empty to clear) — the prompt reopens on the rule,
     so it can be changed.
 
+.VDM MACRO
+    Replay a VisiData macro — cmdlog JSON lines, as VisiData's macro recorder
+    saves them (a template, usually in '''…''') — on the next sheet the
+    pipeline shows: the next .VIEW, or else the final result.  .SHEET does
+    not take it.  The data passes through unchanged; several .VDM steps add
+    up.  An empty "sheet" field means the sheet on top at that moment; lines
+    starting with # are skipped.  In VisiData, zm opens the macro being
+    recorded (or the last one) on a sheet to edit; Y / gY / Ctrl+S there
+    copy / save its commands as jsonl, ready to paste.
+
 Template placeholders
 ---------------------
 {{_0}}             first column value of the current row (for a list row —

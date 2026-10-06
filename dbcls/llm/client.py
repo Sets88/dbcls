@@ -11,7 +11,7 @@ import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
 #: How many times the model may call tools before we stop feeding results back.
 #: Each round trip is a full request, so this bounds both time and token spend.
@@ -37,6 +37,15 @@ class LLMConfig:
     timeout: float = 600.0
     #: Extra HTTP headers (OpenRouter's HTTP-Referer / X-Title, for instance).
     headers: Dict[str, str] = field(default_factory=dict)
+    #: Ask the user before running a tool registered with needs_approval —
+    #: read on every call, so switching it mid-conversation takes effect at once.
+    #: On unless ``no_confirm_tools`` is set.
+    confirm_tools: bool = True
+    #: The same for a tool registered with ``executes`` — one that runs code
+    #: the model wrote (``run_sql``; a shell command, say, from a plugin).
+    #: Separate on purpose: turning off the questions about lookups leaves this
+    #: one on, and only ``no_confirm_exec`` turns it off.
+    confirm_exec: bool = True
 
     def is_configured(self) -> bool:
         return bool(self.base_url and self.model)
@@ -66,7 +75,17 @@ class LLMConfig:
         headers = values.get('headers')
         if isinstance(headers, dict):
             config.headers = {str(k): str(v) for k, v in headers.items()}
+        config.confirm_tools = not parse_bool(values.get('no_confirm_tools'))
+        config.confirm_exec = not parse_bool(values.get('no_confirm_exec'))
         return config
+
+
+def parse_bool(value: Any) -> bool:
+    """A flag from any source: argparse gives a bool, the config file a bool
+    or a string, ``DBCLS_LLM_*`` always a string."""
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
 
 
 def _post_json(url: str, payload: dict, headers: Dict[str, str], timeout: float) -> dict:
@@ -95,9 +114,17 @@ def _post_json(url: str, payload: dict, headers: Dict[str, str], timeout: float)
 class LLMClient:
     """A chat conversation with tools, over the OpenAI chat-completions API."""
 
-    def __init__(self, config: LLMConfig, tools: Optional['ToolRegistry'] = None):
+    def __init__(self, config: LLMConfig, tools: Optional['ToolRegistry'] = None,
+                 approve: Optional[Callable[[str, dict], Awaitable[Union[None, str, dict]]]] = None):
         self.config = config
         self.tools = tools
+        #: ``async approve(name, arguments)`` — asked before a tool that needs
+        #: approval runs, while the config's switch for its kind is on
+        #: (confirm_tools, or confirm_exec for an ``executes`` tool).  None lets it
+        #: run; a string refuses, and is what the model gets back as the
+        #: result; a dict runs it with those arguments instead — the user
+        #: edited the call (see :func:`edited_result`).
+        self.approve = approve
 
     def _headers(self) -> Dict[str, str]:
         headers = dict(self.config.headers)
@@ -266,11 +293,42 @@ class LLMClient:
     async def _call_tool(self, name: str, arguments: dict) -> str:
         if self.tools is None:
             return f'Error: no tools are available (tried to call {name!r})'
+        edited = None
+        if self.approve is not None and self._asks_before(name):
+            answer = await self.approve(name, arguments)
+            if isinstance(answer, str):
+                # The handler never runs; the model is told why instead, so it
+                # carries on without the result rather than retrying blindly.
+                return answer
+            if isinstance(answer, dict):
+                edited = arguments = answer
         try:
             result = await self.tools.call(name, arguments)
         except Exception as exc:   # a broken tool must not kill the conversation
-            return f'Error: {type(exc).__name__}: {exc}'
+            result = f'Error: {type(exc).__name__}: {exc}'
+            if edited is None:
+                return result
+        if edited is not None:
+            result = edited_result(edited, result)
         return truncate_result(result, self.tools.result_limit(name))
+
+    def _asks_before(self, name: str) -> bool:
+        """Whether *name* is put to the user before it runs, as things stand."""
+        kind = self.tools.approval_kind(name)
+        return {'tools': self.config.confirm_tools,
+                'exec': self.config.confirm_exec}.get(kind, False)
+
+
+def edited_result(arguments: dict, result: Any) -> dict:
+    """The result of a call the user changed before it ran.  The model has to
+    be told: otherwise it reads the rows as the answer to what *it* asked."""
+    return {
+        'edited_by_user': True,
+        'ran_with': arguments,
+        'note': 'The user edited this call before it ran; the result is for '
+                'the edited version, not the one you sent.',
+        'result': result,
+    }
 
 
 def truncate_result(result: Any, limit: Optional[int] = MAX_TOOL_RESULT_CHARS) -> str:
@@ -303,21 +361,50 @@ class ToolRegistry:
         self._tools: Dict[str, dict] = {}
 
     def add(self, name: str, description: str, parameters: dict, handler,
-            max_result_chars: Optional[int] = MAX_TOOL_RESULT_CHARS) -> None:
+            max_result_chars: Optional[int] = MAX_TOOL_RESULT_CHARS,
+            needs_approval: bool = True, executes: Optional[str] = None) -> None:
         """*handler* is ``async def handler(**arguments) -> Any``.
 
         *max_result_chars* caps what the tool may send back; pass None for a
-        tool whose result must arrive whole (a reference document, say)."""
+        tool whose result must arrive whole (a reference document, say).
+
+        *needs_approval* False exempts the tool from ``confirm_tools``: the
+        chat's own ways of answering and asking, and the reference documents,
+        touch nothing the user would want to be asked about.
+
+        *executes* names the argument that carries code the tool runs — the
+        statement of ``run_sql``, a shell command line.  It puts the tool under
+        ``confirm_exec`` instead: turning off the questions about lookups must
+        not let that through unasked.  The permission prompt shows that
+        argument and lets the user edit it before the call goes ahead."""
         self._tools[name] = {
             'name': name,
             'description': description,
             'parameters': parameters,
             'handler': handler,
             'max_result_chars': max_result_chars,
+            'needs_approval': needs_approval,
+            'executes': executes,
         }
 
     def names(self) -> List[str]:
         return list(self._tools)
+
+    def approval_kind(self, name: str) -> Optional[str]:
+        """Which switch asks before *name*: ``'exec'`` (confirm_exec),
+        ``'tools'`` (confirm_tools) or None — never asked about.  A tool
+        nobody registered counts as an ordinary one."""
+        tool = self._tools.get(name)
+        if tool is None:
+            return 'tools'
+        if tool['executes']:
+            return 'exec'
+        return 'tools' if tool['needs_approval'] else None
+
+    def executes(self, name: str) -> Optional[str]:
+        """The argument of *name* that holds the code it runs, or None."""
+        tool = self._tools.get(name)
+        return None if tool is None else tool['executes']
 
     def result_limit(self, name: str) -> Optional[int]:
         tool = self._tools.get(name)

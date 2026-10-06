@@ -1,5 +1,6 @@
 include requirements.txt
 include dbcls/llm/pipeline_reference.md
+include dbcls/llm/visidata_macros.md
 
 # distutils puts tests/test*.py into the sdist on its own (sdist.py's
 # _add_defaults_optional), which find_packages(exclude=...) does not affect --

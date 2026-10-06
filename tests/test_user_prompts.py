@@ -82,8 +82,63 @@ class TestInputBar:
         bar.open('Age', '18')
         assert bar.query == '18'
         assert bar.cursor == 2            # cursor at the end of the prefill
+        assert bar.pristine is True       # ...and the prefill is selected
         type_keys(bar, '5')
-        assert bar.query == '185'
+        assert bar.query == '5'           # the first character replaces it
+        assert bar.cursor == 1
+        assert bar.pristine is False
+        type_keys(bar, '0')
+        assert bar.query == '50'          # the rest is typed as usual
+
+    @pytest.mark.parametrize('key', [K(curses.KEY_LEFT), K(curses.KEY_RIGHT),
+                                     K(curses.KEY_HOME), K(curses.KEY_END)])
+    def test_moving_the_cursor_keeps_the_prefill(self, key):
+        bar = InputBar()
+        bar.open('Age', '18')
+        bar.handle_key(key)
+        assert bar.query == '18'
+        assert bar.pristine is False
+        type_keys(bar, '5')
+        assert '5' in bar.query and len(bar.query) == 3
+
+    def test_backspace_edits_the_prefill(self):
+        bar = InputBar()
+        bar.open('Age', '18')
+        bar.handle_key(BACKSPACE)
+        assert bar.query == '1'
+        type_keys(bar, '9')
+        assert bar.query == '19'
+
+    def test_paste_replaces_the_prefill(self):
+        clipboard = MagicMock()
+        clipboard.paste.return_value = 'abc'
+        bar = InputBar(clipboard)
+        bar.open('Name', 'old')
+        bar.handle_key(K(ord('\x16')))
+        assert bar.query == 'abc'
+        assert bar.cursor == 3
+
+    def test_no_prefill_is_not_pristine(self):
+        bar = InputBar()
+        bar.open('Name')
+        assert bar.pristine is False
+
+    def test_recalled_entry_is_appended_to(self):
+        bar = InputBar()
+        _enter(bar, 'Age', '30')
+        bar.open('Age', '3')
+        bar.handle_key(UP)
+        type_keys(bar, '5')
+        assert bar.query == '305'
+
+    def test_reopen_selects_the_prefill_again(self):
+        bar = InputBar()
+        bar.open('Age', '18')
+        type_keys(bar, '5')
+        bar.close()
+        bar.open('Age', '18')
+        type_keys(bar, '7')
+        assert bar.query == '7'
 
     def test_prefill_can_be_cleared(self):
         bar = InputBar()
@@ -960,8 +1015,12 @@ class TestStatusPromptLine:
         ed = self._editor(['\n'])
         assert ed._prompt('Save to: ', default='/tmp/conf.json') == '/tmp/conf.json'
 
-    def test_a_default_can_be_edited(self):
+    def test_typing_replaces_the_default(self):
         ed = self._editor(['x', '\n'])
+        assert ed._prompt('Save to: ', default='/tmp/a') == 'x'
+
+    def test_a_default_can_be_edited(self):
+        ed = self._editor([curses.KEY_END, 'x', '\n'])
         assert ed._prompt('Save to: ', default='/tmp/a') == '/tmp/ax'
 
     def test_esc_returns_nothing(self):

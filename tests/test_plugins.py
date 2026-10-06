@@ -489,7 +489,23 @@ class TestPluginAPI:
 
         api.add_llm_tool('t', 'desc', {'type': 'object'}, handler)
         editor.llm_tools.add.assert_called_once_with(
-            't', 'desc', {'type': 'object'}, handler, max_result_chars=None)
+            't', 'desc', {'type': 'object'}, handler, max_result_chars=None,
+            needs_approval=True, executes=None)
+
+
+class TestViewRows:
+    def test_view_rows_opens_a_blocking_sheet_on_the_current_tab(self):
+        editor = MagicMock()
+        PluginAPI(editor, 'demo').view_rows('orders', [{'id': 1}, 7])
+        editor.doc.run_sheet_prompt.assert_called_once_with(
+            'view', 'orders', [{'id': 1}, {'value': 7}])
+
+    def test_a_tab_with_no_viewer_raises_instead_of_showing_nothing(self):
+        editor = MagicMock()
+        editor.doc.has_sheet_viewer = False
+        with pytest.raises(RuntimeError, match='no VisiData viewer'):
+            PluginAPI(editor, 'demo').view_rows('orders', [{'id': 1}])
+        editor.doc.run_sheet_prompt.assert_not_called()
 
 
 class TestTabsThroughTheAPI:
@@ -540,12 +556,14 @@ class TestLLMToolsOfferedBeforeTheChatExists:
     def test_a_tool_offered_early_is_delivered_when_the_chat_comes_up(self):
         editor = FakeEditor()
         PluginAPI(editor, 'demo').add_llm_tool(
-            'early', 'desc', {'type': 'object'}, self.handler, max_result_chars=99)
+            'early', 'desc', {'type': 'object'}, self.handler, max_result_chars=99,
+            needs_approval=True, executes='command')
 
         registry = MagicMock()
         assert deliver_pending_llm_tools(editor, registry) == 1
         registry.add.assert_called_once_with(
-            'early', 'desc', {'type': 'object'}, self.handler, max_result_chars=99)
+            'early', 'desc', {'type': 'object'}, self.handler, max_result_chars=99,
+            needs_approval=True, executes='command')
 
     def test_what_was_delivered_is_forgotten(self):
         editor = FakeEditor()

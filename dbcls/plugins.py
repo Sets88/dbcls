@@ -307,10 +307,21 @@ class PluginAPI:
         pipeline.register_function(name, value, help_text=help_text)
 
     def add_llm_tool(self, name: str, description: str, parameters: dict,
-                     handler, max_result_chars: Optional[int] = None) -> None:
+                     handler, max_result_chars: Optional[int] = None,
+                     needs_approval: bool = True,
+                     executes: Optional[str] = None) -> None:
         """Offer an extra tool to the LLM chat (no-op when the chat is not
         configured).  *parameters* is a JSON-Schema object; *handler* is
         ``async def handler(**kwargs) -> Any``.
+
+        The user is asked before each call unless ``--llm-no-confirm-tools``
+        is set; pass *needs_approval* False only for a tool that reads nothing the
+        user would want a say about (a static document, say).
+
+        *executes* names the argument holding code the tool runs (a shell
+        command line, say).  Such a tool is asked about under
+        ``--llm-no-confirm-exec`` instead, and the user may edit that argument
+        before the call goes ahead.
 
         The chat is itself a plugin, and plugins register in an order nobody
         controls, so a tool offered before it is up is held and handed over
@@ -319,7 +330,8 @@ class PluginAPI:
         Adding a tool later — from a key handler, once everything is up — goes
         straight to the registry.
         """
-        tool = (name, description, parameters, handler, max_result_chars)
+        tool = (name, description, parameters, handler, max_result_chars,
+                needs_approval, executes)
         registry = getattr(self.editor, 'llm_tools', None)
         if registry is not None:
             _add_llm_tool(registry, tool)
@@ -388,6 +400,22 @@ class PluginAPI:
         """Put a list of row dicts on the VisiData sheet stack (Alt+S)."""
         self.editor.add_pipeline_sheet(name, rows)
 
+    def view_rows(self, name: str, rows) -> None:
+        """Show *rows* on a VisiData sheet named *name* and wait until the user
+        closes it with ``q`` — what ``.VIEW`` does.  Anything a pipeline
+        variable can hold is accepted: dicts are rows, other items land in a
+        ``value`` column.
+
+        It hands the terminal to VisiData, so call it from the main thread
+        (a key handler, an overlay's ``tick``), never from the async loop.
+        Raises RuntimeError on a tab with no viewer (a plain file), where
+        nothing would be shown."""
+        doc = getattr(self.editor, 'doc', self.editor)
+        if not getattr(doc, 'has_sheet_viewer', False):
+            raise RuntimeError('the current tab has no VisiData viewer; '
+                               'switch to a database tab to show rows')
+        doc.run_sheet_prompt('view', str(name), pipeline.normalize_to_dicts(rows))
+
     def confirm(self, message: str) -> bool:
         """Ask a y/n question in the status bar and wait for the answer."""
         return self.editor._confirm(message)
@@ -423,9 +451,10 @@ class PluginAPI:
 def _add_llm_tool(registry, tool) -> None:
     """Put one queued tool into *registry*.  The tuple's shape is known here
     and in :meth:`PluginAPI.add_llm_tool` only."""
-    name, description, parameters, handler, max_result_chars = tool
+    name, description, parameters, handler, max_result_chars, needs_approval, executes = tool
     registry.add(name, description, parameters, handler,
-                 max_result_chars=max_result_chars)
+                 max_result_chars=max_result_chars, needs_approval=needs_approval,
+                 executes=executes)
 
 
 def deliver_pending_llm_tools(editor, registry) -> int:

@@ -54,30 +54,37 @@ class TestMysqlEditing:
             "users", {"id": 1, "name": "O'Hara", "age": None}, "testdb")
         assert sql == (
             "INSERT INTO `testdb`.`users` (`id`, `name`, `age`) "
-            "VALUES (1, 'O''Hara', NULL)"
+            "VALUES (1, 'O''Hara', NULL);"
         )
 
     def test_get_update_sql(self, client):
         sql = client.get_update_sql(
             "users", {"name": "Bob", "age": 30}, {"id": 5}, "testdb")
         assert sql == (
-            "UPDATE `testdb`.`users` SET `name` = 'Bob', `age` = 30 WHERE `id` = 5"
+            "UPDATE `testdb`.`users` SET `name` = 'Bob', `age` = 30 WHERE `id` = 5;"
         )
 
     def test_get_update_sql_composite_pk(self, client):
         sql = client.get_update_sql("t", {"val": 1}, {"b": "k", "a": 2}, "db")
-        assert sql == "UPDATE `db`.`t` SET `val` = 1 WHERE `b` = 'k' AND `a` = 2"
+        assert sql == "UPDATE `db`.`t` SET `val` = 1 WHERE `b` = 'k' AND `a` = 2;"
 
     def test_get_update_sql_with_sql_expr(self, client):
         """z=/g= on the edit sheet feed a SqlExpr through as the changed
         value: it must land unquoted, e.g. `SET col=NOW()` not `SET col='NOW()'`"""
         sql = client.get_update_sql(
             "table", {"col": SqlExpr("NOW()")}, {"id": 1}, "testdb")
-        assert sql == "UPDATE `testdb`.`table` SET `col` = NOW() WHERE `id` = 1"
+        assert sql == "UPDATE `testdb`.`table` SET `col` = NOW() WHERE `id` = 1;"
 
     def test_get_delete_sql(self, client):
         sql = client.get_delete_sql("users", {"id": 5}, "testdb")
-        assert sql == "DELETE FROM `testdb`.`users` WHERE `id` = 5"
+        assert sql == "DELETE FROM `testdb`.`users` WHERE `id` = 5;"
+
+    def test_get_select_by_pk_sql(self, client):
+        """The rows re-read after a commit: one SELECT for all of them."""
+        sql = client.get_select_by_pk_sql(
+            "users", [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}], "testdb")
+        assert sql == ("SELECT * FROM `testdb`.`users` "
+                       "WHERE (`a` = 1 AND `b` = 'x') OR (`a` = 2 AND `b` = 'y')")
 
     @pytest.mark.asyncio
     async def test_get_primary_key_sorted(self, client):
@@ -124,23 +131,23 @@ class TestPostgresEditing:
             "users", {"id": 1, "name": "O'Hara", "age": None}, "testdb")
         assert sql == (
             'INSERT INTO "users" ("id", "name", "age") '
-            "VALUES (1, 'O''Hara', NULL)"
+            "VALUES (1, 'O''Hara', NULL);"
         )
 
     def test_get_update_sql(self, pg_client):
         sql = pg_client.get_update_sql(
             "users", {"name": "Bob", "age": 30}, {"id": 5}, "testdb")
         assert sql == (
-            'UPDATE "users" SET "name" = \'Bob\', "age" = 30 WHERE "id" = 5'
+            'UPDATE "users" SET "name" = \'Bob\', "age" = 30 WHERE "id" = 5;'
         )
 
     def test_get_update_sql_composite_pk(self, pg_client):
         sql = pg_client.get_update_sql("t", {"val": 1}, {"b": "k", "a": 2}, "db")
-        assert sql == 'UPDATE "t" SET "val" = 1 WHERE "b" = \'k\' AND "a" = 2'
+        assert sql == 'UPDATE "t" SET "val" = 1 WHERE "b" = \'k\' AND "a" = 2;'
 
     def test_get_delete_sql(self, pg_client):
         sql = pg_client.get_delete_sql("users", {"id": 5}, "testdb")
-        assert sql == 'DELETE FROM "users" WHERE "id" = 5'
+        assert sql == 'DELETE FROM "users" WHERE "id" = 5;'
 
     @pytest.mark.asyncio
     async def test_get_primary_key(self, pg_client):

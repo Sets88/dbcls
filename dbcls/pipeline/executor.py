@@ -6,6 +6,7 @@ tests need neither curses, nor VisiData, nor a database.
 """
 import asyncio
 import concurrent.futures
+import json
 import re
 from typing import Any, List, Optional, Protocol, Tuple
 
@@ -85,6 +86,24 @@ class PipelineHost(Protocol):
 
 
 
+def parse_vd_macro(text: str) -> List[dict]:
+    """Parse a VisiData macro — cmdlog rows as JSON lines, one command per
+    line (blank lines and ``#`` comments skipped, so a saved ``.vdj`` with its
+    header goes in as it is) — into dicts, checking each names a command."""
+    rows = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise ValueError(f'.VDM line {n} is not valid JSON: {exc}') from None
+        if not isinstance(row, dict) or not (row.get('longname') or row.get('keystrokes')):
+            raise ValueError(f'.VDM line {n} names no command (longname/keystrokes)')
+        rows.append(row)
+    return rows
+
+
 class PipelineExecutor:
     """Executes a pipeline expression against a database client.
 
@@ -118,6 +137,9 @@ class PipelineExecutor:
         # screen.  If the pipeline ends up returning that very object, the host
         # is told not to open a second sheet showing the same rows again.
         self._shown_data: Any = NOTHING_SHOWN
+        # VisiData cmdlog rows queued by .VDM, waiting for the next display
+        # point (.VIEW or the final result) to replay them — see _cmd_vdm.
+        self._pending_macro: List[dict] = []
         # (nodes already run in the current node list, the value that list
         # started from) — what .WATCH re-executes on every refresh.  Maintained
         # by _execute_nodes; see _cmd_watch.
@@ -164,6 +186,7 @@ class PipelineExecutor:
         self._loop_stack = []
         self._call_stack = []
         self._shown_data = NOTHING_SHOWN
+        self._pending_macro = []
         self.prompts.reset()
         self.host.reset_task_info()
 
@@ -184,7 +207,10 @@ class PipelineExecutor:
         # The only normalisation point: rows are shaped into dicts for display,
         # having flowed between steps unchanged.
         rows = [] if data is NO_DATA else normalize_to_dicts(data)
-        return Result(data=rows, rowcount=len(rows), shown=shown)
+        # A .VDM still waiting goes with the final result; the host drops it
+        # when there is nothing to show.
+        return Result(data=rows, rowcount=len(rows), shown=shown,
+                      macro=self._take_macro())
 
     # ── AST execution (walks PipelineStep / ForBlock / WhileBlock / FnBlock) ────
 
@@ -682,7 +708,8 @@ class PipelineExecutor:
         """The variables as display rows, in insertion order."""
         return [{'key': k, 'value': v} for k, v in self.host.vars.items()]
 
-    def _show_blocking_sheet(self, kind: str, title: str, rows: list) -> None:
+    def _show_blocking_sheet(self, kind: str, title: str, rows: list,
+                             extra: Optional[dict] = None) -> None:
         """Show *rows* on a blocking VisiData sheet and wait for it to close.
 
         Shared by the display steps that own the screen while they run
@@ -694,7 +721,10 @@ class PipelineExecutor:
         In a watched prefix the sheet is shown once, before the ``.WATCH``
         opens: there is nothing to answer, so the refreshes replay the empty
         answer (see ``_ask_user``) and step straight past it."""
-        self.prompts.request({'kind': kind, 'title': title, 'rows': rows})
+        request = {'kind': kind, 'title': title, 'rows': rows}
+        if extra:
+            request['extra'] = extra
+        self.prompts.request(request)
 
     def _mark_shown(self, data: Any) -> Any:
         """Record *data* as the value a display step has just had on screen and
@@ -775,10 +805,28 @@ class PipelineExecutor:
         name = self.render_template(args[0], data=data)
         # A display point — shape rows into dicts for VisiData; the pipeline
         # itself continues with the raw data.
-        self._show_blocking_sheet(PromptKind.VIEW, name, normalize_to_dicts(data))
+        macro = self._take_macro()
+        self._show_blocking_sheet(PromptKind.VIEW, name, normalize_to_dicts(data),
+                                  extra={'vdm_macro': macro} if macro else None)
         # the data itself, not the shaped copy: that is what a following step
         # would pass on and what the final result would be normalised from
         return self._mark_shown(data)
+
+    async def _cmd_vdm(self, args: List[str], data: Any) -> Any:
+        """Queue a VisiData macro (``args[0]``, a template rendering to cmdlog
+        JSON lines — what VisiData's macro recorder writes) for the next display
+        point: the next ``.VIEW``, or else the final result.  The data passes
+        through unchanged; ``.SHEET`` leaves the macro waiting.  Several
+        ``.VDM`` steps before one display point add up."""
+        if not args:
+            raise ValueError('.VDM requires a macro argument')
+        self._pending_macro.extend(parse_vd_macro(self.render_template(args[0], data=data)))
+        return data
+
+    def _take_macro(self) -> List[dict]:
+        """Hand the queued ``.VDM`` rows to a display point and clear them."""
+        macro, self._pending_macro = self._pending_macro, []
+        return macro
 
     async def _cmd_watch(self, args: List[str], data: Optional[list]) -> Any:
         """Show the input rows on a *live* sheet that re-reads them every
@@ -820,12 +868,20 @@ class PipelineExecutor:
         loop = asyncio.get_running_loop()
         in_flight: List[concurrent.futures.Future] = []
 
+        async def refresh() -> Any:
+            # A .VDM in the prefix already queued its macro on the first run;
+            # a refresh re-running it must not queue another copy per tick.
+            macro = list(self._pending_macro)
+            try:
+                return await self._execute_nodes(list(prefix), initial)
+            finally:
+                self._pending_macro = macro
+
         def produce() -> List[dict]:
             """Re-run the pipeline prefix and return its rows.  Called from the
             sheet's refresh thread, so it hops back onto the pipeline's event
             loop and waits for the result there."""
-            future = asyncio.run_coroutine_threadsafe(
-                self._execute_nodes(list(prefix), initial), loop)
+            future = asyncio.run_coroutine_threadsafe(refresh(), loop)
             in_flight.append(future)
             try:
                 return normalize_to_dicts(future.result())

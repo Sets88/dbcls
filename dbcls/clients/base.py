@@ -26,6 +26,8 @@ class Result:
     # on screen (.VIEW, .VARS), so the caller does not open a second, identical
     # sheet on top of the one the user has just closed.
     shown: bool = False
+    # VisiData cmdlog rows (.VDM) to replay on the result sheet once it opens.
+    macro: list = field(default_factory=list)
 
     def __str__(self) -> str:
         if self.message:
@@ -342,19 +344,31 @@ class ClientClass(abc.ABC):
             f'{self.quote_ident(name)} = {sql_literal(value)}'
             for name, value in pk.items()
         )
-        return f'UPDATE {self.get_table_ref(table, database)} SET {set_sql} WHERE {where_sql}'
+        return f'UPDATE {self.get_table_ref(table, database)} SET {set_sql} WHERE {where_sql};'
 
     def get_insert_sql(self, table: str, values: dict, database: Optional[str] = None) -> str:
         columns_sql = ', '.join(self.quote_ident(name) for name in values)
         values_sql = ', '.join(sql_literal(value) for value in values.values())
-        return f'INSERT INTO {self.get_table_ref(table, database)} ({columns_sql}) VALUES ({values_sql})'
+        return f'INSERT INTO {self.get_table_ref(table, database)} ({columns_sql}) VALUES ({values_sql});'
 
     def get_delete_sql(self, table: str, pk: dict, database: Optional[str] = None) -> str:
         where_sql = ' AND '.join(
             f'{self.quote_ident(name)} = {sql_literal(value)}'
             for name, value in pk.items()
         )
-        return f'DELETE FROM {self.get_table_ref(table, database)} WHERE {where_sql}'
+        return f'DELETE FROM {self.get_table_ref(table, database)} WHERE {where_sql};'
+
+    def get_select_by_pk_sql(self, table: str, pks: list, database: Optional[str] = None) -> str:
+        """The rows whose primary key is one of *pks* (a list of
+        ``{column: value}``), re-read by the table browser after a commit."""
+        where_sql = ' OR '.join(
+            '(' + ' AND '.join(
+                f'{self.quote_ident(name)} = {sql_literal(value)}'
+                for name, value in pk.items()
+            ) + ')'
+            for pk in pks
+        )
+        return f'SELECT * FROM {self.get_table_ref(table, database)} WHERE {where_sql}'
 
     def reset_pager(self) -> None:
         pass
