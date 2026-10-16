@@ -37,6 +37,16 @@ class FakeColumn:
         return row.get(self.name, self._source)
 
 
+@pytest.fixture(autouse=True)
+def _visidata_hands_up_the_pending_state(monkeypatch):
+    """What VisiData's own getDeferredChanges would return for the sheet:
+    the maps make_sheet put on it (the mock TableSheet has no such method)."""
+    from visidata import TableSheet
+    monkeypatch.setattr(TableSheet, 'getDeferredChanges',
+                        lambda self: (self._adds, self._mods, self._dels),
+                        raising=False)
+
+
 def make_sheet(columns, adds=None, mods=None, dels=None, pk=('id',), table='t'):
     """An EditTableSheet holding exactly the pending state given."""
     sheet = object.__new__(EditTableSheet)
@@ -47,7 +57,6 @@ def make_sheet(columns, adds=None, mods=None, dels=None, pk=('id',), table='t'):
     sheet.columns = columns
     sheet.visibleCols = columns
     sheet._adds, sheet._mods, sheet._dels = adds or {}, mods or {}, dels or {}
-    sheet.getDeferredChanges = lambda: (sheet._adds, sheet._mods, sheet._dels)
     return sheet
 
 
@@ -118,6 +127,48 @@ class TestUpdates:
         sheet = make_sheet([FakeColumn('id'), ts],
                            mods={1: ({'id': 7}, {ts: SqlExpr('NOW()')})})
         assert sqls(sheet) == ['UPDATE `t` SET `ts` = NOW() WHERE `id` = 7;']
+
+
+class TestEditsUndoneByHand:
+    """A cell edited and then edited back to its value: VisiData's
+    getDeferredChanges drops the cell (isChanged is False) but keeps the row
+    in the mods with nothing in it, which used to come out as
+    ``UPDATE t SET  WHERE id = 1;``."""
+
+    def test_a_row_whose_edits_were_all_reverted_produces_no_update(self):
+        id_col, v = FakeColumn('id'), FakeColumn('v')
+        sheet = make_sheet([id_col, v], mods={1: ({'id': 1, 'v': 0}, {})})
+        assert sqls(sheet) == []
+
+    def test_other_rows_still_update(self):
+        id_col, v = FakeColumn('id'), FakeColumn('v')
+        sheet = make_sheet([id_col, v], mods={1: ({'id': 1, 'v': 0}, {}),
+                                              2: ({'id': 2, 'v': 0}, {v: 1})})
+        assert sqls(sheet) == ['UPDATE `t` SET `v` = 1 WHERE `id` = 2;']
+
+    def test_a_reverted_edit_on_a_table_without_a_key_is_not_an_error(self):
+        v = FakeColumn('v')
+        sheet = make_sheet([v], mods={1: ({'v': 0}, {})}, pk=())
+        with pytest.MonkeyPatch().context() as m:
+            import dbcls.vd_modules.vd_db_browser as mod
+            failures = []
+            m.setattr(mod.vd, 'fail', lambda msg: failures.append(msg))
+            assert sqls(sheet) == []
+        assert failures == []
+
+    def test_a_reverted_row_is_not_re_read_after_the_commit(self):
+        id_col = FakeColumn('id', value=1)
+        sheet = make_sheet([id_col], mods={1: ({'id': 1}, {})})
+        assert sheet.committed_rows() == ([], {})
+
+    def test_a_reverted_row_is_no_pending_change_for_anyone(self):
+        """VisiData's own consumers (its commit, the quit guard) ask the same
+        getDeferredChanges, so the row is dropped there, not per caller."""
+        id_col, v = FakeColumn('id'), FakeColumn('v')
+        sheet = make_sheet([id_col, v], mods={1: ({'id': 1, 'v': 0}, {}),
+                                              2: ({'id': 2, 'v': 0}, {v: 1})})
+        adds, mods, dels = sheet.getDeferredChanges()
+        assert list(mods) == [2]
 
 
 class TestDeletes:

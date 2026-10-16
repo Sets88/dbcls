@@ -473,8 +473,9 @@ result(choose('Pick a table', data))
   the same title before and list the matches in a popup above the bar — each
   title keeps its own history (up to 500 lines, for as long as dbcls runs).
   What is typed filters that list, live: only entries containing every
-  space-separated part are offered, e.g. `te st` matches `my test string`.
-  `items` offers values the user never typed — a list of strings or rows of a
+  space-separated part are offered, e.g. `te st` matches `my test string`
+  (an untouched `default` does not filter — `↑` over it lists everything,
+  `↓` past the newest entry brings the default back). `items` offers values the user never typed — a list of strings or rows of a
   previous step (the first column is taken) — as entries older than the ones
   actually entered at this title; they stay in the history afterwards. `Ctrl+V`
   pastes the clipboard into the line (a multi-line clipboard is joined with

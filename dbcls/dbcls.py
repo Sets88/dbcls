@@ -316,7 +316,7 @@ DB_HELP_DATABASE = """\
       Fold-block markers: `Ctrl+P` toggles folding (a folded block shows
       only its `>>>` line); with the cursor on a marker line `Alt+Enter`
       runs the whole block with the marker lines stripped
-  `Shift+Tab` / `Alt+1`
+  `Shift+Tab`
       DB autocomplete (tables, columns, table aliases, functions)
   `Ctrl+B`
       Beautify the query at cursor (or the selection): one clause per
@@ -404,6 +404,12 @@ DB_HELP_KEY_REMAP = """\
       Swap Tab and Shift+Tab
   Tip: enable debug mode (`Ctrl+D`) to see key codes
 
+Alt on macOS
+  When the terminal types a symbol for Option (`®` for `Option+R`)
+  the Alt shortcuts do not work — see the `Alt on macOS` help page
+  for the terminal setting that fixes it; `"696:457"` makes `®` act
+  as `Alt+R` instead.
+
 Tmux-style prefix (`Ctrl+X`)
   `Ctrl+X` followed by another key within 1 second forms a combination
   with its own key code (`PFX` flag in debug mode). Combinations have
@@ -490,6 +496,9 @@ DB-specific extensions
   `E`
       Edit sample-data SQL (table browser only); `Tab` / `Shift+Tab`
       complete column names
+  `gE`
+      Sample data (table browser only): open the loaded rows on an
+      edit sheet without re-reading them from the DB
   `z+Enter`
       Open current cell as a sheet (references, JSON, …)
   `^`
@@ -1660,7 +1669,7 @@ class DbEditor(EditorShell):
         self.add_editor_function(DbFn.RUN_QUERY,       run('_db_query'),          'Execute query',  'Alt+R')
         self.add_editor_function(DbFn.SHOW_TABLES,     run('_db_show_tables'),    'Browse tables',  'Alt+T')
         self.add_editor_function(DbFn.SHOW_DATABASES,  run('_db_show_databases'), 'Browse databases', 'Alt+E')
-        self.add_editor_function(DbFn.SHOW_PREDICTION, run('_db_show_prediction'),'Autocomplete','Shift+Tab / Alt+1')
+        self.add_editor_function(DbFn.SHOW_PREDICTION, run('_db_show_prediction'),'Autocomplete','Shift+Tab')
         self.add_keybinding(DbFn.RUN_QUERY,       key_alt(ord('r')))              # Alt+R  deprecated, to be removed in future releases
         self.add_keybinding(DbFn.RUN_QUERY,       key_alt(ord('\n')))             # Alt+Enter
         self.add_keybinding(DbFn.SHOW_TABLES,     key_alt(ord('t')))              # Alt+T
@@ -1668,7 +1677,7 @@ class DbEditor(EditorShell):
             self.add_keybinding(DbFn.RUN_QUERY,        K(ord('\n')))              # Enter(for readonly mode)
 
         self.add_keybinding(DbFn.SHOW_DATABASES,  key_alt(ord('e')))              # Alt+E
-        self.add_keybinding(DbFn.SHOW_PREDICTION, [key_alt(ord('1')), K(353)])   # Alt+1, Shift+Tab
+        self.add_keybinding(DbFn.SHOW_PREDICTION, K(353))                       # Shift+Tab
         self.add_editor_function(DbFn.SHOW_VD_SHEETS, run('_db_show_vd_sheets'), 'Browse VisiData sheets', 'Alt+S')
         self.add_keybinding(DbFn.SHOW_VD_SHEETS, key_alt(ord('s')))              # Alt+S
         self.add_editor_function(DbFn.BEAUTIFY, run('_db_beautify'), 'Beautify SQL', '^B')
@@ -1861,6 +1870,7 @@ class DbEditor(EditorShell):
             '-->>Database<<--  — connect to databases, browse tables and sample data\n'
             '-->>Editor<<--  — text editor keybindings and shortcuts\n'
             '-->>Key remapping<<--  — customize keybindings via DBCLS_KEY_REMAP\n'
+            '-->>Alt on macOS<<--  — Option keys when the terminal does not send Meta\n'
             '-->>Pipelines<<--  — chain SQL queries, transform data, use variables\n'
             '-->>VisiData<<--  — data navigation, selection, and DB-specific extensions'
         )

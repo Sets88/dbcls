@@ -83,5 +83,13 @@ class MysqlClient(ShowCommandsMixin, ClientClass):
         async with self.connection.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(sql)
             data = await cur.fetchall()
-
-            return Result(data, cur.rowcount)
+            result = Result(data, cur.rowcount)
+        # aiomysql keeps what it buffered for the cursor — every row as a tuple
+        # of the very value objects the dicts above hold — on the connection
+        # until the next query (Connection._result, which _read_query_result
+        # resets then).  Closing the cursor leaves it: a result sheet deleted
+        # in gS would otherwise still cost its values' share of memory (about
+        # a third of a big text result) until the next query.  Nothing public
+        # lets it go short of running another query.
+        self.connection._result = None
+        return result

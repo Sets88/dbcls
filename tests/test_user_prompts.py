@@ -211,8 +211,51 @@ class TestInputHistory:
         bar.open('Age', '3')
         bar.handle_key(UP)
         assert bar.query == '30'
+        assert bar.pristine is False
         bar.handle_key(DOWN)
         assert bar.query == '3'
+        assert bar.pristine is True         # selected again, as when opened
+        type_keys(bar, '5')
+        assert bar.query == '5'             # ...so typing replaces it
+
+    def test_down_past_newest_restores_an_edited_default_as_typed(self):
+        bar = InputBar()
+        _enter(bar, 'Age', '30')
+        bar.open('Age', '3')
+        type_keys(bar, '1')                 # the default was replaced: '1'
+        bar.handle_key(UP)
+        bar.handle_key(DOWN)
+        assert bar.query == '1'
+        assert bar.pristine is False        # the user's own text: appended to
+        type_keys(bar, '5')
+        assert bar.query == '15'
+
+    def test_prefilled_default_does_not_filter_the_history(self):
+        bar = InputBar()
+        _enter(bar, 'path', '/tmp/x')
+        _enter(bar, 'path', '/var/y')
+        bar.open('path', '/home/default')   # matches no entry
+        bar.handle_key(UP)                  # the list opens over the default anyway
+        assert bar.history_popup.active is True
+        assert [i.label for i in bar.history_popup.filtered] == ['/tmp/x', '/var/y']
+        assert bar.query == '/var/y'
+        bar.handle_key(UP)
+        assert bar.query == '/tmp/x'
+        bar.handle_key(DOWN)
+        bar.handle_key(DOWN)
+        assert bar.query == '/home/default'  # ↓ past the newest brings it back
+        # ...and editing the default makes it the filter as before
+        bar.handle_key(BACKSPACE)
+        assert [i.label for i in bar.history_popup.filtered] == []
+
+    def test_edited_default_filters_the_history(self):
+        bar = InputBar()
+        _enter(bar, 'path', '/tmp/x')
+        _enter(bar, 'path', '/var/y')
+        bar.open('path', '/tmp/')
+        bar.handle_key(BACKSPACE)           # '/tmp' — now the user's own text
+        bar.handle_key(UP)
+        assert [i.label for i in bar.history_popup.filtered] == ['/tmp/x']
 
     def test_down_on_draft_does_nothing(self):
         bar = InputBar()
@@ -995,6 +1038,33 @@ class TestConfirmFileChange:
         ed.buf.save.assert_not_called()
         ed.doc.dismiss_file_change.assert_called_once()
         assert '(w)rite' not in ed.prompt_line.read_key.call_args.args[0]
+
+
+class TestStatusPromptResize:
+    """A terminal resize under a blocking question is not an answer: the
+    screen is re-measured and the question waits on (see TestResize in
+    test_key_dispatch for the same rule in _dispatch)."""
+
+    def _editor(self, keys):
+        ed = make_editor()
+        ed.stdscr.get_wch = MagicMock(side_effect=keys)
+        return ed
+
+    def test_a_resize_does_not_answer_a_confirm(self):
+        ed = self._editor([curses.KEY_RESIZE, 'y'])
+        assert ed.prompt_line.confirm('Commit? (y/n)') is True
+        ed.renderer.resize.assert_called_once()
+
+    def test_a_resize_does_not_cancel_an_ask(self):
+        ed = self._editor([curses.KEY_RESIZE, curses.KEY_RESIZE, 'n'])
+        assert ed.prompt_line.yes_no_or_cancel('Sure?') is False
+        assert ed.renderer.resize.call_count == 2
+
+    def test_the_question_is_redrawn_at_the_new_size(self):
+        ed = self._editor([curses.KEY_RESIZE, 'y'])
+        ed.prompt_line.draw = MagicMock()
+        ed.prompt_line.confirm('Commit? (y/n)')
+        assert ed.prompt_line.draw.call_count == 2
 
 
 class TestStatusPromptLine:

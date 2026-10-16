@@ -346,7 +346,7 @@ dbcls -c <(echo "$CONFIG") mydb.sql
 
 | Hotkey | Action |
 |--------|--------|
-| `Alt+1` / `Shift+Tab` | Show DB autocompletion suggestions (tables, columns, table aliases, functions) |
+| `Shift+Tab` | Show DB autocompletion suggestions (tables, columns, table aliases, functions) |
 | `Ctrl+b` | Beautify the query under cursor or the selected text (see [Beautify](#beautify)) |
 | `Alt+Enter` | Execute query under cursor or selected text (`Alt+r` does the same — a deprecated alias kept for now; in read-only mode plain `Enter` runs it too) |
 | `Esc` | Cancel running query. On ClickHouse the query is killed on the server too (`KILL QUERY`), so a long transfer stops instead of running on in the background |
@@ -481,6 +481,33 @@ Press `Ctrl+d` inside the editor to enable debug mode — the key code of every 
 
 You can also open the help (`F1` / `Alt+h`) while debug mode is active to see a full list of all registered keybindings with their codes at the bottom of the help page.
 
+### Alt on macOS
+
+When the terminal does not send `Option` as Meta (Terminal.app: *Use Option as
+Meta key* off; iTerm2: *Option key* set to *Normal*), `Option+R` types `®`
+instead of sending `Alt+r`, and none of the `Alt` shortcuts work — `Alt+Enter`,
+`Alt+P`, `Alt+T`, `Alt+S`, `Alt+E`, `Alt+H`, the word jumps, VisiData's `Alt`
+keys. The `Ctrl` ones do. The fix is to make `Option` send Meta (`Esc+`):
+
+| Terminal | Setting |
+|----------|---------|
+| Terminal.app | Settings → Profiles → Keyboard → *Use Option as Meta key* |
+| iTerm2 | Settings → Profiles → Keys → General → Left / Right Option key: *Esc+* |
+| Ghostty | `macos-option-as-alt = true` |
+| kitty | `macos_option_as_alt yes` |
+| Alacritty | `option_as_alt = "Both"` in `[window]` |
+| WezTerm | `send_composed_key_when_left_alt_is_pressed = false` |
+
+The same is on the `Alt on macOS` page of the in-app help (`F1`). dbcls does
+not read the symbols as `Alt` itself: a paste arrives as keystrokes, and a
+pasted `®` would run a command. A symbol can still be bound to its `Alt`
+code with [`--key-remap`](#key-remapping) by someone who never types it, e.g.
+`®` → `Alt+r` and `π` → `Alt+p`:
+
+```bash
+dbcls --key-remap "696:457,3840:449" mydb.sql
+```
+
 ### Tmux-Style Prefix Key (Ctrl+X)
 
 `Ctrl+x` works as a tmux-like prefix key: the next key pressed within 1 second is combined
@@ -503,7 +530,7 @@ combinations (Alt or Shift ones, for example):
 
 ### Context-Aware Autocomplete
 
-Autocomplete suggestions (`Alt+1`) are ordered by what can legally follow the cursor.
+Autocomplete suggestions (`Shift+Tab`) are ordered by what can legally follow the cursor.
 DbCls looks at the last SQL keyword before it and picks the matching priority order:
 
 | Position | Ordered by |
@@ -572,7 +599,10 @@ When using `Alt+e` (database list) or `Alt+t` (table list), use the arrow keys t
 ### Editing Table Data
 
 The `Edit` table option opens the table's sample data with pending, locally-collected
-edits — nothing is sent to the database until you confirm.
+edits — nothing is sent to the database until you confirm. `gE` on a `Sample data` sheet
+opens the same edit sheet with the rows loaded so far (the `E` query included) without
+re-reading them from the database; `E` or `Ctrl+R` on the edit sheet reads from the
+database again.
 
 | Hotkey | Action |
 |--------|--------|
@@ -602,7 +632,7 @@ only `a` (adding rows) works.
 
 Press `Alt+s` to open a list of currently open VisiData sheets. Use the arrow keys to navigate and press `Enter` to switch to the selected sheet.
 
-To keep sheets open when navigating between them, quit VisiData with `Ctrl+q` instead of `q`. Pressing `q` closes the current sheet, while `Ctrl+q` exits VisiData entirely while leaving all sheets in memory so they remain accessible via `Alt+s`.
+To keep sheets open when navigating between them, quit VisiData with `Ctrl+q` instead of `q`. Pressing `q` closes the current sheet, while `Ctrl+q` exits VisiData entirely while leaving all sheets in memory so they remain accessible via `Alt+s`. A sheet closed with `q` stays reachable through VisiData's `gS` (and `gU` brings it back) with all its rows; deleting it there (`d`) is what frees the memory once VisiData is left — even if it was still open on the stack after `Ctrl+q`.
 
 ## Data Visualization (visidata)
 
@@ -620,6 +650,7 @@ DbCls extends visidata with a handful of DB-aware helpers (cross-sheet reference
 | `g#` | Set the type of the current column to URL. The cells keep displaying the URL unchanged, but `(` expands the column into `schema`, `domain`, `port`, `path`, `query`, `anchor`, and `(` on the resulting `query` column expands it further into one column per query parameter, by name (a parameter repeated in the URL becomes a list). Values that are not URL-shaped display as a typing error, and editing such a cell still writes the URL text back to the database. The parts are editable too, the same way as JSON's: `e` on a column expanded with `(`, or `z Enter` to open the six parts (`d` clears one; they cannot be renamed or added) and `Enter` on `query` for its parameters (`e` on `key` renames, `a` / `d` add / delete). Only the changed part is replaced in the URL text — user info, the case of the host and the encoding of the other parameters stay as they were |
 | `gp` | Draw a chart from the columns you type at the prompt, `Tab` completes column names (see [Plotting](#plotting) below) |
 | `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only); `Tab` / `Shift+Tab` complete column names, and the matches show up in a menu above the prompt |
+| `gE` | On a `Sample data` sheet: open the rows loaded so far on an edit sheet (see [Editing Table Data](#editing-table-data)) without re-reading them from the database |
 | `gT` | Save current or selected rows to pipeline vars |
 | `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
 | `zm` | Open a macro as a sheet of its commands, for a pipeline's `.VDM`: while recording (`m`) it stops the recording — no key binding asked, nothing saved — otherwise it reopens the last macro; on the macros sheet (`gm`) it opens the one under the cursor. The commands are edited with `e`, `d`, `Shift+J` / `Shift+K`; `Y` / `gs gY` copy the current / selected ones and `Ctrl+S` saves them, and on this sheet the format offered is `jsonl` — exactly what `.VDM` reads (visidata's default `tsv`, or `json`'s array, it does not). The sheet holds copies: editing it leaves the recorded macro as it was |
@@ -1044,7 +1075,7 @@ On the VisiData sheets `Enter` always answers with the row under the cursor; `ss
 | `select(title, options, default=None)` | Multi-choice variant of `choose()`: `Tab` marks/unmarks the highlighted item, `Enter` confirms. Returns the list of marked options' values — `[]` when nothing is marked, which is a normal answer the pipeline continues with. `(label, value)` pairs work as in `choose()`. `default` is a list of option values to pre-mark, e.g. `select('Params', [1, 2, 3, 4], default=[1, 2])`. |
 | `schoose(title, rows)` | Open `rows` (e.g. `data`; non-dict rows are shown as a `value` column, the answer holds the original items) in VisiData. `Enter` picks the row under the cursor (VisiData's selection is ignored) and returns *that item itself*, not a list — so it can be compared to a value directly. `q` or quitting VisiData cancels the pipeline. |
 | `sselect(title, rows)` | Multi-row variant of `schoose()`: the rows open the same way and `Enter` returns the row under the cursor, but you can also mark rows with VisiData's selection (`s`/`t`/`gs`...) and return all of them with `g Enter` (nothing marked returns `[]`). `q` on a sub-sheet (e.g. `"` dup-selected) just closes it; `q` on the last sselect sheet or quitting VisiData (`gq`, `Ctrl+Q`) cancels the pipeline. E.g. `.RUN "SELECT * FROM t" \| .PY "result(sselect('Pick rows', data))"`. |
-| `input(title, default=None, items=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. `↑`/`↓` walk what was entered at the same `title` earlier and list the matches in a popup above the bar — every title keeps its own history (up to 500 lines, for as long as dbcls runs). Whatever is typed filters that list live, the way the autocomplete popup filters: only the entries containing every space-separated part are offered, e.g. `te st` matches `my test string`. `items` adds values the user never typed (strings, or rows of a previous step — the first column) as older entries, e.g. `input('path', items=data)`. `Ctrl+V` pastes the clipboard into the line (a multi-line clipboard is joined with spaces — the bar holds one line). `Esc` closes the list first and cancels the pipeline only when no list is up. |
+| `input(title, default=None, items=None)` | Ask the user to type a line of text in the bottom bar; returns the entered string. `default` pre-fills the line, e.g. `input('Your age', default=18)`. `↑`/`↓` walk what was entered at the same `title` earlier and list the matches in a popup above the bar — every title keeps its own history (up to 500 lines, for as long as dbcls runs). Whatever is typed filters that list live, the way the autocomplete popup filters: only the entries containing every space-separated part are offered, e.g. `te st` matches `my test string` (an untouched `default` does not filter: `↑` over it lists everything, `↓` past the newest entry brings the default back). `items` adds values the user never typed (strings, or rows of a previous step — the first column) as older entries, e.g. `input('path', items=data)`. `Ctrl+V` pastes the clipboard into the line (a multi-line clipboard is joined with spaces — the bar holds one line). `Esc` closes the list first and cancels the pipeline only when no list is up. |
 | `ask(title)` | Ask a yes/no question in the status bar; `y`/`Enter` return `True`, `n` returns `False`, `Esc` cancels the pipeline. Any other key is ignored and the question keeps waiting. |
 
 Dismissing any of these prompts with `Esc` (`q` for the VisiData sheets, since `Esc` is a regular key inside VisiData) cancels the pipeline: unlike `stop()`, no result is displayed — only a `Cancelled` notification in the status bar. An empty selection is *not* a dismissal: `select()` and `sselect()`'s `g Enter` return `[]` and the pipeline keeps running.

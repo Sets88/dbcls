@@ -6,7 +6,9 @@ VisiData's "wait for the previous work to finish" mechanisms, otherwise a
 partially loaded sheet blocks commands for good.
 """
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from dbcls.vd_modules.vd_db_browser import TableSampleDataSheet
 
@@ -64,3 +66,52 @@ class TestLoaderThreadOptOuts:
         # "still running syscopyCells_async from previous command".
         t = _run_loader_in_thread(_make_sheet([[{'a': 1}], []]))
         assert t.noblock is True
+
+
+class _Fail(Exception):
+    pass
+
+
+def _sample_sheet(client, rows):
+    sheet = TableSampleDataSheet.__new__(TableSampleDataSheet)
+    sheet.client = client
+    sheet.db = 'db'
+    sheet.table = 't'
+    sheet.rows = rows
+    sheet.columns = []
+    sheet.CUSTOM_SQL = 'SELECT * FROM t WHERE 1'
+    sheet._known_columns = ['a']
+    return sheet
+
+
+def test_ge_refuses_an_engine_without_editing():
+    from dbcls.vd_modules import vd_db_browser
+    client = MagicMock(spec=[])  # no SUPPORTS_EDITING attribute at all
+    sheet = _sample_sheet(client, [{'a': 1}])
+    with patch.object(vd_db_browser.vd, 'fail', side_effect=_Fail), \
+            patch.object(vd_db_browser, 'EditTableSheet') as editor_cls:
+        with pytest.raises(_Fail):
+            sheet.open_editor()
+    editor_cls.assert_not_called()
+
+
+class _EditorStub:
+    def __init__(self, name, **kwargs):
+        self.name = name
+        self.kwargs = kwargs
+
+
+def test_ge_with_nothing_loaded_opens_the_editor_without_seeding_it():
+    from dbcls.vd_modules import vd_db_browser
+    client = MagicMock()
+    client.SUPPORTS_EDITING = True
+    sheet = _sample_sheet(client, [])
+    with patch.object(vd_db_browser, 'EditTableSheet', _EditorStub), \
+            patch.object(vd_db_browser.vd, 'push') as push:
+        editor = sheet.open_editor()
+    assert editor.name == 'edit__db__t'
+    assert editor.kwargs == {'client': client, 'db': 'db', 'table': 't'}
+    assert editor.CUSTOM_SQL == 'SELECT * FROM t WHERE 1'
+    assert editor._known_columns == ['a']
+    assert not hasattr(editor, '_seed')  # the editor loads from the database itself
+    push.assert_called_once_with(editor)

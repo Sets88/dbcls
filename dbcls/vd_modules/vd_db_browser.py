@@ -3,8 +3,9 @@ import decimal
 import re
 import time
 import threading
+from copy import copy
 
-from visidata import VisiData, BaseSheet, TableSheet, Column, ColumnItem
+from visidata import VisiData, BaseSheet, TableSheet, Column, ColumnItem, ItemColumn
 from visidata import vd, asyncthread, ENTER, AttrDict, deduceType, Progress
 
 from ..utils import SqlExpr
@@ -143,6 +144,7 @@ class TableSampleDataSheet(TableSheet):
 Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cursor approaches the bottom.
 
 - `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); the sheet reloads with the new query.  In the prompt `Tab` / `Shift+Tab` complete column names; the matches are listed in a menu above the prompt, the one in the line highlighted.
+- `gE` to open the rows loaded so far on an edit sheet (`e` / `a` / `d`, `Ctrl+S` to commit) without re-reading them from the database.
 - `Ctrl+C` to stop the chunked loader.
 '''
     rowtype = 'tables'
@@ -179,6 +181,36 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
         sql = vd.input('current sql: ', value=self.get_sample_base_sql(self.table, self.db),
                        completer=completer)
         self.update_current_sql(sql)
+
+    def open_editor(self):
+        """`gE`: hand the rows loaded so far to an EditTableSheet -- the
+        same table, the same `E` query -- without asking the database for
+        them again.  The editor is a root of its own pending edits and gets
+        copies of the rows, so this sheet stays the snapshot it was: a commit
+        on the editor does not half-update it (changed values but not the
+        deletes and inserts).
+
+        The chunked loader is left running (unlike `E` and `q`): it idles
+        until this sheet is scrolled again, blocks nothing (see iterload),
+        and killing it would leave the sheet unable to load past the rows
+        it had when the editor opened."""
+        if not getattr(self.client, 'SUPPORTS_EDITING', False):
+            vd.fail('this engine does not support editing')
+        editor = EditTableSheet(
+            f"edit__{self.db}__{self.table}",
+            client=self.client,
+            db=self.db,
+            table=self.table,
+        )
+        editor.CUSTOM_SQL = self.CUSTOM_SQL
+        editor._known_columns = self._known_columns
+        # only the columns that read a key of the row: a computed (`=`) or an
+        # expanded (`(`) column has nothing in the table to write to
+        columns = [copy(col) for col in self.columns if isinstance(col, ItemColumn)]
+        if self.rows and columns:
+            editor._seed = (columns, [AttrDict(row) for row in self.rows])
+        vd.push(editor)
+        return editor
 
     def handle_empty_table(self):
         raise Exception('No data found')
@@ -322,6 +354,7 @@ Editing and deleting existing rows requires the table to have a primary key; wit
     defer = True  # VisiData accumulates edits in _deferredMods/_deferredAdds
     pk_columns = None
     _edit_root = None  # on a copy: the sheet the pending edits belong to
+    _seed = None  # (columns, rows) handed over by `gE` on a Sample data sheet: the first load only
 
     @property
     def edit_root(self):
@@ -365,6 +398,17 @@ Editing and deleting existing rows requires the table to have a primary key; wit
         self.pk_columns = pk if isinstance(pk, list) else []
         if not self.pk_columns:
             vd.warning('no primary key: editing existing rows disabled, only row adds allowed')
+        seed, self._seed = self._seed, None
+        if seed is not None:
+            # rows handed over from a Sample data sheet (`gE`): show them as
+            # they are; a later reload (`E`, the fallback after a commit)
+            # reads from the database as usual
+            columns, rows = seed
+            self.columns = []
+            for col in columns:
+                self.addColumn(col)
+            yield from rows
+            return
         yield from super().iterload()
 
     def handle_empty_table(self):
@@ -475,6 +519,19 @@ Editing and deleting existing rows requires the table to have a primary key; wit
                 vd.fail(f'primary key column {name} has no value')
             pk[name] = value
         return pk
+
+    def getDeferredChanges(self):
+        """VisiData's, less the rows with no cell still different from its
+        source value.  A cell edited and then edited back is no change, but
+        VisiData keeps the row in the mods with nothing left in it (it drops
+        the cells that are not isChanged, not the row), and that would become
+        an UPDATE with an empty SET — and count as a pending change for
+        VisiData's own commit.  Not for its quit guard: that one reads
+        ``hasBeenModified``, which the first edit set, so `q` still asks after
+        an edit was reverted."""
+        adds, mods, dels = super().getDeferredChanges()
+        mods = {rowid: (row, rowmods) for rowid, (row, rowmods) in mods.items() if rowmods}
+        return adds, mods, dels
 
     def pending_statements(self) -> list:
         adds, mods, dels = self.getDeferredChanges()
@@ -701,6 +758,9 @@ The CREATE TABLE statement for _{sheet.table}_ (reconstructed from the system ca
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(f\'table_options__{cursorRow["database"]}__{cursorRow["table"]}\', client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
 TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.edit_sql()', 'Edit current sql (Tab completes column names)')
+# EditTableSheet keeps its own `gE` (edit-selected-sql-expr): the subclass
+# binding wins over this one.
+TableSampleDataSheet.addCommand('gE', 'edit-loaded-rows', 'sheet.open_editor()', 'open the loaded rows on an edit sheet (e/a/d, Ctrl+S to commit)')
 # iterload's chunked loader is designed to idle forever (see the comment in
 # iterload), so leaving the sheet via `q` must explicitly stop it -- otherwise
 # it keeps calling the shared client in the background and starves/blocks

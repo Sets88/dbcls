@@ -88,16 +88,16 @@ class TestOverlays:
         overlay.tick.assert_called_once()
         assert overlay.keys == []
 
-    def test_a_resize_still_reaches_the_renderer(self):
-        # The editor's own resize command never runs while an overlay is up,
-        # but the overlay is drawn with the renderer's screen size.
+    def test_a_resize_reaches_the_renderer_and_not_the_overlay(self):
+        # The overlay is drawn with the renderer's screen size; the resize is
+        # not a key for it to handle.
         import curses
         ed = make_editor()
         overlay = self._overlay()
         ed._overlays.append(overlay)
         ed._dispatch(curses.KEY_RESIZE)
         ed.renderer.resize.assert_called_once()
-        assert overlay.keys == [K(curses.KEY_RESIZE)]
+        assert overlay.keys == []
 
     def test_popping_gives_the_keys_back_to_the_editor(self):
         ed = make_editor()
@@ -264,3 +264,64 @@ class TestTmuxPrefix:
         ed.keys.prefix_pending = False  # what run() does on timeout
         ed._dispatch(ENTER)
         assert calls == ['newline']
+
+
+class TestResize:
+    """KEY_RESIZE is not a key the user pressed — the terminal changed size, or
+    curses re-measured it on the way back from VisiData.  It reaches the
+    renderer and nothing else: a widget over the document must not take it
+    for a keystroke (the info popup used to close on it before it was read)."""
+
+    def test_a_resize_does_not_close_the_info_popup(self):
+        import curses
+        ed = make_editor()
+        ed.info_popup = MagicMock(active=True)
+        ed._dispatch(curses.KEY_RESIZE)
+        ed.info_popup.close.assert_not_called()
+        ed.info_popup.handle_key.assert_not_called()
+        ed.renderer.resize.assert_called_once()
+
+    @pytest.mark.parametrize('widget', ['popup', 'running_popup'])
+    def test_an_open_popup_never_sees_it(self, widget):
+        import curses
+        ed = make_editor()
+        getattr(ed, widget).active = True
+        ed._dispatch(curses.KEY_RESIZE)
+        getattr(ed, widget).handle_key.assert_not_called()
+        ed.renderer.resize.assert_called_once()
+
+    def test_the_search_bar_never_sees_it(self):
+        import curses
+        ed = make_editor()
+        ed.search.active = True
+        ed._dispatch(curses.KEY_RESIZE)
+        ed.search.handle_key.assert_not_called()
+        ed.renderer.resize.assert_called_once()
+
+    def test_a_pipeline_prompt_never_sees_it(self):
+        import curses
+        ed = make_editor()
+        ed._ui_request = {'opened': True, 'kind': None}
+        ed._handle_ui_request_key = MagicMock()
+        ed._dispatch(curses.KEY_RESIZE)
+        ed._handle_ui_request_key.assert_not_called()
+        ed.renderer.resize.assert_called_once()
+
+    def test_it_is_not_typed_into_the_document(self):
+        import curses
+        ed = make_editor()
+        ed._handle_normal_key = MagicMock()
+        ed._dispatch(curses.KEY_RESIZE)
+        ed._handle_normal_key.assert_not_called()
+        ed.renderer.resize.assert_called_once()
+
+    def test_a_pre_hook_that_swallows_every_key_does_not_swallow_it(self):
+        """The lock screen's pre-hook takes every key while it is up; the
+        terminal must still be re-measured, or the editor comes back from the
+        lock drawn at the old size."""
+        import curses
+        ed = make_editor()
+        ed._dispatch_pre_hook = MagicMock(return_value=True)
+        ed._dispatch(curses.KEY_RESIZE)
+        ed._dispatch_pre_hook.assert_not_called()
+        ed.renderer.resize.assert_called_once()

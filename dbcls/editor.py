@@ -16,6 +16,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Union
 
+from . import log
 from .prompts import SHEET_KINDS, PromptKind
 from .syntax import (DEFAULT_SYNTAX, EMBED_PREFIX, Highlighter, Token,  # noqa: F401
                      make_highlighter, syntax_names)
@@ -28,6 +29,9 @@ class PopupItem:
     label:  str        # text displayed in the list
     weight: int = 0    # sort weight (lower = higher priority)
     hint:   str = ''   # optional one-line syntax hint shown above the popup
+
+
+logger = log.get_logger(__name__)
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -124,6 +128,41 @@ WORD_RIGHT_KEYS = (
     key_csi('[', '1', ';', '3', 'C'),
     key_csi('[', '1', ';', '9', 'C'),
 )
+
+# On a Mac whose terminal does not send Option as Meta (Terminal.app "Use
+# Option as Meta key" off, iTerm2 "Option key: Normal") Option+R types ® instead
+# of sending Alt+R, and no Alt shortcut works.  The editor does not read those
+# symbols as Alt itself — a paste arrives as keystrokes, and a pasted ® would
+# run a command — it only documents the terminal setting (the "Alt on macOS"
+# help page) and leaves --key-remap to whoever never types the character.
+#: Where each terminal keeps the switch.
+MAC_OPTION_SETTINGS = """\
+  `Terminal.app`
+      Settings → Profiles → Keyboard → "Use Option as Meta key"
+  `iTerm2`
+      Settings → Profiles → Keys → General → Left / Right Option
+      key: "Esc+"
+  `Ghostty`
+      macos-option-as-alt = true
+  `kitty`
+      macos_option_as_alt yes
+  `Alacritty`
+      [window] option_as_alt = "Both"
+  `WezTerm`
+      send_composed_key_when_left_alt_is_pressed = false"""
+
+MAC_OPTION_HELP = """\
+When the terminal does not send Option as Meta, Option+R types `®`
+instead of sending Alt+R, and no Alt shortcut works — Alt+Enter,
+Alt+P, Alt+T …; the Ctrl ones do.  Switch Option to Meta (Esc+) in
+the terminal settings:
+
+""" + MAC_OPTION_SETTINGS + """
+
+A symbol can also be bound to its Alt combo with `--key-remap` (see
+Key remapping): `"696:457"` makes `®` act as Alt+R, `"3840:449"` `π`
+as Alt+P — only if you never type the character, since it is then a
+command everywhere, in pasted text included."""
 
 # The key that starts a tmux-style prefix sequence.
 # After this key is pressed, the next key within 1 second is tagged with KEY_PREFIX_BIT.
@@ -231,7 +270,6 @@ class Fn(str, enum.Enum):
     DELETE_LINE      = 'delete_line'
     NEWLINE          = 'newline'
     TAB              = 'tab'
-    RESIZE           = 'resize'
     CLEAR_SELECTION  = 'clear_selection'
     COMMAND_PALETTE  = 'command_palette'
     TOGGLE_FOLD      = 'toggle_fold'
@@ -1300,7 +1338,9 @@ class InputBar(LineInputBar):
 
     A pre-filled default is drawn selected: until a key moves the cursor or
     edits the line, the first typed character (or a paste) replaces it instead
-    of being appended — see :attr:`pristine`."""
+    of being appended — see :attr:`pristine`.  The default is not a filter:
+    ↑ lists the whole history over it, and ↓ past the newest entry brings the
+    default back.  Only once the line is edited does its text narrow the list."""
 
     #: keys that walk the history instead of editing the line
     HISTORY_KEYS = (K(curses.KEY_UP), K(curses.KEY_DOWN),
@@ -1310,10 +1350,13 @@ class InputBar(LineInputBar):
         super().__init__(clipboard)
         self.history = InputHistory()
         self.history_popup = SelectPopup()
-        self._draft = ''      # the typed line — also the popup's filter
+        self._draft = ''      # the typed line (or the default) — ↓ brings it back
+        self._filter = ''     # the popup's filter: what was typed, never the default
         self._picked = False  # the line currently holds an entry off the list
         #: the line still holds the untouched default — typing replaces it
         self.pristine = False
+        #: the draft is the untouched default: ↓ brings it back selected
+        self._draft_pristine = False
 
     def open(self, prompt: str = '', text: str = '', items=(), mask: bool = False):
         """*items* are merged into the prompt's history bucket as older
@@ -1327,8 +1370,9 @@ class InputBar(LineInputBar):
         super().open(prompt, text, mask=mask)
         self.history_popup.close()
         self._draft = text
+        self._filter = ''
         self._picked = False
-        self.pristine = bool(text)
+        self.pristine = self._draft_pristine = bool(text)
 
     def close(self):
         super().close()
@@ -1348,7 +1392,7 @@ class InputBar(LineInputBar):
         entry goes on top, so the newest sits closest to the bar."""
         items = [PopupItem(insert=entry, label=entry, weight=i)
                  for i, entry in enumerate(self.history.entries(self.prompt))]
-        self.history_popup.open(items, filter_text=self._draft, title='History')
+        self.history_popup.open(items, filter_text=self._filter, title='History')
         if not self.history_popup.filtered:
             return False
         self.history_popup._nav_end()
@@ -1358,7 +1402,8 @@ class InputBar(LineInputBar):
         """The line was just edited: it is the user's own text again, and the
         popup's filter.  An open list stays up — narrowed, possibly to nothing
         until the text is cut back; a closed one is not opened by typing."""
-        self._draft = self.query
+        self._draft = self._filter = self.query
+        self._draft_pristine = False
         self._picked = False
         if self.history_popup.active:
             self._fill_history()
@@ -1381,6 +1426,8 @@ class InputBar(LineInputBar):
         elif not older and popup.selected_idx >= len(popup.filtered) - 1:
             self._picked = False
             self._set_text(self._draft)
+            # an untouched default comes back as it was opened: selected
+            self.pristine = self._draft_pristine
             return
         else:
             popup.handle_key(key)
@@ -4327,10 +4374,13 @@ class StatusPrompt:
     ESC = 27
 
     def __init__(self, stdscr: curses.window, colors: 'ColorManager',
-                 keys: 'KeyCodec') -> None:
+                 keys: 'KeyCodec', on_resize: Optional[Callable[[], None]] = None) -> None:
         self.stdscr = stdscr
         self.colors = colors
         self.keys = keys
+        #: called when the terminal changes size under a question, so the
+        #: screen is re-measured the way _dispatch does it between questions
+        self.on_resize = on_resize
 
     def draw(self, message: str, color: int, extra: str = '') -> None:
         """Draw a one-line prompt in the status bar, cursor after it."""
@@ -4349,7 +4399,11 @@ class StatusPrompt:
 
         With *resolve*, an Esc is followed up so that an arrow key or an Alt
         combo does not read as a bare Esc — which a question offering Esc as
-        "cancel" would otherwise take as the answer."""
+        "cancel" would otherwise take as the answer.
+
+        A terminal resize is not a key either (see EditorShell._dispatch): it
+        re-measures the screen, redraws the question and keeps waiting —
+        returned, it would answer a y/n question with "no"."""
         self.draw(message, self.colors.status_warn)
         while True:
             try:
@@ -4358,6 +4412,11 @@ class StatusPrompt:
                 continue
             key = self.keys.normalize(key)
             if key == -1:
+                continue
+            if key == curses.KEY_RESIZE:
+                if self.on_resize is not None:
+                    self.on_resize()
+                self.draw(message, self.colors.status_warn)
                 continue
             return self.keys.resolve(key) if resolve else key
 
@@ -4557,7 +4616,9 @@ class EditorShell:
         #: Everything between a keypress and the code a command is bound to.
         self.keys = KeyCodec(stdscr, idle_timeout_ms=self.TICK_MS)
         #: The blocking one-line questions asked on the status bar.
-        self.prompt_line = StatusPrompt(stdscr, self.colors, self.keys)
+        # (the renderer is looked up at call time: tests replace it)
+        self.prompt_line = StatusPrompt(stdscr, self.colors, self.keys,
+                                        on_resize=lambda: self.renderer.resize())
         self.renderer = Renderer(stdscr, self.colors)
         self.tab_bar = TabBar()
         #: Open documents, in tab order, and the index of the visible one.
@@ -4754,10 +4815,6 @@ class EditorShell:
                 # not reach handle_key(): KEY_MOUSE is a printable code point
                 # and a text field would type it.
                 return False
-            if key == K(curses.KEY_RESIZE):
-                # The overlay is drawn with the renderer's screen size, and the
-                # editor's own resize command never runs while one is up.
-                self.renderer.resize()
             overlay.handle_key(key)
         self.request_redraw()
         return True
@@ -5099,7 +5156,6 @@ class EditorShell:
         add(Fn.SEARCH,          self._cmd_search,               'Search',                 '^F')
         add(Fn.QUIT,            self._quit,                     'Quit',                   '^Q')
         add(Fn.HELP,            self.show_help,                 'Show help',              'F1 / Alt+H')
-        add(Fn.RESIZE,          self._cmd_resize,               'Handle terminal resize')
         add(Fn.COMMAND_PALETTE, self._cmd_command_palette,      'Command palette',        'Alt+P')
         add(Fn.TOGGLE_FOLD,     self._cmd_toggle_fold,          'Toggle >>> <<< block folding', '^P')
         add(Fn.NEXT_TAB,        self._cmd_next_tab,             'Next tab',    'Ctrl+Shift+Right / ^X Right')
@@ -5118,7 +5174,8 @@ class EditorShell:
         add(Fn.SEARCH,          K(ord('\x06')))
         add(Fn.QUIT,            K(ord('\x11')))
         add(Fn.HELP,            [K(curses.KEY_F1), key_alt(ord('h'))])
-        add(Fn.RESIZE,          K(curses.KEY_RESIZE))
+        # KEY_RESIZE is not a command: _dispatch handles it before any widget
+        # could take it for a key (see there).
         add(Fn.COMMAND_PALETTE, key_alt(ord('p')))   # Alt+P
         add(Fn.TOGGLE_FOLD,     K(ord('\x10')))      # Ctrl+P
         # Ctrl+Shift+arrow as the raw CSI sequence: the terminfo codes for it
@@ -5244,6 +5301,20 @@ class EditorShell:
 
         key = self.keys.remap(self.keys.encode(self.keys.resolve(key)))
 
+        if key == K(curses.KEY_RESIZE):
+            # Not something the user pressed — the terminal changed size, or
+            # curses re-measured it on the way back from VisiData.  Handled
+            # here, once, before anything that takes keys: nothing over the
+            # document (the info popup, the palette, the search bar, a prompt,
+            # an overlay, the lock screen in the pre-hook) may take it for a
+            # key — the info popup used to close on it before it was ever
+            # read — and all of them are drawn with the renderer's size.
+            # The loops that read keys on their own (StatusPrompt.read_key,
+            # _prompt, the lock screen) have to do the same themselves.
+            self.renderer.resize()
+            self.request_redraw()
+            return
+
         if self._dispatch_pre_hook(key):
             return
 
@@ -5365,6 +5436,7 @@ class EditorShell:
         """The info popup is up; *key* is very likely the one closing it."""
         if self.info_popup.handle_key(key) != 'close':
             return
+        logger.debug('info popup %r closed by key %d', self.info_popup._title, key)
         self.info_popup.close()
         req = self._ui_request
         if req is not None and req['opened'] and req['kind'] == PromptKind.WARN:
@@ -5455,9 +5527,6 @@ class EditorShell:
         self.set_status_notification(
             f'Block folding: {"on" if self.doc.toggle_fold() else "off"}')
 
-    def _cmd_resize(self):
-        self.renderer.resize()
-
     # ── Printable character ───────────────────────────────────────────────────
 
     def _handle_printable(self, key):
@@ -5513,7 +5582,8 @@ class EditorShell:
         self.info_popup.open('Help', pages)
 
     def _help_pages(self) -> dict:
-        return {'main': '-->>Editor<<--', 'Editor': EDITOR_HELP}
+        return {'main': '-->>Editor<<--\n-->>Alt on macOS<<--',
+                'Editor': EDITOR_HELP, 'Alt on macOS': MAC_OPTION_HELP}
 
     def _keybindings_text(self) -> str:
         return self.commands.bindings_text()

@@ -34,12 +34,37 @@ would bring a dropped sheet back are forgotten.
 `Q` (VisiData's quit-sheet-free) empties the sheet's rows at once; wrapped
 here, it also releases the closed sheets derived from it (see
 :func:`release_derived_sheets`), which would otherwise keep those rows.
+
+Which sheets are gone is not read off those holders: they are what to clean
+up, and a sheet can be dropped with no trace in any of them (the `gS` delete
+leaves none with VisiData's undo off; a sheet loaded without a thread is in no
+thread; the option cache is emptied here on every call).  Every sheet ever
+pushed is remembered weakly instead (the ``vd.push`` wrapper at the end of
+this module), and one still alive but out of the user's reach is dropped —
+it then owes its life to a holder above, or to the cycle between a sheet and
+its columns, and either way only this module lets it go.
+
+It runs after every session, so it has to be quick when there is nothing of
+the user's to let go — which is most sessions: a result viewed and closed with
+`q` stays reachable through `gS`.  Two things here would otherwise grow with
+the data in memory.  The sheets' ``source`` lists and the undo arguments are
+looked through for sheets, and a result's source *is* its rows, so a long
+list is walked only when it starts or ends with a sheet (a join's sources,
+`gS`'s rows), see :func:`_sheets_in` — whole only once something looks
+dropped, to make sure it is (see :func:`_kept_sheets`).  And a
+``gc.collect()`` — the only thing that frees a sheet, since it and its columns
+reference each other — walks every tracked object in the process, the rows of
+every sheet still open included, so it runs only for a sheet that held the
+user's rows.  VisiData makes and drops small sheets of its own on every
+session (the help sheet behind the command palette, the cmdlog view of a
+sheet); those are left to the ordinary garbage collector.
 """
 import gc
 import sys
+import weakref
 from typing import Iterable, Set
 
-from visidata import BaseSheet, Column, UNLOADED, vd
+from visidata import BaseSheet, Column, UNLOADED, VisiData, vd
 
 # TODO: most of this module works around VisiData leaks that
 # https://github.com/saulpw/visidata/pull/3231 fixes (open as of 2026-10-05):
@@ -58,9 +83,13 @@ from visidata import BaseSheet, Column, UNLOADED, vd
 #                     main-thread .sheet reset, vd.options._cache.clear(),
 #                     SettingsMgr._mappings.cache_clear(), the allobjs loop, and
 #                     the vd.cmdlog undo scan (_holds, _undo_refs, and the loop
-#                     collecting sheets from undofuncs).  With all of them gone,
-#                     so is _drop_references, _kept_sheets and the gc.collect.
-#                  tests: test_a_sheet_deleted_in_gS_is_freed
+#                     collecting sheets from undofuncs), and the vd.push
+#                     wrapper with _pushed (how a dropped sheet is known at
+#                     all).  With all of them gone, so is _drop_references,
+#                     _kept_sheets, _holds_data, _sheets_in and the
+#                     gc.collect.
+#                  tests: test_a_sheet_deleted_in_gS_is_freed,
+#                         test_a_sheet_nothing_of_visidatas_holds_is_still_freed
 #   vd-leak-Q      "Q (quit-sheet-free) frees nothing after a sort or a selection"
 #                  -> the loop over a dropped sheet's own cmdlog_sheet in
 #                     _drop_references.  Also needed for vd-leak-gS's sheets
@@ -79,9 +108,46 @@ from visidata import BaseSheet, Column, UNLOADED, vd
 # keeps them in gS for gU on purpose.
 
 
-def _kept_sheets() -> Set[int]:
+#: Every sheet ever pushed that is still alive, by id — weakly, so that this
+#: is never what keeps one.  A sheet in here that the user can no longer reach
+#: is dropped, whatever VisiData still holds it from (see the module
+#: docstring).  TODO(vd-leak-gS): goes with the vd.push wrapper
+_pushed: 'weakref.WeakValueDictionary[int, BaseSheet]' = weakref.WeakValueDictionary()
+
+#: a list up to this long is looked through whole for sheets; a longer one
+#: only when it starts or ends with a sheet — see _sheets_in
+_SHORT_LIST = 1000
+
+
+def _sheets_in(obj, whole: bool = False) -> list:
+    """The sheets in *obj* when it is a list of sheets (a join's sources,
+    `gS`'s rows, ``vd.allSheets`` held by an undo); nothing for anything else.
+    A list of rows can be millions long, and a result's ``source`` is one, so
+    a long list is looked through only when its first or last element is a
+    sheet — or with *whole*, see :func:`_kept_sheets`.  A short one always
+    is: a loader's or plugin's source may keep its sheets between
+    placeholders, ``[meta, sheet, meta]``, and a list of sheets is never
+    long."""
+    if not isinstance(obj, (list, tuple)) or not obj:
+        return []
+    if not whole and len(obj) > _SHORT_LIST and not (
+            isinstance(obj[0], BaseSheet) or isinstance(obj[-1], BaseSheet)):
+        return []
+    return [s for s in obj if isinstance(s, BaseSheet)]
+
+
+def _kept_sheets(whole: bool = False) -> Set[int]:
     """ids of the sheets the user can still reach: the stack, `gS`, VisiData's
-    own meta sheets (sheets_all, cmdlog, …) and everything they derive from."""
+    own meta sheets (sheets_all, cmdlog, …) and everything they derive from.
+
+    Without *whole*, a long source list is not looked through unless it starts
+    or ends with a sheet (:func:`_sheets_in`), so a sheet a plugin keeps
+    inside one, ``[hdr] + rows + [sheet]``, is missed — and a missed sheet
+    counts as dropped, which forgets its undos.  :func:`_drop_references`
+    therefore confirms what looked dropped with ``whole=True``, which walks
+    every list: that costs a pass over the rows, and happens only when there
+    is something of the user's to drop (:func:`_holds_data`), before the far
+    dearer ``gc.collect()``."""
     todo = list(vd.sheets) + list(vd.allSheets)
     todo += [v for v in vars(vd).values() if isinstance(v, BaseSheet)]
     kept: Set[int] = set()
@@ -93,9 +159,20 @@ def _kept_sheets() -> Set[int]:
         src = getattr(vs, 'source', None)
         if isinstance(src, BaseSheet):
             todo.append(src)
-        elif isinstance(src, (list, tuple)):
-            todo.extend(s for s in src if isinstance(s, BaseSheet))
+        else:
+            todo.extend(_sheets_in(src, whole))
     return kept
+
+
+def _holds_data(vs) -> bool:
+    """Whether a dropped sheet held rows of the user's, which only a
+    collection frees.  A VisiData sheet that is not precious is one of its
+    "discardable metasheets" (help, a sheet's cmdlog view, columns…) with
+    nothing of the user's in it; dbcls's own non-precious sheets — the
+    pipeline pickers, .VIEW — are kept out of `gS` that way but do hold rows,
+    and so may a plugin's."""
+    return bool(getattr(vs, 'precious', True)) or \
+        not type(vs).__module__.startswith('visidata')
 
 
 def _holds(obj, dropped: Set[int], dropped_rows: Set[int]) -> bool:
@@ -108,7 +185,7 @@ def _holds(obj, dropped: Set[int], dropped_rows: Set[int]) -> bool:
         return id(getattr(obj, 'sheet', None)) in dropped
     if isinstance(obj, list):
         return id(obj) in dropped_rows or any(
-            isinstance(x, BaseSheet) and id(x) in dropped for x in obj)
+            id(x) in dropped for x in _sheets_in(obj))
     return False
 
 
@@ -142,10 +219,29 @@ def _clear_draw_caches() -> None:
     vd.clearCaches()    # TODO(vd-leak-clip), see the TODO at the top
 
 
+def forget_deleted_from_stack() -> int:
+    """Take the sheets deleted in `gS` off the sheet stack.  Not a workaround,
+    keep: VisiData's `d` there only takes a sheet off ``allSheets``, and a
+    session left with `Ctrl+Q` keeps its stack — so a sheet deleted that way
+    would stay on it, reachable through `Alt+S` and held with all its rows
+    for the rest of the process, although the user has just thrown it away.
+    A precious sheet is on ``allSheets`` from the moment it is pushed; one on
+    the stack and not there was deleted.  (The non-precious ones — pickers,
+    VisiData's own — are never there, and are not the user's to delete.)
+    Returns how many were taken off."""
+    in_all = {id(vs) for vs in vd.allSheets}
+    deleted = [vs for vs in vd.sheets if vs.precious and id(vs) not in in_all]
+    for vs in deleted:
+        vd.remove(vs)
+    return len(deleted)
+
+
 def release_closed_sheets() -> int:
     """Drop VisiData's incidental references to every sheet that is no longer
-    reachable from the stack or `gS`, and collect them.  Returns how many
-    such sheets were found."""
+    reachable from the stack or `gS`, and collect them.  Returns how many of
+    them held rows of the user's (see :func:`_holds_data`) — the collection
+    runs only for those, see the module docstring."""
+    forget_deleted_from_stack()
     n = _drop_references()
     _clear_draw_caches()
     if n:
@@ -189,8 +285,11 @@ def _drop_references() -> int:
     SettingsMgr = type(vd.options._opts)
     mgrs = [m for m in vars(vd).values() if isinstance(m, SettingsMgr)]  # options, commands, bindkeys
 
-    # Everything the holders below reference and nobody can reach any more.
-    found = [t.sheet for t in vd.threads if isinstance(getattr(t, 'sheet', None), BaseSheet)]
+    # Every sheet still alive that nobody can reach any more: the pushed ones
+    # (all of them, see _pushed), plus what the holders below reference — a
+    # sheet never pushed is nobody's, but what holds it is still dropped.
+    found = list(_pushed.values())
+    found += [t.sheet for t in vd.threads if isinstance(getattr(t, 'sheet', None), BaseSheet)]
     found += [k[1] for k in vd.options._cache if isinstance(k[1], BaseSheet)]
     found += [v for m in mgrs for v in m.allobjs.values() if isinstance(v, BaseSheet)]
     dropped_sheets = {id(vs): vs for vs in found if id(vs) not in kept}
@@ -198,12 +297,21 @@ def _drop_references() -> int:
     for r in _cmdlog_rows_to_scan(kept):
         for undofunc in r.undofuncs or ():
             for ref in _undo_refs(undofunc):
-                if isinstance(ref, BaseSheet) and id(ref) not in kept:
-                    dropped_sheets[id(ref)] = ref
-                elif isinstance(ref, list):
-                    for x in ref:
-                        if isinstance(x, BaseSheet) and id(x) not in kept:
-                            dropped_sheets[id(x)] = x
+                sheets = [ref] if isinstance(ref, BaseSheet) else _sheets_in(ref)
+                for x in sheets:
+                    if id(x) not in kept:
+                        dropped_sheets[id(x)] = x
+    if not any(_holds_data(vs) for vs in dropped_sheets.values()):
+        # Nothing, or only VisiData's own metasheets (the help sheet behind
+        # the command palette, a closed cmdlog or columns view): nothing of
+        # the user's to free, so not worth the pass over the rows below — left
+        # to the ordinary GC, see the module docstring.  They stay in _pushed
+        # and go along with the next dropped sheet that does hold data.
+        return 0
+    # Looked dropped, with the long source lists skipped; a sheet held inside
+    # one of those is reachable all the same — now look everywhere.
+    kept = _kept_sheets(whole=True)
+    dropped_sheets = {i: vs for i, vs in dropped_sheets.items() if i not in kept}
     if not dropped_sheets:
         return 0
 
@@ -237,7 +345,7 @@ def _drop_references() -> int:
         for r in (own_log.rows if own_log is not None else ()):
             r.undofuncs = []
 
-    return len(dropped_sheets)
+    return sum(1 for vs in dropped_sheets.values() if _holds_data(vs))
 
 
 def _derives_from(vs, base) -> bool:
@@ -246,9 +354,7 @@ def _derives_from(vs, base) -> bool:
     while todo:
         src = todo.pop()
         if isinstance(src, (list, tuple)):
-            # a join's sources; a plain list of rows is not looked through
-            if src and isinstance(src[0], BaseSheet):
-                todo.extend(s for s in src if isinstance(s, BaseSheet))
+            todo.extend(_sheets_in(src))   # a join's sources, never rows
         elif isinstance(src, BaseSheet) and id(src) not in seen:
             if src is base:
                 return True
@@ -271,6 +377,22 @@ def release_derived_sheets(base) -> int:
         vs.rows = UNLOADED
         vd.allSheets.remove(vs)
     return len(derived)
+
+
+# TODO(vd-leak-gS): the wrapper goes with _pushed, see the TODO at the top.
+# Every sheet the user ever had goes through vd.push (vd.run, vd.replace and
+# the .SHEET pipeline step all push); a sheet made and never pushed was never
+# the user's to drop.
+if not getattr(VisiData, '_dbcls_push_wrapped', False):
+    _orig_push = VisiData.push
+
+    @VisiData.api
+    def push(vd, vs, *args, **kwargs):
+        if isinstance(vs, BaseSheet):
+            _pushed[id(vs)] = vs
+        return _orig_push(vd, vs, *args, **kwargs)
+
+    VisiData._dbcls_push_wrapped = True
 
 
 # hasattr: the test suite's stand-in BaseSheet has no such method (the seams

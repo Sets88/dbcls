@@ -54,6 +54,7 @@ class TestTheModulesLoad:
             assert getattr(VisiData, '_dbcls_idle_wrapped', False), 'idle wrapper missing'
             assert getattr(VisiData, '_dbcls_sidebar_wrapped', False), 'sidebar wrapper missing'
             assert getattr(BaseSheet, '_dbcls_release_wrapped', False), 'Q wrapper missing'
+            assert getattr(VisiData, '_dbcls_push_wrapped', False), 'push wrapper missing'
         ''')
 
     def test_importing_it_twice_does_not_stack_the_wrappers(self):
@@ -790,6 +791,59 @@ class TestClosedSheetsAreReleased:
             assert ref() is None, gc.get_referrers(ref())
         ''')
 
+    def test_a_sheet_deleted_in_gS_while_still_on_the_stack_is_freed(self):
+        """Ctrl+Q leaves VisiData with the stack intact; `d` in gS only takes
+        a sheet off allSheets, so one deleted that way would stay on the
+        stack — reachable through Alt+S and held for good — although the user
+        has just thrown it away.  A picker on the stack (not precious, so
+        never on allSheets) is not the user's to delete and stays."""
+        self.run('''
+            from dbcls.vd_modules.vd_memory import forget_deleted_from_stack
+            from dbcls.vd_modules.vd_utils import ViewSheet
+
+            vs = opened('result')
+            picker = ViewSheet('view', source=[{'a': 1}])
+            vd.push(picker)
+            delete_in_gS(vs)
+            assert vs in vd.sheets and vs not in vd.allSheets
+            ref = weakref.ref(vs)
+            del vs
+            assert release_closed_sheets() >= 1
+            assert ref() is None, gc.get_referrers(ref())
+            assert vd.sheets == [picker]
+            assert forget_deleted_from_stack() == 0
+        ''')
+
+    # TODO(vd-leak-gS): delete with the workaround, see dbcls/vd_modules/vd_memory.py
+    def test_a_sheet_nothing_of_visidatas_holds_is_still_freed(self):
+        """A dropped sheet is known from having been pushed, not from what
+        VisiData happens to hold it from: with undo off the gS delete leaves
+        no trace, a sheet loaded without a thread is in no thread, and the
+        option caches are emptied on every call.  Only the cycle between the
+        sheet and its columns keeps it then — and only a collection frees
+        that, which release_closed_sheets runs for a sheet it knows dropped."""
+        self.run('''
+            vd.options.undo = False
+            vs = visidata.PyobjSheet('result', source=[{'a': i} for i in range(100)])
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            vd.quit(vs)
+            delete_in_gS(vs)
+            assert not vd.cmdlog.rows[-1].undofuncs, 'undo is off: no trace of the delete'
+            vd.threads[:] = [t for t in vd.threads if getattr(t, 'sheet', None) is not vs]
+            vd.options._cache.clear()
+            SettingsMgr = type(vd.options._opts)
+            for m in [m for m in vars(vd).values() if isinstance(m, SettingsMgr)]:
+                for k in [k for k, v in m.allobjs.items() if v is vs]:
+                    del m.allobjs[k]
+            ref = weakref.ref(vs)
+            del vs
+            assert ref() is not None, 'the sheet-columns cycle should still hold it'
+            assert release_closed_sheets() == 1
+            assert ref() is None, gc.get_referrers(ref())
+        ''')
+
     # TODO(vd-leak-gS): delete with the workaround, see dbcls/vd_modules/vd_memory.py
     def test_a_later_call_scans_only_the_new_log_and_still_frees(self):
         """The second call starts the undo scan where the first one stopped;
@@ -806,6 +860,159 @@ class TestClosedSheetsAreReleased:
             del vs, first
             assert release_closed_sheets() >= 1
             assert ref() is None, gc.get_referrers(ref())
+        ''')
+
+    def test_visidatas_own_dropped_sheets_do_not_cost_a_collection(self):
+        """Every session drops small sheets of VisiData's own making (the help
+        sheet behind the command palette, a sheet's cmdlog view); a full
+        gc.collect() walks every row in memory, so they are not worth one.
+        A dropped sheet of the user's still is."""
+        self.run('''
+            import types
+            import visidata
+            from dbcls.vd_modules import vd_memory as m
+
+            # Counted at the call, not through gc.callbacks: CPython may run a
+            # collection of its own on any allocation, which would be taken
+            # for one of vd_memory's.
+            collections = []
+            real_collect = gc.collect
+            def counting_collect(*args, **kwargs):
+                collections.append(args)
+                return real_collect(*args, **kwargs)
+            m.gc = types.SimpleNamespace(collect=counting_collect)
+            try:
+                vs = opened('result')
+                vd.quit(vs)
+                # what the command palette and the undo machinery leave behind
+                visidata.HelpSheet('', source=vs).options.quitguard
+                vd.cmdlog.cmdlog.options.quitguard
+                collections.clear()
+                assert release_closed_sheets() == 0
+                assert not collections, 'collected for a VisiData metasheet'
+
+                delete_in_gS(vs)
+                del vs
+                assert release_closed_sheets() == 1
+                assert collections, 'a deleted result sheet was not collected'
+            finally:
+                m.gc = gc
+        ''')
+
+    def test_visidatas_own_dropped_sheets_do_not_walk_the_rows(self):
+        """A metasheet the user opened and closed (here a sheet's columns
+        view) is pushed, so it looks dropped; confirming that with the whole
+        walk would pass over every row of every open sheet — for nothing of
+        the user's.  A dropped sheet of the user's is still confirmed and
+        freed, metasheet and all."""
+        self.run('''
+            from dbcls.vd_modules import vd_memory as m
+
+            class Rows(list):
+                def __iter__(self):
+                    raise AssertionError('the rows were walked')
+
+            vs = opened('result')
+            vs.source = Rows([{'a': 1}] * (m._SHORT_LIST + 1))
+            cols = visidata.ColumnsSheet('cols', source=[vs])
+            vd.push(cols)
+            vd.sync()
+            vd.quit(cols)
+            cols.options.quitguard
+            ref = weakref.ref(cols)
+            del cols
+            assert release_closed_sheets() == 0
+            assert ref() is not None, 'left to the ordinary GC, not freed here'
+
+            vs.source = [{'a': 1}] * (m._SHORT_LIST + 1)
+            vd.quit(vs)
+            delete_in_gS(vs)
+            vref = weakref.ref(vs)
+            del vs
+            assert release_closed_sheets() == 1
+            assert vref() is None, gc.get_referrers(vref())
+            assert ref() is None, gc.get_referrers(ref())
+        ''')
+
+    def test_a_pickers_rows_still_count(self):
+        """dbcls's own non-precious sheets hold the user's rows."""
+        self.run('''
+            from dbcls.vd_modules.vd_utils import ViewSheet
+            vs = ViewSheet('view', source=[{'a': 1}])
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            vs.options.quitguard
+            vd.remove(vs)       # as _run_picker_sheet does
+            del vs
+            assert release_closed_sheets() == 1
+        ''')
+
+    def test_a_results_rows_are_not_walked(self):
+        """A result's source is its rows — millions of them; only a list of
+        sheets (a join's sources, gS's rows) is looked through."""
+        self.run('''
+            from dbcls.vd_modules import vd_memory as m
+
+            class Rows(list):
+                def __iter__(self):
+                    raise AssertionError('the rows were walked')
+
+            many = [{'a': 1}] * (m._SHORT_LIST + 1)
+            vs = opened('result')
+            vs.source = Rows(many)
+            vd.quit(vs)
+            assert id(vs) in m._kept_sheets()
+            assert not m._holds(Rows(many), {1}, set())
+            assert m._holds([vs], {id(vs)}, set())     # a list of sheets is
+            release_closed_sheets()
+        ''')
+
+    def test_a_source_list_with_placeholders_around_the_sheets_is_still_walked(self):
+        """A loader's or plugin's source may be ``[meta, sheet, meta]``; the
+        sheets in it are the user's and must stay kept."""
+        self.run('''
+            from dbcls.vd_modules import vd_memory as m
+
+            a, b = opened('a'), opened('b')
+            assert m._sheets_in([{'filter': 1}, a, b]) == [a, b]
+            assert m._sheets_in([a, {'meta': 1}]) == [a]
+            assert m._sheets_in([{'x': 1}, a, {'y': 2}]) == [a]
+            assert m._sheets_in([{'x': 1}, {'y': 2}]) == []
+            assert m._sheets_in(None) == []
+            # a long list is walked only when it starts or ends with a sheet
+            long = [{'x': 1}] * m._SHORT_LIST
+            assert m._sheets_in(long + [a] + long) == []
+            assert m._sheets_in(long + [a]) == [a]
+            assert m._holds([{'x': 1}, a, {'y': 2}], {id(a)}, set())
+
+            top = opened('top')
+            top.source = [{'meta': 1}, a, b, {'meta': 2}]
+            vd.quit(a)
+            vd.quit(b)
+            delete_in_gS(a)
+            delete_in_gS(b)
+            kept = m._kept_sheets()
+            assert id(a) in kept and id(b) in kept
+        ''')
+
+    def test_a_sheet_held_inside_a_long_source_list_is_not_dropped(self):
+        """``[hdr] + rows + [sheet] + [trailer]``: the quick pass skips the
+        list, so the sheet looks dropped — it must still be confirmed before
+        anything of it is let go (here: the thread that loaded it, which
+        release_closed_sheets drops for a dropped sheet)."""
+        self.run('''
+            from dbcls.vd_modules import vd_memory as m
+
+            child = opened('child')
+            top = opened('top')
+            top.source = [{'hdr': 1}] + [{'x': 1}] * (m._SHORT_LIST + 1) + [child, {'trailer': 1}]
+            vd.quit(child)
+            delete_in_gS(child)      # the undo of that is what holds it
+            assert id(child) not in m._kept_sheets()
+            assert id(child) in m._kept_sheets(whole=True)
+            assert release_closed_sheets() == 0
+            assert any(getattr(t, 'sheet', None) is child for t in vd.threads)
         ''')
 
     def test_a_quit_sheet_stays_for_gU(self):
@@ -999,4 +1206,172 @@ class TestEditingACopy:
             assert [dict(r) for r in sheet.rows] == expected, sheet.rows
             assert [dict(r) for r in dup.rows] == expected, dup.rows
             assert not sheet._deferredMods and not sheet._deferredDels
+        ''')
+
+
+class TestHandingSampleDataToTheEditor:
+    """`gE` on a Sample data sheet opens an EditTableSheet with the rows
+    already loaded instead of reading the table again."""
+
+    _SETUP = '''
+        import asyncio, os, tempfile, threading, time
+        import dbcls.vd_modules  # noqa: F401
+        from visidata import vd
+        from dbcls.clients.sqlite3 import Sqlite3Client
+        from dbcls.vd_modules.vd_db_browser import (
+            EditTableSheet, PendingSqlSheet, TableSampleDataSheet)
+
+        class Sync:  # what SyncClient does, without the event-loop thread
+            def __init__(self, client):
+                self.client = client
+                self.executed = []
+            def execute(self, sql):
+                self.executed.append(sql)
+                return asyncio.run(self.client.execute(sql))
+            def __getattr__(self, name):
+                attr = getattr(self.client, name)
+                if asyncio.iscoroutinefunction(attr):
+                    return lambda *a, **k: asyncio.run(attr(*a, **k))
+                return attr
+
+        def wait_rows(sheet, n):
+            for _ in range(200):
+                if len(sheet.rows) == n and not sheet.currentThreads:
+                    return
+                time.sleep(0.05)
+            raise AssertionError(f'{sheet.name}: {len(sheet.rows)} rows loaded, expected {n}')
+
+        col = lambda s, name: next(c for c in s.columns if c.name == name)
+
+        path = os.path.join(tempfile.mkdtemp(), 't.db')
+        client = Sync(Sqlite3Client(path))
+        client.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, n INTEGER)')
+        client.execute("INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
+
+        sample = TableSampleDataSheet('t', client=client, db=path, table='t')
+        sample.CUSTOM_SQL = 'SELECT * FROM t WHERE n > 10'
+        vd.push(sample)
+        wait_rows(sample, 2)
+        client.executed.clear()
+    '''
+
+    def _run(self, body):
+        run_with_real_visidata(textwrap.dedent(self._SETUP) + textwrap.dedent(body))
+
+    def test_ge_is_bound_on_the_sample_sheet_and_the_editor_keeps_its_own(self):
+        run_with_real_visidata('''
+            import dbcls.vd_modules  # noqa: F401
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet, TableSampleDataSheet
+
+            sample = TableSampleDataSheet('t', client=None, db='d', table='t')
+            cmd = sample.getCommand('gShift+E')  # how VisiData spells the `gE` keystroke
+            assert cmd.longname == 'edit-loaded-rows'
+            assert 'sheet.open_editor()' in cmd.execstr, cmd.execstr
+            # the loader stays alive: the sample sheet must still load past
+            # the rows it had when the editor opened (see open_editor)
+            assert 'cancelThread' not in cmd.execstr, cmd.execstr
+
+            editor = EditTableSheet('t', client=None, db='d', table='t')
+            assert editor.getCommand('gShift+E').longname == 'edit-selected-sql-expr'
+        ''')
+
+    def test_the_editor_shows_the_loaded_rows_without_querying_again(self):
+        self._run('''
+            editor = sample.open_editor()
+            assert isinstance(editor, EditTableSheet)
+            assert vd.sheets[0] is editor
+            wait_rows(editor, 2)
+
+            assert client.executed == [], client.executed
+            assert editor.pk_columns == ['id']
+            assert editor.CUSTOM_SQL == sample.CUSTOM_SQL
+            assert [c.name for c in editor.columns] == ['id', 'name', 'n']
+            assert [dict(r) for r in editor.rows] == [dict(r) for r in sample.rows]
+            # copies: the sample sheet is a snapshot, not a view of the editor
+            assert all(e is not s for e, s in zip(editor.rows, sample.rows))
+            assert editor._seed is None
+            assert all(c.sheet is editor and c.defer for c in editor.columns)
+        ''')
+
+    def test_edits_on_the_handed_over_rows_commit_and_leave_the_sample_sheet_alone(self):
+        self._run('''
+            editor = sample.open_editor()
+            wait_rows(editor, 2)
+            before = [dict(r) for r in sample.rows]
+
+            col(editor, 'name').setValues([editor.rows[0]], 'EDITED')
+            editor.delete_row(1)
+            editor.addRows([editor.newRow()], index=1)  # the stock `a`
+            added = editor.rows[-1]
+            col(editor, 'id').setValues([added], 4)
+            col(editor, 'name').setValues([added], 'd')
+
+            statements = [s.sql for s in editor.pending_statements()]
+            assert any(s.startswith('INSERT') for s in statements), statements
+            assert any(s.startswith('UPDATE') for s in statements), statements
+            assert any(s.startswith('DELETE') for s in statements), statements
+
+            pending = PendingSqlSheet('p', source=editor, client=client,
+                                      statements=editor.pending_statements())
+            vd.push(pending)
+            thread = pending.execute_all()
+            if isinstance(thread, threading.Thread):
+                thread.join()
+
+            assert client.execute('SELECT * FROM t ORDER BY id').data == [
+                {'id': 1, 'name': 'a', 'n': 10},
+                {'id': 2, 'name': 'EDITED', 'n': 20},
+                {'id': 4, 'name': 'd', 'n': None},
+            ]
+            assert [dict(r) for r in editor.rows] == [
+                {'id': 2, 'name': 'EDITED', 'n': 20},
+                {'id': 4, 'name': 'd', 'n': None},
+            ], editor.rows
+            assert not editor._deferredAdds and not editor._deferredMods and not editor._deferredDels
+            assert [dict(r) for r in sample.rows] == before
+        ''')
+
+    def test_a_cell_edited_back_to_its_value_is_no_pending_change(self):
+        """Through VisiData's own setValues/isChanged: `e` 0 -> 1, then `e`
+        1 -> 0 again must leave nothing to commit (and no empty UPDATE)."""
+        self._run('''
+            editor = sample.open_editor()
+            wait_rows(editor, 2)
+            n = col(editor, 'n')
+            row = editor.rows[0]
+            n.setValues([row], 21)
+            assert [s.sql for s in editor.pending_statements()] == \
+                ["UPDATE `t` SET `n` = 21 WHERE `id` = 2;"]
+            n.setValues([row], 20)
+            assert editor.rowid(row) in editor._deferredMods  # VisiData keeps the row
+            assert editor.pending_statements() == []
+            assert editor.committed_rows() == ([], {})
+            try:
+                editor.show_pending_sql()
+            except Exception as exc:
+                assert 'no pending changes' in str(exc), exc
+            else:
+                raise AssertionError('show_pending_sql did not fail')
+        ''')
+
+    def test_a_reload_of_the_editor_reads_from_the_database_again(self):
+        self._run('''
+            editor = sample.open_editor()
+            wait_rows(editor, 2)
+            assert client.executed == []
+
+            editor.update_current_sql('SELECT * FROM t')
+            wait_rows(editor, 3)
+            assert any('SELECT * FROM t' in sql for sql in client.executed), client.executed
+            assert [r['id'] for r in editor.rows] == [1, 2, 3]
+        ''')
+
+    def test_an_empty_sample_sheet_opens_a_plain_editor(self):
+        self._run('''
+            sample.rows = []
+            editor = sample.open_editor()
+            assert editor._seed is None
+            wait_rows(editor, 2)  # loaded by the editor itself, with the same `E` query
+            assert client.executed, 'the editor should have queried the table'
+            assert [r['id'] for r in editor.rows] == [2, 3]
         ''')
