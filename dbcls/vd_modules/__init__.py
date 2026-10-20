@@ -78,6 +78,7 @@ LiveRowsSheet.addCommand('Ctrl+R', 'watch-refresh', 'sheet.refresh_now()', 'refr
 LiveRowsSheet.addCommand('p', 'watch-pause', 'sheet.toggle_pause()', 'pause/resume the live sheet')
 LiveRowsSheet.addCommand('zi', 'watch-interval', 'sheet.set_interval()', 'set the live sheet refresh interval')
 LiveRowsSheet.addCommand('gf', 'watch-filter', 'sheet.set_filter()', 'show only the rows whose current column matches a regex (! to hide them, empty to clear)')
+LiveRowsSheet.addCommand('gR', 'watch-delta', 'sheet.set_delta()', 'add a column with the change of the current column over N seconds (N/s per second, empty removes)')
 
 TableSheet.addCommand('gT', 'save-to-vars', 'save_rows_to_vars(sheet, selectedRows or [cursorRow])', 'Save selected rows (or current row) to _vars under a prompted name')
 TableSheet.addCommand('gzT', 'save-col-to-vars', 'save_col_values_to_vars(sheet, cursorCol, selectedRows or [cursorRow])', 'Save selected values of current column (or current cell) to _vars as a flat list')

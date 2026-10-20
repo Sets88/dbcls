@@ -9,8 +9,9 @@ changes the view the user lands on.
 
 ## Where it applies
 
-- The macro waits for the **next display point**: the next `.VIEW`, or else the
-  final result. `.SHEET` does **not** take it — the macro keeps waiting past it.
+- The macro waits for the **next display point**: the next `.VIEW` or `.WATCH`,
+  or else the final result. A `.WATCH` replays it once, when the live sheet
+  opens, not on its refreshes. `.SHEET` does **not** take it — the macro keeps waiting past it.
 - Several `.VDM` steps before one display point are joined into one macro.
 - The data passes through `.VDM` unchanged, so it can sit anywhere before the
   display point; right before it reads best.

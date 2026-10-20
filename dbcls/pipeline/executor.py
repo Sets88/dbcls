@@ -815,7 +815,7 @@ class PipelineExecutor:
     async def _cmd_vdm(self, args: List[str], data: Any) -> Any:
         """Queue a VisiData macro (``args[0]``, a template rendering to cmdlog
         JSON lines — what VisiData's macro recorder writes) for the next display
-        point: the next ``.VIEW``, or else the final result.  The data passes
+        point: the next ``.VIEW`` or ``.WATCH``, or else the final result.  The data passes
         through unchanged; ``.SHEET`` leaves the macro waiting.  Several
         ``.VDM`` steps before one display point add up."""
         if not args:
@@ -867,10 +867,14 @@ class PipelineExecutor:
         prefix, initial = self._watch_prefix
         loop = asyncio.get_running_loop()
         in_flight: List[concurrent.futures.Future] = []
+        # A display point like .VIEW: a .VDM before it is replayed on the live
+        # sheet, once, when it opens — not on every refresh, and not again on
+        # the final result.
+        sheet_macro = self._take_macro()
 
         async def refresh() -> Any:
-            # A .VDM in the prefix already queued its macro on the first run;
-            # a refresh re-running it must not queue another copy per tick.
+            # A refresh re-runs the prefix's .VDM steps too; what they queue is
+            # thrown away, or every tick would add a copy for the final result.
             macro = list(self._pending_macro)
             try:
                 return await self._execute_nodes(list(prefix), initial)
@@ -892,7 +896,8 @@ class PipelineExecutor:
             'kind': PromptKind.WATCH,
             'title': WATCH_SHEET_NAME,
             'rows': normalize_to_dicts(data),
-            'extra': {'producer': produce, 'interval': interval},
+            'extra': {'producer': produce, 'interval': interval,
+                      **({'vdm_macro': sheet_macro} if sheet_macro else {})},
         }
         self.prompts.in_watch = True
         try:

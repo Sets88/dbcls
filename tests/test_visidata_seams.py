@@ -1375,3 +1375,60 @@ class TestHandingSampleDataToTheEditor:
             assert client.executed, 'the editor should have queried the table'
             assert [r['id'] for r in editor.rows] == [2, 3]
         ''')
+
+
+class TestLiveSheetChangeColumns:
+    """`gR` columns on a .WATCH sheet: which field they follow, and that a
+    removed one leaves nothing behind in the sort order."""
+
+    _SETUP = '''
+        import dbcls.vd_modules  # noqa: F401
+        from visidata import vd
+        from dbcls.vd_modules.vd_live import LiveRowsSheet
+
+        rows = [{'id': 1, 'n': 10}, {'id': 2, 'n': 5}]
+        sheet = LiveRowsSheet('watch', source=rows, producer=lambda: rows, interval=5)
+        sheet.apply_rows(rows, at=100.0)
+        sheet.column('id').keycol = 1
+        sheet.apply_rows(rows, at=100.0)
+
+        def gR(col, answer):
+            vd.input = lambda *a, **k: answer
+            sheet.cursorVisibleColIndex = sheet.visibleCols.index(col)
+            sheet.set_delta()
+
+        names = lambda: [c.name for c in sheet.columns]
+    '''
+
+    def _run(self, body):
+        run_with_real_visidata(textwrap.dedent(self._SETUP) + textwrap.dedent(body))
+
+    def test_a_renamed_column_is_followed_by_its_field(self):
+        self._run('''
+            col = sheet.column('n')
+            col.name = 'renamed'
+            gR(col, '2')
+            assert names() == ['id', 'renamed', 'n_d2s'], names()
+        ''')
+
+    def test_removing_the_column_takes_it_out_of_the_sort(self):
+        self._run('''
+            gR(sheet.column('n'), '2')
+            delta = sheet.column('n_d2s')
+            sheet._ordering = [(delta, False)]
+            assert sheet.ordering == [(delta, False)]
+            gR(delta, '')
+            assert sheet._ordering == [] and sheet.ordering == [], sheet._ordering
+            assert names() == ['id', 'n'], names()
+        ''')
+
+    def test_a_deleted_column_leaves_the_sort_on_the_next_refresh(self):
+        self._run('''
+            gR(sheet.column('n'), '2')
+            delta = sheet.column('n_d2s')
+            sheet._ordering = [(delta.name, True)]
+            sheet.columns.remove(delta)
+            sheet.apply_rows(list(rows), at=101.0)
+            assert sheet._ordering == [], sheet._ordering
+            assert sheet._deltas == {}
+        ''')

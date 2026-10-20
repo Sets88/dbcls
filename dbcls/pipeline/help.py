@@ -663,7 +663,9 @@ Example:
 
 HELP_VDM = _help_entry('vdm', """
 Replay a VisiData macro on the next sheet the pipeline shows — the next
-`.VIEW`, or else the final result — as soon as it opens. The data passes
+`.VIEW` or `.WATCH`, or else the final result — as soon as it opens. A live
+`.WATCH` sheet replays it once, when it opens, not on every refresh — so a
+macro can set its key (`!`) and change columns (`gR`) up front. The data passes
 through unchanged.
 
 MACRO is VisiData cmdlog in JSON lines, exactly what its macro recorder saves
@@ -674,8 +676,8 @@ write it. It is a template. Each line needs a `longname` or
 the sheet on top at that moment — so after `open-row` the next command runs on
 the sheet it opened.
 
-`.SHEET` does not take the macro: it stays waiting for the next `.VIEW` or the
-final result. Several `.VDM` steps before one display point add up. A macro left
+`.SHEET` does not take the macro: it stays waiting for the next `.VIEW` / `.WATCH`
+or the final result. Several `.VDM` steps before one display point add up. A macro left
 with nothing to show (the run ends on `.VIEW`, or with no rows) is dropped.
 A command that fails stops the replay, like in VisiData itself.
 
@@ -723,6 +725,18 @@ key on it instead, and selections then stick to a row while its other values
 change.
 
 On the sheet: `Ctrl+R` refreshes now, `p` pauses, `zi` changes the interval.
+The status bar counts down to the next refresh (`every 5s, next 3s`).
+
+`gR` on a numeric column adds a column with its **change** over the last N
+seconds — answer `60` for `cpu_d60s` — or that change per second, `60/s`. Rows
+are followed by their key, so a key column has to be set with `!` first, and it
+must be unique — rows sharing a key value get no change (the status bar counts
+them; `!` on more columns fixes it). Changing the key starts the history over,
+and so does a row missing from a refresh. The column is empty until N seconds have been
+watched, and for values that are not numbers (`int`/`float`/`Decimal` only — a
+string like `'123'` is not one), which the status bar warns about. `gR` again
+(on the column or on its change column) changes the period, an empty answer
+removes it; a hidden change column keeps being computed, a deleted one stops.
 
 `gf` narrows what is on display to the rows whose **current column** matches a
 regex — `gf` again reopens the prompt on that rule, so it is changed rather than

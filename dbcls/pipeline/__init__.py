@@ -151,13 +151,18 @@ Pipeline commands
     On the sheet: q ends the run, Ctrl+R refreshes now, p pauses, zi changes
     the interval, gf shows only the rows whose current column matches a regex
     (! to hide those instead, empty to clear) — the prompt reopens on the rule,
-    so it can be changed.
+    so it can be changed.  gR on a numeric column (key columns set with `!`)
+    adds a column with its change over the last N seconds, or N/s for the
+    change per second; empty until N seconds are watched, gR again changes
+    the period, an empty answer removes it.  The status bar counts down to
+    the next refresh.
 
 .VDM MACRO
     Replay a VisiData macro — cmdlog JSON lines, as VisiData's macro recorder
     saves them (a template, usually in '''…''') — on the next sheet the
-    pipeline shows: the next .VIEW, or else the final result.  .SHEET does
-    not take it.  The data passes through unchanged; several .VDM steps add
+    pipeline shows: the next .VIEW or .WATCH (replayed once, when the live
+    sheet opens — not on its refreshes), or else the final result.  .SHEET
+    does not take it.  The data passes through unchanged; several .VDM steps add
     up.  An empty "sheet" field means the sheet on top at that moment; lines
     starting with # are skipped.  In VisiData, zm opens the macro being
     recorded (or the last one) on a sheet to edit; Y / gY / Ctrl+S there

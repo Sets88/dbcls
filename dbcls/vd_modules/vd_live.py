@@ -15,6 +15,10 @@ What is *shown* out of that can be narrowed by a regex rule the user types on
 the sheet (`gf`, see :meth:`LiveRowsSheet.set_filter`) and retypes as the thing
 worth watching changes; the rows it hides go on being watched underneath.
 
+A numeric column can also be given a companion column with its *change* over a
+period the user types (`gR`, see :meth:`LiveRowsSheet.set_delta`): every
+refresh is a sample, kept per row key just long enough to look that far back.
+
 Two seams make that possible without a thread ever touching the screen:
 
 *Producing* the new rows happens on a short-lived daemon thread, so a slow
@@ -31,12 +35,15 @@ which stretches the poll interval once nothing is happening.  It asks
 :func:`live_sheet_wait_ms` first, so a live sheet gets its frame when its
 interval is up rather than when the idle poll happens to come round.
 """
+import math
 import re
 import threading
 import time
-from collections import deque
-from typing import Any, Callable, Iterable, List, NamedTuple, Optional, Sequence
+from collections import Counter, deque
+from decimal import Decimal
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
+from visidata import Column
 from visidata import ColumnItem
 from visidata import ReturnValue
 from visidata import TableSheet
@@ -209,10 +216,22 @@ def frame_wait_ms(interval: float, last_start: float, now: float,
     0 means "the ordinary frame rate": while a producer run is *busy* the sheet
     wants frames as usual, since its result is picked up on one frame (see
     :meth:`LiveRowsSheet.tick`) and drawn on the next.  Otherwise the wait is
-    what is left of *interval* since the run started."""
+    what is left of *interval* since the run started — but never past the
+    moment the countdown in the status bar (:func:`seconds_to_refresh`) goes
+    down by one, or a long interval would leave it frozen until the refresh."""
     if busy:
         return 0.0
-    return max(0.0, interval - (now - last_start)) * 1000
+    remaining = interval - (now - last_start)
+    if remaining <= 0:
+        return 0.0
+    # The part of `remaining` above the next whole second, in (0, 1].
+    return (remaining - math.ceil(remaining) + 1) * 1000
+
+
+def seconds_to_refresh(interval: float, last_start: float, now: float) -> int:
+    """Whole seconds left until the next refresh, rounded up — what the status
+    bar counts down (0 once the refresh is due)."""
+    return max(0, math.ceil(interval - (now - last_start)))
 
 
 #: What the live sheet puts in front of ``disp_rstatus_fmt`` (see
@@ -244,6 +263,199 @@ def new_column_names(existing: Iterable[str], rows: Iterable[dict]) -> List[str]
                 known.add(name)
                 out.append(name)
     return out
+
+
+# ── Change columns (`gR`; pure, so it is unit-testable) ───────────────────────
+
+#: Suffix of a `gR` answer asking for the rate (change per second) rather than
+#: the change itself: ``60/s``.
+DELTA_RATE_SUFFIX = '/s'
+
+
+class DeltaSpec(NamedTuple):
+    """What a `gR` change column shows: the change over the last *period*
+    seconds, or that change divided by the seconds it took (*per_second*)."""
+    source: str          #: as typed, so the prompt can be re-opened on it
+    period: float
+    per_second: bool
+
+
+def parse_delta_spec(source: str) -> Optional[DeltaSpec]:
+    """The `gR` answer *source* — ``60`` or ``60/s`` — or ``None`` for an empty
+    one, which removes the column.  Anything else raises ``ValueError``."""
+    source = (source or '').strip()
+    if not source:
+        return None
+    per_second = source.endswith(DELTA_RATE_SUFFIX)
+    body = source[:-len(DELTA_RATE_SUFFIX)].strip() if per_second else source
+    try:
+        period = float(body)
+    except ValueError:
+        raise ValueError(f'not a number of seconds: {source!r}') from None
+    if not math.isfinite(period) or period <= 0:
+        raise ValueError(f'the period must be a positive number of seconds: {source!r}')
+    return DeltaSpec(source, period, per_second)
+
+
+def delta_column_name(field: str, spec: DeltaSpec) -> str:
+    """``cpu_d60s``, or ``cpu_d60s/s`` for the rate."""
+    return f'{field}_d{spec.period:g}s' + (DELTA_RATE_SUFFIX if spec.per_second else '')
+
+
+def is_number(value: Any) -> bool:
+    """Is *value* something a change can be computed of?  Only what the driver
+    or the Python handed over as a number counts: a string that happens to
+    read as one does not (``'12345'`` stays text), and neither does a bool."""
+    return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+
+
+def value_change(old: Any, new: Any, seconds: float, per_second: bool) -> Any:
+    """``new - old``, or that per second of *seconds*.
+
+    Decimal and float do not mix in arithmetic, and a column can hold both (a
+    driver's ``DECIMAL`` next to a computed float), so a mixed pair is done in
+    floats; so is the rate, which is a float anyway."""
+    try:
+        diff = new - old
+    except TypeError:
+        diff = float(new) - float(old)
+    if per_second:
+        return float(diff) / seconds if seconds > 0 else None
+    return diff
+
+
+class ValueHistory:
+    """Numeric samples of one field, ``(time, value)`` per row key, kept just
+    long enough to look a period back from the newest one."""
+
+    def __init__(self):
+        self._samples: Dict[Any, deque] = {}
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def clear(self) -> None:
+        self._samples.clear()
+
+    def change(self, key: Any, at: float, value: Any, spec: DeltaSpec) -> Any:
+        """Record *value* for *key* at time *at* and return its change over
+        *spec* — ``None`` while no sample is old enough yet.
+
+        The change is taken against the newest sample at least ``spec.period``
+        old: refreshes come at least an interval apart, so that is the sample
+        of the refresh closest to "period ago".  The samples before it are
+        never needed again and are dropped here.
+
+        A sample at *at* or later is replaced rather than added to: that is the
+        same batch seen again (the column was just added, or its period
+        changed)."""
+        samples = self._samples.setdefault(key, deque())
+        while samples and samples[-1][0] >= at:
+            samples.pop()
+        samples.append((at, value))
+        horizon = at - spec.period
+        while len(samples) >= 2 and samples[1][0] <= horizon:
+            samples.popleft()
+        then, old = samples[0]
+        if then > horizon:
+            return None
+        return value_change(old, value, at - then, spec.per_second)
+
+    def keep_only(self, keys: Set[Any]) -> None:
+        """Forget every row but *keys* — the ones sampled in the latest batch.
+
+        A row missing from a batch — gone, out of a ``LIMIT``, its value
+        ``NULL``, its key shared with another row — starts afresh when it is
+        back: its change would otherwise be measured across the gap, against
+        a value that may not even have been its own."""
+        for key in [k for k in self._samples if k not in keys]:
+            del self._samples[key]
+
+
+class DeltaTracker:
+    """The change of *field* over *spec*, per row key, for a `gR` column.
+
+    Fed one batch at a time by :meth:`observe`; the column reads
+    :attr:`values` by row key.  A row whose value is ``None`` (``NULL``) has no
+    change.  Two kinds of rows have none either and are counted for the sheet
+    to report, since an empty cell alone does not say why: values that are not
+    numbers (:attr:`non_numeric`) and rows whose key another row has too
+    (:attr:`shared_key`) — with two rows to one key there is no telling which
+    old value belongs to which, and the cure is a key of more columns."""
+
+    def __init__(self, field: str, spec: DeltaSpec):
+        self.field = field
+        self.spec = spec
+        self.history = ValueHistory()
+        self.values: dict = {}
+        self.non_numeric = 0
+        self.shared_key = 0
+
+    def reset(self) -> None:
+        """Drop every sample: the row keys they are filed under no longer mean
+        the same rows (the user changed the key columns)."""
+        self.history.clear()
+        self.values = {}
+        self.non_numeric = 0
+        self.shared_key = 0
+
+    def observe(self, keyed_rows: Iterable[Tuple[Any, dict]], at: float) -> bool:
+        """Take the batch *keyed_rows* (``(row_key, row)`` pairs) sampled at
+        *at*.  True when it brought non-numeric values or rows sharing a key
+        where the batch before had none of that kind — the moment to warn the
+        user, once rather than per refresh."""
+        keyed_rows = list(keyed_rows)
+        counts = Counter(key for key, _ in keyed_rows)
+        shared = sum(n for n in counts.values() if n > 1)
+        values: dict = {}
+        sampled = set()
+        bad = 0
+        for key, row in keyed_rows:
+            if counts[key] > 1:
+                continue
+            value = row.get(self.field)
+            if value is None:
+                continue
+            if not is_number(value):
+                bad += 1
+                continue
+            sampled.add(key)
+            change = self.history.change(key, at, value, self.spec)
+            if change is not None:
+                values[key] = change
+        self.history.keep_only(sampled)
+        # Rebound in one go: the drawing thread reads it.
+        self.values = values
+        appeared = ((bool(bad) and not self.non_numeric)
+                    or (bool(shared) and not self.shared_key))
+        self.non_numeric = bad
+        self.shared_key = shared
+        return appeared
+
+    def problems(self, hints: bool = False) -> List[str]:
+        """Why some cells of the column are empty, as short notes — with
+        *hints*, also what to do about it (for the one-off warning; the status
+        bar has no room for that)."""
+        notes = []
+        if self.shared_key:
+            notes.append(f'{self.shared_key} rows share a key'
+                         + (' (press ! on more columns to tell them apart)' if hints else ''))
+        if self.non_numeric:
+            notes.append(f'{self.non_numeric} not numbers')
+        return notes
+
+
+class DeltaColumn(Column):
+    """A `gR` column: the change its :class:`DeltaTracker` holds for the row's
+    key.  Computed at refresh time rather than on draw, so sorting on it sees
+    the same numbers the screen does."""
+
+    def __init__(self, tracker: DeltaTracker, **kwargs):
+        super().__init__(delta_column_name(tracker.field, tracker.spec), **kwargs)
+        self.tracker = tracker
+
+    def calcValue(self, row):
+        return self.tracker.values.get(self.sheet.rowid(row))
 
 
 # ── The sheet ─────────────────────────────────────────────────────────────────
@@ -282,6 +494,10 @@ cursor position survive every refresh.
 - `!` on a column (e.g. an id) to make row identity follow it: matching rows
   are then updated in place even when their other values change, so `s`/`t`
   selections stick. Without a key column the whole row is the identity.
+- `gR` on a numeric column to add a column with its **change** over the last
+  N seconds (answer `N`), or that change per second (`N/s`). Needs a key
+  (`!`) unique to each row; it is empty until N seconds have been watched. `gR` again
+  changes the period, an empty answer (or deleting the column) removes it.
 '''
     rowtype = 'rows'
     precious = False
@@ -305,9 +521,13 @@ cursor position survive every refresh.
         self._rowkeys: dict = {}     # id(row) -> row_key(row)
         self._key_names_used: List[str] = []
         self._worker: Optional[threading.Thread] = None
-        self._produced: Optional[tuple] = None   # (rows, exc) handed over by the worker
+        self._produced: Optional[tuple] = None   # (rows, exc, started) handed over by the worker
         self._last_start = 0.0
         self._prev_timeouts = None
+        # `gR` columns by the field they follow, and when the batch on screen
+        # was sampled — the time their history is filed under.
+        self._deltas: Dict[str, DeltaColumn] = {}
+        self._batch_at = 0.0
 
     def __copy__(self):
         """A sheet derived from this one is a *snapshot*, not a second monitor.
@@ -347,6 +567,10 @@ cursor position survive every refresh.
         # have its bookkeeping pruned by the original's next refresh.
         ret._rowkeys = dict(self._rowkeys)
         ret._selectedRows = dict(self._selectedRows)
+        # The copied `gR` columns still read the original's trackers, so their
+        # numbers move like the values do; the copy just has none of its own
+        # to feed or change.
+        ret._deltas = {}
         return ret
 
     # ── loading ──────────────────────────────────────────────────────────────
@@ -426,12 +650,12 @@ cursor position survive every refresh.
         exception would take down the mainloop."""
         try:
             if self._produced is not None:
-                rows, exc = self._produced
+                rows, exc, started = self._produced
                 self._produced = None
                 self._worker = None
                 if exc is None:
                     self.error = ''
-                    self.apply_rows(rows)
+                    self.apply_rows(rows, at=started)
                 else:
                     # Keep the last good rows on screen: a transient failure
                     # (connection blip, a moment where `ps` returns nothing)
@@ -461,15 +685,15 @@ cursor position survive every refresh.
         drawing thread only picks up its result on a later frame."""
         if self._worker is not None or self.producer is None:
             return
-        self._last_start = time.monotonic()
+        started = self._last_start = time.monotonic()
 
         def _run():
             try:
                 rows = self.producer()
             except Exception as e:      # noqa: BLE001 — reported on the sheet
-                self._produced = ([], e)
+                self._produced = ([], e, started)
             else:
-                self._produced = (list(rows or []), None)
+                self._produced = (list(rows or []), None, started)
 
         # A plain thread, deliberately not vd.execAsync: an execAsync thread is
         # registered on the sheet, shows up as "processing…" in the status bar
@@ -479,9 +703,15 @@ cursor position survive every refresh.
                                         name=f'watch-{self.name}')
         self._worker.start()
 
-    def apply_rows(self, new_rows: List[dict]) -> None:
-        """Replace the sheet's contents with *new_rows*, in place.  Drawing thread."""
+    def apply_rows(self, new_rows: List[dict], at: Optional[float] = None) -> None:
+        """Replace the sheet's contents with *new_rows*, in place.  Drawing thread.
+
+        *at* is when the producer run that made them started (now by default):
+        the moment the values are true of, which is what the `gR` columns
+        measure their period against — not when a slow query happened to
+        return."""
         started = time.monotonic()
+        self._batch_at = started if at is None else at
         for name in new_column_names((c.name for c in self.columns), new_rows):
             value = next((r[name] for r in new_rows if r.get(name) is not None), None)
             self.addColumn(ColumnItem(name, type=deduceType(value)))
@@ -493,6 +723,11 @@ cursor position survive every refresh.
             # that has disappeared.  Re-file them under the new one instead.
             self._key_names_used = key_names
             self._rekey_selection(key_names)
+            # The `gR` history is filed under the old keys too, and unlike a
+            # selection it cannot be carried over: under another key the
+            # samples would belong to other rows.  It starts over.
+            for col in self._deltas.values():
+                col.tracker.reset()
 
         # Merged against everything the last run produced, not against what is
         # on screen: a row the display filter hides is still watched, so it keeps
@@ -504,11 +739,30 @@ cursor position survive every refresh.
         # Rebind rather than mutate: the drawing thread may be walking the old
         # list right now, and swapping the attribute is atomic.
         self._all_rows = merge.rows
+        # Before the sort, so that sorting on a `gR` column sees this batch.
+        self._update_deltas()
         self._resort()
         self._show_filtered_rows()
 
         self.stats = (f'{self._count_text()}  +{merge.added} -{merge.removed}'
                       f'  {(time.monotonic() - started) * 1000:.0f}ms')
+
+    def _update_deltas(self) -> None:
+        """Feed the batch just merged to every `gR` column's tracker.
+
+        All watched rows count, not only the ones on display, so a row the
+        filter hides keeps its history.  A hidden column is fed like any other
+        — hiding is not removing — but one the user deleted is not (see
+        :meth:`_live_deltas`).  With no key column there is nothing to follow a
+        row by, so nothing is computed (see :meth:`_delta_status`)."""
+        for col in self._live_deltas():
+            tracker = col.tracker
+            if not self._key_names_used:
+                tracker.reset()
+                continue
+            keyed = ((self._rowkeys[id(row)], row) for row in self._all_rows)
+            if tracker.observe(keyed, self._batch_at):
+                vd.warning(f'{col.name} stays empty for: {"; ".join(tracker.problems(hints=True))}')
 
     def _show_filtered_rows(self) -> None:
         """Put the rows the filter keeps on screen (all of them when there is no
@@ -637,6 +891,117 @@ cursor position survive every refresh.
         vd.status(f'filter {rowfilter.summary}' if rowfilter.pattern is not None
                   else 'filter cleared')
 
+    def set_delta(self) -> None:
+        """`gR`: add a column with the change of the current column over the
+        last N seconds — or, answered ``N/s``, that change per second.
+
+        Rows are told apart by the key columns, so one has to be set (`!`)
+        first: with the whole row as the identity, a row whose value moved is a
+        new row with no past.  The column is empty until N seconds of samples
+        exist, and for values that are not numbers (the user is warned).
+
+        On a column that already has one — or on the change column itself —
+        the prompt opens on its period, to change it; an empty answer removes
+        the column, as deleting it does."""
+        if self.producer is None:
+            vd.fail('a copy of a live sheet does not refresh: use gR on the live sheet')
+        col = self.cursorCol
+        if col is None:
+            vd.fail('no column to follow')
+        if isinstance(col, DeltaColumn):
+            field = col.tracker.field
+        elif isinstance(col, ColumnItem):
+            # The row key, which a rename (`^`) leaves as it was.
+            field = col.expr
+        else:
+            field = col.name
+        existing = next((c for c in self._live_deltas() if c.tracker.field == field), None)
+        if existing is None:
+            if not self._key_names():
+                vd.fail('press ! on a column that identifies the row first: '
+                        'without a key a changed row is a new row')
+            if not any(field in row for row in self._all_rows):
+                vd.fail(f'{field} is not a field of the watched rows')
+
+        answer = vd.input(f'change of {field} over seconds (N, N/s per second, empty removes): ',
+                          value=existing.tracker.spec.source if existing else '')
+        try:
+            spec = parse_delta_spec(answer)
+        except ValueError as e:
+            vd.fail(str(e))
+
+        if spec is None:
+            if existing is not None:
+                self._remove_delta(field)
+                vd.status(f'{existing.name} removed')
+            return
+
+        if existing is None:
+            tracker = DeltaTracker(field, spec)
+            delta = DeltaColumn(tracker, type=self._delta_type(col.type, spec))
+            # The type of the change in absolute mode is the source's, which
+            # can be gone by the time the period is changed.
+            delta.source_type = col.type
+            index = next(i for i, c in enumerate(self.columns) if c is col) + 1
+            self.addColumn(delta, index=index)
+            self._deltas[field] = delta
+        else:
+            delta = existing
+            delta.tracker.spec = spec
+            delta.name = delta_column_name(field, spec)
+            delta.type = self._delta_type(delta.source_type, spec)
+
+        # Take the batch on screen as the first sample (or re-read the change
+        # under the new period) — unless the key was changed since that batch
+        # was merged, in which case the next refresh starts afresh anyway.
+        if self._key_names() == self._key_names_used:
+            self._update_deltas()
+        vd.status(f'{delta.name}: change over {spec.period:g}s'
+                  + (' per second' if spec.per_second else ''))
+
+    @staticmethod
+    def _delta_type(source_type: Any, spec: DeltaSpec):
+        """A rate is a float; a change is of its source's type when that is int
+        or float, and a float otherwise (a Decimal column is typed `anytype`)."""
+        if spec.per_second:
+            return float
+        return source_type if source_type in (int, float) else float
+
+    def _live_deltas(self) -> list:
+        """The `gR` columns still on the sheet.  One the user deleted is
+        removed for good here, as an empty `gR` answer would."""
+        on_sheet = {id(c) for c in self.columns}
+        for field, col in list(self._deltas.items()):
+            if id(col) not in on_sheet:
+                self._remove_delta(field)
+        return list(self._deltas.values())
+
+    def _remove_delta(self, field: str) -> None:
+        """Take the `gR` column of *field* off the sheet — and out of the sort
+        order, which would otherwise go on sorting by its last values with no
+        column left to show or unset them."""
+        delta = self._deltas.pop(field)
+        self.columns[:] = [c for c in self.columns if c is not delta]
+        if any(c is delta or c == delta.name for c, _ in self._ordering):
+            self._ordering = [(c, rev) for c, rev in self._ordering
+                              if c is not delta and c != delta.name]
+            # `ordering` is cached until the next command, and the refresh
+            # that re-sorts may come before that.
+            vd.clearCaches()
+
+    def _delta_status(self) -> str:
+        """What the `gR` columns need the user to know — no key column to follow
+        rows by, or values that are not numbers — as status-bar markup."""
+        notes = []
+        for col in self._live_deltas():
+            if not self._key_names_used:
+                notes.append(f'{col.name}: no key (!)')
+            elif col.tracker.problems():
+                notes.append(f'{col.name}: {", ".join(col.tracker.problems())}')
+        if not notes:
+            return ''
+        return f'  [:warning]{escape_vdcode(", ".join(notes))}[/]'
+
     def answer_rows(self, rows: list) -> None:
         """``Enter`` / ``g Enter``: hand *rows* to the pipeline, which carries on
         with them (see ``PipelineExecutor._cmd_watch``).
@@ -680,6 +1045,19 @@ cursor position survive every refresh.
             sheet.paused = True
             sheet._restore_mainloop_idle()
 
+    def _refresh_state(self) -> str:
+        """``every 5s, next 3s`` — the countdown is kept ticking by
+        :func:`frame_wait_ms`, which wakes the mainloop once a second.  An
+        interval of a second or less has nothing to count down."""
+        if self.paused:
+            return 'paused'
+        if self.interval <= 1:
+            return f'every {self.interval:g}s'
+        if self._worker is not None or self._produced is not None:
+            return f'every {self.interval:g}s, refreshing'
+        left = seconds_to_refresh(self.interval, self._last_start, time.monotonic())
+        return f'every {self.interval:g}s, next {left}s'
+
     @property
     def watchStatus(self) -> str:
         """The live-sheet part of the right status bar (see
@@ -692,8 +1070,7 @@ cursor position survive every refresh.
             return ''
         if self.error:
             return f'[:error]watch: {self.error}[/]'
-        state = 'paused' if self.paused else f'every {self.interval:g}s'
-        status = f'[:working]{self.stats}  {state}[/]'
+        status = f'[:working]{self.stats}  {self._refresh_state()}[/]' + self._delta_status()
         if self._filter.pattern is None:
             return status
         # The rule is user-typed text on a line that is markup — a regex like

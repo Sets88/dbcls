@@ -1257,13 +1257,24 @@ class TestPipelineWatch:
         assert calls == ['one', 'two', 'one', 'two', 'one', 'two']
         assert produced == [[{'sql': 'two'}], [{'sql': 'two'}]]
 
-    async def test_a_vdm_in_the_watched_prefix_is_queued_once(self):
+    async def test_the_live_sheet_takes_a_vdm_before_it_once(self):
         dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
         dbeditor.request_user_input = MagicMock(
             side_effect=self._showing(refreshes=3, picked=[{'id': 1}]))
         exe = PipelineExecutor(dbeditor)
         result = await exe.execute(f'.RUN "q" | .VDM """{_MACRO}""" | .WATCH 1')
-        # three refreshes re-ran the .VDM, but its macro is still queued once
+        request = dbeditor.request_user_input.call_args.args[0]
+        assert request['extra']['vdm_macro'] == _MACRO_ROWS
+        # three refreshes re-ran the .VDM, and none of them queued it again
+        assert result.macro == []
+
+    async def test_a_vdm_after_the_watch_goes_with_the_result(self):
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        dbeditor.request_user_input = MagicMock(
+            side_effect=self._showing(refreshes=2, picked=[{'id': 1}]))
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(f'.RUN "q" | .WATCH 1 | .VDM """{_MACRO}"""')
+        assert 'vdm_macro' not in dbeditor.request_user_input.call_args.args[0]['extra']
         assert result.macro == _MACRO_ROWS
 
     async def test_defaults_to_one_second_and_the_name_watch(self):

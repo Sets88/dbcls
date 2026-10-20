@@ -861,7 +861,7 @@ A pipeline may span several lines: keep a trailing `|` on every line except the 
 | `.SHEET NAME` | Create a VisiData sheet named `NAME` (a template) from the input rows and pass the data through unchanged. The sheet is built in the background as the step runs — it never blocks the pipeline and it survives a cancelled run; reach it mid-run with VisiData's `Shift+S` from a picker sheet, or with `Alt+S` afterwards. The whole stack opens when the pipeline finishes. |
 | `.VIEW NAME` | Like `.SHEET`, but **blocking**: the sheet is shown immediately and the pipeline waits until it is closed with `q`. Use it inside a `.WHILE` loop or a `.FN` function to see rows at the point they are produced. Closing the sheet is not an answer — it never cancels the pipeline. As the last step the rows are not opened a second time. |
 | `.WATCH [INTERVAL]` | Like `.VIEW`, but **live**: everything to the left of the step **in the same block** is re-run every `INTERVAL` seconds (default `1`) and merged into the sheet. `INTERVAL` is the only argument — the sheet is always named `watch`. It is a row picker too: `Enter` hands the row under the cursor to the next step, `g Enter` the marked ones, while `q` cancels the run. `gf` on the sheet filters what is shown by a regex on the current column. See below. |
-| `.VDM MACRO` | Replay a VisiData macro on the next sheet the pipeline shows — the next `.VIEW`, or else the final result — as soon as it opens; `.SHEET` does not take it. `MACRO` is the cmdlog in JSON lines exactly as VisiData's macro recorder saves it (a template; a `"""…"""` string suits it). The data passes through unchanged, and several `.VDM` steps add up. An empty `sheet` field means the sheet on top at that moment, so after `open-row` the next command runs on the sheet it opened; `#` lines are skipped, so a saved `.vdj` goes in as it is. To take a macro out of visidata, record it with `m` and press `zm` (see [Hotkeys](#hotkeys)). |
+| `.VDM MACRO` | Replay a VisiData macro on the next sheet the pipeline shows — the next `.VIEW` or `.WATCH` (once, when the live sheet opens — not on every refresh), or else the final result — as soon as it opens; `.SHEET` does not take it. `MACRO` is the cmdlog in JSON lines exactly as VisiData's macro recorder saves it (a template; a `"""…"""` string suits it). The data passes through unchanged, and several `.VDM` steps add up. An empty `sheet` field means the sheet on top at that moment, so after `open-row` the next command runs on the sheet it opened; `#` lines are skipped, so a saved `.vdj` goes in as it is. To take a macro out of visidata, record it with `m` and press `zm` (see [Hotkeys](#hotkeys)). |
 | `.CONN ID` | Run every following step against the connection named `ID` (an id from the [`connections`](#multiple-connections-and-tabs) section of the config file). Data passes through unchanged, so `.CONN` can sit anywhere and be used any number of times. Only the running pipeline is switched — when it finishes the tab is still on its own connection. `ID` is a template. See [Moving data between databases](#moving-data-between-databases). |
 
 ### Moving data between databases
@@ -922,7 +922,22 @@ Sheets you derive from a live one are **snapshots**: `"` / `g"` (duplicate) and 
 
 Row identity is the whole row by default, so a row that changed counts as a new one. Press `!` on a column that identifies the row (a `pid`, an `Id`) and identity follows that column instead — then `s` / `t` selections stick to a row while its other values keep moving.
 
-On the sheet: `Enter` / `g Enter` pick rows (see below), `q` **ends the run**, `Ctrl+R` refreshes now, `p` pauses, `zi` changes the interval, `gf` filters what is shown (see below). The right status bar shows the row count, how many were added and removed on the last tick, and how long it took.
+On the sheet: `Enter` / `g Enter` pick rows (see below), `q` **ends the run**, `Ctrl+R` refreshes now, `p` pauses, `zi` changes the interval, `gf` filters what is shown, `gR` adds a change column (both below). The right status bar shows the row count, how many were added and removed on the last tick, how long it took, and the seconds left until the next refresh (`every 5s, next 3s`).
+
+#### How much a value changed (`gR`)
+
+`gR` on a numeric column asks for a period and adds a column next to it with the column's **change** over the last that many seconds: answer `60` on `Rows_examined` and you get `Rows_examined_d60s`. Answer `60/s` for the change **per second** instead (`Rows_examined_d60s/s`). Every refresh is a sample; the change is taken against the newest one at least the period old, so a period shorter than the interval gives the change since the previous refresh.
+
+```sql
+.RUN "SELECT relname, n_tup_ins, n_tup_upd FROM pg_stat_user_tables" | .WATCH 5
+-- ! on relname, then gR on n_tup_ins, answer 60/s
+```
+
+- Rows are followed by their **key**, so press `!` on a column that identifies them first — without one a row whose value moved is a new row with no past, and nothing is computed. Changing the key starts the history over.
+- The key has to be **unique**: rows that share a key value get no change (there is no telling whose old value is whose), and the status bar says how many there are — press `!` on more columns until each row has its own.
+- The column is empty until the period has been watched, and for a row that has just appeared. A row missing from even one refresh (a `LIMIT` it fell out of, a `NULL` value) starts afresh when it is back.
+- Only real numbers count — `int`, `float`, `Decimal` as the driver or the Python handed them over. A string such as `'12345'` (MySQL's `SHOW STATUS` returns them) is not one: its cell stays empty, and you are warned, once when such values appear and in the status bar while they are there. `NULL` is just empty.
+- `gR` again, on the column or on its change column, reopens the prompt on the period to change it; an empty answer removes the change column. Hiding it (`-`) keeps it computed, deleting it stops it.
 
 #### Filtering what is shown (`gf`)
 
