@@ -1066,7 +1066,11 @@ class DbEditorTab(Editor):
         # .VARS as the last step): reopening it would just stack an identical
         # read-only copy on top of the sheet the user has only now closed.
         has_result = bool(result and result.data and not result.shown)
-        if self._pipeline_sheets:
+        # Forgotten before the session: on its way out it frees the sheets
+        # deleted in gS, and this list would keep the .SHEET ones alive.
+        had_pipeline_sheets = bool(self._pipeline_sheets)
+        self._pipeline_sheets = []
+        if had_pipeline_sheets:
             # .SHEET was used: its sheets are already on the stack (pushed as
             # the steps ran, see add_pipeline_sheet) — put the pipeline's final
             # result on top and hand control to VisiData.
@@ -1165,6 +1169,9 @@ class DbEditorTab(Editor):
                 is_error = True
                 self.info_popup.open('Error', {'main': message})
             finally:
+                # a failed or cancelled run's .SHEET sheets stay on the stack;
+                # this list must not outlive them there (see _open_result_in_visidata)
+                self._pipeline_sheets = []
                 query_client().on_progress = None
                 self.set_status_name(self.client.get_title())
                 # popup=False: the error branch above already opened the popup

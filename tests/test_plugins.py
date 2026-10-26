@@ -508,6 +508,22 @@ class TestViewRows:
         editor.doc.run_sheet_prompt.assert_not_called()
 
 
+class TestOpenSheet:
+    def test_the_sheet_is_built_inside_the_current_tabs_handover(self):
+        editor = MagicMock()
+        make_sheet = MagicMock()
+        PluginAPI(editor, 'demo').open_sheet(make_sheet)
+        editor.doc._show_in_visidata.assert_called_once_with(make_sheet)
+        make_sheet.assert_not_called()
+
+    def test_a_tab_with_no_viewer_raises(self):
+        editor = MagicMock()
+        editor.doc.has_sheet_viewer = False
+        with pytest.raises(RuntimeError, match='no VisiData viewer'):
+            PluginAPI(editor, 'demo').open_sheet(MagicMock())
+        editor.doc._show_in_visidata.assert_not_called()
+
+
 class TestTabsThroughTheAPI:
     """A plugin reaches every open connection, not just the one on screen."""
 
@@ -864,6 +880,11 @@ class TestArgumentParsing:
     def test_plugin_paths_split_like_PATH(self):
         assert resolve_plugin_paths('/a:/b') == ['/a', '/b']
         assert resolve_plugin_paths('') == []
+
+    def test_a_tilde_the_shell_left_alone_is_expanded(self, monkeypatch):
+        monkeypatch.setenv('HOME', '/home/me')
+        assert resolve_plugin_paths('~/plugins:/a:~/more') == \
+            ['/home/me/plugins', '/a', '/home/me/more']
 
     def test_plugin_names_split_on_commas(self):
         assert resolve_plugin_names(' a , b ') == ['a', 'b']

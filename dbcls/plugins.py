@@ -416,6 +416,21 @@ class PluginAPI:
                                'switch to a database tab to show rows')
         doc.run_sheet_prompt('view', str(name), pipeline.normalize_to_dicts(rows))
 
+    def open_sheet(self, make_sheet) -> None:
+        """Open VisiData on the sheet *make_sheet()* returns, on top of the
+        sheets already open, and come back to the editor when the user leaves
+        it.  A callable rather than a sheet, so that building the sheet runs
+        inside the handover and an error it raises is reported like one from
+        VisiData itself.
+
+        Like :meth:`view_rows`, call it from the main thread; raises
+        RuntimeError on a tab with no viewer (a plain file)."""
+        doc = getattr(self.editor, 'doc', self.editor)
+        if not getattr(doc, 'has_sheet_viewer', False):
+            raise RuntimeError('the current tab has no VisiData viewer; '
+                               'switch to a database tab to open a sheet')
+        doc._show_in_visidata(make_sheet)
+
     def confirm(self, message: str) -> bool:
         """Ask a y/n question in the status bar and wait for the answer."""
         return self.editor._confirm(message)
@@ -750,10 +765,12 @@ def _log_error(what: str, exc: Exception) -> None:
 
 def resolve_plugin_paths(arg_value: Optional[str]) -> List[str]:
     """Split a ``--plugin-dir`` / ``DBCLS_PLUGIN_DIR`` value (``os.pathsep``
-    separated, like PATH) into directories."""
+    separated, like PATH) into directories.  ``~`` is expanded: the shell
+    does it only where it stands unquoted, and ``DBCLS_PLUGIN_DIR="~/x"``
+    or a second directory after ``:`` would otherwise name no directory."""
     if not arg_value:
         return []
-    return [p for p in arg_value.split(os.pathsep) if p]
+    return [os.path.expanduser(p) for p in arg_value.split(os.pathsep) if p]
 
 
 def resolve_plugin_names(arg_value: Optional[str]) -> List[str]:

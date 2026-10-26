@@ -1461,6 +1461,7 @@ Keys present in that section but never declared as options reach `api.settings` 
 | `api.show_info(title, text)` | Scrollable text in a popup |
 | `api.show_rows(name, rows)` | Put row dicts on the VisiData sheet stack (`Alt+S`) |
 | `api.view_rows(name, rows)` | Show rows on a VisiData sheet and wait until the user closes it — what `.VIEW` does. Main thread only |
+| `api.open_sheet(make_sheet)` | Open VisiData on the sheet `make_sheet()` returns (a plugin's own sheet class), on top of the open ones; back to the editor when the user leaves VisiData. Main thread only |
 | `api.confirm(message)` | A y/n question in the status bar |
 | `api.notify(text, error=False)` | A message in the status bar |
 | `api.push_overlay(overlay)` / `api.pop_overlay(overlay)` | A full-screen window (`draw(stdscr, H, W)`, `handle_key(key)`, optional `tick()` and `cursor_pos()`) |
