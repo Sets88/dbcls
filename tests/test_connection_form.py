@@ -4,6 +4,7 @@ Three layers: the form overlay itself (fields, validation, what Alt+Enter and
 Ctrl+T do), writing connections to a config file, and the password that is
 asked for when the connection is first used instead of being kept in the file.
 """
+import asyncio
 import curses
 import json
 import os
@@ -17,6 +18,7 @@ from dbcls.connection_form import ConnectionForm
 from dbcls.dbcls import (
     ConnectionConfig,
     DbEditor,
+    PasswordUnavailable,
     attach_password_provider,
     save_connections_to_config,
 )
@@ -931,11 +933,21 @@ class FakeClient(ClientClass):
 def in_worker(func, *args):
     """Run *func* off the main thread — where a client connects, and the only
     place a prompt may block waiting for the main loop to answer."""
-    result = []
-    thread = threading.Thread(target=lambda: result.append(func(*args)))
+    outcome = []
+
+    def run():
+        try:
+            outcome.append((True, func(*args)))
+        except BaseException as exc:     # re-raised on the caller's thread
+            outcome.append((False, exc))
+
+    thread = threading.Thread(target=run)
     thread.start()
     thread.join()
-    return result[0]
+    ok, value = outcome[0]
+    if not ok:
+        raise value
+    return value
 
 
 class TestAskPassword:
@@ -985,13 +997,72 @@ class TestAskPassword:
         shell.forget_connection_passwords()
         assert config.runtime_password is None
 
-    def test_asking_from_the_main_thread_reports_instead_of_deadlocking(self):
+    def test_asking_from_the_main_thread_refuses_instead_of_deadlocking(self):
         shell = make_shell()
         config = ConnectionConfig(id='shop', ask_password=True)
         shell.request_user_input = MagicMock()
-        assert shell.ask_connection_password(config) == ''
+        with pytest.raises(PasswordUnavailable, match='shop'):
+            shell.ask_connection_password(config)
         shell.request_user_input.assert_not_called()
-        assert 'shop' in shell._status_notification
+
+    def test_asking_on_the_event_loop_refuses_instead_of_blocking_it(self):
+        """A provider read straight off the loop (a connect() that skipped
+        resolve_password()) must not park the loop on a prompt."""
+        shell = make_shell()
+        config = ConnectionConfig(id='shop', ask_password=True)
+        shell.request_user_input = MagicMock()
+
+        async def on_loop():
+            try:
+                shell.ask_connection_password(config)
+            except PasswordUnavailable as exc:
+                return exc
+            return None
+
+        outcome = in_worker(asyncio.run, on_loop())
+        assert isinstance(outcome, PasswordUnavailable)
+        assert 'query loop' in str(outcome)
+        shell.request_user_input.assert_not_called()
+
+    @pytest.mark.parametrize('obstacle', ['overlay', 'prompt', 'visidata'])
+    def test_asking_while_the_prompt_could_not_open_refuses(self, obstacle):
+        """The main loop opens a worker's prompt only on a tick with the screen
+        free: the chat (an overlay), VisiData (a .WATCH refresh, the table
+        browser) and another prompt all keep it from ever doing so — the
+        caller is told rather than left waiting forever."""
+        shell = make_shell()
+        config = ConnectionConfig(id='shop', ask_password=True)
+        shell.request_user_input = MagicMock()
+        if obstacle == 'overlay':
+            shell.push_overlay(MagicMock())
+        elif obstacle == 'prompt':
+            shell._ui_request = {'kind': 'watch', 'opened': True}
+        else:
+            shell.visidata_on_screen = True
+        with pytest.raises(PasswordUnavailable, match='run a query on it from the editor'):
+            in_worker(shell.ask_connection_password, config)
+        shell.request_user_input.assert_not_called()
+        assert config.runtime_password is None
+
+    def test_a_remembered_password_needs_no_prompt_whatever_is_on_screen(self):
+        shell = make_shell()
+        config = ConnectionConfig(id='shop', ask_password=True, runtime_password='secret')
+        shell.push_overlay(MagicMock())
+        assert shell.ask_connection_password(config) == 'secret'
+
+    def test_the_lock_screen_does_not_refuse(self):
+        """Locked is not 'cannot open': the prompt waits for the unlock, as
+        every worker prompt does (see the main loop's overlay check)."""
+        shell = make_shell()
+        config = ConnectionConfig(id='shop', ask_password=True)
+        shell.lock_screen = MagicMock(active=True)
+        shell.request_user_input = MagicMock(return_value='secret')
+        assert in_worker(shell.ask_connection_password, config) == 'secret'
+
+    def test_the_run_reports_a_missing_password_in_one_line(self):
+        shell = make_shell('shop')
+        exc = PasswordUnavailable('The password of connection …')
+        assert shell.doc._format_query_error(exc) == str(exc)
 
     def test_the_flag_is_read_from_a_connection_block(self):
         config = ConnectionConfig.from_dict('shop', {'engine': 'mysql',

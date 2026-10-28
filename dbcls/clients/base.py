@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import re
 from typing import Any, Callable, Optional
 from dataclasses import dataclass, field
@@ -115,6 +116,9 @@ class ClientClass(abc.ABC):
         self.username = username
         self._password = ''
         self._password_provider: Optional[Callable[[], str]] = None
+        # What the provider answered for the connect() under way — see
+        # resolve_password(); None outside one.
+        self._asked_password: Optional[str] = None
         self.password = password
         self.dbname = dbname
         self.port = port or self.DEFAULT_PORT
@@ -126,14 +130,23 @@ class ClientClass(abc.ABC):
         """The password to connect with — normally the one given at construction.
 
         With a provider set (a connection configured with ``ask_password``) and
-        nothing given, the password is asked for here: this is read inside
+        nothing given, the password is the provider's answer: it is read inside
         connect(), so the question comes when the connection is really needed
         and not when the client is built.  Nothing is cached on the client —
         the answer is kept by the connection it belongs to, so forgetting it
-        there is all it takes to be asked again."""
-        if self._password_provider is not None and not self._password:
-            return self._password_provider() or ''
-        return self._password
+        there is all it takes to be asked again.
+
+        The provider blocks until the user has answered, and a connect() runs
+        on the event loop, which must not block: :meth:`resolve_password` asks
+        beforehand, on a thread of its own, and what it got is what connect()
+        reads here.  The provider is only called from here when nothing was
+        asked beforehand — a connect() reached some other way than
+        :meth:`_execute_with_reconnect`."""
+        if self._password or self._password_provider is None:
+            return self._password
+        if self._asked_password is not None:
+            return self._asked_password
+        return self._password_provider() or ''
 
     @password.setter
     def password(self, value: str) -> None:
@@ -141,6 +154,20 @@ class ClientClass(abc.ABC):
 
     def set_password_provider(self, provider: Optional[Callable[[], str]]) -> None:
         self._password_provider = provider
+
+    async def resolve_password(self) -> None:
+        """Ask the provider for the password before connect() reads it.
+
+        The provider puts a prompt on screen and blocks until it is answered,
+        so it runs on a worker thread while this coroutine awaits it: the event
+        loop stays free for everything else (the main thread's cancel, a chat
+        request, another tab's query).  Its answer is kept only until
+        :meth:`_execute_with_reconnect` is done connecting — see
+        :attr:`password`.  Nothing to do without a provider or with a password
+        given outright."""
+        if self._password_provider is None or self._password:
+            return
+        self._asked_password = await asyncio.to_thread(self._password_provider) or ''
 
     @property
     def all_commands(self):
@@ -309,7 +336,13 @@ class ClientClass(abc.ABC):
         for tries in range(2):
             try:
                 if self.connection is None:
-                    await self.connect()
+                    await self.resolve_password()
+                    try:
+                        await self.connect()
+                    finally:
+                        # connect() has read it; the connection it belongs to
+                        # keeps the answer, this client does not.
+                        self._asked_password = None
 
                 return await run_query()
             except reconnect_exc:

@@ -296,6 +296,13 @@ runs and shared by every tab and `.CONN` client of that connection;
 again (what to do after typing one wrong). Turn the checkbox off to keep the old
 behaviour and have the password saved in the file in plain text.
 
+The prompt opens on the editor screen, so the first use of such a connection
+has to come from there: a query run with `Alt+R` (or `.CONN` in a pipeline run
+from the editor) asks. Reaching it first from somewhere the prompt cannot open
+— the LLM chat's tools, a `.CONN` inside a `.WATCH` refresh, the table browser
+— fails with a message saying so instead of waiting for a prompt that never
+comes; run a query from the editor and try again.
+
 **Saving.** The form never writes to disk — a connection described or changed in
 the editor lives until dbcls exits. Writing is a separate, deliberate step:
 `Save connections to config…` in the palette (`Ctrl+S` is unchanged — it still
@@ -611,7 +618,8 @@ database again.
 | `zE` | Set the current cell to a **raw SQL expression** (e.g. `NOW()`), emitted unquoted in the generated SQL — unlike stock VisiData's `z=`, this is not evaluated as Python |
 | `gE` | Same as `zE`, applied to all selected rows in the current column |
 | `a` | Add a new row (pending, shown in green) |
-| `d` / `gd` | Mark the current / selected rows for deletion (pending, shown in red) |
+| `d` / `gd` | Mark the current / selected rows for deletion (pending, shown in red); a row added with `a` is just removed. A marked row stays selected; bulk edits of the selection leave its cells as they are |
+| `gn` | Revert the selected rows: edited cells get their original values back, deletion marks are cleared, added rows are removed. Right after `gd` it takes the marks back |
 | `E` | Edit the underlying SQL (add `WHERE` / `ORDER BY`, ...); the sheet reloads with the new query |
 | `"` | Open the selected rows on a sheet of their own and edit them there: the copy shares the pending edits with the edit sheet, so a change made on either shows on both and `Ctrl+S` on either commits all of them |
 | `Ctrl+S` | Review the generated `INSERT`/`UPDATE`/`DELETE` statements on a confirmation sheet; `Enter` there executes them sequentially, `q` goes back without executing |

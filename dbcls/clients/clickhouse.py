@@ -145,11 +145,27 @@ class ClickhouseClient(ShowCommandsMixin, ClientClass):
             self._query_id = None
 
         data = reader.result()
-        rowcount = len(data)
-        if not rowcount:
-            rowcount = query_result.summary.get('result_rows', None)
+        rowcount = len(data) or self._summary_rowcount(query_result.summary)
 
         return Result(data=data, rowcount=rowcount)
+
+    @staticmethod
+    def _summary_rowcount(summary) -> int:
+        """How many rows a statement that returned none touched.
+
+        The X-ClickHouse-Summary header is JSON with every number as a string
+        ('"written_rows":"3"'), so it goes through int() before it can be
+        compared with 0 — otherwise an empty SELECT reports "'0' rows affected"
+        instead of "Empty set".  An INSERT counts in written_rows and leaves
+        result_rows at 0, so written_rows is looked at first."""
+        for key in ('written_rows', 'result_rows'):
+            try:
+                count = int(summary.get(key, 0))
+            except (TypeError, ValueError):
+                continue
+            if count:
+                return count
+        return 0
 
     def request_cancel(self) -> None:
         """Kill the running query on the server (`KILL QUERY`).

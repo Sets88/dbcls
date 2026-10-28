@@ -159,6 +159,13 @@ class ConnectionConfig:
         return self.id
 
 
+class PasswordUnavailable(Exception):
+    """The password of an ``ask_password`` connection is wanted, has not been
+    given yet, and cannot be asked for right now (see
+    :meth:`dbcls.dbcls.DbEditor.ask_connection_password`).  Shown as a
+    one-line error, like a database's own refusal to connect."""
+
+
 def attach_password_provider(client: ClientClass, config: ConnectionConfig,
                              password_asker) -> ClientClass:
     """Teach *client* to ask for the password of an ``ask_password`` connection.
@@ -209,13 +216,10 @@ def _default_connection(config: dict, args: argparse.Namespace,
     """Build the `default` connection, layering command line over the flat
     config keys over the ``connections['default']`` block (if there is one)."""
     block = block or ConnectionConfig(id=DEFAULT_CONNECTION_ID)
-    host = args.host
-    if host == '127.0.0.1':  # argparse default — treat as "not set"
-        host = ''
     return ConnectionConfig(
         id=DEFAULT_CONNECTION_ID,
         engine=_first(args.engine, config.get('engine'), block.engine),
-        host=_first(host, config.get('host'), block.host),
+        host=_first(args.host, config.get('host'), block.host),
         port=_first(args.port, config.get('port'), block.port),
         username=_first(args.user, config.get('username'), block.username),
         password=_first(args.password, config.get('password'), block.password),

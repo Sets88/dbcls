@@ -8,6 +8,7 @@ between them.
 import argparse
 import asyncio
 import curses
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -136,6 +137,10 @@ class TestParseConnections:
         assert [c.id for c in conns] == [DEFAULT_CONNECTION_ID, 'mysql01']
         assert conns[0].host == 'cli-host'
 
+    def test_an_explicit_loopback_host_beats_the_config(self):
+        (conn,) = parse_connections({'host': 'remote'}, cli(host='127.0.0.1'))
+        assert conn.host == '127.0.0.1'
+
     def test_command_line_overrides_a_named_default_block(self):
         config = {'connections': {'default': {'engine': 'mysql', 'host': 'block',
                                               'filename': 'd.sql'},
@@ -240,6 +245,58 @@ class TestMakeClient:
     def test_unknown_engine_is_reported(self):
         with pytest.raises(ValueError, match='nosuchdb'):
             make_client(ConnectionConfig(id='x', engine='nosuchdb'))
+
+    def test_check_engine_refuses_the_same_configs_without_building(self):
+        from dbcls.clients import check_engine
+        assert check_engine(ConnectionConfig(id='x', engine='sqlite3')).name == 'sqlite3'
+        assert check_engine(ConnectionConfig(id='x')).name == 'sqlite3'
+        with pytest.raises(ValueError, match='nosuchdb'):
+            check_engine(ConnectionConfig(id='x', engine='nosuchdb'))
+
+
+class TestMainChecksEveryConnection:
+    """main() used to build a client only for the first connection before
+    starting curses; the others were built inside DbEditor, where an unknown
+    engine ended in a traceback.  Every connection is checked up front now."""
+
+    @staticmethod
+    def _run_main(monkeypatch, tmp_path, connections):
+        import json
+        import dbcls.dbcls as module
+        config_path = tmp_path / 'dbcls.json'
+        config_path.write_text(json.dumps({'connections': connections}))
+        monkeypatch.setattr(sys, 'argv',
+                            ['dbcls', '--no-plugins', '--config', str(config_path)])
+        monkeypatch.delenv('DBCLS_CONFIG', raising=False)
+        wrapper = MagicMock()
+        monkeypatch.setattr(module.curses, 'wrapper', wrapper)
+        return module.main, wrapper
+
+    def test_unknown_engine_in_a_later_connection_exits_before_curses(
+            self, monkeypatch, tmp_path, capsys):
+        main, wrapper = self._run_main(monkeypatch, tmp_path, {
+            'one': {'engine': 'sqlite3', 'dbfilepath': str(tmp_path / 'one.sqlite')},
+            'two': {'engine': 'nosuchdb'},
+        })
+
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "connection 'two'" in err
+        assert 'nosuchdb' in err
+        assert not wrapper.called
+
+    def test_valid_connections_start_the_editor(self, monkeypatch, tmp_path):
+        main, wrapper = self._run_main(monkeypatch, tmp_path, {
+            'one': {'engine': 'sqlite3', 'dbfilepath': str(tmp_path / 'one.sqlite')},
+            'two': {'engine': 'sqlite3', 'dbfilepath': str(tmp_path / 'two.sqlite')},
+        })
+
+        main()
+
+        assert wrapper.called
 
 
 # ── The tab bar ───────────────────────────────────────────────────────────────

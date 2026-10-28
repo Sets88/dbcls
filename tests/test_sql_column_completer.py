@@ -136,8 +136,13 @@ class TestSqlCompletions:
         assert sheet.sql_completions() == ['id', 'name', 't']
         sheet.client.get_table_columns.assert_called_once_with('t', 'db')
 
-    def test_a_failed_lookup_leaves_just_the_table(self):
-        # SyncClient answers a timeout with a Result, not a list
-        sheet = make_sheet([], table_columns=MagicMock())
+    def test_a_failed_lookup_leaves_just_the_table(self, monkeypatch):
+        # SyncClient raises on a timeout; completion is best effort
+        from dbcls.vd_modules import vd_db_browser
+        warnings = []
+        monkeypatch.setattr(vd_db_browser.vd, 'warning', warnings.append)
+        sheet = make_sheet([])
+        sheet.client.get_table_columns.side_effect = TimeoutError('no answer in 60s')
         assert sheet.sql_completions() == ['t']
+        assert warnings == ['could not fetch table columns: no answer in 60s']
 

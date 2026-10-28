@@ -101,49 +101,42 @@ class TestSyncClient:
         assert mock_task.is_done.call_count == 3  # Called in while loop twice, then in finally block once
         assert result == "test_result"
 
-    def test_run_coro_timeout(self, sync_client):
-        """Test _run_coro handles timeout"""
-        # Setup
+    def test_run_coro_timeout_raises_and_cancels_the_task(self, sync_client):
         mock_task = MagicMock()
-        mock_task.is_done.return_value = False  # Never done
+        mock_task.is_done.return_value = False  # never done
 
         sync_client.asyncloop_thread.submit.return_value = mock_task
-        sync_client.timeout = 0.1  # Set a short timeout
+        sync_client.timeout = 0.1
 
-        # Test
-        async_mock = AsyncMock()
-        result = sync_client._run_coro(async_mock)
+        # submit() is mocked, so a plain function stands in for the coroutine
+        # function (a real one would leave a never-awaited coroutine behind)
+        def get_table_columns():
+            return None
 
-        # Verify
-        assert result.message == 'Timeout'
+        with pytest.raises(TimeoutError, match='get_table_columns'):
+            sync_client._run_coro(get_table_columns)
         mock_task.cancel.assert_called_once()
 
-    def test_run_coro_exception(self, sync_client):
-        """Test _run_coro handles exceptions"""
-        from dbcls.clients.base import Result
+    def test_run_coro_cancelled_task_raises(self, sync_client):
+        import asyncio
 
-        # Replace the _run_coro method with our own version to test
-        original_run_coro = sync_client._run_coro
+        mock_task = MagicMock()
+        mock_task.is_done.return_value = True
+        mock_task.result.side_effect = asyncio.CancelledError()
+        sync_client.asyncloop_thread.submit.return_value = mock_task
 
-        def mocked_run_coro(coro, *args, **kwargs):
-            # This simulates what happens in the original method when an exception occurs
-            return Result(message='Canceled')
+        with pytest.raises(asyncio.CancelledError):
+            sync_client._run_coro(lambda: None)
+        mock_task.cancel.assert_not_called()
 
-        try:
-            # Replace with our mock
-            sync_client._run_coro = mocked_run_coro
+    def test_run_coro_exception_propagates(self, sync_client):
+        mock_task = MagicMock()
+        mock_task.is_done.return_value = True
+        mock_task.result.side_effect = RuntimeError('boom')
+        sync_client.asyncloop_thread.submit.return_value = mock_task
 
-            # Test
-            async_mock = AsyncMock()
-            result = sync_client._run_coro(async_mock)
-
-            # Verify
-            assert isinstance(result, Result)
-            assert result.message == 'Canceled'
-
-        finally:
-            # Restore original method
-            sync_client._run_coro = original_run_coro
+        with pytest.raises(RuntimeError, match='boom'):
+            sync_client._run_coro(lambda: None)
 
 
 class TestTopKValues:

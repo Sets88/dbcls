@@ -132,10 +132,40 @@ class TestStreamQuery:
             FakeStream([], ('id',), summary={'result_rows': 7})
         )
 
-        result = await client._run_query('INSERT INTO t VALUES')
+        result = await client._run_query('SELECT 1 FORMAT Null')
 
         assert result.data == []
         assert result.rowcount == 7
+
+    @pytest.mark.asyncio
+    async def test_summary_strings_become_ints(self):
+        # X-ClickHouse-Summary is JSON with every number quoted.
+        client = make_client()
+        client.connection = FakeConnection(
+            FakeStream([], ('id',), summary={'written_rows': '0', 'result_rows': '0'})
+        )
+
+        result = await client._run_query('SELECT 1 WHERE 0')
+
+        assert result.rowcount == 0
+        assert str(result) == 'Empty set'
+
+    @pytest.mark.asyncio
+    async def test_insert_reports_written_rows(self):
+        client = make_client()
+        client.connection = FakeConnection(
+            FakeStream([], (), summary={'written_rows': '3', 'result_rows': '0'})
+        )
+
+        result = await client._run_query('INSERT INTO t VALUES (1), (2), (3)')
+
+        assert result.rowcount == 3
+        assert str(result) == '3 rows affected'
+
+    def test_summary_rowcount_ignores_garbage(self):
+        assert ClickhouseClient._summary_rowcount({}) == 0
+        assert ClickhouseClient._summary_rowcount({'written_rows': 'n/a', 'result_rows': '2'}) == 2
+        assert ClickhouseClient._summary_rowcount({'written_rows': None}) == 0
 
     @pytest.mark.asyncio
     async def test_query_runs_under_a_known_query_id(self):

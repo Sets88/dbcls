@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 import re
@@ -160,3 +161,93 @@ class TestClientClass:
         """Test get_title returns properly formatted string"""
         expected = f"MockDB localhost:5432 test_db"
         assert client.get_title() == expected
+
+class AskingClient(MockClient):
+    """A client that connects, as the server-backed engines do, so that
+    _execute_with_reconnect() calls connect() — which reads the password."""
+    RECONNECT_ERROR = ConnectionError
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.connected_with = []
+
+    async def connect(self):
+        self.connected_with.append(self.password)
+        self.connection = object()
+
+
+class TestPasswordProvider:
+    """An ``ask_password`` connection: the provider puts a prompt up and blocks
+    until the main loop has answered it — which must never happen on the event
+    loop the query runs on."""
+
+    @pytest.mark.asyncio
+    async def test_the_provider_is_asked_off_the_loop_before_connect_reads_it(self):
+        import threading
+        client = AskingClient('localhost', 'user', '', 'db')
+        loop_thread = threading.current_thread()
+        asked_on = []
+
+        def provider():
+            asked_on.append(threading.current_thread())
+            return 'secret'
+
+        client.set_password_provider(provider)
+        await client._execute('SELECT 1')
+        assert client.connected_with == ['secret']
+        assert asked_on and asked_on[0] is not loop_thread
+        # Kept only for the connect(); the connection owns the answer.
+        assert client._asked_password is None
+
+    @pytest.mark.asyncio
+    async def test_a_provider_waiting_on_the_loop_does_not_deadlock(self):
+        """The real provider waits for the main loop; here the loop stands in
+        for it — if the provider ran on the loop, nobody could answer."""
+        client = AskingClient('localhost', 'user', '', 'db')
+        loop = asyncio.get_running_loop()
+        answered = asyncio.Event()
+
+        def provider():
+            future = asyncio.run_coroutine_threadsafe(answered.wait(), loop)
+            future.result(timeout=5)
+            return 'secret'
+
+        client.set_password_provider(provider)
+        loop.call_later(0.05, answered.set)
+        await asyncio.wait_for(client._execute('SELECT 1'), timeout=5)
+        assert client.connected_with == ['secret']
+
+    @pytest.mark.asyncio
+    async def test_a_dismissed_prompt_connects_with_nothing(self):
+        client = AskingClient('localhost', 'user', '', 'db')
+        client.set_password_provider(lambda: None)
+        await client._execute('SELECT 1')
+        assert client.connected_with == ['']
+
+    @pytest.mark.asyncio
+    async def test_a_password_given_outright_asks_nobody(self):
+        client = AskingClient('localhost', 'user', 'given', 'db')
+        client.set_password_provider(lambda: pytest.fail('asked anyway'))
+        await client._execute('SELECT 1')
+        assert client.connected_with == ['given']
+
+    def test_a_connect_outside_the_reconnect_path_still_gets_a_password(self):
+        """connect() called by hand (a plugin, a test): the property falls
+        back to asking right there."""
+        client = AskingClient('localhost', 'user', '', 'db')
+        client.set_password_provider(lambda: 'secret')
+        asyncio.run(client.connect())
+        assert client.connected_with == ['secret']
+
+    @pytest.mark.asyncio
+    async def test_the_provider_failing_fails_the_query(self):
+        client = AskingClient('localhost', 'user', '', 'db')
+
+        def provider():
+            raise LookupError('no prompt possible')
+
+        client.set_password_provider(provider)
+        with pytest.raises(LookupError):
+            await client._execute('SELECT 1')
+        assert client.connected_with == []
+        assert client._asked_password is None

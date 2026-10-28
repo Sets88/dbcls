@@ -218,8 +218,15 @@ def engine_probe(name: str) -> str:
     return engine.probe if engine else 'databases'
 
 
-def build_client(config) -> ClientClass:
-    """The client for *config*, or a clear error for an engine we cannot open."""
+def check_engine(config) -> Engine:
+    """The engine *config* names, or a clear error for one we cannot open.
+
+    ``ValueError`` for a name no engine goes by, ``RuntimeError`` for an
+    engine whose driver is not installed — the same errors
+    :func:`build_client` raises, so a caller can refuse a connection before
+    building anything for it (``main()`` does, for every configured
+    connection, so a typo in the second one is reported instead of taking the
+    editor down once it has started)."""
     name = getattr(config, 'engine', '') or DEFAULT_ENGINE
     engine = ENGINES.get(name)
     if engine is None:
@@ -230,4 +237,9 @@ def build_client(config) -> ClientClass:
     if not engine.available():
         raise RuntimeError(engine.missing_driver or
                            f'the driver for {name} is not installed')
-    return engine.factory(config)
+    return engine
+
+
+def build_client(config) -> ClientClass:
+    """The client for *config*, or a clear error for an engine we cannot open."""
+    return check_engine(config).factory(config)

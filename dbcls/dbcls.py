@@ -24,11 +24,12 @@ from .clients.base import Result
 from .vd_modules import (
     DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet, VarsSheet,
     LiveRowsSheet, release_closed_sheets)
-from .clients import DEFAULT_ENGINE, engine_names
+from .clients import DEFAULT_ENGINE, check_engine, engine_names
 from .config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_CONNECTION_ID,
     ConnectionConfig,
+    PasswordUnavailable,
     as_bool,
     attach_password_provider,
     connection_in_config,
@@ -154,6 +155,15 @@ class AsyncLoopThread(threading.Thread):
 
 
 class SyncClient:
+    """The async client as seen from a VisiData thread: every coroutine method
+    becomes a blocking call that returns what the coroutine returns.
+
+    A call that outlives ``timeout`` raises :class:`TimeoutError`; one whose
+    task was cancelled raises :class:`asyncio.CancelledError`.  Neither is
+    turned into a :class:`Result`, so a caller that expects a list gets a list
+    or an exception, and a loader that dies of a timeout shows the timeout
+    rather than "no data"."""
+
     def __init__(self, asyncloop_th, async_client: ClientClass):
         self.asyncloop_thread = asyncloop_th
         self.client = async_client
@@ -171,17 +181,15 @@ class SyncClient:
         task = None
         try:
             task = self.asyncloop_thread.submit(coro(*args, **kwargs))
-            start = time.time()
+            start = time.monotonic()
 
             while not task.is_done():
                 time.sleep(0.1)
 
-                if time.time() - start > self.timeout:
-                    return Result(message='Timeout')
+                if time.monotonic() - start > self.timeout:
+                    raise TimeoutError(f'{coro.__name__}: no answer in {self.timeout:g}s')
 
             return task.result()
-        except asyncio.CancelledError:
-            return Result(message='Canceled')
         finally:
             if task is not None and not task.is_done():
                 task.cancel()
@@ -382,7 +390,10 @@ DB_HELP_DATABASE = """\
       With `"ask_password": true` a connection keeps no password in
       the config file: it is asked for when the connection is first
       used and remembered until dbcls exits.  This drops what was
-      remembered, so the next query asks again
+      remembered, so the next query asks again.  The prompt opens on
+      the editor screen only: the first use of such a connection from
+      the chat, a `.WATCH` refresh or the table browser is refused
+      until a query run from the editor has asked
   `.CONN "tab"` (in a pipeline)
       Run the following steps against the connection of the named tab
       (`mysql01`, `mysql01#2`, …), without changing the connection of the
@@ -519,7 +530,12 @@ Edit mode (table browser `Edit` option; MySQL/PostgreSQL/SQLite only)
       Add a new row — kept pending (green) until committed
   `d / gd`
       Mark current / selected rows for deletion — kept pending (red)
-      until committed (`U` undoes the mark)
+      until committed (`U` undoes the mark); a row added with `a`
+      is just removed; a marked row stays selected
+  `gn`
+      Revert the selected rows: edited cells get their original
+      values back, deletion marks are cleared, added rows removed
+      (right after `gd` it takes the marks back)
   `zd`
       Set cell to NULL (pending)
   `Ctrl+S`
@@ -959,9 +975,11 @@ class DbEditorTab(Editor):
         are released — VisiData would otherwise keep them, and every row they
         loaded, for the rest of the process (see vd_modules.vd_memory)."""
         self._fix_visidata_curses()
+        self.shell.visidata_on_screen = True
         try:
             yield
         finally:
+            self.shell.visidata_on_screen = False
             self._fix_curses_after_visidata()
             try:
                 release_closed_sheets()
@@ -1089,7 +1107,8 @@ class DbEditorTab(Editor):
                 self._vd_run(visidata.PyobjSheet('result', source=result.data))
 
     def _format_query_error(self, exc: Exception) -> str:
-        if isinstance(exc, (PipelineStepError, StaleSheetError)) or self.client.is_db_error_exception(exc):
+        if (isinstance(exc, (PipelineStepError, StaleSheetError, PasswordUnavailable))
+                or self.client.is_db_error_exception(exc)):
             return str(exc)
         return ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
@@ -1347,6 +1366,10 @@ class DbEditor(EditorShell):
         # VisiData's pristine idle threshold, captured before anything of ours
         # has had a chance to change it — see _fix_visidata_curses.
         self._vd_timeouts_before_idle = visidata.vd.timeouts_before_idle
+        #: True while a tab has handed the terminal to VisiData (see
+        #: DbEditorTab._visidata_session): the main loop is not ticking then,
+        #: so no worker-thread prompt can open until the sheet is closed.
+        self.visidata_on_screen = False
         self.asyncloop_thread = AsyncLoopThread(daemon=True)
         self.asyncloop_thread.start()
         #: Pipeline variables, shared by every tab.
@@ -1476,21 +1499,29 @@ class DbEditor(EditorShell):
     def ask_connection_password(self, config: ConnectionConfig) -> str:
         """The password of an ``ask_password`` connection, asked for once.
 
-        Called from the connection's own thread the first time it connects (see
-        :meth:`ClientClass.password`).  The answer is kept on the connection,
-        so every tab and every `.CONN` client sharing it are covered by the one
-        question; `Forget connection passwords` clears it again.  A dismissed
-        prompt (Esc) is not remembered: the query fails to authenticate and the
-        next one asks again."""
+        Called on a worker thread the first time a client of the connection
+        connects (see :meth:`ClientClass.resolve_password`), and blocks it
+        until the main loop has shown the prompt and the user answered.  The
+        answer is kept on the connection, so every tab and every `.CONN` client
+        sharing it are covered by the one question; `Forget connection
+        passwords` clears it again.  A dismissed prompt (Esc) is not
+        remembered: the query fails to authenticate and the next one asks
+        again.
+
+        Raises :class:`PasswordUnavailable` instead of asking when the prompt
+        could not open — the main loop only puts a worker's prompt on screen
+        when nothing else holds the screen (see :meth:`Editor.request_user_input`),
+        so waiting here would hang whatever asked: the chat's tool call, a
+        `.WATCH` refresh running `.CONN`, the table browser.  Those are told
+        to come back once a query run from the editor has asked."""
         if config.runtime_password is not None:
             return config.runtime_password
-        if threading.current_thread() is threading.main_thread():
-            # request_user_input() blocks until the main loop answers, which is
-            # this very thread.  Nothing in dbcls connects from here, so say
-            # what happened instead of deadlocking.
-            self.set_status_notification(
-                f'Cannot ask for the password of {config.id!r} here', error=True)
-            return ''
+        obstacle = self._password_prompt_obstacle()
+        if obstacle is not None:
+            raise PasswordUnavailable(
+                f'The password of connection {config.id!r} has not been given '
+                f'yet, and {obstacle} — run a query on it from the editor '
+                f'first, which asks for it')
         answer = self.request_user_input({
             'kind': 'input',
             'title': f'Password for {config.id}',
@@ -1500,6 +1531,34 @@ class DbEditor(EditorShell):
             return ''
         config.runtime_password = answer
         return answer
+
+    def _password_prompt_obstacle(self) -> Optional[str]:
+        """Why a password prompt could not open right now, or None.
+
+        Each is a state in which the main loop would never reach
+        ``_open_ui_request`` for it, or in which the thread asking is the one
+        that would have to open it: waiting would be a deadlock."""
+        if threading.current_thread() is threading.main_thread():
+            # The main loop answers prompts — it cannot wait on one.
+            return 'it cannot be asked for from the main thread'
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # A provider read straight off the loop (a connect() that did not
+            # go through resolve_password()): blocking here stops every query.
+            return 'it cannot be asked for from the query loop'
+        if self.visidata_on_screen or self._ui_request is not None:
+            # VisiData owns the terminal (a .WATCH sheet refreshing through
+            # .CONN, the table browser), or another prompt is up.
+            return 'the prompt cannot open while VisiData or another prompt is on screen'
+        if self.active_overlay() is not None:
+            # The chat or the connection form takes every key and the whole
+            # screen until it is closed; the lock screen is not an overlay in
+            # this sense — a prompt simply waits for the unlock.
+            return 'the prompt cannot open while the chat or a form is on screen'
+        return None
 
     def forget_connection_passwords(self) -> None:
         """Drop every password given at a prompt, so the next connection asks
@@ -2064,11 +2123,20 @@ def main():
 
     connections = parse_connections(config, args)
 
+    # Every connection's engine is checked here, not only the first one's:
+    # the other tabs' clients are built inside DbEditor, under curses, where
+    # an unknown engine or a missing driver would end in a traceback.
     try:
-        client = make_client(connections[0])
+        for connection in connections:
+            check_engine(connection)
+        connection = connections[0]
+        client = make_client(connection)
     except (ValueError, RuntimeError) as exc:
         parser.print_help(sys.stderr)
-        print(exc)
+        if len(connections) > 1:
+            print(f'connection {connection.id!r}: {exc}', file=sys.stderr)
+        else:
+            print(exc, file=sys.stderr)
         sys.exit(1)
 
     autocomplete = AutoComplete(client)

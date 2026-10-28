@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import decimal
 import re
@@ -169,10 +170,11 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
         known = self._known_columns or []
         known = list(dict.fromkeys(known + [col.name for col in self.columns]))
         if not known:
-            names = self.client.get_table_columns(self.table, self.db)
-            # SyncClient returns a Result on timeout/cancel instead of a list
-            if isinstance(names, list):
-                known = list(names)
+            try:
+                known = list(self.client.get_table_columns(self.table, self.db))
+            except Exception as exc:
+                # completion is best effort: a timeout leaves just the table
+                vd.warning(f'could not fetch table columns: {exc}')
         self._known_columns = known
         return known + [self.table]
 
@@ -328,6 +330,11 @@ class _ModsByName(dict):
         return row, _RowModsByName(mods)
 
 
+def _row_index(rows, row):
+    """Index of *row* in *rows* by identity (AttrDict rows compare by value)."""
+    return next((i for i, r in enumerate(rows) if r is row), None)
+
+
 class EditTableSheet(TableSampleDataSheet):
     """Sample-data browsing with pending edits: `e`/`zd` mark cell changes
     (yellow), `zE`/`gE` set cell(s) to a raw (unquoted) SQL expression,
@@ -343,7 +350,8 @@ Changes are collected locally and only executed after confirmation.
 - `gE` to do the same for all selected rows in the current column.
 - Inside a JSON (`g@`) or URL (`g#`) cell, the values that cannot be expanded further are edited: `e` on a column expanded with `(`, or `z Enter` into the value and edit there (`e` on `key` renames, `a` / `d` add / delete) -- the change is pending as an edit of the whole cell.
 - `a` to add a new row (green until committed).
-- `d` / `gd` to mark the current / selected rows for deletion (red until committed).
+- `d` / `gd` to mark the current / selected rows for deletion (red until committed); a row added with `a` is just removed, on its copies too.  A marked row stays selected; bulk edits of the selection leave its cells as they are.
+- `gn` to revert the selected rows: edited cells get their original values back, deletion marks are cleared, added rows are removed.  Right after `gd` it takes the marks back.
 - `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); `Tab` / `Shift+Tab` complete column names, listed in a menu above the prompt.
 - `"` to edit the selected rows on a sheet of their own: its edits are this sheet's too, `Ctrl+S` on either commits them all.
 - `Ctrl+S` to review the INSERT/UPDATE/DELETE statements before executing them.  Afterwards only the changed rows are re-read, by primary key.
@@ -355,6 +363,9 @@ Editing and deleting existing rows requires the table to have a primary key; wit
     pk_columns = None
     _edit_root = None  # on a copy: the sheet the pending edits belong to
     _seed = None  # (columns, rows) handed over by `gE` on a Sample data sheet: the first load only
+    # on the root: bumped when a commit or a reload ends the pending edits, so
+    # an undo recorded before can tell it must not bring them back
+    _edits_epoch = 0
 
     @property
     def edit_root(self):
@@ -387,15 +398,14 @@ Editing and deleting existing rows requires the table to have a primary key; wit
             # reloading a copy must not drop the edits it shares with the root
             BaseSheet.preloadHook(self)
             return
+        self._edits_epoch += 1
         super().preloadHook()
 
     def newRow(self):
         return AttrDict()
 
     def iterload(self):
-        pk = self.client.get_primary_key(self.table, self.db)
-        # SyncClient returns a Result on timeout/cancel instead of a list
-        self.pk_columns = pk if isinstance(pk, list) else []
+        self.pk_columns = list(self.client.get_primary_key(self.table, self.db))
         if not self.pk_columns:
             vd.warning('no primary key: editing existing rows disabled, only row adds allowed')
         seed, self._seed = self._seed, None
@@ -415,7 +425,7 @@ Editing and deleting existing rows requires the table to have a primary key; wit
         # an empty table must still be editable: build the columns from the
         # table schema so `a` (add-row) has somewhere to put values
         names = self.client.get_table_columns(self.table, self.db)
-        if not isinstance(names, list) or not names:
+        if not names:
             raise Exception('No data found (and could not fetch table columns)')
         self.columns = []
         for name in names:
@@ -449,29 +459,144 @@ Editing and deleting existing rows requires the table to have a primary key; wit
         for row in rows:
             self.ensure_editable(row)
 
-    def delete_row(self, rowidx):
-        row = self.rows[rowidx]
-        rowid = self.rowid(row)
-        if rowid in self._deferredAdds:
-            # a pending (not yet committed) add: remove the row entirely
-            # instead of marking it red for deletion
+    def sharing_sheets(self) -> list:
+        """The root and its copies: the sheets showing the same pending edits
+        (see __copy__).  Those closed with `q` too -- they stay in
+        ``vd.allSheets`` and `gS` brings them back."""
+        root = self.edit_root
+        sheets = {}
+        for s in [*vd.sheets, *vd.allSheets, root]:
+            if isinstance(s, EditTableSheet) and s.edit_root is root:
+                sheets.setdefault(id(s), s)
+        return list(sheets.values())
+
+    def remove_added_rows(self, rows):
+        """Cancel pending (not yet committed) adds: the rows are removed
+        entirely instead of being marked red for deletion."""
+        mods = {}
+        for row in rows:
+            rowid = self.rowid(row)
             del self._deferredAdds[rowid]
             # drop any stray cell mods too: once the rowid leaves
             # _deferredAdds a leftover entry would resurface as an UPDATE
             # for a row that was never inserted
-            self._deferredMods.pop(rowid, None)
-            self.rows.pop(rowidx)
-            if self.isSelected(row):
-                self.addUndoSelection()
-                self.unselectRow(row)
+            if rowid in self._deferredMods:
+                # the raw dict entry: _ModsByName.__getitem__ would wrap it
+                mods[rowid] = dict.pop(self._deferredMods, rowid)
+        # from every sheet sharing the edits: left on the original after
+        # a delete on a copy, a row would look read from the table -- one
+        # without a key, which `d` could only mark for a DELETE
+        ids = {id(row) for row in rows}
+        sheets = self.sharing_sheets()
+        # every list once, and every cursor taken before any list changes:
+        # a copy may hold the same list object as another sheet
+        removed = {}  # id(list) -> (list, [(index, row)])
+        for sheet in sheets:
+            if id(sheet.rows) not in removed:
+                found = [(i, r) for i, r in enumerate(sheet.rows) if id(r) in ids]
+                if found:
+                    removed[id(sheet.rows)] = (sheet.rows, found)
+        cursors = [(sheet, sheet.cursorRow) for sheet in sheets if id(sheet.rows) in removed]
+        for rowlist, _ in removed.values():
+            rowlist[:] = [r for r in rowlist if id(r) not in ids]
+        for sheet, cursor_row in cursors:
+            if cursor_row is not None and id(cursor_row) not in ids:
+                # rows removed above the cursor must not move it to another row
+                sheet.cursorRowIndex = _row_index(sheet.rows, cursor_row)
+            selected = [row for row in rows if sheet.isSelected(row)]
+            if selected:
+                sheet.addUndoSelection()
+                for row in selected:
+                    sheet.unselectRow(row)
 
-            def _undo(sheet=self, row=row, rowidx=rowidx):
-                sheet.rows.insert(rowidx, row)
-                sheet._deferredAdds[sheet.rowid(row)] = row
-            vd.addUndo(_undo)
-            self.setModified()
+        root = self.edit_root
+        def _undo(removed=removed, cursors=cursors, mods=mods, rows=rows,
+                  root=root, epoch=root._edits_epoch):
+            if root._edits_epoch != epoch:
+                vd.warning('cannot undo removing an added row after a commit')
+                return
+            # each row back at its place: putting back a copy of the whole list
+            # would also undo what was done to it since (on another sheet)
+            for rowlist, found in removed.values():
+                for i, row in found:
+                    rowlist.insert(i, row)
+            for sheet, cursor_row in cursors:
+                i = _row_index(sheet.rows, cursor_row)
+                if i is not None:
+                    sheet.cursorRowIndex = i
+            for row in rows:
+                root._deferredAdds[root.rowid(row)] = row
+            for rowid, entry in mods.items():
+                dict.__setitem__(root._deferredMods, rowid, entry)
+        vd.addUndo(_undo)
+        self.setModified()
+
+    def delete_row(self, rowidx):
+        row = self.rows[rowidx]
+        if self.rowid(row) in self._deferredAdds:
+            self.remove_added_rows([row])
             return row
         return super().delete_row(rowidx)
+
+    def revert_rows(self, rows):
+        """`gn`: drop the pending changes of *rows*: cell edits go back to
+        the values read from the table, a deletion mark is cleared and a
+        row added with `a` is removed."""
+        rows = list(rows)
+        added = [row for row in rows if self.rowid(row) in self._deferredAdds]
+        # the raw dict entries: _ModsByName.__getitem__ would wrap them
+        mods = {}
+        dels = {}
+        for row in rows:
+            rowid = self.rowid(row)
+            if rowid in self._deferredMods:
+                mods[rowid] = dict.pop(self._deferredMods, rowid)
+            if rowid in self._deferredDels:
+                dels[rowid] = self._deferredDels.pop(rowid)
+
+        root = self.edit_root
+        def _undo(root=root, mods=mods, dels=dels, epoch=root._edits_epoch):
+            if root._edits_epoch != epoch:
+                # the reverted edits would come back as statements to run
+                # again (or for rows that are gone)
+                vd.warning('cannot undo reverting rows after a commit')
+                return
+            for rowid, entry in mods.items():
+                dict.__setitem__(root._deferredMods, rowid, entry)
+            root._deferredDels.update(dels)
+        vd.addUndo(_undo)
+        if added:
+            self.remove_added_rows(added)
+        n = len({*mods, *dels} | {self.rowid(row) for row in added})
+        vd.status(f'reverted the changes of {n} {self.rowtype}' if n else 'no pending changes in the selected rows')
+
+    def rowDeleted(self, row):
+        # the stock one unselects the row, as if it were gone; marked red it
+        # is still here, and left selected `gn` right after `gd` takes the
+        # marks back.  Bulk edits of the selection pass it by (_cellChanged).
+        selected = self.isSelected(row)
+        super().rowDeleted(row)
+        if selected:
+            self.selectRow(row)
+
+    def deleteSelected(self):
+        # the stock one marks every selected row red, pending adds included,
+        # and clears the selection.  A row already marked is left alone: its
+        # undo would take the earlier mark away too.
+        added = [row for row in self.selectedRows if self.rowid(row) in self._deferredAdds]
+        if added:
+            self.remove_added_rows(added)
+        self.deleteBy(lambda row: self.isSelected(row) and not self.isDeleted(row))
+
+    def delete_cursor_row(self):
+        """`d`: a row marked for deletion stays where it is and the cursor
+        moves on to the next one; a pending add is removed, so the next row
+        is already under the cursor."""
+        self.ensure_editable(self.cursorRow)
+        nrows = len(self.rows)
+        self.delete_row(self.cursorRowIndex)
+        if len(self.rows) == nrows:
+            self.cursorDown(1)
 
     def _typed(self, col, value):
         # editCell values arrive as strings; convert by column type so
@@ -498,8 +623,10 @@ Editing and deleting existing rows requires the table to have a primary key; wit
 
     def edit_selected_sql_expr(self, col, rows):
         self.ensure_rows_editable(rows)
-        for row in rows:
-            self.ensure_not_deleted(row)
+        # rows marked for deletion stay selected (see rowDeleted)
+        rows = [row for row in rows if not self.isDeleted(row)]
+        if not rows:
+            vd.fail('the selected rows are all marked for deletion')
         expr = vd.input('set sql expr for selected= ')
         if not expr:
             return
@@ -640,12 +767,8 @@ Editing and deleting existing rows requires the table to have a primary key; wit
         False when some changed row did not come back under the key it was
         looked up by (a trigger moved it, a key that did not match after all):
         that row would be left stale, so the caller reloads the table."""
-        sheets = [s for s in vd.sheets
-                  if isinstance(s, EditTableSheet) and s.edit_root is self]
-        if self not in sheets:
-            sheets.append(self)
         if deleted:
-            for sheet in sheets:
+            for sheet in self.sharing_sheets():
                 sheet.rows[:] = [r for r in sheet.rows if sheet.rowid(r) not in deleted]
 
         names = {col.name for col in self.columns}
@@ -706,9 +829,10 @@ The statements generated from the pending edits, one per row.
                 continue
             try:
                 self.client.execute(row.sql)
-            except Exception as exc:
-                # stop at the first error; the edit sheet keeps its pending
-                # state, so the user can fix the value and retry
+            except (Exception, asyncio.CancelledError) as exc:
+                # stop at the first error (a SyncClient timeout or cancel
+                # included); the edit sheet keeps its pending state, so the
+                # user can fix the value and retry
                 row.status = 'ERROR'
                 self._executing = False
                 vd.warning(str(exc))
@@ -721,6 +845,7 @@ The statements generated from the pending edits, one per row.
         edit_sheet._deferredAdds.clear()
         edit_sheet._deferredMods.clear()
         edit_sheet._deferredDels.clear()
+        edit_sheet._edits_epoch += 1
         vd.remove(self)
         if refetch is not None:
             try:
@@ -777,8 +902,24 @@ EditTableSheet.bindkey('Bksp', 'delete-cell')  # shadow the stock menu-help
 # emitted unquoted (see SqlExpr / _typed), e.g. z= "NOW()" -> SET col=NOW().
 EditTableSheet.addCommand('zE', 'edit-cell-sql-expr', 'sheet.edit_cell_sql_expr(cursorCol, cursorRow)', 'set current cell to a raw SQL expression, e.g. NOW() (pending until Ctrl+S)')
 EditTableSheet.addCommand('gE', 'edit-selected-sql-expr', 'sheet.edit_selected_sql_expr(cursorCol, someSelectedRows)', 'set current column for selected rows to a raw SQL expression (pending until Ctrl+S)')
-EditTableSheet.addCommand('d', 'delete-row', 'ensure_editable(cursorRow); delete_row(cursorRowIndex); cursorDown(1)', 'mark row for deletion (pending until Ctrl+S)')
+EditTableSheet.addCommand('d', 'delete-row', 'sheet.delete_cursor_row()', 'mark row for deletion (pending until Ctrl+S)')
 EditTableSheet.addCommand('gd', 'delete-selected', 'ensure_rows_editable(onlySelectedRows); deleteSelected()', 'mark selected rows for deletion (pending until Ctrl+S)')
+EditTableSheet.addCommand('gn', 'revert-selected', 'sheet.revert_rows(onlySelectedRows)', 'revert the pending changes of the selected rows (edits, deletion marks, added rows)')
 EditTableSheet.addCommand('Ctrl+S', 'show-pending-sql', 'sheet.show_pending_sql()', 'show SQL for pending changes')
 EditTableSheet.bindkey('zCtrl+S', 'show-pending-sql')  # shadow the stock commit-sheet
+
+# A row marked for deletion stays selected (EditTableSheet.rowDeleted), so the
+# stock bulk edits of the selection (`ge`, `g=`, `gzd`, `gzp`, ...) reach it:
+# its cells are left as they are, as `e` refuses to change them.
+_stock_cellChanged = Column.cellChanged
+
+
+def _cellChanged(col, row, val):
+    sheet = col.sheet
+    if isinstance(sheet, EditTableSheet) and sheet.isDeleted(row):
+        return
+    return _stock_cellChanged(col, row, val)
+
+
+Column.cellChanged = _cellChanged
 PendingSqlSheet.addCommand(ENTER, 'pending-sql-execute', 'sheet.confirm_execute()', 'execute the statements sequentially')

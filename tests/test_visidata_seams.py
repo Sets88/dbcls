@@ -1208,6 +1208,419 @@ class TestEditingACopy:
             assert not sheet._deferredMods and not sheet._deferredDels
         ''')
 
+    def test_deleting_an_added_row_on_a_copy_removes_it_from_the_original(self):
+        """The add is cancelled for both sheets (shared _deferredAdds), so a
+        row left on the original looked read from the table: `d` there marked
+        a keyless row for a DELETE that blocked every commit."""
+        run_with_real_visidata('''
+            import asyncio, os, tempfile, time
+            from copy import copy
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.clients.sqlite3 import Sqlite3Client
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            class Sync:
+                def __init__(self, client):
+                    self.client = client
+                def __getattr__(self, name):
+                    attr = getattr(self.client, name)
+                    if asyncio.iscoroutinefunction(attr):
+                        return lambda *a, **k: asyncio.run(attr(*a, **k))
+                    return attr
+
+            path = os.path.join(tempfile.mkdtemp(), 't.db')
+            client = Sync(Sqlite3Client(path))
+            client.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)')
+            client.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+
+            sheet = EditTableSheet('edit_t', client=client, db=path, table='t')
+            vd.push(sheet)
+            for _ in range(100):
+                if len(sheet.rows) == 2:
+                    break
+                time.sleep(0.05)
+            t = sheet.addRows([sheet.newRow()], index=1)  # the stock `a`
+            if t is not None and hasattr(t, 'join'):
+                t.join()
+            added = sheet.rows[2]
+            assert sheet.rowid(added) in sheet._deferredAdds
+            sheet.selectRow(added)
+
+            dup = copy(sheet)
+            dup.reload = lambda vs=dup, rows=sheet.selectedRows: setattr(vs, 'rows', list(rows))
+            vd.push(dup)
+            assert dup.rows == [added]
+            dup.cursorRowIndex = 0
+            undos = []  # outside a command VisiData records no undo
+            vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+            dup.delete_cursor_row()
+
+            assert dup.rows == [] and added not in sheet.rows
+            assert not sheet._deferredAdds and not sheet._deferredDels
+            assert not sheet.isSelected(added)
+            assert sheet.pending_statements() == []
+
+            for f, a, k in reversed(undos):
+                f(*a, **k)
+            assert added in sheet.rows and dup.rows == [added]
+            assert sheet.rowid(added) in sheet._deferredAdds
+        ''')
+
+    def test_deleting_an_added_row_reaches_a_copy_closed_with_q(self):
+        """`q` takes a copy off the stack but leaves it in gS: reopened, a
+        row whose add was cancelled would look read from the table."""
+        run_with_real_visidata('''
+            from copy import copy
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, AttrDict
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            sheet = EditTableSheet('edit_t', client=None, db='d', table='t')
+            sheet.pk_columns = ['id']
+            sheet.rows = [AttrDict(id=1), AttrDict(id=2)]
+            vd.push(sheet)
+            added = sheet.rows[1]
+            sheet._deferredAdds[sheet.rowid(added)] = added
+            dup = copy(sheet)
+            dup.rows = [added]
+            vd.push(dup)
+            vd.remove(dup)  # `q`
+            assert dup not in vd.sheets and dup in vd.allSheets
+
+            sheet.cursorRowIndex = 1
+            sheet.delete_cursor_row()
+            assert sheet.rows == [sheet.rows[0]] and dup.rows == []
+        ''')
+
+    def test_removing_added_rows_keeps_every_cursor_and_undo_restores_all(self):
+        """Two sheets holding one list object both keep their cursor row;
+        undo puts back the cursors and the stray cell mods too."""
+        run_with_real_visidata('''
+            from copy import copy
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, AttrDict, ColumnItem
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            sheet = EditTableSheet('edit_t', client=None, db='d', table='t')
+            sheet.pk_columns = ['id']
+            sheet.columns = []
+            sheet.addColumn(ColumnItem('id'))
+            sheet.addColumn(ColumnItem('name'))
+            sheet.rows = [AttrDict(id=i, name=str(i)) for i in range(1, 5)]
+            vd.push(sheet)
+            r1, a2, r3, r4 = sheet.rows
+            sheet._deferredAdds[sheet.rowid(a2)] = a2
+            # a stray mod, as a paste could leave one
+            stray = (a2, {sheet.columns[1]: 'x'})
+            dict.__setitem__(sheet._deferredMods, sheet.rowid(a2), stray)
+            dup = copy(sheet)
+            dup.rows = sheet.rows  # the same list object
+            vd.push(dup)
+            sheet.cursorRowIndex = 2  # r3
+            dup.cursorRowIndex = 3  # r4
+
+            undos = []  # outside a command VisiData records no undo
+            vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+            sheet.remove_added_rows([a2])
+
+            assert sheet.rows == [r1, r3, r4] and dup.rows is sheet.rows
+            assert sheet.cursorRow is r3 and dup.cursorRow is r4
+            assert sheet.rowid(a2) not in sheet._deferredMods
+
+            for f, a, k in reversed(undos):
+                f(*a, **k)
+            assert sheet.rows == [r1, a2, r3, r4]
+            assert sheet.cursorRow is r3 and dup.cursorRow is r4
+            assert dict.__getitem__(sheet._deferredMods, sheet.rowid(a2)) is stray
+        ''')
+
+    def test_d_on_an_added_row_leaves_the_cursor_on_the_next_row(self):
+        run_with_real_visidata('''
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, AttrDict
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            sheet = EditTableSheet('edit_t', client=None, db='d', table='t')
+            sheet.pk_columns = ['id']
+            sheet.rows = [AttrDict(id=1), AttrDict(id=2), AttrDict(id=3)]
+            vd.push(sheet)
+            added = sheet.rows[1]
+            sheet._deferredAdds[sheet.rowid(added)] = added
+
+            sheet.cursorRowIndex = 1
+            sheet.delete_cursor_row()  # the pending add goes away
+            assert sheet.cursorRowIndex == 1 and sheet.cursorRow.id == 3
+
+            sheet.cursorRowIndex = 0
+            sheet.delete_cursor_row()  # an existing row is marked and stays
+            assert sheet.isDeleted(sheet.rows[0])
+            assert sheet.cursorRowIndex == 1
+        ''')
+
+    def test_gn_reverts_edits_deletion_marks_and_adds_of_the_selected_rows(self):
+        run_with_real_visidata('''
+            from copy import copy
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, AttrDict, ColumnItem
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            sheet = EditTableSheet('edit_t', client=None, db='d', table='t')
+            sheet.pk_columns = ['id']
+            sheet.columns = []
+            sheet.addColumn(ColumnItem('id'))
+            sheet.addColumn(ColumnItem('name'))
+            sheet.rows = [AttrDict(id=i, name=str(i)) for i in range(1, 6)]
+            vd.push(sheet)
+            r1, r2, r3, a4, r5 = sheet.rows
+            sheet._deferredAdds[sheet.rowid(a4)] = a4
+            dup = copy(sheet)
+            dup.rows = [r1, a4]
+            vd.push(dup)
+            name = lambda s: next(c for c in s.columns if c.name == 'name')
+
+            # edited on the copy: the original holds the same pending edit
+            name(dup).setValues([r1], 'EDITED')
+            name(sheet).setValues([r5], 'KEPT')  # not selected: stays
+            sheet.rowDeleted(r2)
+            sheet.rowDeleted(r3)
+            for row in (r1, r2, a4):
+                sheet.selectRow(row)
+
+            undos = []  # outside a command VisiData records no undo
+            vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+            sheet.revert_rows(sheet.selectedRows)
+
+            assert sheet.rows == [r1, r2, r3, r5] and dup.rows == [r1]
+            assert name(sheet).getValue(r1) == '1' and name(dup).getValue(r1) == '1'
+            assert not sheet.isChanged(name(sheet), r1)
+            assert not sheet.isDeleted(r2) and sheet.isDeleted(r3)
+            assert name(sheet).getValue(r5) == 'KEPT'
+            assert not sheet._deferredAdds
+            adds, mods, dels = sheet.getDeferredChanges()
+            assert not adds and set(mods) == {sheet.rowid(r5)} and set(dels) == {sheet.rowid(r3)}
+
+            for f, a, k in reversed(undos):
+                f(*a, **k)
+            assert sheet.rows == [r1, r2, r3, a4, r5] and dup.rows == [r1, a4]
+            assert name(sheet).getValue(r1) == 'EDITED'
+            assert sheet.isDeleted(r2) and sheet.rowid(a4) in sheet._deferredAdds
+
+            cmd = sheet.getCommand('gn')
+            assert cmd.longname == 'revert-selected' and 'onlySelectedRows' in cmd.execstr
+        ''')
+
+    def test_gd_removes_selected_added_rows_and_marks_the_rest(self):
+        run_with_real_visidata('''
+            import threading
+            from copy import copy
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, AttrDict
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            sheet = EditTableSheet('edit_t', client=None, db='d', table='t')
+            sheet.pk_columns = ['id']
+            sheet.rows = [AttrDict(id=i) for i in range(1, 6)]
+            vd.push(sheet)
+            r1, a2, r3, a4, r5 = sheet.rows
+            for row in (a2, a4):
+                sheet._deferredAdds[sheet.rowid(row)] = row
+            dup = copy(sheet)
+            dup.rows = [a2, r3]
+            vd.push(dup)
+
+            for row in (r1, a2, a4):
+                sheet.selectRow(row)
+            sheet.cursorRowIndex = 4  # r5: rows removed above must not move it
+            undos = []  # outside a command VisiData records no undo
+            vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+            t = sheet.deleteSelected()
+            if isinstance(t, threading.Thread):
+                t.join()
+
+            assert sheet.rows == [r1, r3, r5] and dup.rows == [r3]
+            assert sheet.cursorRow is r5
+            assert not sheet._deferredAdds
+            assert sheet.isDeleted(r1) and not sheet.isDeleted(r3)
+            # the marked row stays selected, for `gn`; the removed ones do not
+            assert sheet.selectedRows == [r1]
+
+            for f, a, k in reversed(undos):
+                f(*a, **k)
+            assert sheet.rows == [r1, a2, r3, a4, r5] and dup.rows == [a2, r3]
+            assert set(sheet._deferredAdds) == {sheet.rowid(a2), sheet.rowid(a4)}
+            assert not sheet.isDeleted(r1)
+            assert set(map(id, sheet.selectedRows)) == {id(r1), id(a2), id(a4)}
+        ''')
+
+    def test_gn_right_after_gd_takes_the_marks_back(self):
+        """`gd` used to unselect what it marked, so `gn` found nothing."""
+        run_with_real_visidata('''
+            import threading
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, AttrDict
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            sheet = EditTableSheet('edit_t', client=None, db='d', table='t')
+            sheet.pk_columns = ['id']
+            sheet.rows = [AttrDict(id=i) for i in range(1, 4)]
+            vd.push(sheet)
+            r1, r2, r3 = sheet.rows
+            sheet.rowDeleted(r3)  # marked by an earlier `d`
+            for row in (r1, r2, r3):
+                sheet.selectRow(row)
+            undos = []  # outside a command VisiData records no undo
+            vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+            t = sheet.deleteSelected()
+            if isinstance(t, threading.Thread):
+                t.join()
+            assert all(sheet.isDeleted(r) for r in (r1, r2, r3))
+            # r3 was marked already: undoing `gd` must leave its mark
+            for f, a, k in reversed(undos):
+                f(*a, **k)
+            assert not sheet.isDeleted(r1) and not sheet.isDeleted(r2)
+            assert sheet.isDeleted(r3)
+
+            t = sheet.deleteSelected()
+            if isinstance(t, threading.Thread):
+                t.join()
+            sheet.revert_rows(sheet.onlySelectedRows)
+            assert not sheet._deferredDels
+            assert sheet.pending_statements() == []
+        ''')
+
+    def test_bulk_edits_of_the_selection_leave_marked_rows_alone(self):
+        run_with_real_visidata('''
+            import threading
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, AttrDict, ColumnItem
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            sheet = EditTableSheet('edit_t', client=None, db='d', table='t')
+            sheet.pk_columns = ['id']
+            sheet.columns = []
+            sheet.addColumn(ColumnItem('id'))
+            sheet.addColumn(ColumnItem('name'))
+            sheet.rows = [AttrDict(id=i, name=str(i)) for i in range(1, 3)]
+            vd.push(sheet)
+            r1, r2 = sheet.rows
+            name = sheet.columns[1]
+            sheet.rowDeleted(r2)
+            sheet.selectRow(r1)
+            sheet.selectRow(r2)
+
+            t = name.setValues(sheet.selectedRows, 'X')  # `ge`
+            if isinstance(t, threading.Thread):
+                t.join()
+            assert name.getValue(r1) == 'X' and name.getValue(r2) == '2'
+            assert set(sheet._deferredMods) == {sheet.rowid(r1)}
+
+            sheet.revert_rows([r2])  # the mark goes, no UPDATE turns up
+            adds, mods, dels = sheet.getDeferredChanges()
+            assert set(mods) == {sheet.rowid(r1)} and not dels
+        ''')
+
+    def test_undo_after_a_commit_brings_no_change_back(self):
+        """Undo of `gn` or of removing an added row used to put the reverted
+        changes back after Ctrl+S: the next commit ran them again."""
+        run_with_real_visidata('''
+            import asyncio, os, tempfile, threading, time
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, ColumnItem
+            from dbcls.clients.sqlite3 import Sqlite3Client
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet, PendingSqlSheet
+
+            class Sync:
+                def __init__(self, client):
+                    self.client = client
+                def __getattr__(self, name):
+                    attr = getattr(self.client, name)
+                    if asyncio.iscoroutinefunction(attr):
+                        return lambda *a, **k: asyncio.run(attr(*a, **k))
+                    return attr
+
+            path = os.path.join(tempfile.mkdtemp(), 't.db')
+            client = Sync(Sqlite3Client(path))
+            client.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)')
+            client.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+
+            sheet = EditTableSheet('edit_t', client=client, db=path, table='t')
+            vd.push(sheet)
+            for _ in range(100):
+                if len(sheet.rows) == 3:
+                    break
+                time.sleep(0.05)
+            r1, r2, r3 = sheet.rows
+            name = next(c for c in sheet.columns if c.name == 'name')
+            t = sheet.addRows([sheet.newRow()], index=2)  # the stock `a`
+            if t is not None and hasattr(t, 'join'):
+                t.join()
+            added = sheet.rows[3]
+
+            undos = []  # outside a command VisiData records no undo
+            vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+            t = name.setValues([r1], 'EDITED')
+            if isinstance(t, threading.Thread):
+                t.join()
+            sheet.rowDeleted(r3)
+            del undos[:]
+            sheet.revert_rows([r1, r3])  # `gn`
+            sheet.delete_row(3)  # `d` on the added row
+            assert added not in sheet.rows
+            reverted = list(undos)
+
+            t = name.setValues([r2], 'B')  # something left to commit
+            if isinstance(t, threading.Thread):
+                t.join()
+            pending = PendingSqlSheet('p', source=sheet, client=client,
+                                      statements=sheet.pending_statements())
+            vd.push(pending)
+            thread = pending.execute_all()
+            if isinstance(thread, threading.Thread):
+                thread.join()
+
+            for f, a, k in reversed(reverted):  # `U`, `U`
+                f(*a, **k)
+            assert sheet.pending_statements() == []
+            assert [r.id for r in sheet.rows] == [1, 2, 3]
+            assert client.execute('SELECT name FROM t ORDER BY id').data == [
+                {'name': 'a'}, {'name': 'B'}, {'name': 'c'}]
+        ''')
+
+    def test_undo_of_removing_an_added_row_keeps_what_another_sheet_added(self):
+        """The undo put back a copy of the whole list: a row added on the
+        original after `d` on a copy vanished, still pending as an INSERT."""
+        run_with_real_visidata('''
+            from copy import copy
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd, AttrDict
+            from dbcls.vd_modules.vd_db_browser import EditTableSheet
+
+            sheet = EditTableSheet('edit_t', client=None, db='d', table='t')
+            sheet.pk_columns = ['id']
+            sheet.rows = [AttrDict(id=1), AttrDict(id=2)]
+            vd.push(sheet)
+            r1, a2 = sheet.rows
+            sheet._deferredAdds[sheet.rowid(a2)] = a2
+            dup = copy(sheet)
+            dup.rows = [a2]
+            vd.push(dup)
+
+            undos = []  # outside a command VisiData records no undo
+            vd.addUndo = lambda f, *a, **k: undos.append((f, a, k))
+            dup.cursorRowIndex = 0
+            dup.delete_cursor_row()
+            removal = list(undos)
+            a3 = AttrDict(id=3)
+            sheet.rows.append(a3)  # `a` on the original afterwards
+            sheet._deferredAdds[sheet.rowid(a3)] = a3
+
+            for f, a, k in reversed(removal):
+                f(*a, **k)
+            assert sheet.rows == [r1, a2, a3] and dup.rows == [a2]
+            assert all(r in sheet.rows for r in sheet._deferredAdds.values())
+        ''')
+
 
 class TestHandingSampleDataToTheEditor:
     """`gE` on a Sample data sheet opens an EditTableSheet with the rows
