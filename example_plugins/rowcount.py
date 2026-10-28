@@ -69,8 +69,10 @@ def register(api):
     api.add_editor_function('example_comment_out', comment_out,
                             'Comment out the statement under the cursor')
 
-    # Transform data on its way through: number every result row.
-    def number_rows(result):
+    # Transform data on its way through: number every result row.  `meta`
+    # describes the run (sql, elapsed, error, …); `result` is None when the
+    # query failed or was cancelled.
+    def number_rows(result, meta):
         if not getattr(result, 'data', None):
             return None                      # nothing to change
         for index, row in enumerate(result.data, start=1):

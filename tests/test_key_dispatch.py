@@ -55,6 +55,32 @@ class TestRemap:
         assert ed.keys.prefix_pending is True
 
 
+class TestRemapConfig:
+    """--key-remap / DBCLS_KEY_REMAP is applied while curses is already up:
+    a bad string goes to the status bar, never to stdout."""
+
+    @staticmethod
+    def _editor(remap):
+        import curses
+        from dbcls.dbcls import DbEditor
+        curses.COLORS = 256  # the curses module is a MagicMock in tests
+        stdscr = MagicMock()
+        stdscr.getmaxyx.return_value = (24, 80)
+        return DbEditor(stdscr, remap_config=remap)
+
+    def test_a_good_string_fills_the_remap_table(self, capsys):
+        ed = self._editor('36:1412')
+        assert ed.keys.remap_table[36] == 1412
+        assert capsys.readouterr().out == ''
+
+    def test_a_bad_string_is_reported_in_the_status_bar_not_on_stdout(self, capsys):
+        ed = self._editor('36-1412')
+        captured = capsys.readouterr()
+        assert captured.out == '' and captured.err == ''
+        assert 'Invalid key remap' in ed.renderer.status_notification
+        assert ed.renderer.status_notification_error is True
+
+
 class TestOverlays:
     """A pushed overlay (the LLM chat, the lock screen) takes every key."""
 

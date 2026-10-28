@@ -1488,12 +1488,14 @@ Keys present in that section but never declared as options reach `api.settings` 
 
 **Filters**
 
-`api.add_filter(event, func)` puts a plugin in the path of the data. The function returns a replacement, or `None` to leave the value alone; one that raises is reported and skipped.
+`api.add_filter(event, func)` puts a plugin in the path of the data. The function is `func(value, meta)`: it returns a replacement, or `None` to leave the value alone; one that raises is reported and skipped. `meta` is a dict describing the run, the same object through both events of one run, so a plugin can leave something in it on the way in and read it on the way out.
 
 | Event | Signature |
 |-------|-----------|
-| `before_query` | `func(sql) -> str` — just before a query or pipeline runs |
-| `after_query` | `func(result) -> Result` — just before the result is handed to VisiData |
+| `before_query` | `func(sql, meta) -> str` — just before a query or pipeline runs. `meta`: `started` (datetime), `tab`, `engine`, `database` |
+| `after_query` | `func(result, meta) -> Result` — once the run is over, before the result is handed to VisiData. `result` is `None` when the run failed or was cancelled. `meta` adds `sql` (what ran, after `before_query`), `pipeline`, `elapsed` (seconds), `rowcount`, `status` (the status-bar line), `error` (the exception or `None`), `cancelled` |
+
+[`plugins/query_log.py`](plugins/query_log.py) is an `after_query` filter and nothing else: it keeps the last 10000 runs — start time, tab, SQL, outcome, status, duration, row count — in memory, opens them as a sheet from the command palette (`Query log`) and offers them to pipelines as `query_log()`.
 
 Built-in pipeline commands cannot be replaced — registering `.RUN` is refused. Neither can the pipeline context: a function named after a helper (`info`, `get_var`, `data`, …) or a built-in value (`datetime`, `json`, …) is refused too, as is any name starting with `_` (those are the `_0` / `_i` overlays). A registered name does shadow a same-named result column inside `{{…}}`, so pick one no column is likely to have.
 

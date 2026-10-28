@@ -317,7 +317,9 @@ class TestFailingToOpenIt:
     def test_an_unwritable_path_does_not_take_the_app_down(self, tmp_path, capsys):
         """The log is a convenience; refusing to start over it would not be."""
         assert log.configure(str(tmp_path / 'no' / 'such' / 'dir' / 'x.log')) is None
-        assert 'cannot write the log' in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert 'cannot write the log' in captured.err
+        assert captured.out == ''
 
     def test_and_leaves_logging_off(self, tmp_path):
         log.configure(str(tmp_path / 'no' / 'such' / 'dir' / 'x.log'))

@@ -94,17 +94,28 @@ class PluginError(Exception):
 class HookBus:
     """Named filter chains the editor runs its data through.
 
-    A filter takes the value and returns a replacement, or None to leave it
-    alone.  One that raises is reported and skipped — a plugin must not be able
-    to break query execution.
+    A filter is ``func(value, meta)``: it returns a replacement for *value*,
+    or None to leave it alone.  One that raises is reported and skipped — a
+    plugin must not be able to break query execution.
+
+    ``meta`` is a dict describing the run the value belongs to.  The same dict
+    object goes through ``before_query`` and ``after_query`` of one run, so a
+    plugin can leave something in it on the way in and find it on the way out.
 
     The events the editor emits:
 
-    ``before_query(sql) -> str``
+    ``before_query(sql, meta) -> str``
         Just before a query or pipeline runs; the returned SQL is what runs.
-    ``after_query(result) -> Result``
-        Just before the result is handed to VisiData; the returned Result is
-        what the user sees.
+        ``meta``: ``started`` (datetime), ``tab``, ``engine``, ``database``.
+    ``after_query(result, meta) -> Result``
+        Once the run is over, before the result is handed to VisiData; the
+        returned Result is what the user sees.  ``result`` is None when the
+        run failed or was cancelled.  ``meta`` adds ``sql`` (what actually ran,
+        after ``before_query``), ``pipeline`` (bool), ``elapsed`` (seconds),
+        ``rowcount`` (None without a result), ``status`` (the line the status
+        bar shows: ``12 rows returned``, the error text, ``Cancelled``),
+        ``error`` (the exception, or None) and ``cancelled`` (bool).  They
+        describe the result as the engine returned it, before any filter.
     """
 
     def __init__(self, on_error=None):
@@ -117,11 +128,13 @@ class HookBus:
     def has(self, event: str) -> bool:
         return bool(self._filters.get(event))
 
-    def filter(self, event: str, value, **context):
+    def filter(self, event: str, value, meta: Optional[dict] = None):
         """Run *value* through every filter registered for *event*."""
+        if meta is None:
+            meta = {}
         for func in self._filters.get(event, ()):
             try:
-                replacement = func(value, **context) if context else func(value)
+                replacement = func(value, meta)
             except Exception as exc:
                 self._report(event, func, exc)
                 continue

@@ -38,6 +38,7 @@ which is the point.
 """
 import logging
 import os
+import sys
 import threading
 import warnings
 from typing import Optional
@@ -180,7 +181,7 @@ def configure(path: Optional[str] = None, level: Optional[str] = None) -> Option
         handler = logging.FileHandler(path, encoding='utf-8')
     except OSError as exc:
         # Before curses: stderr is still the terminal.
-        print(f'dbcls: cannot write the log to {path}: {exc}')
+        print(f'dbcls: cannot write the log to {path}: {exc}', file=sys.stderr)
         return None
 
     handler.setFormatter(logging.Formatter(_FORMAT))

@@ -5,13 +5,15 @@ actually running it.
 """
 import argparse
 import asyncio
+import datetime
 import sys
 import textwrap
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from dbcls import pipeline
+from dbcls.clients.base import Result
 from dbcls.editor import CommandTable, TextBuffer
 from dbcls.plugins import (
     HookBus,
@@ -680,29 +682,132 @@ class TestFilters:
     def test_before_query_filters_run_in_order(self):
         editor = FakeEditor()
         api = PluginAPI(editor, 'demo')
-        api.add_filter('before_query', lambda sql: sql + ' LIMIT 10')
-        api.add_filter('before_query', lambda sql: sql.upper())
+        api.add_filter('before_query', lambda sql, meta: sql + ' LIMIT 10')
+        api.add_filter('before_query', lambda sql, meta: sql.upper())
         assert editor.hooks.filter('before_query', 'select 1') == 'SELECT 1 LIMIT 10'
 
     def test_returning_none_leaves_the_value_alone(self):
         editor = FakeEditor()
-        PluginAPI(editor, 'demo').add_filter('before_query', lambda sql: None)
+        PluginAPI(editor, 'demo').add_filter('before_query', lambda sql, meta: None)
         assert editor.hooks.filter('before_query', 'select 1') == 'select 1'
 
     def test_a_failing_filter_is_reported_and_skipped(self):
         editor = FakeEditor()
         api = PluginAPI(editor, 'demo')
 
-        def boom(sql):
+        def boom(sql, meta):
             raise RuntimeError('filter is broken')
 
         api.add_filter('after_query', boom)
-        api.add_filter('after_query', lambda result: result + ['extra'])
+        api.add_filter('after_query', lambda result, meta: result + ['extra'])
         assert editor.hooks.filter('after_query', ['row']) == ['row', 'extra']
         assert any('filter is broken' in message for message, _ in editor.notifications)
 
     def test_unregistered_events_pass_through(self):
         assert HookBus().filter('nobody_listens', 'value') == 'value'
+
+    def test_meta_reaches_every_filter_and_defaults_to_an_empty_dict(self):
+        seen = []
+        bus = HookBus()
+        bus.add('after_query', lambda result, meta: seen.append(meta))
+        meta = {'sql': 'select 1'}
+        bus.filter('after_query', None, meta)
+        bus.filter('after_query', 'value')
+        assert seen[0] is meta
+        assert seen[1] == {}
+
+    def test_a_none_value_still_reaches_the_filters(self):
+        """after_query runs with None on a failed or cancelled query; the
+        filters see it, with meta telling what happened."""
+        bus = HookBus()
+        bus.add('after_query', lambda result, meta: meta.update(seen=True))
+        meta = {'error': RuntimeError('boom')}
+        assert bus.filter('after_query', None, meta) is None
+        assert meta['seen'] is True
+
+
+class TestQueryMeta:
+    """What _db_query tells the filters about a run, on every outcome."""
+
+    def _run(self, sql, outcome, before=None):
+        from tests.test_tabs import make_shell
+        ed = make_shell('one')
+        ed.doc.client = MagicMock(SUPPORTS_SERVER_SIDE_PAGING=False, ENGINE='sqlite3',
+                                  dbname='main')
+        ed.doc.client.execute = AsyncMock(side_effect=outcome)
+        ed.doc.client.is_db_error_exception = lambda exc: True
+        ed.doc.client.get_title = lambda: 'one'
+        ed.buf.lines = [sql]
+        ed.buf.cursor_row = ed.buf.cursor_col = 0
+        ed.asyncloop_thread = MagicMock(submit=lambda coro: _finished_task(coro))
+        ed.open_running_popup = (
+            lambda task, start, on_done, on_cancel=None, owner=None: on_done())
+        ed.doc._open_result_in_visidata = MagicMock()
+        seen = {}
+        if before is not None:
+            ed.hooks.add('before_query', before)
+        ed.hooks.add('before_query', lambda sql, meta: seen.update(before=dict(meta)))
+        ed.hooks.add('after_query', lambda result, meta: seen.update(after=meta, result=result))
+        ed.doc._db_query()
+        return ed, seen
+
+    def test_a_result_comes_with_its_meta(self):
+        ed, seen = self._run('select 1', lambda sql: Result(data=[{'a': 1}], rowcount=1))
+        assert seen['before']['tab'] == 'one'
+        assert seen['before']['engine'] == 'sqlite3'
+        assert seen['before']['database'] == 'main'
+        assert isinstance(seen['before']['started'], datetime.datetime)
+        meta = seen['after']
+        assert seen['result'].rowcount == 1
+        assert meta['sql'] == 'select 1'
+        assert meta['pipeline'] is False
+        assert meta['rowcount'] == 1
+        assert meta['status'] == '1 rows returned'
+        assert meta['error'] is None and meta['cancelled'] is False
+        assert meta['elapsed'] >= 0
+        # the same dict both ways: what before_query saw is in after_query's
+        assert meta['started'] == seen['before']['started']
+
+    def test_an_error_reaches_after_query_with_no_result(self):
+        ed, seen = self._run('select nope', lambda sql: _raise(RuntimeError('no such table')))
+        meta = seen['after']
+        assert seen['result'] is None
+        assert isinstance(meta['error'], RuntimeError)
+        assert meta['status'] == 'no such table'
+        assert meta['rowcount'] is None
+        assert meta['cancelled'] is False
+        ed.doc._open_result_in_visidata.assert_not_called()
+
+    def test_a_cancelled_run_reaches_after_query_too(self):
+        ed, seen = self._run('select 1', lambda sql: _raise(asyncio.CancelledError()))
+        meta = seen['after']
+        assert seen['result'] is None
+        assert meta['cancelled'] is True
+        assert meta['status'] == 'Cancelled'
+        assert meta['error'] is None
+
+    def test_the_sql_a_filter_rewrote_is_what_meta_reports(self):
+        ed, seen = self._run('select 1', lambda sql: Result(data=[], rowcount=0),
+                             before=lambda sql, meta: '.RUN "select 2"')
+        assert seen['after']['sql'] == '.RUN "select 2"'
+        assert seen['after']['pipeline'] is True
+        ed.doc.client.execute.assert_awaited_once_with('select 2')
+
+
+def _finished_task(coro):
+    """What asyncloop_thread.submit hands back, once the coroutine has run."""
+    task = MagicMock()
+    try:
+        value = asyncio.run(coro)
+    except BaseException as exc:   # CancelledError is a BaseException
+        task.result = MagicMock(side_effect=exc)
+    else:
+        task.result = MagicMock(return_value=value)
+    return task
+
+
+def _raise(exc):
+    raise exc
 
 
 class TestPipelineCommandRegistration:

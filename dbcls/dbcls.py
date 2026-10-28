@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import copy
+import datetime
 from contextlib import contextmanager
 import threading
 import json
@@ -1121,6 +1122,17 @@ class DbEditorTab(Editor):
             return
         start = time.time()
         executor: Optional[PipelineExecutor] = None
+        # What the plugins' before_query / after_query filters are told about
+        # this run (see HookBus); one dict for both, so a plugin can carry
+        # something from one to the other.
+        meta = {
+            'started': datetime.datetime.now(),
+            'tab': self.tab_title(),
+            'engine': getattr(self.client, 'ENGINE', '') or '',
+            'database': getattr(self.client, 'dbname', '') or '',
+            'sql': sel.strip(),
+            'pipeline': is_pipeline(sel),
+        }
 
         def query_client() -> ClientClass:
             """The client this run is on *right now*.
@@ -1133,8 +1145,9 @@ class DbEditorTab(Editor):
         async def fetch_all():
             nonlocal executor
             # before_query: a plugin may rewrite what actually runs.
-            sql = self.hooks.filter('before_query', sel.strip())
-            if is_pipeline(sql):
+            sql = self.hooks.filter('before_query', sel.strip(), meta)
+            meta['sql'], meta['pipeline'] = sql, is_pipeline(sql)
+            if meta['pipeline']:
                 executor = PipelineExecutor(self)
                 return await executor.execute(sql)
 
@@ -1162,27 +1175,40 @@ class DbEditorTab(Editor):
 
         def on_done():
             end = time.time()
-            message = ''
-            is_error = False
+            result = error = None
+            cancelled = self.running_popup.cancelled
+            if not cancelled:
+                try:
+                    result = task.result()
+                # PipelineCancelled: a dismissed user prompt (Esc / q in
+                # sselect) — abort with no result, just the status notification.
+                except (asyncio.CancelledError, asyncio.InvalidStateError, PipelineCancelled):
+                    cancelled = True
+                except Exception as exc:
+                    error = exc
+            if cancelled:
+                message = 'Cancelled'
+            elif error is not None:
+                message = self._format_query_error(error)
+            else:
+                message = str(result)
+            is_error = error is not None
             # A live pipeline info() popup is intentionally left open after the
             # run finishes — it stays until the user dismisses it (Esc/any key).
             # The error branch below reuses the same popup via info_popup.open().
             try:
-                if self.running_popup.cancelled:
-                    message = 'Cancelled'
-                    return
-                result = task.result()
-                # after_query: a plugin may transform the rows before they are
-                # shown (add columns, filter, annotate).
-                result = self.hooks.filter('after_query', result)
-                message = str(result)
-                self._open_result_in_visidata(result)
-            except (asyncio.CancelledError, asyncio.InvalidStateError):
-                message = 'Cancelled'
-            except PipelineCancelled:
-                # A dismissed user prompt (Esc / q in sselect): abort with no
-                # result — just the status notification.
-                message = 'Cancelled'
+                # after_query: every outcome reaches the plugins — the result
+                # to transform before it is shown (add columns, filter,
+                # annotate), or None with meta telling what happened instead.
+                meta.update(elapsed=end - start, status=message, error=error,
+                            cancelled=cancelled,
+                            rowcount=None if result is None else result.rowcount)
+                result = self.hooks.filter('after_query', result, meta)
+                if is_error:
+                    self.info_popup.open('Error', {'main': message})
+                elif not cancelled:
+                    message = str(result)
+                    self._open_result_in_visidata(result)
             except Exception as exc:
                 message = self._format_query_error(exc)
                 is_error = True
@@ -1881,6 +1907,12 @@ class DbEditor(EditorShell):
         return self.save_connections(self.connections.values())
 
     def apply_keys_remap(self, remap_str: str):
+        """Apply a ``--key-remap`` / ``DBCLS_KEY_REMAP`` string: ``from:to``
+        pairs, comma-separated.
+
+        Curses is already up when this runs (it is called from ``__init__``
+        after the shell is built), so a bad string is reported in the status
+        bar — a print() here would land across the screen."""
         if not remap_str:
             return
         try:
@@ -1888,7 +1920,9 @@ class DbEditor(EditorShell):
                 key, seq = pair.split(':')
                 self.keys.add_remap(int(key), int(seq))
         except Exception:
-            print('Invalid key remap string in DBCLS_KEY_REMAP')
+            self.set_status_notification(
+                f'Invalid key remap string: {remap_str!r} (expected from:to[,from:to...])',
+                error=True)
 
     def _toggle_readonly(self):
         super()._toggle_readonly()
