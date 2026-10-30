@@ -8,14 +8,25 @@ and open it with `Query log` in the editor's command palette (Alt+P).  Every
 run from the editor (Alt+R) is one row — a pipeline is a single row too, with
 the row count of its final result: when it started, on which tab, the SQL that
 ran, how it ended (``ok``, ``error``, ``cancelled``), the status line the
-editor showed, how long it took and how many rows came back.  No data is kept,
-only this.
+editor showed, how long it took, how many rows came back and how many sheets
+it opened.  No data is kept, only this.
 
 The last 10000 runs are kept (``--query-log-size`` to change it), in memory
 only: a new dbcls starts with an empty log.
 
-- `Enter` inserts the SQL under the cursor into the editor and closes the log.
+- `Enter` opens the list of the sheets the run under the cursor put on screen
+  — the pipeline's `.SHEET` ones and the result — with what they held and
+  whether VisiData still has them (``state``: ``open`` on the stack, ``closed``
+  with `q` but still in `gS`, ``gone`` once deleted and freed).  `Enter` there
+  goes to the sheet, if it is not gone.
 - `q` closes it.
+
+The log keeps no sheet and no rows: a sheet is remembered by the id dbcls gave
+it and looked for again each time, so the log never keeps a result from being
+freed.  The result's row is what dbcls promised before the ``after_query``
+filters ran: a filter that reshapes the result leaves its row count and
+columns stale here, and one that empties it leaves a sheet that never opened
+(it shows as ``gone`` from the start).
 
 The same rows, oldest first, are ``query_log()`` inside a pipeline
 (``.PY query_log()``), so the log can be filtered and viewed like any data.
@@ -23,7 +34,7 @@ The same rows, oldest first, are ``query_log()`` inside a pipeline
 import collections
 from typing import Optional
 
-from visidata import ColumnItem, Sheet, date, vd
+from visidata import Column, ColumnItem, Sheet, date, vd
 
 #: runs kept when ``--query-log-size`` is not given
 DEFAULT_SIZE = 10000
@@ -46,6 +57,9 @@ def record(meta: dict) -> dict:
         'status': _last_line(meta.get('status', '')),
         'elapsed': round(meta.get('elapsed') or 0.0, 3),
         'rows': meta.get('rowcount'),
+        # snapshots (id, name, rows, cols) of the sheets the run opened — not
+        # the sheets themselves, see the module docstring
+        'sheets': list(meta.get('sheets') or []),
     }
 
 
@@ -56,16 +70,74 @@ def _last_line(text: str) -> str:
     return lines[-1].strip() if lines else ''
 
 
+class RunSheetsSheet(Sheet):
+    """The sheets one run opened, like `gS` but from the log's snapshot, so
+    the rows are there for the sheets that are gone too; Enter goes to one."""
+    guide = '''# Sheets of a run
+The sheets this run put on screen, in the order they were opened: the
+pipeline's `.SHEET` ones, then the result.  `state` is where the sheet is now:
+`open` on the sheet stack, `closed` (closed with `q`, still in `gS`), `gone`
+(deleted there and freed).  The result's row describes it before any
+`after_query` filter: a filter may have reshaped it, or kept it from opening
+at all (then it is `gone` from the start).
+
+- `Enter` to go to the sheet under the cursor, if it is not gone.
+- `q` to go back to the log.
+'''
+    rowtype = 'sheets'
+    precious = False     # a listing: not worth keeping in gS once closed
+    columns = [
+        ColumnItem('id', type=int),
+        ColumnItem('name'),
+        ColumnItem('rows', type=int),
+        Column('cols', type=int, getter=lambda col, row: len(row['cols'])),
+        Column('columns', getter=lambda col, row: ' '.join(row['cols'])),
+        # looked up on every draw: never cached, never held
+        Column('state', getter=lambda col, row: col.sheet.state(row)),
+    ]
+
+    def reload(self) -> None:
+        self.rows = list(self.source)
+
+    def find(self, row):
+        return self.api.find_sheet(sheet_id=row['id'])
+
+    def state(self, row) -> str:
+        found = self.find(row)
+        if found is None:
+            return 'gone'
+        return 'open' if found in vd.sheets else 'closed'
+
+    def go_to_sheet(self) -> None:
+        """`Enter`: the sheet under the cursor comes to the top of the stack,
+        if VisiData still has it."""
+        row = self.cursorRow
+        if row is None:
+            vd.fail('this run opened no sheet')
+        found = self.find(row)
+        if found is None:
+            vd.fail(f'sheet {row["id"]} ({row["name"]}) is gone')
+        vd.push(found)
+
+
+RunSheetsSheet.addCommand('Enter', 'query-log-go-to-sheet', 'sheet.go_to_sheet()',
+                          'go to the sheet under the cursor, if VisiData still has it',
+                          replay=False)
+
+
 class QueryLogSheet(Sheet):
-    """The log, newest run first; Enter puts the SQL back in the editor."""
+    """The log, newest run first; Enter lists the sheets a run opened."""
     guide = '''# Query log
 Every query run from the editor, newest first: when it started, on which tab,
-the SQL, how it ended, how long it took and how many rows came back.
+the SQL, how it ended, how long it took, how many rows came back and how many
+sheets it opened.
 
-- `Enter` to insert the SQL under the cursor into the editor and close the log.
+- `Enter` to list the sheets the run under the cursor opened and go to one of
+  them, if VisiData still has it.
 - `q` to close the log.
 '''
     rowtype = 'queries'
+    precious = False     # a listing: not worth keeping in gS once closed
     columns = [
         ColumnItem('started', type=date, fmtstr='%Y-%m-%d %H:%M:%S'),
         ColumnItem('tab'),
@@ -75,24 +147,24 @@ the SQL, how it ended, how long it took and how many rows came back.
         ColumnItem('status', width=30),
         ColumnItem('elapsed', type=float, fmtstr='{:.3f}'),
         ColumnItem('rows', type=int),
+        Column('sheets', type=int, getter=lambda col, row: len(row['sheets'])),
     ]
 
     def reload(self) -> None:
         self.rows = list(reversed(self.source))
 
-    def insert_sql(self) -> None:
-        """`Enter`: the SQL of the row under the cursor goes into the editor
-        at the cursor, and the log closes."""
+    def open_run_sheets(self) -> None:
+        """`Enter`: the sheets the run under the cursor opened, as a sheet."""
         row = self.cursorRow
         if row is None:
             vd.fail('the log is empty')
-        if not self.api.insert_text(row['sql']):
-            vd.fail('the editor is read-only')
-        vd.quit(self)
+        if not row['sheets']:
+            vd.fail('this run opened no sheet')
+        vd.push(RunSheetsSheet('run_sheets', source=row['sheets'], api=self.api))
 
 
-QueryLogSheet.addCommand('Enter', 'query-log-insert', 'sheet.insert_sql()',
-                         'insert the SQL under the cursor into the editor and close the log',
+QueryLogSheet.addCommand('Enter', 'query-log-sheets', 'sheet.open_run_sheets()',
+                         'list the sheets the run under the cursor opened',
                          replay=False)
 
 
@@ -122,4 +194,5 @@ def register(api):
     api.add_pipeline_function(
         'query_log', lambda: list(log),
         help_text='\n    The query log as rows (oldest first): started, tab, database, sql, '
-                  'outcome, status, elapsed, rows.')
+                  'outcome, status, elapsed, rows, sheets (id, name, rows, cols of each '
+                  'sheet the run opened).')

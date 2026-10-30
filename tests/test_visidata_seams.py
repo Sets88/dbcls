@@ -55,6 +55,7 @@ class TestTheModulesLoad:
             assert getattr(VisiData, '_dbcls_sidebar_wrapped', False), 'sidebar wrapper missing'
             assert getattr(BaseSheet, '_dbcls_release_wrapped', False), 'Q wrapper missing'
             assert getattr(VisiData, '_dbcls_push_wrapped', False), 'push wrapper missing'
+            assert getattr(BaseSheet, '_dbcls_copy_wrapped', False), 'copy wrapper missing'
         ''')
 
     def test_importing_it_twice_does_not_stack_the_wrappers(self):
@@ -67,6 +68,23 @@ class TestTheModulesLoad:
             first = VisiData.getkeystroke
             importlib.reload(m)
             assert VisiData.getkeystroke is first, 'getkeystroke was wrapped twice'
+        ''')
+
+    def test_a_copied_sheet_does_not_keep_the_dbcls_id(self):
+        """BaseSheet.__copy__ copies the whole __dict__; the wrapper takes the
+        id off, so an id names exactly one sheet (see api.find_sheet)."""
+        run_with_real_visidata('''
+            import copy
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import PyobjSheet
+
+            original = PyobjSheet('r', source=[{'a': 1}], dbcls_id=42)
+            dup = copy.copy(original)
+            assert original.dbcls_id == 42
+            assert not hasattr(dup, 'dbcls_id'), vars(dup).get('dbcls_id')
+            # a copy of a copy, and a sheet that never had an id, copy as before
+            assert not hasattr(copy.copy(dup), 'dbcls_id')
+            assert not hasattr(copy.copy(PyobjSheet('p', source=[])), 'dbcls_id')
         ''')
 
 

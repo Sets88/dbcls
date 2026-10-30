@@ -409,3 +409,25 @@ if hasattr(BaseSheet, 'quitAndReleaseMemory') and \
             release_derived_sheets(vs)
 
     BaseSheet._dbcls_release_wrapped = True
+
+
+# A sheet's ``dbcls_id`` (see dbcls.sheet_snapshot) names the one sheet a run
+# opened under it; a plugin that kept the id asks api.find_sheet(sheet_id=...)
+# whether *that* sheet is still around.  VisiData builds several sheets by
+# copying one — `"` / `g"` / `z"` (duplicate), a join, dedupe, random rows,
+# the drill-down out of a frequency table — and BaseSheet.__copy__ does
+# ``ret.__dict__.update(self.__dict__)``, so a copy would carry the id too
+# and, pushed on top, be found before the original: reported open after the
+# original was deleted and freed, jumped to in its place.  The copy was
+# opened by no run and promised under no id, so it gets none.
+if hasattr(BaseSheet, '__copy__') and \
+        not getattr(BaseSheet, '_dbcls_copy_wrapped', False):
+    _orig_copy = BaseSheet.__copy__
+
+    @BaseSheet.api
+    def __copy__(vs):
+        ret = _orig_copy(vs)
+        ret.__dict__.pop('dbcls_id', None)
+        return ret
+
+    BaseSheet._dbcls_copy_wrapped = True

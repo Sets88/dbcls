@@ -729,12 +729,20 @@ class TestFilters:
 class TestQueryMeta:
     """What _db_query tells the filters about a run, on every outcome."""
 
-    def _run(self, sql, outcome, before=None):
+    def _run(self, sql, outcome, before=None, during=None):
+        """*during(ed)* runs while the query executes — what a pipeline step
+        would do mid-run, such as putting a .SHEET sheet on the stack."""
         from tests.test_tabs import make_shell
         ed = make_shell('one')
         ed.doc.client = MagicMock(SUPPORTS_SERVER_SIDE_PAGING=False, ENGINE='sqlite3',
                                   dbname='main')
-        ed.doc.client.execute = AsyncMock(side_effect=outcome)
+
+        def execute(sql):
+            if during is not None:
+                during(ed)
+            return outcome(sql)
+
+        ed.doc.client.execute = AsyncMock(side_effect=execute)
         ed.doc.client.is_db_error_exception = lambda exc: True
         ed.doc.client.get_title = lambda: 'one'
         ed.buf.lines = [sql]
@@ -792,6 +800,97 @@ class TestQueryMeta:
         assert seen['after']['sql'] == '.RUN "select 2"'
         assert seen['after']['pipeline'] is True
         ed.doc.client.execute.assert_awaited_once_with('select 2')
+
+    def test_the_result_sheet_is_promised_in_meta_under_the_id_it_then_gets(self):
+        ed, seen = self._run('select 1', lambda sql: Result(data=[{'a': 1, 'b': 2}], rowcount=1))
+        sheets = seen['after']['sheets']
+        assert len(sheets) == 1
+        assert sheets[0]['name'] == 'result'
+        assert sheets[0]['rows'] == 1
+        assert sheets[0]['cols'] == ['a', 'b']
+        assert isinstance(sheets[0]['id'], int)
+        # the snapshot holds nothing of the result: not the rows, not a sheet
+        assert set(sheets[0]) == {'id', 'name', 'rows', 'cols'}
+        ed.doc._open_result_in_visidata.assert_called_once_with(seen['result'], sheets[0]['id'])
+
+    def test_every_run_gets_a_fresh_sheet_id(self):
+        _, first = self._run('select 1', lambda sql: Result(data=[{'a': 1}], rowcount=1))
+        _, second = self._run('select 1', lambda sql: Result(data=[{'a': 1}], rowcount=1))
+        assert second['after']['sheets'][0]['id'] > first['after']['sheets'][0]['id']
+
+    def test_a_run_that_opens_no_sheet_lists_none(self):
+        _, seen = self._run('select nope', lambda sql: _raise(RuntimeError('no such table')))
+        assert seen['after']['sheets'] == []
+        _, seen = self._run('delete from t', lambda sql: Result(data=[], rowcount=3))
+        assert seen['after']['sheets'] == []
+
+    def test_the_pipeline_sheets_come_before_the_result(self):
+        pushed = MagicMock(dbcls_id=7, source=[{'x': 1}, {'x': 2}])
+        pushed.name = 'orders'
+        _, seen = self._run('select 1', lambda sql: Result(data=[{'a': 1}], rowcount=1),
+                            during=lambda ed: ed.doc._pipeline_sheets.append(pushed))
+        sheets = seen['after']['sheets']
+        assert [s['name'] for s in sheets] == ['orders', 'result']
+        assert sheets[0] == {'id': 7, 'name': 'orders', 'rows': 2, 'cols': ['x']}
+        assert sheets[1]['id'] != 7
+
+    def test_a_failed_pipeline_still_lists_the_sheets_it_opened(self):
+        pushed = MagicMock(dbcls_id=8, source=[])
+        pushed.name = 'orders'
+        _, seen = self._run('select 1', lambda sql: _raise(RuntimeError('boom')),
+                            during=lambda ed: ed.doc._pipeline_sheets.append(pushed))
+        assert seen['after']['sheets'] == [{'id': 8, 'name': 'orders', 'rows': 0, 'cols': []}]
+
+
+class TestFindSheet:
+    """api.find_sheet: by dbcls_id anywhere VisiData still has the sheet, by
+    name or position on the stack."""
+
+    def _vd(self, monkeypatch, stack, closed=()):
+        import visidata
+        monkeypatch.setattr(visidata.vd, 'sheets', list(stack))
+        monkeypatch.setattr(visidata.vd, 'allSheets', list(stack) + list(closed))
+
+    @staticmethod
+    def _sheet(name, dbcls_id=None):
+        vs = MagicMock()
+        vs.name = name
+        if dbcls_id is None:
+            del vs.dbcls_id
+        else:
+            vs.dbcls_id = dbcls_id
+        return vs
+
+    def test_by_id_on_the_stack_and_among_the_closed_sheets(self, monkeypatch):
+        on_top, closed = self._sheet('a', 1), self._sheet('b', 2)
+        self._vd(monkeypatch, [on_top], [closed])
+        assert PluginAPI.find_sheet(sheet_id=1) is on_top
+        assert PluginAPI.find_sheet(sheet_id=2) is closed
+        assert PluginAPI.find_sheet(sheet_id=3) is None
+
+    def test_a_sheet_without_an_id_never_matches(self, monkeypatch):
+        self._vd(monkeypatch, [self._sheet('plain')])
+        assert PluginAPI.find_sheet(sheet_id=1) is None
+
+    def test_by_name_takes_the_first_on_the_stack(self, monkeypatch):
+        first, second, closed = self._sheet('r', 1), self._sheet('r', 2), self._sheet('c', 3)
+        self._vd(monkeypatch, [first, second], [closed])
+        assert PluginAPI.find_sheet(name='r') is first
+        assert PluginAPI.find_sheet(name='c') is None    # closed sheets are not on the stack
+
+    def test_by_index_on_the_stack(self, monkeypatch):
+        top, below = self._sheet('a'), self._sheet('b')
+        self._vd(monkeypatch, [top, below])
+        assert PluginAPI.find_sheet(index=0) is top
+        assert PluginAPI.find_sheet(index=1) is below
+        assert PluginAPI.find_sheet(index=2) is None
+
+    def test_exactly_one_lookup_key(self, monkeypatch):
+        self._vd(monkeypatch, [])
+        with pytest.raises(TypeError, match='exactly one'):
+            PluginAPI.find_sheet()
+        with pytest.raises(TypeError, match='exactly one'):
+            PluginAPI.find_sheet(sheet_id=1, name='a')
 
 
 def _finished_task(coro):

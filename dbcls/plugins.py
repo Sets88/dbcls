@@ -71,6 +71,8 @@ import sys
 import traceback
 from typing import Callable, Dict, List, Optional, Sequence
 
+import visidata
+
 from . import clients, log, pipeline, syntax
 
 #: Entry-point group installed packages advertise their plugins in.
@@ -114,8 +116,24 @@ class HookBus:
         after ``before_query``), ``pipeline`` (bool), ``elapsed`` (seconds),
         ``rowcount`` (None without a result), ``status`` (the line the status
         bar shows: ``12 rows returned``, the error text, ``Cancelled``),
-        ``error`` (the exception, or None) and ``cancelled`` (bool).  They
-        describe the result as the engine returned it, before any filter.
+        ``error`` (the exception, or None), ``cancelled`` (bool) and
+        ``sheets``: the VisiData sheets the run opens, in order — the
+        pipeline's .SHEET ones, then the result's — as ``{'id', 'name',
+        'rows', 'cols'}`` snapshots (``cols`` the column names); ``[]`` when
+        it opens none.  ``id`` is the sheet's ``dbcls_id``, unique for the
+        process: ``PluginAPI.find_sheet(sheet_id=id)`` finds the sheet again
+        while VisiData still has it.  The snapshots hold no sheet and no rows,
+        so a plugin may keep them for as long as it likes.
+
+        The result's entry is provisional: it is made from the result as the
+        engine returned it, before any ``after_query`` filter, and the sheet
+        itself is opened from what the filters return.  So a filter that
+        reshapes the result leaves the entry's ``rows`` and ``cols`` behind;
+        one that empties it, returns None or marks it ``shown`` leaves an
+        entry for a sheet that never opens (``find_sheet`` says it is gone);
+        and a result a filter makes out of nothing opens a sheet the list
+        never mentioned.  The .SHEET entries are exact: those sheets are on
+        the stack already.
     """
 
     def __init__(self, on_error=None):
@@ -443,6 +461,43 @@ class PluginAPI:
             raise RuntimeError('the current tab has no VisiData viewer; '
                                'switch to a database tab to open a sheet')
         doc._show_in_visidata(make_sheet)
+
+    @staticmethod
+    def find_sheet(sheet_id: Optional[int] = None, name: Optional[str] = None,
+                   index: Optional[int] = None):
+        """A VisiData sheet that is still around, or None.  Exactly one of:
+
+        ``sheet_id``
+            the ``dbcls_id`` dbcls gives every sheet a run opens (``meta['sheets']``
+            of ``after_query`` lists them).  Looked for on the sheet stack and
+            among the sheets closed with ``q`` that VisiData still keeps (``gS``);
+            None once the sheet is deleted there and freed.  The one lookup
+            that names a sheet for certain: names repeat and stack positions
+            shift, and a sheet VisiData copies from it (`"`, a join, a
+            frequency drill-down) carries no id.
+        ``name``
+            the first sheet of that name on the stack, as VisiData's own lookup.
+        ``index``
+            the sheet at that position on the stack, 0 the one on top.
+
+        Nothing is kept: the sheet is searched for each time, so a plugin
+        that holds only the id keeps no sheet alive."""
+        given = [k for k, v in (('sheet_id', sheet_id), ('name', name), ('index', index))
+                 if v is not None]
+        if len(given) != 1:
+            raise TypeError('find_sheet() takes exactly one of sheet_id, name, index')
+        vd = visidata.vd
+        if sheet_id is not None:
+            for vs in list(vd.sheets) + list(vd.allSheets):
+                if getattr(vs, 'dbcls_id', None) == sheet_id:
+                    return vs
+            return None
+        if name is not None:
+            return next((vs for vs in vd.sheets if vs.name == name), None)
+        try:
+            return vd.sheets[index]
+        except IndexError:
+            return None
 
     def confirm(self, message: str) -> bool:
         """Ask a y/n question in the status bar and wait for the answer."""

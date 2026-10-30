@@ -13,6 +13,7 @@ import traceback
 import secrets
 import subprocess
 from functools import partial
+import itertools
 import time
 from typing import Coroutine, List, Optional
 import logging
@@ -68,6 +69,33 @@ class StaleSheetError(Exception):
     """Raised when VisiData resurrects a sselect sheet whose pipeline step
     already returned (via a stale ReturnValue reaching an unrelated
     vd.run() session, e.g. through gU/gS)."""
+
+
+#: Where every sheet dbcls opens from a run — the query result, the .SHEET
+#: ones — gets its ``dbcls_id`` (see :func:`sheet_snapshot`): one counter for
+#: the process, so an id names one sheet for as long as dbcls runs, which
+#: neither a sheet's name nor its place on the stack does.  A sheet VisiData
+#: copies from it (`"`, a join, a frequency drill-down) gets no id — see the
+#: ``BaseSheet.__copy__`` wrapper in :mod:`dbcls.vd_modules.vd_memory`.
+_SHEET_IDS = itertools.count(1)
+
+
+def sheet_snapshot(sheet_id: int, name: str, rows) -> dict:
+    """What ``meta['sheets']`` tells the plugins about one sheet a run opened:
+    its ``dbcls_id``, name, row count and column names — numbers and strings
+    only, never the rows or the sheet, so that whoever keeps the snapshot (the
+    query log, for every run) keeps nothing that would stop VisiData's memory
+    from being freed.  A plugin finds the sheet again, if it is still around,
+    with ``api.find_sheet(sheet_id=...)``.  The result's snapshot is taken
+    before the ``after_query`` filters, see :class:`~dbcls.plugins.PluginHooks`
+    for what that means to a plugin."""
+    first = rows[0] if rows else None
+    return {
+        'id': sheet_id,
+        'name': str(name),
+        'rows': len(rows),
+        'cols': [str(k) for k in first.keys()] if isinstance(first, dict) else [],
+    }
 
 
 class DbFn(str, enum.Enum):
@@ -1079,33 +1107,49 @@ class DbEditorTab(Editor):
         log.rows = [log.newRow(**r) for r in rows]
         visidata.vd.replay(log)
 
-    def _open_result_in_visidata(self, result) -> None:
-        """Open pipeline .SHEET results and/or the query result in VisiData."""
-        # `shown` marks a result the pipeline already had on screen (.VIEW or
-        # .VARS as the last step): reopening it would just stack an identical
-        # read-only copy on top of the sheet the user has only now closed.
-        has_result = bool(result and result.data and not result.shown)
+    @staticmethod
+    def _opens_result_sheet(result) -> bool:
+        """Whether *result* gets a sheet of its own in VisiData.  `shown`
+        marks a result the pipeline already had on screen (.VIEW or .VARS as
+        the last step): reopening it would just stack an identical read-only
+        copy on top of the sheet the user has only now closed."""
+        return bool(result and result.data and not result.shown)
+
+    def _open_result_in_visidata(self, result, sheet_id: Optional[int] = None) -> None:
+        """Open pipeline .SHEET results and/or the query result in VisiData.
+
+        *sheet_id* is the ``dbcls_id`` the result sheet was promised under in
+        ``meta['sheets']`` (see _db_query); None when the plugins were told of
+        no result sheet — a filter has since made one — and it is numbered
+        here."""
+        has_result = self._opens_result_sheet(result)
         # Forgotten before the session: on its way out it frees the sheets
         # deleted in gS, and this list would keep the .SHEET ones alive.
         had_pipeline_sheets = bool(self._pipeline_sheets)
         self._pipeline_sheets = []
+        if not has_result and not had_pipeline_sheets:
+            return
+        if has_result:
+            result_sheet = visidata.PyobjSheet(
+                'result', source=result.data,
+                dbcls_id=next(_SHEET_IDS) if sheet_id is None else sheet_id)
         if had_pipeline_sheets:
             # .SHEET was used: its sheets are already on the stack (pushed as
             # the steps ran, see add_pipeline_sheet) — put the pipeline's final
             # result on top and hand control to VisiData.
             with self._visidata_session():
                 if has_result:
-                    visidata.vd.push(visidata.PyobjSheet('result', source=result.data))
+                    visidata.vd.push(result_sheet)
                     # .SHEET sheets take no macro: .VDM goes to the result only
                     self._queue_macro(result.macro)
                 self._vd_run(visidata.vd.sheets[0])
-        elif has_result:
+        else:
             with self._visidata_session():
                 self._queue_macro(result.macro)
                 # not visidata.vd.view(): that calls vd.run() unguarded, and a
                 # stale handover sheet left on the stack (see _vd_run) raises
                 # ReturnValue right through it and kills the app.
-                self._vd_run(visidata.PyobjSheet('result', source=result.data))
+                self._vd_run(result_sheet)
 
     def _format_query_error(self, exc: Exception) -> str:
         if (isinstance(exc, (PipelineStepError, StaleSheetError, PasswordUnavailable))
@@ -1203,12 +1247,26 @@ class DbEditorTab(Editor):
                 meta.update(elapsed=end - start, status=message, error=error,
                             cancelled=cancelled,
                             rowcount=None if result is None else result.rowcount)
+                # The sheets this run opens, for the plugins: the .SHEET ones
+                # (on the stack already, see add_pipeline_sheet) and the result
+                # sheet, numbered now so the log can name it before it exists.
+                # Snapshots, not sheets — see sheet_snapshot.  The result's is
+                # provisional: taken before the filters, while the sheet opens
+                # from what they return (documented on PluginHooks); a filter
+                # that drops the data leaves an id no sheet ever gets, one that
+                # makes data from nothing gets its sheet numbered below.
+                meta['sheets'] = [sheet_snapshot(vs.dbcls_id, vs.name, vs.source)
+                                  for vs in self._pipeline_sheets]
+                result_id = None
+                if self._opens_result_sheet(result):   # None when failed or cancelled
+                    result_id = next(_SHEET_IDS)
+                    meta['sheets'].append(sheet_snapshot(result_id, 'result', result.data))
                 result = self.hooks.filter('after_query', result, meta)
                 if is_error:
                     self.info_popup.open('Error', {'main': message})
                 elif not cancelled:
                     message = str(result)
-                    self._open_result_in_visidata(result)
+                    self._open_result_in_visidata(result, result_id)
             except Exception as exc:
                 message = self._format_query_error(exc)
                 is_error = True
@@ -1335,8 +1393,10 @@ class DbEditorTab(Editor):
         that moment on — reachable with Alt+S even while the pipeline is still
         running, and still there if the run is later cancelled — and the whole
         stack is handed to VisiData when the pipeline finishes (see
-        _open_result_in_visidata)."""
-        sheet = visidata.PyobjSheet(str(name), source=list(rows))
+        _open_result_in_visidata).
+
+        The sheet gets its ``dbcls_id`` here (see :func:`sheet_snapshot`)."""
+        sheet = visidata.PyobjSheet(str(name), source=list(rows), dbcls_id=next(_SHEET_IDS))
         visidata.vd.push(sheet, load=False)
         self._pipeline_sheets.append(sheet)
 
