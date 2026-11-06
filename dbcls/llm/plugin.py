@@ -45,6 +45,13 @@ The window has three panes; `Tab` moves between them.
   `Ctrl+N`
       Start over: the conversation so far is forgotten and the query in the
       Result pane becomes the context of the new one.
+  `Ctrl+P`
+      The chat's own command palette: the keys above by name, and the
+      commands that have no key — `Toggle read-only mode of the document`,
+      for a result that `Ctrl+T` refuses to apply because the document is
+      read-only (leaving the chat to switch it there would lose the result),
+      and the two confirmation toggles below. Only what works inside the
+      window is listed; the editor's palette does not open over it.
   `Esc`
       Close and change nothing; while a request is running, cancel it.
 
@@ -84,9 +91,9 @@ Two separate switches turn the questions off. `--llm-no-confirm-tools` (or
 section of the config file) lets the lookups and plugin tools run unasked; it
 leaves the code-running ones alone. Only `--llm-no-confirm-exec`
 (`DBCLS_LLM_NO_CONFIRM_EXEC=1`, `"no_confirm_exec": true`) lets those through
-without asking. The command palette's `Toggle asking before the model's tool
-calls` and `Toggle asking before the model runs code (SQL, ...)` switch them
-mid-conversation.
+without asking. `Toggle asking before the model's tool calls` and `Toggle
+asking before the model runs code (SQL, ...)` switch them mid-conversation —
+from the chat's palette (`Ctrl+P` in the window) or the editor's.
 
 When a choice is yours to make rather than its to guess — which of two tables
 you meant, whether you want the rows or a count — it can put the question to
@@ -203,19 +210,26 @@ def register(api):
     api.add_editor_function(RESET_CHAT, chat.reset,
                             'Start a new model conversation', '^N (in the chat)')
 
+    # The switches are wanted in both palettes: the editor's before a chat is
+    # opened, the chat's own (Ctrl+P in the window) mid-conversation, where the
+    # editor's cannot open.  chat.notify() puts the answer wherever the user
+    # is looking.
     def toggle_confirm_tools():
         config.confirm_tools = not config.confirm_tools
-        api.notify('Model tool calls: ask first' if config.confirm_tools
-                   else 'Model tool calls: run without asking')
-
-    api.add_editor_function(TOGGLE_CONFIRM, toggle_confirm_tools,
-                            "Toggle asking before the model's tool calls")
+        chat.notify('Model tool calls: ask first' if config.confirm_tools
+                    else 'Model tool calls: run without asking')
 
     def toggle_confirm_exec():
         config.confirm_exec = not config.confirm_exec
-        api.notify('Model-written code: ask first' if config.confirm_exec
-                   else 'Model-written code: run without asking')
+        chat.notify('Model-written code: ask first' if config.confirm_exec
+                    else 'Model-written code: run without asking')
 
-    api.add_editor_function(TOGGLE_CONFIRM_EXEC, toggle_confirm_exec,
-                            'Toggle asking before the model runs code (SQL, ...)')
+    for name, func, description in (
+        (TOGGLE_CONFIRM, toggle_confirm_tools,
+         "Toggle asking before the model's tool calls"),
+        (TOGGLE_CONFIRM_EXEC, toggle_confirm_exec,
+         'Toggle asking before the model runs code (SQL, ...)'),
+    ):
+        api.add_editor_function(name, func, description)
+        chat.commands.add(name, func, description)
     api.add_help_page('LLM chat', HELP_PAGE)

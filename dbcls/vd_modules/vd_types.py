@@ -1,19 +1,23 @@
-"""JSON (`g@`) and URL (`g#`) column types, registered with visidata's type map.
+"""JSON (`g@`), URL (`g#`) and byte size (`g$`) column types, registered
+with visidata's type map.
 
 A visidata type is just a constructor: the sheet calls `col.type(rawvalue)`
 whenever it needs the *typed* value — for display, sorting, expansion (`(`,
 `g+`) and, on the editable table sheet, for converting what was typed into
 a cell back into a Python value.  Registering one is `vd.addType()`; the
 name given there is also published into the namespace visidata evaluates
-command execstrings and `=` expressions in, which is how the `type-json`
-and `type-url` commands resolve `jsontype` and `urltype`.
+command execstrings and `=` expressions in, which is how the `type-json`,
+`type-url` and `type-size` commands resolve `jsontype`, `urltype` and
+`sizetype`.
 
-The types are deliberately *not* named `json` / `url`: those names would
-shadow the `json` module and any `url` column in `=` expressions.
+The types are deliberately *not* named `json` / `url` / `size`: those names
+would shadow the `json` module and any `url` or `size` column in `=`
+expressions.
 """
 import ast
 import copy
 import json
+import re
 from urllib.parse import parse_qsl, quote_plus, urlsplit, urlunsplit
 
 from visidata import vd, Column
@@ -180,7 +184,62 @@ def format_url_cell(fmtstr, value):
 vd.addType(urltype, icon='/', formatter=format_url_cell, name='urltype')
 
 
-URL_PARTS = ('schema', 'domain', 'port', 'path', 'query', 'anchor')
+_SIZE_UNITS = {'': 0, 'B': 0, 'K': 1, 'M': 2, 'G': 3, 'T': 4, 'P': 5}
+# `1.5G`, `512 B`, `2 MiB`, `3kb`, `-1024`: a number, maybe a unit letter,
+# maybe `B` / `iB` after it (the `B` alone is a unit of its own)
+_SIZE_RE = re.compile(r'^([-+]?\d+(?:\.\d+)?)\s*([KMGTP]?)(?:I?B)?$', re.IGNORECASE)
+
+
+def human_bytes(n) -> str:
+    """``1.5G``, ``312.0M``, ``880K``, ``512B``."""
+    n = float(n)
+    for unit in ('B', 'K', 'M', 'G', 'T'):
+        if abs(n) < 1024 or unit == 'T':
+            return f'{n:.0f}{unit}' if unit in ('B', 'K') else f'{n:.1f}{unit}'
+        n /= 1024
+    return f'{n:.1f}T'
+
+
+class sizetype(int):
+    """A byte count: shown human-readable (`human_bytes`), sorted and summed
+    as the number it is.
+
+    Takes whatever a driver or a text column hands over: an int, a float, a
+    ``Decimal`` (MySQL's SUM), a numeric string (ClickHouse's UInt64), or a
+    size already written for humans — ``1.5G``, ``512B``, ``2 MiB``, ``3kb``
+    (1024-based, like the display).  Anything else — a blank string
+    included — raises, exactly as ``int('')`` does: visidata turns the
+    exception into a cell that still sorts (a typing error, like a bad `@`
+    date cell), whereas a bare None coming back from a type would not and
+    the whole column could no longer be sorted.  A None cell never gets
+    here: visidata wraps it before calling the type.  Called with nothing,
+    it is 0 — the default visidata asks a numeric type for.
+    """
+
+    def __new__(cls, value=0):
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode('utf-8', errors='replace')
+        if isinstance(value, str):
+            text = value.strip()
+            m = _SIZE_RE.match(text)
+            if not m:
+                raise ValueError(f'not a size: {value!r}')
+            number, unit = m.groups()
+            value = float(number) * 1024 ** _SIZE_UNITS[unit.upper()]
+        return super().__new__(cls, int(value))
+
+
+def format_size_cell(fmtstr, value):
+    """Render the byte count human-readable, whatever `fmtstr` says."""
+    return human_bytes(value)
+
+
+vd.addType(sizetype, icon='B', formatter=format_size_cell, name='sizetype')
+# a numeric type like int: `+` sums it, plots and `describe` treat it as a number
+vd.numericTypes.append(sizetype)
+
+
+URL_PARTS =('schema', 'domain', 'port', 'path', 'query', 'anchor')
 
 
 def _part_text(value):

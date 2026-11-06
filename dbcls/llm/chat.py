@@ -5,9 +5,16 @@ model came back with.  The last two are ordinary :class:`~dbcls.editor.TextArea`
 fields, so selection, word jumps, undo and the clipboard work there exactly as
 they do in the editor.
 
-Nothing touches the document until Alt+A: Esc always leaves the buffer as it
+Nothing touches the document until Ctrl+T: Esc always leaves the buffer as it
 was.  Applying goes through the buffer's own edit methods, so Ctrl+Z takes it
 back like any other change.
+
+The window has a command table of its own (:attr:`ChatWindow.commands`) — the
+editor's is under the overlay and none of it applies here.  Every key the
+window answers to is a binding in that table, and ^P lists the described
+commands in a palette, the way the editor's does: that is where a command with
+no key of its own, such as the plugin's confirmation toggles, is reached from
+inside the chat.
 """
 import asyncio
 import curses
@@ -15,7 +22,9 @@ import threading
 import time
 from typing import Any, List, Optional, Tuple, Union
 
-from ..editor import K, Lexer, PopupItem, SelectPopup, TextArea, key_alt, key_ctrl
+from ..editor import (
+    CommandTable, K, Lexer, PopupItem, SelectPopup, TextArea, key_alt, key_ctrl,
+)
 from ..syntax import Highlighter, Token
 from .client import LLMClient, LLMError
 from .prompt import build_context_message, build_system_prompt
@@ -37,6 +46,25 @@ KEY_APPLY = (key_ctrl('t'),)    # take the result into the document
 #: window is up — the overlay takes every keystroke — and there are no tabs to
 #: open from inside the chat, so the letter is free to mean "new" here.
 KEY_RESET = (key_ctrl('n'),)
+#: ^P is the palette key everywhere in dbcls — the editor's too.
+KEY_PALETTE = (key_ctrl('p'),)
+
+#: The window's own commands — what :attr:`ChatWindow.commands` lists and the
+#: keys above run.  A plugin adds to the table under a name of its own.
+CMD_SEND = 'send'
+CMD_APPLY = 'apply'
+CMD_RESET = 'reset'
+CMD_NEXT_PANE = 'next_pane'
+CMD_PREV_PANE = 'prev_pane'
+CMD_CLOSE = 'close'
+CMD_PALETTE = 'command_palette'
+#: The editor's read-only switch, reachable from inside the window: a result
+#: cannot be applied to a read-only document, and leaving the chat to flip
+#: the switch there would lose the result (reopening seeds the pane anew).
+CMD_TOGGLE_READONLY = 'toggle_readonly'
+
+#: What apply() says on a read-only document — and where the way out is.
+READONLY_ERROR = 'The document is read-only — ^P, Toggle read-only mode'
 
 SPINNER = '|/-\\'
 
@@ -132,7 +160,9 @@ class ChatWindow:
     """A full-screen overlay driven by the editor loop (see
     :meth:`dbcls.editor.Editor.push_overlay`)."""
 
-    HINT = ' Alt+Enter send · ^T apply · ^N new chat · Tab pane · Esc close '
+    HINT = ' Alt+Enter send · ^T apply · ^N new chat · Tab pane · ^P commands · Esc close'
+    #: Shown instead while the command palette is up.
+    HINT_PALETTE = ' Commands · ↑↓ pick · type to filter · Enter run · Esc close the list '
     #: Shown instead while the model is waiting on an ask_user answer.
     HINT_ASK = ' The assistant is asking · ↑↓ pick or type your own · Enter answer · Esc skip the question '
     HINT_ASK_MULTI = ' The assistant is asking · ↑↓ move · Tab mark · type your own · Enter answer · Esc skip '
@@ -222,6 +252,84 @@ class ChatWindow:
         #: The pending 'edit_code' request while code_area is up, else None.
         self._code_edit: Optional[dict] = None
         self.pane_rects: List[Tuple[int, int]] = []
+
+        #: The window's commands and keys — see the module docstring.  Public:
+        #: a plugin that wants a command reachable from inside the chat adds it
+        #: here (``commands.add(name, func, description, keybinding)``), and it
+        #: shows up in the chat's palette; the editor's own table is not
+        #: consulted while the window is up.
+        self.commands = CommandTable()
+        #: The chat's command palette — the editor's cannot open over an
+        #: overlay, and would list commands that mean nothing here anyway.
+        self.palette = SelectPopup()
+        #: What a command had to say (the plugin's "run without asking"),
+        #: shown on the hint bar until the next key.  The editor's status bar
+        #: is under the window: a notification sent there would surface only
+        #: after the chat closed.
+        self._notice = ''
+        self._register_commands()
+
+    def _register_commands(self) -> None:
+        add, bind = self.commands.add, self.commands.bind
+        add(CMD_SEND,      self.send,         'Send the request',                'Alt+Enter')
+        add(CMD_APPLY,     self.apply,        'Apply the result to the document', '^T')
+        add(CMD_RESET,     self.reset,        'Start a new conversation',        '^N')
+        add(CMD_NEXT_PANE, self._next_pane,   'Next pane',                       'Tab')
+        add(CMD_PREV_PANE, self._prev_pane,   'Previous pane',                   'Shift+Tab')
+        add(CMD_CLOSE,     self.close,        'Close the chat',                  'Esc')
+        add(CMD_TOGGLE_READONLY, self._toggle_readonly, 'Toggle read-only mode of the document')
+        # No description: a palette need not list itself, the hint bar names
+        # the key.
+        add(CMD_PALETTE,   self.open_palette)
+        bind(CMD_SEND, list(KEY_SEND))
+        bind(CMD_APPLY, list(KEY_APPLY))
+        bind(CMD_RESET, list(KEY_RESET))
+        bind(CMD_NEXT_PANE, KEY_TAB)
+        bind(CMD_PREV_PANE, KEY_SHIFT_TAB)
+        bind(CMD_CLOSE, KEY_ESC)
+        bind(CMD_PALETTE, list(KEY_PALETTE))
+
+    def _next_pane(self) -> None:
+        self.focus = (self.focus + 1) % len(self.panes)
+
+    def _prev_pane(self) -> None:
+        self.focus = (self.focus - 1) % len(self.panes)
+
+    def _toggle_readonly(self) -> None:
+        """The editor's own switch, on the document under the window — the
+        same buffer apply() writes to."""
+        buf = self.editor.buf
+        buf.readonly = not buf.readonly
+        if not buf.readonly and self._error == READONLY_ERROR:
+            self._error = ''        # the way out was taken
+        self.notify('Read-only mode enabled' if buf.readonly
+                    else 'Read-only mode disabled — ^T applies the result')
+
+    def notify(self, text: str) -> None:
+        """Tell the user *text*: on the chat's hint bar while the window is up,
+        in the editor's status bar otherwise."""
+        if self.active:
+            self._notice = text
+            self.editor.request_redraw()
+        else:
+            self.api.notify(text)
+
+    # ── The command palette ──────────────────────────────────────────────────
+
+    def open_palette(self) -> None:
+        """List the window's described commands; Enter runs the chosen one."""
+        self.palette.open(self.commands.palette_items(), title='Commands')
+        self.editor.request_redraw()
+
+    def _handle_palette_key(self, key) -> None:
+        popup = self.palette
+        action = popup.handle_key(key)
+        if action == 'insert':
+            name = popup.selected_word()
+            popup.close()
+            self.commands.run(name)
+        elif action == 'cancel':
+            popup.close()
 
     def _register_result_tool(self, tools) -> None:
         """The model returns its answer by calling this, not by writing it in
@@ -771,6 +879,9 @@ class ChatWindow:
             if request is None or request['opened']:
                 return
             request['opened'] = True
+        # The question takes every key until it is answered; a palette left
+        # open under it would only come back once that was done, out of date.
+        self.palette.close()
         if request['kind'] == 'edit_code':
             self._open_code_edit(request)
             return
@@ -894,7 +1005,7 @@ class ChatWindow:
             self._error = 'Nothing to apply'
             return
         if not self.api.replace_statement(query):
-            self._error = 'The document is read-only'
+            self._error = READONLY_ERROR
             return
         self.api.notify("Applied the assistant's query")
         self.close()
@@ -902,6 +1013,14 @@ class ChatWindow:
     # ── Keys ─────────────────────────────────────────────────────────────────
 
     def handle_key(self, key) -> None:
+        # Like the editor's status bar: a notice lasts until the next key.
+        self._notice = ''
+        # The palette is the user's own doing and finishes in a keystroke or
+        # two, so it comes before everything — a question opening under it
+        # closes it (see _open_question), so the two are never up together.
+        if self.palette.active:
+            self._handle_palette_key(key)
+            return
         # A question from the model takes every key until it is answered: it is
         # the one thing the run is blocked on.  So does the code being edited.
         if self._code_edit is not None:
@@ -910,23 +1029,7 @@ class ChatWindow:
         if self.question_popup.active:
             self._handle_question_key(key)
             return
-        if key == KEY_ESC:
-            self.close()
-            return
-        if key in KEY_SEND:
-            self.send()
-            return
-        if key in KEY_APPLY:
-            self.apply()
-            return
-        if key in KEY_RESET:
-            self.reset()
-            return
-        if key == KEY_TAB:
-            self.focus = (self.focus + 1) % len(self.panes)
-            return
-        if key == KEY_SHIFT_TAB:
-            self.focus = (self.focus - 1) % len(self.panes)
+        if self.commands.run_key(key):
             return
         # is_text: the editor turns the mouse wheel and the function keys into
         # key codes that look like printable characters; without this the
@@ -939,7 +1042,7 @@ class ChatWindow:
             if self.code_area.view.click_to_cursor(mx, my):
                 self.editor.request_redraw()
             return
-        if self.question_popup.active:
+        if self.question_popup.active or self.palette.active:
             return
         for index, pane in enumerate(self.panes):
             if pane.view.click_to_cursor(mx, my):
@@ -1012,6 +1115,8 @@ class ChatWindow:
         # above the bottom, leaving the hint bar visible under it.
         if self.question_popup.active:
             self.question_popup.draw(stdscr, self.editor.colors, height, width)
+        if self.palette.active:
+            self.palette.draw(stdscr, self.editor.colors, height, width)
 
     def _history_title(self) -> str:
         model = self.config.model or 'model'
@@ -1024,7 +1129,10 @@ class ChatWindow:
 
     def _draw_hint(self, stdscr, height: int, width: int) -> None:
         colors = self.editor.colors
-        if self._code_edit is not None:
+        if self.palette.active:
+            text = self.HINT_PALETTE
+            pair = colors.status_bar
+        elif self._code_edit is not None:
             text = self.HINT_EDIT
             pair = colors.status_warn
         elif self.question_popup.active:
@@ -1038,6 +1146,10 @@ class ChatWindow:
             # Red: the run is stopped until the user answers, and the bar is the
             # only thing on screen that says so — the same colour an error uses.
             pair = colors.status_warn
+        elif self._notice:
+            # Newer than any error on record, and gone with the next key.
+            text = f' {self._notice} '
+            pair = colors.status_bar
         elif self._error:
             text = f' {self._error} '
             pair = colors.status_warn
@@ -1055,7 +1167,7 @@ class ChatWindow:
         the list marks the choice itself."""
         if self._code_edit is not None:
             return self.code_area.cursor_screen_pos()
-        if self.question_popup.active:
+        if self.question_popup.active or self.palette.active:
             return None
         pane = self.panes[self.focus]
         if pane is self.history_area:

@@ -308,7 +308,7 @@ class PluginAPI:
     def add_editor_function(self, name: str, func: Callable[[], None],
                             description: str = '', keybinding: str = '') -> None:
         """Add a command; with a *description* it also appears in the command
-        palette (Alt+P)."""
+        palette (Ctrl+P)."""
         self.editor.add_editor_function(name, func, description, keybinding)
 
     def add_keybinding(self, name: str, key) -> None:

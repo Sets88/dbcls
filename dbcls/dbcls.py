@@ -350,7 +350,7 @@ DB_HELP_DATABASE = """\
       alias for the same command; in read-only mode plain `Enter` runs
       the query too
   `>>>` ... `<<<`
-      Fold-block markers: `Ctrl+P` toggles folding (a folded block shows
+      Fold-block markers: `Ctrl+R` toggles folding (a folded block shows
       only its `>>>` line); with the cursor on a marker line `Alt+Enter`
       runs the whole block with the marker lines stripped
   `Shift+Tab`
@@ -368,7 +368,7 @@ DB_HELP_DATABASE = """\
       (to keep sheets open, quit visidata with `Ctrl+q` instead of `q`)
   `Ctrl+G`
       Open files within the current directory
-  `Alt+P`
+  `Ctrl+P`
       Open command palette
   `Ctrl+Shift+←` / `Ctrl+Shift+→`
       Previous / next tab, with one tab per configured connection
@@ -2133,7 +2133,7 @@ def main():
         ' of key codes as shown in debug mode (Ctrl+D), e.g. "36:1412,1412:36" to remap Tab to behave like' \
         ' Shift+Tab and Shift+Tab to behave like Tab')
     parser.add_argument('--fold', dest='fold', action='store_true', default=False,
-        help='start with >>> ... <<< block folding enabled (same as pressing Ctrl+P)')
+        help='start with >>> ... <<< block folding enabled (same as pressing Ctrl+R)')
     parser.add_argument('--readonly', '-R', dest='readonly', action='store_true', default=False,
         help='open the editor in read-only mode (document cannot be modified or saved)')
     # Its choices, like --engine's, wait for the plugins: one may bring a syntax.

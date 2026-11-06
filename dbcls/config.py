@@ -309,7 +309,7 @@ def save_connections_to_config(path: str, connections, base=None) -> str:
     nothing else — no ``fold``, no lock options, none of a plugin's settings —
     and starting dbcls from that file would not be the same dbcls.  It matters
     more than it sounds: a config passed through a shell's process substitution
-    (``--config <(...)``, see the README) has no path to be written back to at
+    (``--config <(...)``, see docs/configuration.md) has no path to be written back to at
     all, so *base* is the only copy of what it held.
 
     The write goes through a temporary file in the same directory and a rename,

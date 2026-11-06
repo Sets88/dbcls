@@ -6,7 +6,7 @@ from visidata import ENTER
 # inside addCommand execstrings below resolve through the VisiData API at
 # runtime, not through imports in this module.
 from . import vd_plotter  # noqa: F401
-from . import vd_types  # noqa: F401 — registers the `jsontype`/`urltype` column types
+from . import vd_types  # noqa: F401 — registers the `jsontype`/`urltype`/`sizetype` column types
 from .vd_db_browser import DataBaseSheet, TablesSheet  # re-exported for dbcls.py
 from .vd_utils import SheetWithReference
 from .vd_utils import SselectSheet, SchooseSheet, ViewSheet, VarsSheet  # re-exported for dbcls.py
@@ -30,6 +30,7 @@ TableSheet.guide += '''
 - `g+` to expand a list cell vertically on a new sheet.
 - `g@` to type the current column as JSON (like `@` for dates), so its cells expand with `(` / `g+` and display as real JSON.  The cell itself is edited as text (parsed again with `json.loads`); inside it only what cannot be expanded further (a string, number, bool, null): `e` on a column expanded with `(`, or `z Enter` to open the object / array (`Enter` goes deeper, `e` on `key` renames, `a` / `d` add / delete).  Each change rewrites the whole JSON cell.
 - `g#` to type the current column as URL: cells look unchanged, but `(` expands them into schema/domain/port/path/query/anchor, and `(` on `query` into one column per parameter.  The parts are edited like JSON's (`e` on an expanded column, `z Enter`); only the changed part is replaced in the URL text.
+- `g$` to type the current column as byte size (like `$` for currency): cells display as `512B` / `880K` / `1.5G` but sort, sum and plot as the number of bytes; a cell written for humans (`2 MiB`, `3kb`) is read back into bytes.
 - `gp` to draw a plotext chart from the columns you type at the prompt: `x[,bucket],y` or `x,y1,y2,…` (`Tab` completes column names).
 - `+` also takes `topk<N>` (the N most common values of the group, as a list) and any `p<N>` percentile, not just the ones the prompt lists.
 - `gT` / `gzT` to save the selected rows / column values to pipeline _vars.
@@ -45,6 +46,8 @@ TableSheet.addCommand('gp', 'alt-plot', 'plot_sheet(sheet)', 'Draw plotext chart
 TableSheet.addCommand('g@', 'type-json', 'cursorCol.type = jsontype', 'set type of current column to JSON')
 # `g#` is stock only on ColumnsSheet too (type-int-selected), same as `g@` above.
 TableSheet.addCommand('g#', 'type-url', 'cursorCol.type = urltype', 'set type of current column to URL')
+# `g$` is stock only on ColumnsSheet too (type-currency-selected), same as `g@` above.
+TableSheet.addCommand('g$', 'type-size', 'cursorCol.type = sizetype', 'set type of current column to byte size (shown as 1.5G, sorted as a number)')
 IndexSheet.addCommand('^', 'reference', 'left, rights = someSelectedRows[0], someSelectedRows[1:]; vd.push(SheetWithReference(left, rights))', 'Create new sheet containing rows from first sheet and adding new row with a reference to other sheet based on value of current column')
 SheetWithReference.addCommand('gz'+ENTER, 'dive-selected-cells', 'openRefCells(cursorCol, selectedRows)', 'open combined reference sheet for selected cells')
 TableSheet.addCommand('z'+ENTER, 'open-cell', 'vd.push(openCellAltered(sheet, cursorCol, cursorRow))', 'open sheet with copies of rows referenced in current cell')

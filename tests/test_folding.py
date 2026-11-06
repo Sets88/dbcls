@@ -1,6 +1,6 @@
 """Tests for >>> ... <<< block folding.
 
-Folding (toggled with Ctrl+P) is display-only: hidden rows are collected in
+Folding (toggled with Ctrl+R) is display-only: hidden rows are collected in
 ``TextBuffer.hidden_rows`` by ``Editor._update_folds`` — a folded block shows
 only its ``>>>`` line, cursor movement skips hidden rows and the renderer does
 not draw them. Query execution treats the markers as statement separators;

@@ -4,7 +4,7 @@ Load it with:
 
     dbcls --plugin-dir ./plugins ...
 
-and open it with `Query log` in the editor's command palette (Alt+P).  Every
+and open it with `Query log` in the editor's command palette (Ctrl+P).  Every
 run from the editor (Alt+R) is one row — a pipeline is a single row too, with
 the row count of its final result: when it started, on which tab, the SQL that
 ran, how it ended (``ok``, ``error``, ``cancelled``), the status line the

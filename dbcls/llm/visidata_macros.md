@@ -95,7 +95,7 @@ Checked against the VisiData dbcls ships with. "input" is what goes into the
 | `addcol-regex-subst` | new column `<name>_re`: cursor column with a regex replaced | object `{"before": "regex", "after": "text"}` |
 | `resize-cols-max` | widen all visible columns to their content | — |
 | `type-int` / `type-float` / `type-date` / `type-string` / `type-currency` / `type-len` | set the cursor column's type | — |
-| `type-json` / `type-url` | dbcls types: JSON (dive into it with `open-cell`) / URL | — |
+| `type-json` / `type-url` / `type-size` | dbcls types: JSON (dive into it with `open-cell`) / URL / byte size (shown as `1.5G`, sorted and summed as a number; also parses `512B`, `2 MiB`) | — |
 
 ### Selecting rows
 
@@ -123,7 +123,56 @@ Checked against the VisiData dbcls ships with. "input" is what goes into the
 | `describe-sheet` | per-column statistics (nulls, distinct, min, max, mean…) | — |
 | `transpose` | rows become columns | — |
 | `columns-sheet` | the sheet's columns as rows | — |
-| `alt-plot` | dbcls chart from columns | `"x,y"`, `"x,bucket,y"` or `"x,y1,y2"` (column names) |
+| `alt-plot` | in-terminal line chart (the user's `gp`) — see **Charts** below | column names, comma-separated: `"x,y"`, `"x,bucket,y"` or `"x,y1,y2,…"` |
+
+### Charts
+
+`alt-plot` is how a pipeline *draws* a result: it opens a plotext line chart
+over the sheet, and the user closes it with `q` to get back to the rows. When
+the user asks for a chart, a plot or a graph, this is the step to use.
+
+The `input` names the columns by role, in order:
+
+| position | must be | role |
+|---|---|---|
+| first | date / datetime / number (an untyped column holding timestamps is accepted) | X axis, usually time |
+| middle, optional | non-numeric | bucket: one line per distinct value |
+| last, or all the rest | number | Y values |
+
+- `"ts,cnt"` — one line.
+- `"ts,action,cnt"` — one line per `action` value (bucket mode).
+- `"ts,ok,err,total"` — one line per value column; chosen whenever every column
+  after the first is numeric. To bucket by a *numeric* column (a shard id, a
+  status code) mark it with `*`: `"ts,*shard,cnt"`.
+
+What it cannot do, and what to do instead:
+
+- **No bar charts, no text on the X axis.** The X column has to be a time or a
+  number, so "sales by category" is not a chart here — group in SQL and show it
+  as a table (`freq-col` / `sort-desc`) instead. Charts are for something
+  *over time* or over a numeric scale.
+- **The axes come from the SQL.** Produce them in the query: a bucketed time
+  (`DATE_TRUNC`, `toStartOfHour`, `strftime`…) as the first column, the numbers
+  as the rest, ordered or not — the chart sorts by X itself. One row per X (per
+  X per bucket in bucket mode); aggregate in SQL, don't chart raw rows.
+- **Y columns must already be numbers.** When the driver returns them as text
+  (decimals in some drivers, `COUNT` from SQLite over JSON…), put a `type-int` /
+  `type-float` line on that column before `alt-plot`.
+- **A selection narrows the chart.** With rows selected only those are plotted,
+  so `select-expr` before `alt-plot` charts a subset without changing the SQL.
+- **Biggest series first — sort before you plot.** Every series gets a number
+  in the legend, and the user presses that number (`1`–`9`) to hide the series;
+  the chart then rescales to what is left. That is how a small series is read
+  under a huge one, so the huge ones need the low numbers. In bucket mode the
+  numbers follow the order the bucket values are first met in the rows, so put
+  `{"col": "<y column>", "longname": "sort-desc"}` right before `alt-plot`: the
+  bucket with the largest value becomes `1`. In multi-value mode the numbers
+  follow the order of the Y columns in `input` — list the largest measure
+  first. Only nine series can be toggled, another reason to keep the big ones
+  in front.
+- **Last line of the macro.** `alt-plot` opens the chart sheet on top; any line
+  after it runs on the chart, where nothing works. Do everything else first.
+- On a `.WATCH` sheet the chart follows the live data and redraws with it.
 
 ## Recipes
 
@@ -168,6 +217,22 @@ Only the interesting rows, on a sheet of their own:
 """
 ```
 
+A chart — the SQL makes the time axis and the numbers, the macro sorts so the
+biggest series is numbered `1` and then draws:
+
+```sql
+.RUN "SELECT DATE_TRUNC('hour', created_at) AS hour, status, COUNT(*) AS cnt FROM orders WHERE created_at > now() - interval '1 day' GROUP BY 1, 2" | .VDM """
+{"col": "cnt", "longname": "sort-desc"}
+{"longname": "alt-plot", "input": "hour,status,cnt"}
+"""
+```
+
+One line per `status`, the dominant one first in the legend so a press of `1`
+hides it and the rest fill the chart. For a single line drop the bucket
+(`"hour,cnt"`) — and the sort; for several measures make them columns
+(`"hour,ok,err"`, largest first). A `type-float` line on a value column goes
+*before* `alt-plot` when the driver returns it as text.
+
 Shaping a `.VIEW` inside a loop — each view gets the macro that comes right
 before it:
 
@@ -188,5 +253,7 @@ before it:
    the aggregates.
 3. A command that asks something has its `input`.
 4. Nothing that quits, saves, edits a table or runs a shell command.
+   `alt-plot`, if any, is the last line, its X column is a time or a number,
+   and in bucket mode a `sort-desc` on the Y column comes right before it.
 5. The macro sits before the display point it is meant for (`.VIEW` or the end),
    not before a `.SHEET`.

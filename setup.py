@@ -1,4 +1,5 @@
 import os
+import re
 
 from setuptools import (
     find_packages,
@@ -17,9 +18,23 @@ def get_requirements():
         raise RuntimeError('No requirements info found.')
 
 
+def get_long_description():
+    """README.md with its repository-relative links made absolute.
+
+    The README points into docs/, plugins/ and data/ by relative path, which
+    GitHub resolves and PyPI does not; on the package page those links would
+    lead nowhere."""
+    repo = 'https://github.com/Sets88/dbcls/blob/main/'
+    raw = 'https://raw.githubusercontent.com/Sets88/dbcls/main/'
+    with open('README.md') as f:
+        text = f.read()
+    text = re.sub(r'\]\(/data/', '](' + raw + 'data/', text)
+    return re.sub(r'\]\((?!https?://|#|' + re.escape(raw) + ')/?', '](' + repo, text)
+
+
 setup(
     name='dbcls',
-    version='1.4.9',
+    version='1.4.10',
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',
@@ -29,7 +44,7 @@ setup(
     # is what keeps that true if one is ever added.
     packages=find_packages(exclude=("tests", "tests.*", "plugins", "plugins.*")),
     description='dbcls is a versatile client that supports various databases',
-    long_description=open('README.md').read(),
+    long_description=get_long_description(),
     long_description_content_type='text/markdown',
     include_package_data=True,
     package_data={'dbcls.llm': ['*.md']},

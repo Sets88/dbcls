@@ -29,6 +29,7 @@ ALT_ENTER = key_alt(ord('\n'))
 # layout (see dbcls.editor.key_ctrl).
 CTRL_T = key_ctrl('t')      # apply
 CTRL_N = key_ctrl('n')      # new conversation
+CTRL_P = key_ctrl('p')      # the chat's command palette (a control code: the same on any layout)
 
 
 class FakeTask:
@@ -291,10 +292,10 @@ class TestKeys:
 
     def test_the_letter_shortcuts_are_control_codes(self):
         from dbcls.editor import key_base, key_flags
-        from dbcls.llm.chat import KEY_APPLY, KEY_RESET
+        from dbcls.llm.chat import KEY_APPLY, KEY_PALETTE, KEY_RESET
         from dbcls.llm.plugin import OPEN_CHAT_KEY
 
-        for key in (OPEN_CHAT_KEY, KEY_APPLY[0], KEY_RESET[0]):
+        for key in (OPEN_CHAT_KEY, KEY_APPLY[0], KEY_RESET[0], KEY_PALETTE[0]):
             assert key_flags(key) == 0          # no Alt/ESC prefix
             assert key_base(key) < 32           # a control code
 
@@ -312,10 +313,10 @@ class TestKeys:
         """The panes are TextAreas — a shortcut that stole one of their keys
         would break editing inside the window."""
         from dbcls.editor import TEXT_EDIT_BINDINGS
-        from dbcls.llm.chat import KEY_APPLY, KEY_RESET
+        from dbcls.llm.chat import KEY_APPLY, KEY_PALETTE, KEY_RESET
 
         field_keys = {key for _fn, keys, _d, _k in TEXT_EDIT_BINDINGS for key in keys}
-        assert not field_keys & {KEY_APPLY[0], KEY_RESET[0]}
+        assert not field_keys & {KEY_APPLY[0], KEY_RESET[0], *KEY_PALETTE}
 
     def test_apply_and_reset_answer_to_the_new_keys(self):
         editor, chat = make_chat('SELECT old')
@@ -337,7 +338,150 @@ class TestKeys:
     def test_the_hint_line_shows_the_new_keys(self):
         _editor, chat = make_chat()
         assert '^T apply' in chat.HINT and '^N new chat' in chat.HINT
-        assert 'Alt+Enter send' in chat.HINT
+        assert 'Alt+Enter send' in chat.HINT and '^P commands' in chat.HINT
+        assert len(chat.HINT) <= 80          # whole on a standard terminal
+
+
+def palette_labels(chat):
+    return [item.label for item in chat.palette.filtered]
+
+
+class TestCommandPalette:
+    """^P inside the window: the chat's own commands, and only those —
+    the editor's palette cannot open over the overlay, and what it lists
+    (Open file, Save…) means nothing here."""
+
+    def test_ctrl_p_opens_it_and_esc_closes_it(self):
+        _editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(CTRL_P)
+        assert chat.palette.active
+        chat.handle_key(ESC)
+        assert not chat.palette.active
+        chat.handle_key(CTRL_P)
+        assert chat.palette.active
+
+    def test_alt_p_is_not_a_key_here(self):
+        """Alt+letter does not arrive on a non-Latin layout, so the palette
+        has no Alt spelling at all — the editor's dropped it too."""
+        from dbcls.llm.chat import KEY_PALETTE
+        assert key_alt(ord('p')) not in KEY_PALETTE
+        _editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(key_alt(ord('p')))
+        assert not chat.palette.active
+
+    def test_it_lists_the_windows_keys_by_name_and_nothing_of_the_editors(self):
+        _editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(CTRL_P)
+        labels = palette_labels(chat)
+        assert any(label.startswith('Send the request') for label in labels)
+        assert any(label.startswith('Apply the result') for label in labels)
+        assert any(label.startswith('Close the chat') for label in labels)
+        assert not any('Open file' in label or 'Save' in label for label in labels)
+        assert labels == sorted(labels)
+
+    def test_the_key_is_shown_beside_the_command(self):
+        _editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(CTRL_P)
+        assert 'Apply the result to the document  [^T]' in palette_labels(chat)
+
+    def test_the_palette_does_not_list_itself(self):
+        _editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(CTRL_P)
+        assert not any('palette' in label.lower() for label in palette_labels(chat))
+
+    def test_typing_filters_and_enter_runs_the_command(self):
+        _editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(CTRL_P)
+        type_text(chat, 'previous')
+        assert palette_labels(chat) == ['Previous pane  [Shift+Tab]']
+        chat.handle_key(ENTER)
+        assert not chat.palette.active
+        assert chat.panes[chat.focus] is chat.history_area
+        assert chat.input_area.text == ''        # nothing typed into the pane
+
+    def test_a_command_that_closes_the_window_works_from_the_list(self):
+        editor, chat = make_chat('SELECT old')
+        editor.rows = [0]
+        chat.open('SELECT old')
+        chat.result_area.set_text('SELECT new')
+        chat.handle_key(CTRL_P)
+        type_text(chat, 'apply')
+        chat.handle_key(ENTER)
+        assert editor.buf.lines == ['SELECT new']
+        assert chat.active is False and not chat.palette.active
+
+    def test_esc_closes_the_list_not_the_window(self):
+        _editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(CTRL_P)
+        chat.handle_key(ESC)
+        assert not chat.palette.active
+        assert chat.active is True
+
+    def test_a_plugins_command_shows_up_and_runs(self):
+        _editor, chat = make_chat()
+        chat.open()
+        ran = []
+        chat.commands.add('plugin_thing', lambda: ran.append(1), 'Do the plugin thing')
+        chat.handle_key(CTRL_P)
+        type_text(chat, 'plugin')
+        chat.handle_key(ENTER)
+        assert ran == [1]
+
+    def test_a_notice_from_a_command_is_shown_on_the_hint_bar_until_the_next_key(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.commands.add('say', lambda: chat.notify('Switched it off'), 'Say something')
+        chat.handle_key(CTRL_P)
+        type_text(chat, 'say')
+        chat.handle_key(ENTER)
+        chat.draw(editor.stdscr, 24, 80)
+        assert 'Switched it off' in editor.stdscr.row(23)
+        assert editor.notifications == []       # not the status bar under the window
+        chat.handle_key(K(ord('x')))
+        chat.draw(editor.stdscr, 24, 80)
+        assert 'Switched it off' not in editor.stdscr.row(23)
+
+    def test_a_notice_outside_the_window_goes_to_the_status_bar(self):
+        editor, chat = make_chat()
+        chat.notify('Switched it off')
+        assert editor.notifications == [('Switched it off', False)]
+
+    def test_the_list_is_drawn_over_the_panes_with_its_own_hint(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(CTRL_P)
+        chat.draw(editor.stdscr, 24, 80)
+        dump = editor.stdscr.dump()
+        assert 'Commands' in dump and 'Send the request' in dump
+        assert 'Enter run' in editor.stdscr.row(23)
+        assert chat.cursor_pos() is None
+
+    def test_a_click_is_ignored_while_the_list_is_up(self):
+        editor, chat = make_chat()
+        chat.open()
+        chat.draw(editor.stdscr, 24, 80)
+        chat.handle_key(CTRL_P)
+        top, _rows = chat.pane_rects[2]
+        chat.handle_click(1, top + 1)            # inside the Result pane
+        assert chat.focus == 0
+
+    @pytest.mark.asyncio
+    async def test_a_question_from_the_model_takes_the_list_down(self):
+        _editor, chat = make_chat()
+        chat.open()
+        chat.handle_key(CTRL_P)
+        task = await ask(chat)
+        assert not chat.palette.active
+        assert chat.question_popup.active
+        chat.handle_key(ENTER)                   # answers the question, not the list
+        assert (await asyncio.wait_for(task, 1))['chosen'] == 'orders'
 
 
 class TestResetInTheWindow:
@@ -855,8 +999,40 @@ class TestApply:
         chat.result_area.set_text('SELECT new')
         chat.apply()
         assert 'read-only' in chat._error
+        assert '^P' in chat._error               # says where the way out is
         assert editor.buf.lines == ['SELECT old']
         assert chat.active is True
+
+    def test_read_only_can_be_switched_off_from_the_chats_palette(self):
+        """Leaving the chat to do it in the editor would lose the result:
+        reopening seeds the pane from the document again."""
+        editor, chat = make_chat('SELECT old')
+        editor.buf.readonly = True
+        editor.rows = [0]
+        chat.open()
+        chat.result_area.set_text('SELECT new')
+        chat.handle_key(CTRL_T)
+        assert 'read-only' in chat._error
+        chat.handle_key(CTRL_P)
+        type_text(chat, 'read-only')
+        assert palette_labels(chat) == ['Toggle read-only mode of the document']
+        chat.handle_key(ENTER)
+        assert editor.buf.readonly is False
+        assert chat._error == ''                 # the message is no longer true
+        chat.draw(editor.stdscr, 24, 80)
+        assert 'Read-only mode disabled' in editor.stdscr.row(23)
+        assert chat.result_area.text == 'SELECT new'     # still there to apply
+        chat.handle_key(CTRL_T)
+        assert editor.buf.lines == ['SELECT new']
+        assert chat.active is False
+
+    def test_the_toggle_switches_read_only_back_on_too(self):
+        editor, chat = make_chat('SELECT old')
+        chat.open()
+        chat.commands.run('toggle_readonly')
+        assert editor.buf.readonly is True
+        chat.draw(editor.stdscr, 24, 80)
+        assert 'Read-only mode enabled' in editor.stdscr.row(23)
 
 
 class TestLayout:
@@ -1762,6 +1938,31 @@ class TestPluginWiring:
         assert getattr(config, field) is False and getattr(config, other) is True
         toggle()
         assert getattr(config, field) is True
+
+    @pytest.mark.parametrize('function, field', [
+        ('llm_toggle_confirm_tools', 'confirm_tools'),
+        ('llm_toggle_confirm_exec', 'confirm_exec'),
+    ])
+    def test_the_switches_are_in_the_chats_own_palette_too(self, function, field):
+        """Mid-conversation the editor's palette is out of reach: the window
+        lists the toggles itself, and says what it did on its hint bar."""
+        editor = self._register()
+        chat = editor.llm_chat
+        chat.open()
+        chat.handle_key(CTRL_P)
+        labels = palette_labels(chat)
+        assert any(label.startswith('Toggle asking before') for label in labels)
+        chat.palette.close()
+        chat.commands.run(function)
+        assert getattr(chat.config, field) is False
+        chat.draw(editor.stdscr, 24, 80)
+        assert 'run without asking' in editor.stdscr.row(23)
+        assert editor.notifications == []
+
+    def test_a_switch_flipped_from_the_editor_reports_to_the_status_bar(self):
+        editor = self._register()
+        editor.editor_functions['llm_toggle_confirm_tools']()
+        assert editor.notifications == [('Model tool calls: run without asking', False)]
 
     def test_nothing_is_registered_without_a_configured_model(self):
         editor = self._register(model='')

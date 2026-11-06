@@ -5,7 +5,7 @@ Load it with:
 
     dbcls --plugin-dir ./plugins ...
 
-and open it with `Database info` in the editor's command palette (Alt+P).
+and open it with `Database info` in the editor's command palette (Ctrl+P).
 Three sheets, one inside the other:
 
 - the databases: name, how many tables, rows, size on disk, and what the
@@ -64,6 +64,7 @@ from dbcls.pipeline import WATCH_MIN_INTERVAL
 from dbcls.utils import sql_literal
 from dbcls.vd_modules.vd_db_browser import TableOptionsSheet, TableSchemaSheet
 from dbcls.vd_modules.vd_live import LiveRowsSheet
+from dbcls.vd_modules.vd_types import human_bytes, sizetype
 
 #: seconds between refreshes of the running queries when ``--db-info-interval``
 #: is not given
@@ -72,27 +73,11 @@ DEFAULT_INTERVAL = 1.0
 OWN_QUERY_TAG = '/* dbcls:db_info */'
 
 
-# ── Sizes ────────────────────────────────────────────────────────────────────
-
-def human_bytes(n) -> str:
-    """``1.5G``, ``312.0M``, ``880K``, ``512B``."""
-    n = float(n)
-    for unit in ('B', 'K', 'M', 'G', 'T'):
-        if abs(n) < 1024 or unit == 'T':
-            return f'{n:.0f}{unit}' if unit in ('B', 'K') else f'{n:.1f}{unit}'
-        n /= 1024
-    return f'{n:.1f}T'
-
-
-class dbsize(int):
-    """A byte count shown human-readable, sorted as the number it is."""
-
-
-vd.addType(dbsize, icon='B', formatter=lambda fmtstr, value: human_bytes(value),
-           name='dbsize')
+# ── Column types ─────────────────────────────────────────────────────────────
 
 #: column name → VisiData type, for the columns the list sheets build from
-#: their rows (anything else is text)
+#: their rows (anything else is text); sizes are dbcls's `sizetype`
+#: (``1.5G`` on screen, a number underneath)
 SIZE_COLUMNS = ('size', 'data', 'index', 'free', 'uncompressed', 'toast', 'file_size',
                 'memory', 'read_bytes', 'written_bytes')
 COUNT_COLUMNS = ('tables', 'rows', 'parts', 'partitions', 'columns', 'indexes',
@@ -103,7 +88,7 @@ DATE_COLUMNS = ('created', 'updated', 'modified', 'last_vacuum', 'last_analyze',
 
 def _column_type(name: str):
     if name in SIZE_COLUMNS:
-        return dbsize
+        return sizetype
     if name in COUNT_COLUMNS:
         return int
     if name in FLOAT_COLUMNS:

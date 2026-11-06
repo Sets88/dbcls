@@ -37,6 +37,7 @@ from visidata import ColumnItem, Sheet, date, vd
 
 from dbcls.pipeline import WATCH_MIN_INTERVAL
 from dbcls.vd_modules.vd_live import LiveRowsSheet
+from dbcls.vd_modules.vd_types import human_bytes, sizetype
 
 try:
     import psutil
@@ -52,26 +53,6 @@ LIST_ATTRS = ['pid', 'username', 'name', 'cmdline', 'memory_percent',
               'memory_info', 'cpu_percent', 'create_time']
 
 DENIED = 'access denied'
-
-
-# ── Sizes ────────────────────────────────────────────────────────────────────
-
-def human_bytes(n) -> str:
-    """``1.5G``, ``312.0M``, ``880K``, ``512B``."""
-    n = float(n)
-    for unit in ('B', 'K', 'M', 'G', 'T'):
-        if abs(n) < 1024 or unit == 'T':
-            return f'{n:.0f}{unit}' if unit in ('B', 'K') else f'{n:.1f}{unit}'
-        n /= 1024
-    return f'{n:.1f}T'
-
-
-class memsize(int):
-    """A byte count shown human-readable, sorted as the number it is."""
-
-
-vd.addType(memsize, icon='B', formatter=lambda fmtstr, value: human_bytes(value),
-           name='memsize')
 
 
 # ── The list ─────────────────────────────────────────────────────────────────
@@ -136,7 +117,7 @@ Every process of this machine, re-read every {sheet.interval}s. `pid` is the key
         ColumnItem('user'),
         ColumnItem('cmd', width=60),
         ColumnItem('%mem', type=float),
-        ColumnItem('mem', type=memsize),
+        ColumnItem('mem', type=sizetype),
         ColumnItem('%cpu', type=float),
         ColumnItem('started', type=date, fmtstr='%Y-%m-%d %H:%M:%S'),
     ]

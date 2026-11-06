@@ -5,7 +5,7 @@ The command set is written out in:
 * the package docstring (:mod:`dbcls.pipeline`)
 * the in-app help page (``HELP_ENTRIES``)
 * the reference the LLM chat hands the model (``llm/pipeline_reference.md``)
-* the README
+* the user documentation (``docs/pipelines.md``)
 
 That is roughly 1900 lines of prose, all maintained by hand.  Each is written
 for a different reader, so generating them from one source would flatten four
@@ -23,7 +23,7 @@ from dbcls.pipeline.catalog import _BLOCK_CLOSERS, _COMMAND_TABLE, CONTROL_KEYWO
 
 ROOT = Path(__file__).resolve().parent.parent
 REFERENCE = ROOT / 'dbcls' / 'llm' / 'pipeline_reference.md'
-README = ROOT / 'README.md'
+USER_DOCS = ROOT / 'docs' / 'pipelines.md'
 
 #: The commands a user types.  Block closers (.NOFOR, .ENDWHILE, .ENDFN) are
 #: documented in the entry of the command that opens the block, so they are
@@ -53,8 +53,8 @@ class TestEverySourceNamesEveryCommand:
     def test_the_llm_reference(self):
         assert not missing_from(REFERENCE.read_text())
 
-    def test_the_readme(self):
-        assert not missing_from(README.read_text())
+    def test_the_user_docs(self):
+        assert not missing_from(USER_DOCS.read_text())
 
 
 class TestNoSourceInventsOne:

@@ -40,7 +40,7 @@ class TestRemap:
         assert calls == ['newline']
 
     def test_remapped_key_acts_as_target(self):
-        # Tab (36) remapped to Shift+Tab (1412) — the README swap example
+        # Tab (36) remapped to Shift+Tab (1412) — the docs/editor.md swap example
         ed = make_editor()
         calls = bind(ed, 'show_prediction', K(SHIFT_TAB))
         ed.keys.remap_table[K(ord('\t'))] = K(SHIFT_TAB)

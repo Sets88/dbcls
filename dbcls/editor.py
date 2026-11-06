@@ -45,14 +45,14 @@ SHEET_PROMPT_KINDS = SHEET_KINDS
 
 # ─── Key code bitfield ────────────────────────────────────────────────────────
 # Layout (LSB-first):
-#   bit 0  KEY_ESC_BIT    — ESC/Alt prefix was used (e.g. Alt+P)
+#   bit 0  KEY_ESC_BIT    — ESC/Alt prefix was used (e.g. Alt+T)
 #   bit 1  KEY_PREFIX_BIT — tmux-style prefix was used
 #   bit 2+ key value      — Unicode codepoint or curses constant, shifted left 2
 #
 # Examples:
-#   plain 'p'   = K(ord('p'))  = 448
-#   Alt+P       = key_alt(ord('p'))  = 449
-#   Prefix + P  = key_pfx(ord('p')) = 450
+#   plain 't'   = K(ord('t'))  = 464
+#   Alt+T       = key_alt(ord('t'))  = 465
+#   Prefix + T  = key_pfx(ord('t')) = 466
 #   curses UP   = K(curses.KEY_UP)  (curses constant << 2)
 
 KEY_ESC_BIT      = 0b01   # bit 0
@@ -154,14 +154,14 @@ MAC_OPTION_SETTINGS = """\
 MAC_OPTION_HELP = """\
 When the terminal does not send Option as Meta, Option+R types `®`
 instead of sending Alt+R, and no Alt shortcut works — Alt+Enter,
-Alt+P, Alt+T …; the Ctrl ones do.  Switch Option to Meta (Esc+) in
+Alt+T, Alt+E …; the Ctrl ones do.  Switch Option to Meta (Esc+) in
 the terminal settings:
 
 """ + MAC_OPTION_SETTINGS + """
 
 A symbol can also be bound to its Alt combo with `--key-remap` (see
-Key remapping): `"696:457"` makes `®` act as Alt+R, `"3840:449"` `π`
-as Alt+P — only if you never type the character, since it is then a
+Key remapping): `"696:457"` makes `®` act as Alt+R, `"32896:465"` `†`
+as Alt+T — only if you never type the character, since it is then a
 command everywhere, in pasted text included."""
 
 # The key that starts a tmux-style prefix sequence.
@@ -373,14 +373,14 @@ Other
       combination (see the Key remapping help page)
   `Ctrl+K`
       Toggle line mark (highlight)
-  `Ctrl+P`
+  `Ctrl+R`
       Toggle folding of `>>>` ... `<<<` blocks (a folded block
       shows only its `>>>` line, marked with `-` in the gutter)
   `Ctrl+W`
       Toggle word wrap
   `Ctrl+D`
       Toggle debug mode (shows key codes in the status bar)
-  `Alt+P`
+  `Ctrl+P`
       Command palette (run commands by name)
   `F1 / Alt+H`
       This help"""
@@ -3926,7 +3926,7 @@ class Renderer:
         total_lines = len(buf.lines)
         conn = f' {self.status_name} ' if self.status_name else ' '
         right = f' Ln {ln}/{total_lines}  Col {col} '
-        hints = 'Alt+H/F1 Help Alt+P Command palette ^S Save ^Q Quit'
+        hints = 'Alt+H/F1 Help ^P Command palette ^S Save ^Q Quit'
         mid_space = W - len(conn) - len(right)
         if mid_space > len(hints):
             mid = hints.center(mid_space)
@@ -3983,7 +3983,7 @@ class Editor:
         # Watching this document's file on disk — see file_change_pending().
         self._file_change_dismissed: bool = False
         self._file_check_counter: int = 0
-        # >>> ... <<< block folding (Ctrl+P); _fold_key caches the buffer
+        # >>> ... <<< block folding (Ctrl+R); _fold_key caches the buffer
         # version the hidden-row set was computed for.
         self.fold_enabled = fold
         self._fold_key = None
@@ -5156,8 +5156,8 @@ class EditorShell:
         add(Fn.SEARCH,          self._cmd_search,               'Search',                 '^F')
         add(Fn.QUIT,            self._quit,                     'Quit',                   '^Q')
         add(Fn.HELP,            self.show_help,                 'Show help',              'F1 / Alt+H')
-        add(Fn.COMMAND_PALETTE, self._cmd_command_palette,      'Command palette',        'Alt+P')
-        add(Fn.TOGGLE_FOLD,     self._cmd_toggle_fold,          'Toggle >>> <<< block folding', '^P')
+        add(Fn.COMMAND_PALETTE, self._cmd_command_palette,      'Command palette',        '^P')
+        add(Fn.TOGGLE_FOLD,     self._cmd_toggle_fold,          'Toggle >>> <<< block folding', '^R')
         add(Fn.NEXT_TAB,        self._cmd_next_tab,             'Next tab',    'Ctrl+Shift+Right / ^X Right')
         add(Fn.PREV_TAB,        self._cmd_prev_tab,             'Previous tab', 'Ctrl+Shift+Left / ^X Left')
         add(Fn.SWITCH_TAB,      self._cmd_switch_tab,           'Switch to tab…', '^X Down')
@@ -5176,8 +5176,10 @@ class EditorShell:
         add(Fn.HELP,            [K(curses.KEY_F1), key_alt(ord('h'))])
         # KEY_RESIZE is not a command: _dispatch handles it before any widget
         # could take it for a key (see there).
-        add(Fn.COMMAND_PALETTE, key_alt(ord('p')))   # Alt+P
-        add(Fn.TOGGLE_FOLD,     K(ord('\x10')))      # Ctrl+P
+        # Ctrl rather than Alt for the letters: a control code is the same on
+        # every keyboard layout, Alt+P on a Cyrillic one arrives as Alt+з.
+        add(Fn.COMMAND_PALETTE, K(ord('\x10')))      # Ctrl+P
+        add(Fn.TOGGLE_FOLD,     K(ord('\x12')))      # Ctrl+R
         # Ctrl+Shift+arrow as the raw CSI sequence: the terminfo codes for it
         # (kLFT6/kRIT6) already belong to select-word-left/right, so only the
         # escape-sequence form is free.  Ctrl+X arrow always works.

@@ -688,6 +688,44 @@ class TestPipelineMacro:
             assert not vd._nextCommands and vd.currentReplay is None
         ''')
 
+    def test_the_guides_chart_recipe_opens_a_chart_when_replayed(self):
+        """The LLM guide tells the model a chart is an `alt-plot` line whose
+        `input` names the columns; the replay has to feed that input to the
+        prompt and land on the chart sheet."""
+        run_with_real_visidata('''
+            import datetime
+            import visidata
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.dbcls import DbEditorTab
+            from dbcls.pipeline.executor import parse_vd_macro
+            from dbcls.vd_modules.vd_plotter import Plot
+
+            # the guide's recipe: sort so the dominant bucket is series 1, then draw
+            macro = parse_vd_macro(
+                '{"col": "cnt", "longname": "sort-desc"}\\n'
+                '{"longname": "alt-plot", "input": "hour,status,cnt"}')
+            t0 = datetime.datetime(2024, 1, 1)
+            rows = [{'hour': t0 + datetime.timedelta(hours=h), 'status': s, 'cnt': h * 10 + len(s)}
+                    for h in range(3) for s in ('ok', 'err')]   # 'err' always ahead
+            vs = visidata.PyobjSheet('result', source=rows)
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            DbEditorTab._queue_macro(macro)
+            while vd._nextCommands:
+                vd._playNextQueuedCommand(vd.activeSheet)
+                vd.sync()
+            chart = vd.activeSheet
+            assert isinstance(chart, Plot), [s.name for s in vd.sheets]
+            assert chart.source_sheet is vs
+            assert chart.plot_cols == ['hour', 'status', 'cnt']
+            assert vs._plot_cols == 'hour,status,cnt'
+            # the sort took: 'err' is met first, so it is the series the user hides with `1`
+            assert [r['status'] for r in vs.rows][:2] == ['err', 'ok'], [r['cnt'] for r in vs.rows]
+            vd.replay_cancel()
+        ''')
+
     def test_zm_stops_a_recording_and_opens_it_as_a_sheet_vdm_reads(self):
         """`zm` hands the recorded commands to an editable sheet whose stock
         Y / gY / Ctrl+S default to jsonl — the only stock format .VDM reads."""

@@ -378,8 +378,9 @@ def register_reference_tool(registry) -> None:
         'get_visidata_macro_reference',
         'Read the guide to writing VisiData macros for the .VDM pipeline step — '
         'the JSON-lines format, the commands that sort, group, select, hide or '
-        'add columns on the sheet the user lands on, and recipes. Call this '
-        'before putting a .VDM step in a pipeline.',
+        'add columns on the sheet the user lands on, the in-terminal chart '
+        '(alt-plot) and recipes. Call this before putting a .VDM step in a '
+        'pipeline, and whenever the user asks for a chart, plot or graph.',
         {'type': 'object', 'properties': {}},
         get_visidata_macro_reference,
         max_result_chars=None,
