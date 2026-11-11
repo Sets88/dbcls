@@ -220,7 +220,7 @@ class PluginAPI:
     """What a plugin is allowed to do to the running editor.
 
     Everything a plugin needs is reachable from here: its own settings, the DB
-    client, the pipeline variables, the async loop it can submit work to, and
+    client, the shared variables, the async loop it can submit work to, and
     helpers for the things plugins actually do — put a menu on screen, read or
     replace the query under the cursor, transform data on its way through.  It
     is a facade rather than the editor itself so the surface plugins depend on
@@ -250,7 +250,7 @@ class PluginAPI:
 
     @property
     def vars(self) -> dict:
-        """The pipeline variable store (``.SET_VAR`` / ``.GET_VAR``)."""
+        """The shared variable store (``.SET_VAR`` / ``.GET_VAR``)."""
         return self.editor.vars
 
     # ── Tabs ─────────────────────────────────────────────────────────────────

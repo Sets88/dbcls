@@ -53,7 +53,7 @@ Looking at the database:
   query reads from one database and writes to another. Only reach for it when
   the task really does span two connections, and check the schema on both tabs
   first.
-- The user may have results stashed in pipeline variables from an earlier run.
+- The user may have results stashed in shared variables from an earlier run.
   get_vars_keys lists them, get_var reads one. Check there when they refer to
   something they saved, and before writing a pipeline that reads a variable.
 

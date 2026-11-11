@@ -34,6 +34,7 @@ Every loop iteration's rows are merged, so the pipeline ends with one result set
 - Steps run left to right; each one gets the previous step's output as `data`.
 - **Data crosses `|` exactly as produced.** A scalar stays a scalar, a nested list keeps its shape, `None` / `0` / `''` pass through. Rows are only wrapped into `{'value': …}` dicts at display points (the final result, `.SHEET`, `.VIEW`, `sselect()`), so only `.RUN` / `.URUN` / `.FOR_RUN` guarantee a list of dicts.
 - Anything in `{{…}}` is Python, evaluated with the current row's columns, `data`, `_vars`, the loop items and all the [helpers](#helpers-in-python-steps-and-templates) in scope.
+- The same `{{…}}` works in the `E` query of the table browser (`Sample data` / `Edit`), with `_vars`, `get_var`, `set_var` and the SQL helpers but no interactive prompts — see [Templates in the table browser query](visidata.md#templates-in-the-table-browser-query).
 - A step that fails aborts the run — unless it is marked as a [soft step](#soft-steps-) with `?`.
 - `Esc` cancels a running pipeline at any point (`q` inside a VisiData prompt sheet).
 
@@ -74,7 +75,7 @@ A pipeline may span several lines: keep a trailing `|` on every line except the 
 | `.SET_VAR KEY [code]` | Store data (or the result of `code`) into a named variable. Data passes through unchanged, so `.SET_VAR` can appear mid-pipeline. With no `code` and no input data, deletes `KEY`. |
 | `.GET_VAR KEY` | Inject a stored variable into the pipeline. If input data exists, the variable's rows are appended after it. A missing `KEY` contributes nothing (no error). |
 | `.VOID` | Discard input data. The next step starts fresh with no data (as if it were the first step). |
-| `.VARS` | Open all stored pipeline variables as an **editable** `key` / `value` sheet, then return them as rows. Blocking like `.VIEW`, and it opens even when there are no variables yet; as the last step the rows are not opened a second time. Edits hit the store immediately: `e` renames the key or sets the value (as a string), `z=` / `g=` set the value to the result of a Python expression, `a` adds a variable once its key is filled in, `d` / `gd` delete, `U` undoes. |
+| `.VARS` | Open all shared variables as an **editable** `key` / `value` sheet, then return them as rows. Blocking like `.VIEW`, and it opens even when there are no variables yet; as the last step the rows are not opened a second time. Edits hit the store immediately: `e` renames the key or sets the value (as a string), `z=` / `g=` set the value to the result of a Python expression, `a` adds a variable once its key is filled in, `d` / `gd` delete, `U` undoes. |
 | `.SHEET NAME` | Create a VisiData sheet named `NAME` (a template) from the input rows and pass the data through unchanged. The sheet is built in the background as the step runs — it never blocks the pipeline and it survives a cancelled run; reach it mid-run with VisiData's `Shift+S` from a picker sheet, or with `Alt+S` afterwards. The whole stack opens when the pipeline finishes. |
 | `.VIEW NAME` | Like `.SHEET`, but **blocking**: the sheet is shown immediately and the pipeline waits until it is closed with `q`. Use it inside a `.WHILE` loop or a `.FN` function to see rows at the point they are produced. Closing the sheet is not an answer — it never cancels the pipeline. As the last step the rows are not opened a second time. |
 | `.WATCH [INTERVAL]` | Like `.VIEW`, but **live**: everything to the left of the step **in the same block** is re-run every `INTERVAL` seconds (default `1`) and merged into the sheet. `INTERVAL` is the only argument — the sheet is always named `watch`. It is a row picker too: `Enter` hands the row under the cursor to the next step, `g Enter` the marked ones, while `q` cancels the run. `gf` on the sheet filters what is shown by a regex on the current column. See below. |
@@ -106,7 +107,7 @@ unchanged, and the name is a template like every other argument:
 .CONN "{{choose('Where', ['dev', 'prod'])}}" | .RUN "SELECT version()"
 ```
 
-Pipeline variables (`.SET_VAR` / `.GET_VAR`) are shared by every tab, which is
+The shared variables (`.SET_VAR` / `.GET_VAR`) are one store for every tab, which is
 the other way to carry a result across.
 
 ## Live sheets (`.WATCH`)
@@ -297,8 +298,8 @@ On the VisiData sheets `Enter` always answers with the row under the cursor; `ss
 | Helper | Effect |
 |--------|--------|
 | `result(val)` | Set the step's output value (the last call wins). Lets a multi-statement snippet return a value, e.g. `.SLEEP "from random import randint; result(randint(1, 10))"`. Inside a `{{expr}}` placeholder it sets what the placeholder renders to — and since `result(val)` returns `val`, it chains with other calls: `.RUN "SHOW TABLES" \| .FOR_RUN "SELECT * FROM {{result(_0) and info(_0)}}"` substitutes `_0` and shows it in a popup. |
-| `set_var(name, value)` | Store `value` in the shared pipeline variables under `name` (same store as `.SET_VAR` / `gT` / `gzT`). |
-| `get_var(name, default=None)` | Return the pipeline variable `name` (`default` if absent). |
+| `set_var(name, value)` | Store `value` in the shared variables under `name` (same store as `.SET_VAR` / `gT` / `gzT`). |
+| `get_var(name, default=None)` | Return the shared variable `name` (`default` if absent). |
 | `info(msg)` | Show `msg` in a popup without halting execution; calling it again updates the text. `Esc` on the popup stops the pipeline; `Backspace` hides it until the next `info()` call. The popup stays after the pipeline finishes until dismissed. |
 | `warn(msg)` | Like `info()`, but pause the pipeline until the popup is closed: `Esc` cancels the pipeline (no result is shown), any other closing key resumes it. |
 | `br()` | Break out of the current `.FOR` / `.WHILE` loop. A `result(...)` set just before `br()` becomes the loop's result. Inside a `.FN` function with no loop of its own it returns from the function. |
@@ -323,7 +324,7 @@ Dismissing any of these prompts with `Esc` (`q` for the VisiData sheets, since `
 | `{{_ii}}`, `{{_iii}}` | Items of nested `.FOR` loops (second, third level, …) |
 | `{{row['any-name']}}` | Full row dict access — use for names with spaces or hyphens |
 | `{{price:.2f}}` | Python format spec support |
-| `{{_vars['key']}}` | Value of a pipeline variable stored by `.SET_VAR` |
+| `{{_vars['key']}}` | Value of a shared variable stored by `.SET_VAR` |
 | `{{result(val)}}` | Renders `val` — a placeholder runs the same Python a `.PY` step does, so `result()` sets what it substitutes to. Useful when the expression also does something else: `{{result(_0) and info(_0)}}`. Statements work too (`{{x = _0.strip(); result(x)}}`); code that never calls `result()` renders as an empty string. |
 
 ## Helper Functions

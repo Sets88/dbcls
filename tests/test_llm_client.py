@@ -11,9 +11,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from dbcls.llm.client import (
+    EXTEND,
+    FINISH,
+    STOP,
+    Decision,
     LLMClient,
     LLMConfig,
     LLMError,
+    ToolBudgetSpent,
     ToolRegistry,
     truncate_result,
 )
@@ -102,12 +107,21 @@ class TestConfig:
         assert built.max_tokens == LLMConfig().max_tokens
 
     def test_from_mapping_casts_numbers(self):
-        built = LLMConfig.from_mapping({'max_tokens': '100', 'timeout': '30'})
-        assert (built.max_tokens, built.timeout) == (100, 30.0)
+        built = LLMConfig.from_mapping({'max_tokens': '100', 'timeout': '30',
+                                        'max_tool_rounds': '25'})
+        assert (built.max_tokens, built.timeout, built.max_tool_rounds) == (100, 30.0, 25)
 
     def test_from_mapping_rejects_a_bad_number(self):
         with pytest.raises(LLMError, match='must be a number'):
             LLMConfig.from_mapping({'max_tokens': 'lots'})
+        with pytest.raises(LLMError, match='max-tool-rounds must be a number'):
+            LLMConfig.from_mapping({'max_tool_rounds': 'many'})
+
+    def test_tool_rounds_default_and_lower_bound(self):
+        assert LLMConfig().max_tool_rounds == 10
+        assert LLMConfig.from_mapping({'max_tool_rounds': 0}).max_tool_rounds == 0
+        with pytest.raises(LLMError, match='0 .no limit. or more'):
+            LLMConfig.from_mapping({'max_tool_rounds': -1})
 
     @pytest.mark.parametrize('value, expected', [
         (None, False), ('', False), (False, False), ('0', False), ('no', False),
@@ -137,6 +151,9 @@ class TestConfig:
         assert LLMConfig.from_mapping({'confirm_tools': False}).confirm_tools is True
 
 
+DENIED = Decision(allowed=False, refusal='Denied: the user said no')
+
+
 class TestApproval:
     """confirm_tools / confirm_exec: the client asks before a tool that needs
     approval, by the switch for its kind."""
@@ -164,22 +181,22 @@ class TestApproval:
         return ran, asked, result['content']
 
     def test_off_nothing_is_asked(self, endpoint):
-        ran, asked, _ = self._client(endpoint, confirm=False, answer='Denied: no')
+        ran, asked, _ = self._client(endpoint, confirm=False, answer=DENIED)
         assert ran == [True] and asked == []
 
     def test_on_an_allowed_call_runs(self, endpoint):
-        ran, asked, content = self._client(endpoint, confirm=True, answer=None)
+        ran, asked, content = self._client(endpoint, confirm=True, answer=Decision())
         assert asked == [('list_tables', {})]
         assert ran == [True] and 'users' in content
+        assert json.loads(content) == {'tables': ['users']}     # not wrapped
 
     def test_on_a_refusal_is_the_result_and_the_tool_never_runs(self, endpoint):
-        ran, _asked, content = self._client(endpoint, confirm=True,
-                                            answer='Denied: the user said no')
+        ran, _asked, content = self._client(endpoint, confirm=True, answer=DENIED)
         assert ran == []
         assert content == 'Denied: the user said no'
 
     def test_an_exempt_tool_is_never_asked_about(self, endpoint):
-        ran, asked, _ = self._client(endpoint, confirm=True, answer='Denied: no',
+        ran, asked, _ = self._client(endpoint, confirm=True, answer=DENIED,
                                      needs_approval=False)
         assert ran == [True] and asked == []
 
@@ -188,29 +205,70 @@ class TestApproval:
 
     def test_turning_off_tool_questions_still_asks_about_exec(self, endpoint):
         ran, asked, _ = self._client(endpoint, confirm=False, executes='sql',
-                                     answer='Denied: no')
+                                     answer=DENIED)
         assert ran == [] and asked == [('list_tables', {})]
 
     def test_turning_off_exec_questions_leaves_the_other_tools_asked(self, endpoint):
         ran, asked, _ = self._client(endpoint, confirm=True, confirm_exec=False,
-                                     answer='Denied: no')
+                                     answer=DENIED)
         assert ran == [] and asked == [('list_tables', {})]
 
     def test_turning_off_exec_questions_runs_sql_unasked(self, endpoint):
         ran, asked, _ = self._client(endpoint, confirm=True, confirm_exec=False,
-                                     executes='sql', answer='Denied: no')
+                                     executes='sql', answer=DENIED)
         assert ran == [True] and asked == []
 
     def test_edited_arguments_are_what_runs_and_the_model_is_told(self, endpoint):
         ran, _asked, content = self._client(
             endpoint, confirm=True, executes='sql',
             arguments={'sql': 'SELECT * FROM t'},
-            answer={'sql': 'SELECT * FROM t WHERE id = 1'})
+            answer=Decision(arguments={'sql': 'SELECT * FROM t WHERE id = 1'}))
         assert ran == [{'sql': 'SELECT * FROM t WHERE id = 1'}]
         result = json.loads(content)
         assert result['edited_by_user'] is True
         assert result['ran_with'] == {'sql': 'SELECT * FROM t WHERE id = 1'}
         assert result['result'] == {'tables': ['users']}
+        assert 'user_says' not in result
+
+    def test_a_note_rides_along_with_the_result(self, endpoint):
+        ran, _asked, content = self._client(
+            endpoint, confirm=True, answer=Decision(note='the ids are strings'))
+        assert ran == [True]
+        result = json.loads(content)
+        assert result == {'user_says': 'the ids are strings',
+                          'result': {'tables': ['users']}}
+
+    def test_a_note_rides_along_with_a_refusal(self, endpoint):
+        ran, _asked, content = self._client(
+            endpoint, confirm=True,
+            answer=Decision(allowed=False, refusal='Denied: no',
+                            note='use the orders table instead'))
+        assert ran == []
+        assert content == 'Denied: no\nThe user says: use the orders table instead'
+
+    def test_a_note_on_an_edited_call_keeps_both(self, endpoint):
+        _ran, _asked, content = self._client(
+            endpoint, confirm=True, executes='sql', arguments={'sql': 'SELECT 1'},
+            answer=Decision(arguments={'sql': 'SELECT 2'}, note='two, not one'))
+        result = json.loads(content)
+        assert result['edited_by_user'] is True
+        assert result['user_says'] == 'two, not one'
+        assert result['result'] == {'tables': ['users']}
+
+    def test_a_failing_tool_still_carries_the_note(self, endpoint):
+        async def boom():
+            raise RuntimeError('gone')
+
+        async def approve(name, arguments):
+            return Decision(note='careful')
+
+        tools = ToolRegistry()
+        tools.add('boom', 'fails', {'type': 'object'}, boom)
+        endpoint(tool_answer('boom', {}), text_answer('ok'))
+        appended = asyncio.run(LLMClient(config(), tools, approve=approve).run([]))
+        result = json.loads(next(m for m in appended if m.get('role') == 'tool')['content'])
+        assert result['user_says'] == 'careful'
+        assert result['result'].startswith('Error: RuntimeError')
 
     def test_approval_kinds(self):
         tools = ToolRegistry()
@@ -338,18 +396,249 @@ class TestToolLoop:
         assert calls == []            # the tool was never reached
         assert 'cannot parse arguments' in [m for m in appended if m.get('role') == 'tool'][0]['content']
 
-    def test_the_loop_is_bounded(self, endpoint):
-        client, fake, _calls = self._client(
-            endpoint,
+class TestToolBudget:
+    """After max_tool_rounds rounds the user decides: more rounds, have the
+    model finish with what it has, or stop.  The model hears nothing unless
+    the answer is FINISH."""
+
+    def _client(self, endpoint, answer, *payloads, finishing=()):
+        calls = []
+        asked = []
+
+        async def list_tables(database=None):
+            calls.append('list_tables')
+            return {'tables': ['users']}
+
+        async def propose_query(query):
+            calls.append('propose_query')
+            return 'shown'
+
+        async def extend(used, more):
+            asked.append((used, more))
+            return answer
+
+        tools = ToolRegistry()
+        tools.add('list_tables', 'lists tables', {'type': 'object', 'properties': {}}, list_tables)
+        tools.add('propose_query', 'hands over',
+                  {'type': 'object', 'properties': {'query': {'type': 'string'}}}, propose_query)
+        fake = endpoint(*payloads)
+        return LLMClient(config(max_tool_rounds=2), tools, extend=extend), fake, calls, asked
+
+    def test_the_user_is_asked_once_the_rounds_are_spent(self, endpoint):
+        client, fake, calls, asked = self._client(
+            endpoint, EXTEND,
             tool_answer('list_tables', {}),
             tool_answer('list_tables', {}),
-            text_answer('finally'),
+            tool_answer('list_tables', {}),
+            text_answer('done'),
         )
-        appended = asyncio.run(client.run([], max_rounds=2))
-        # Two tool rounds, then one last request with the tools withheld
-        assert len(fake.requests) == 3
-        assert 'tools' not in fake.requests[2]['body']
-        assert appended[-1]['content'] == 'finally'
+        appended = asyncio.run(client.run([]))
+        assert asked == [(2, 2)]
+        assert calls == ['list_tables'] * 3
+        assert appended[-1]['content'] == 'done'
+        # Nothing was said to the model: only its own calls and their results
+        assert all(m['role'] in ('assistant', 'tool') for m in appended[:-1])
+
+    def test_extending_asks_again_after_as_many_rounds_more(self, endpoint):
+        client, _fake, _calls, asked = self._client(
+            endpoint, EXTEND, *([tool_answer('list_tables', {})] * 5), text_answer('done'),
+        )
+        asyncio.run(client.run([]))
+        assert asked == [(2, 2), (4, 2)]
+
+    def test_no_limit_with_zero(self, endpoint):
+        client, _fake, calls, asked = self._client(
+            endpoint, STOP, *([tool_answer('list_tables', {})] * 6), text_answer('done'),
+        )
+        asyncio.run(client.run([], max_rounds=0))
+        assert asked == []
+        assert len(calls) == 6
+
+    def test_stopping_raises_and_leaves_every_call_answered(self, endpoint):
+        client, fake, _calls, _asked = self._client(
+            endpoint, STOP,
+            tool_answer('list_tables', {}, call_id='c1'),
+            tool_answer('list_tables', {}, call_id='c2'),
+        )
+        messages = [{'role': 'user', 'content': 'tables?'}]
+        with pytest.raises(ToolBudgetSpent, match='2 rounds'):
+            asyncio.run(client.run(messages))
+        assert len(fake.requests) == 2
+        answered = {m.get('tool_call_id') for m in messages if m.get('role') == 'tool'}
+        assert answered == {'c1', 'c2'}
+
+    def test_without_a_callback_the_request_stops(self, endpoint):
+        client, _fake, _calls, _asked = self._client(
+            endpoint, EXTEND, tool_answer('list_tables', {}), tool_answer('list_tables', {}),
+        )
+        client.extend = None
+        with pytest.raises(ToolBudgetSpent):
+            asyncio.run(client.run([]))
+
+    def test_finishing_tells_the_model_and_refuses_the_lookups(self, endpoint):
+        client, fake, calls, _asked = self._client(
+            endpoint, FINISH,
+            tool_answer('list_tables', {}),
+            tool_answer('list_tables', {}),
+            tool_answer('list_tables', {}, call_id='c3'),        # refused
+            tool_answer('propose_query', {'query': 'SELECT 1'}, call_id='c4'),
+            text_answer('here'),
+        )
+        messages = [{'role': 'user', 'content': 'tables?'}]
+        appended = asyncio.run(client.run(messages, require_tool='propose_query'))
+        # The model was told, in a user turn, from the third request on
+        nudge = fake.requests[2]['body']['messages'][-1]
+        assert nudge['role'] == 'user'
+        assert 'budget for this request is spent' in nudge['content']
+        assert 'propose_query' in nudge['content']
+        assert fake.requests[3]['body']['messages'][-3] == nudge
+        seen = next(m for m in fake.requests[3]['body']['messages']
+                    if m.get('tool_call_id') == 'c3')
+        assert seen['content'].startswith('Refused:')
+        # ... and once the request is over the refusal no longer says "closed":
+        # the next question in the chat starts with the lookups open
+        refused = next(m for m in appended if m.get('tool_call_id') == 'c3')
+        assert 'list_tables is available again' in refused['content']
+        assert refused in messages
+        assert calls == ['list_tables', 'list_tables', 'propose_query']
+        # The tools stayed in every request — a history with tool calls in it
+        # is rejected by some endpoints when their definitions are missing
+        assert all('tools' in r['body'] for r in fake.requests)
+        assert appended[-1]['content'] == 'here'
+
+    def test_a_hand_over_on_the_last_round_is_not_followed_by_the_question(self, endpoint):
+        """The answer is in: the model gets one more round to say so."""
+        client, _fake, calls, asked = self._client(
+            endpoint, STOP,
+            tool_answer('list_tables', {}),
+            tool_answer('propose_query', {'query': 'SELECT 1'}),
+            text_answer('done'),
+        )
+        appended = asyncio.run(client.run([], require_tool='propose_query'))
+        assert asked == []
+        assert calls == ['list_tables', 'propose_query']
+        assert appended[-1]['content'] == 'done'
+
+    def test_a_hand_over_that_failed_earns_no_extra_round(self, endpoint):
+        """Arguments that do not parse handed nothing over: the user decides,
+        as after any other round."""
+        broken = tool_answer('propose_query', {})
+        broken['choices'][0]['message']['tool_calls'][0]['function']['arguments'] = '{"query": '
+        client, fake, calls, asked = self._client(
+            endpoint, STOP,
+            tool_answer('list_tables', {}),
+            broken,
+            tool_answer('list_tables', {}),
+        )
+        with pytest.raises(ToolBudgetSpent):
+            asyncio.run(client.run([], require_tool='propose_query'))
+        assert asked == [(2, 2)]
+        assert calls == ['list_tables']
+        assert len(fake.requests) == 2
+
+    def test_a_hand_over_whose_handler_raised_earns_no_extra_round(self, endpoint):
+        client, fake, _calls, asked = self._client(
+            endpoint, STOP,
+            tool_answer('list_tables', {}),
+            tool_answer('propose_query', {'query': 'SELECT 1', 'nope': 1}),   # TypeError
+            tool_answer('list_tables', {}),
+        )
+        with pytest.raises(ToolBudgetSpent):
+            asyncio.run(client.run([], require_tool='propose_query'))
+        assert asked == [(2, 2)]
+        assert len(fake.requests) == 2
+
+    def test_the_round_after_a_hand_over_is_granted_once(self, endpoint):
+        client, _fake, calls, asked = self._client(
+            endpoint, STOP,
+            tool_answer('list_tables', {}),
+            tool_answer('propose_query', {'query': 'SELECT 1'}),
+            tool_answer('propose_query', {'query': 'SELECT 2'}),
+        )
+        with pytest.raises(ToolBudgetSpent):
+            asyncio.run(client.run([], require_tool='propose_query'))
+        assert asked == [(3, 2)]
+        assert calls == ['list_tables', 'propose_query', 'propose_query']
+
+    def test_the_finish_notice_does_not_outlive_the_request(self, endpoint):
+        """It is about this request's budget: left in the history, the next
+        question would be answered with the lookups "closed"."""
+        client, _fake, _calls, _asked = self._client(
+            endpoint, FINISH,
+            tool_answer('list_tables', {}),
+            tool_answer('list_tables', {}),
+            text_answer('here'),
+        )
+        messages = [{'role': 'user', 'content': 'tables?'}]
+        appended = asyncio.run(client.run(messages))
+        assert not any(m['role'] == 'user' for m in appended)
+        assert [m['role'] for m in messages] == \
+            ['user', 'assistant', 'tool', 'assistant', 'tool', 'assistant']
+        assert messages[1:] == appended
+
+    def test_the_finish_notice_is_gone_after_a_cancel_too(self, endpoint):
+        client, _fake, _calls, _asked = self._client(
+            endpoint, FINISH,
+            tool_answer('list_tables', {}),
+            tool_answer('list_tables', {}),
+        )
+        messages = [{'role': 'user', 'content': 'tables?'}]
+        original = client.complete
+
+        async def complete(msgs, **kwargs):
+            if any(m['role'] == 'user' and 'budget' in m['content'] for m in msgs):
+                raise asyncio.CancelledError()
+            return await original(msgs, **kwargs)
+
+        client.complete = complete
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(client.run(messages))
+        assert not any('budget for this request' in (m.get('content') or '')
+                       for m in messages)
+
+    def test_the_last_closing_round_forbids_calls(self, endpoint):
+        client, fake, _calls, _asked = self._client(
+            endpoint, FINISH,
+            tool_answer('list_tables', {}),
+            tool_answer('list_tables', {}),
+            tool_answer('list_tables', {}, call_id='c3'),
+            tool_answer('list_tables', {}, call_id='c4'),
+            tool_answer('list_tables', {}, call_id='c5'),
+        )
+        appended = asyncio.run(client.run([]))
+        assert [r['body']['tool_choice'] for r in fake.requests] == \
+            ['auto', 'auto', 'auto', 'auto', 'none']
+        # It would not stop calling: the run ends with every call answered
+        assert appended[-1]['tool_call_id'] == 'c5'
+
+    def test_an_endpoint_that_refuses_tool_choice_none_gets_an_ordinary_round(self, endpoint):
+        """Some endpoints know only 'auto' and a named function.  This is the
+        round meant to salvage the answer, so it must not die on that."""
+        client, fake, calls, _asked = self._client(
+            endpoint, FINISH,
+            tool_answer('list_tables', {}),
+            tool_answer('list_tables', {}),
+            tool_answer('list_tables', {}, call_id='c3'),
+            tool_answer('list_tables', {}, call_id='c4'),
+            {'error': {'message': "tool_choice 'none' is not supported"}},
+            tool_answer('list_tables', {}, call_id='c5'),   # still refused
+        )
+        appended = asyncio.run(client.run([]))
+        assert [r['body']['tool_choice'] for r in fake.requests] == \
+            ['auto', 'auto', 'auto', 'auto', 'none', 'auto']
+        assert calls == ['list_tables', 'list_tables']
+        assert appended[-1]['tool_call_id'] == 'c5'
+        # refused, and reworded once the request was over
+        assert 'list_tables is available again' in appended[-1]['content']
+
+    def test_the_budget_event_reports_the_answer(self, endpoint):
+        client, _fake, _calls, _asked = self._client(
+            endpoint, EXTEND,
+            tool_answer('list_tables', {}), tool_answer('list_tables', {}), text_answer('ok'),
+        )
+        events = []
+        asyncio.run(client.run([], on_event=lambda kind, d: events.append((kind, d))))
+        assert ('budget', {'rounds': 2, 'answer': EXTEND}) in events
 
 
 class TestRequiredTool:
@@ -692,7 +981,7 @@ class TestPipelineReferenceTool:
 
 
 class TestVarsTools:
-    """The pipeline variable store, as the model sees it: names first, then one
+    """The shared variable store, as the model sees it: names first, then one
     value at a time, and never more of a value than fits in a request."""
 
     def _tools(self, **variables):

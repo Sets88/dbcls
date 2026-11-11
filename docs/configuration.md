@@ -37,6 +37,7 @@ Plugins add options of their own — they show up in `dbcls --help` alongside th
 | `--llm-model` | Model name, e.g. `qwen2.5-coder` or `anthropic/claude-sonnet-4` |
 | `--llm-max-tokens` | Maximum tokens in a reply (default `131072`) |
 | `--llm-timeout` | Seconds to wait for a reply (default `600`) |
+| `--llm-max-tool-rounds` | Rounds of tool calls one request may make before you are asked whether to allow as many again, have the model finish, or stop (default `10`; `0` for no limit — see [When it keeps looking things up](llm.md#when-it-keeps-looking-things-up)) |
 | `--llm-no-confirm-tools` | Run the model's lookups without asking first; does not cover `run_sql` (see [Approving tool calls](llm.md#approving-tool-calls)) |
 | `--llm-no-confirm-exec` | Run code the model writes (`run_sql`, a plugin's shell command) without asking first |
 

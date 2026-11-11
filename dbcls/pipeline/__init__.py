@@ -120,7 +120,7 @@ Pipeline commands
     the first step in the pipeline).
 
 .VARS
-    Open all stored pipeline variables as an editable {key, value} sheet
+    Open all shared variables as an editable {key, value} sheet
     (blocking, like .VIEW; it opens even when there are none yet), then
     return them as a list of {key, value} dicts.
 

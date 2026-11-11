@@ -76,15 +76,18 @@ when you run it.
 Every call is put to you first: `Allow`, `Allow for this chat` (not asked again
 for that tool until `Ctrl+N`) or `Deny`. A refusal — `Deny` or `Esc` — is handed
 to the model as the call's result, so it knows you said no and carries on
-without it. Reading the pipeline or `.VDM` reference, asking you a question and
-handing over its answer are never asked about.
+without it. `Allow with a note…` and `Deny with a note…` do the same and open a
+line to type a word to the model into — "the ids are strings", "use the orders
+table instead" — which goes along with the result or the refusal. Reading the
+pipeline or `.VDM` reference, asking you a question and handing over its
+answer are never asked about.
 
 A tool that runs code the model wrote — `run_sql`, or a plugin's, a shell
 command say — is asked about differently: the title shows the code, and the
-choices are `Allow`, `Edit…` and `Deny`. `Edit…` opens the code in place of the
-Result pane — make a query cheaper (an indexed column in the `WHERE`, a
-`LIMIT`), then `Alt+Enter` runs your version and the model is told it was
-edited; `Esc` there refuses it.
+choices are `Allow`, `Edit…`, `Deny` and the two with a note. `Edit…` opens the
+code in place of the Result pane — make a query cheaper (an indexed column in
+the `WHERE`, a `LIMIT`), then `Alt+Enter` runs your version and the model is
+told it was edited; `Esc` there refuses it.
 
 Two separate switches turn the questions off. `--llm-no-confirm-tools` (or
 `DBCLS_LLM_NO_CONFIRM_TOOLS=1`, or `"no_confirm_tools": true` in the `"llm"`
@@ -94,6 +97,17 @@ leaves the code-running ones alone. Only `--llm-no-confirm-exec`
 without asking. `Toggle asking before the model's tool calls` and `Toggle
 asking before the model runs code (SQL, ...)` switch them mid-conversation —
 from the chat's palette (`Ctrl+P` in the window) or the editor's.
+
+A request that keeps looking things up is not cut off behind your back: after
+`--llm-max-tool-rounds` rounds of tool calls (`DBCLS_LLM_MAX_TOOL_ROUNDS`,
+`"max_tool_rounds"`; 10 by default, 0 for no limit) you are asked whether to
+allow as many again, to tell the model its budget is spent so it finishes with
+what it has, or to stop the request. The model hears nothing of the limit
+unless you choose the second — told its budget is short, a model rushes to a
+poor answer. Told so, it gets two more rounds in which only `propose_query`
+and `answer_question` still run (every other call is refused), then one in
+which no call is accepted at all; the notice is dropped from the conversation
+once the request is over, so the next question starts with the lookups open.
 
 When a choice is yours to make rather than its to guess — which of two tables
 you meant, whether you want the rows or a count — it can put the question to
@@ -158,6 +172,10 @@ def setup(setup):
         help=f'maximum tokens in a reply (default {LLMConfig().max_tokens})')
     setup.add_argument('--llm-timeout', dest='llm_timeout', default='',
         help=f'seconds to wait for a reply (default {LLMConfig().timeout:g})')
+    setup.add_argument('--llm-max-tool-rounds', dest='llm_max_tool_rounds', default='',
+        help='rounds of tool calls one request may make before you are asked '
+             'whether to allow as many again, have the model finish with what '
+             f'it has, or stop (default {LLMConfig().max_tool_rounds}; 0 for no limit)')
     # Asking is the default, so the options turn it off.  They are flags
     # rather than on/off values on purpose: an explicit False from the command
     # line cannot override the config file (see PluginManager.configure).

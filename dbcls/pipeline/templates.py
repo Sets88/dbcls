@@ -249,7 +249,8 @@ def _build_context(row: Optional[dict], data: Optional[list], extra: Optional[di
     }
 
 
-def render_template(template: str, row: dict = None, data: Optional[list] = None) -> str:
+def render_template(template: str, row: dict = None, data: Optional[list] = None,
+                    extra: Optional[dict] = None) -> str:
     """Render a pipeline template by evaluating every ``{{expr}}`` placeholder.
 
     The standalone form, for code that holds no running pipeline — a plugin
@@ -275,6 +276,10 @@ def render_template(template: str, row: dict = None, data: Optional[list] = None
     When *row* is omitted (or ``None``) only ``data`` and ``sql_in_list`` are
     in scope — useful for SQL-level templates like ``.RUN``.
 
+    *extra* adds names of the caller's own on top of all that (and wins over
+    them) — how the table browser's ``E`` query gets ``_vars`` / ``get_var``
+    / ``set_var`` without a running pipeline.
+
     Examples::
 
         render_template('{{name.upper()}}', {'name': 'alice'})
@@ -289,7 +294,7 @@ def render_template(template: str, row: dict = None, data: Optional[list] = None
         render_template("SELECT * FROM t WHERE id IN {{sql_in_list(data)}}", data=[1, 2])
         # → "SELECT * FROM t WHERE id IN (1,2)"
     """
-    return _render(template, _build_context(row, data))
+    return _render(template, _build_context(row, data, extra))
 
 
 def normalize_to_dicts(value: Any) -> List[dict]:

@@ -22,10 +22,10 @@ To keep sheets open when navigating between them, quit VisiData with `Ctrl+q` in
 | `g#` | Set the type of the current column to URL. The cells keep displaying the URL unchanged, but `(` expands the column into `schema`, `domain`, `port`, `path`, `query`, `anchor`, and `(` on the resulting `query` column expands it further into one column per query parameter, by name (a parameter repeated in the URL becomes a list). Values that are not URL-shaped display as a typing error, and editing such a cell still writes the URL text back to the database. The parts are editable too, the same way as JSON's: `e` on a column expanded with `(`, or `z Enter` to open the six parts (`d` clears one; they cannot be renamed or added) and `Enter` on `query` for its parameters (`e` on `key` renames, `a` / `d` add / delete). Only the changed part is replaced in the URL text — user info, the case of the host and the encoding of the other parameters stay as they were |
 | `g$` | Set the type of the current column to byte size (the counterpart of visidata's `$` for currency; `type-size` by name). Cells display human-readable (`512B`, `880K`, `1.5G`, 1024-based) but sort, sum (`+`), plot and `describe` as the number of bytes. Whatever a driver or a text column hands over is accepted: an int, a float, a `Decimal`, a numeric string, or a size already written for humans (`1.5G`, `512B`, `2 MiB`, `3kb`). Anything else, a blank cell included, shows as a typing error, like a bad `@` date. `Database info` and the process manager type their size columns this way, and a `.VDM` step can do the same for a query result |
 | `gp` | Draw a chart from the columns you type at the prompt, `Tab` completes column names (see [Plotting](#plotting) below) |
-| `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only); `Tab` / `Shift+Tab` complete column names, and the matches show up in a menu above the prompt |
+| `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only); `Tab` / `Shift+Tab` complete column names, and the matches show up in a menu above the prompt. `{{expr}}` in the query is rendered as in a pipeline — see [Templates in the table browser query](#templates-in-the-table-browser-query) |
 | `gE` | On a `Sample data` sheet: open the rows loaded so far on an edit sheet (see [Editing Table Data](editor.md#editing-table-data)) without re-reading them from the database |
-| `gT` | Save current or selected rows to pipeline vars |
-| `gzT` | Save values of current column from selected rows to pipeline vars as a flat list |
+| `gT` | Save current or selected rows to shared vars |
+| `gzT` | Save values of current column from selected rows to shared vars as a flat list |
 | `zm` | Open a macro as a sheet of its commands, for a pipeline's `.VDM`: while recording (`m`) it stops the recording — no key binding asked, nothing saved — otherwise it reopens the last macro; on the macros sheet (`gm`) it opens the one under the cursor. The commands are edited with `e`, `d`, `Shift+J` / `Shift+K`; `Y` / `gs gY` copy the current / selected ones and `Ctrl+S` saves them, and on this sheet the format offered is `jsonl` — exactly what `.VDM` reads (visidata's default `tsv`, or `json`'s array, it does not). The sheet holds copies: editing it leaves the recorded macro as it was |
 | `Alt+↑` / `Alt+↓` | Jump 5 rows up / down |
 | `Alt+←` / `Alt+→` | Jump 3 columns left / right |
@@ -142,6 +142,27 @@ The following functions are available in visidata expressions (press `=` to crea
 | `ts_to_dt_utc(ts)` | Convert Unix timestamp (str/float/int) to UTC datetime |
 | `dt_to_start_of_interval(dt, interval)` | Round a datetime to the start of an interval (interval in seconds) |
 | `ts_to_start_of_interval(ts, interval)` | Round a Unix timestamp to the start of an interval (interval in seconds), preserving input type |
-| `get_var(key)` | Read a pipeline variable saved by `.SET_VAR`, `gT` or `gzT` |
+| `get_var(key)` | Read a shared variable saved by `.SET_VAR`, `gT` or `gzT` |
 
-Pipeline variables tie the editor and VisiData together: rows saved with `gT` / `gzT` in VisiData (or `.SET_VAR` in a pipeline) are available both as `_vars['key']` in pipelines and as `get_var('key')` in visidata expressions.
+Shared variables tie the editor and VisiData together: rows saved with `gT` / `gzT` in VisiData (or `.SET_VAR` in a pipeline) are available both as `_vars['key']` in pipelines and as `get_var('key')` in visidata expressions.
+
+## Templates in the table browser query
+
+The query typed at the `E` prompt of a `Sample data` or `Edit` sheet may hold `{{expr}}` placeholders — the same Python a [pipeline](pipelines.md) template runs, with no input rows:
+
+```sql
+SELECT * FROM orders WHERE user_id IN {{sql_in_list(_vars['users'])}} AND created >= '{{datetime.date.today()}}'
+```
+
+| In scope | |
+|---|---|
+| `_vars`, `get_var(name, default)`, `set_var(name, value)` | The shared variables — one store for every tab: what `.SET_VAR` stored, what `gT` / `gzT` saved from a sheet |
+| `sql_in_list(...)`, `sql_values(...)` | The SQL helpers of a pipeline |
+| `datetime`, `json`, … and plugin functions | The same modules and `register_function()` helpers a pipeline has |
+| `info(msg)`, `warn(msg)` | Shown on the VisiData status line |
+
+`row`, `data`, `_0` and the loop items are empty here: there is no previous step. The interactive helpers — `choose`, `select`, `schoose`, `sselect`, `input`, `ask` — are refused with an error, as the query is rendered while VisiData owns the screen.
+
+The query is kept as typed, so `E` shows the template again, and it is rendered once per load: on `E`, on `Ctrl+R`, on the reload that follows a commit — a variable changed in between is picked up then, and every chunk of one load runs the same text. A failing expression is reported at the prompt and the sheet stays as it was. The engine's default query (before the first `E`) is never treated as a template.
+
+Every `{{…}}` in the query is Python, so a literal pair of braces has to be escaped: write `\{{` for `{{` — `WHERE body LIKE '%\{{user}}%'` searches for `{{user}}`.

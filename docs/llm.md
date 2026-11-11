@@ -4,13 +4,13 @@
 
 `Ctrl+L` opens a chat with a language model that can write and fix queries for the database you are connected to. It is off unless you configure it: with no `--llm-*` settings nothing is registered and `Ctrl+L` is not bound.
 
-The model is given the pipeline language reference and the engine you are connected to, and it can look at the database on its own through four read-only tools — `list_databases`, `list_tables`, `get_table_schema` and `sample_data`. Two more read the [pipeline variables](pipelines.md) an earlier run left behind: `get_vars_keys` lists what is in the store with each variable's type and size, `get_var` reads one of them. So "filter by the ids I saved" is something it can act on — the same store `.SET_VAR` writes and `.VARS` shows. A long variable arrives cut to its first 20 rows with the real length alongside, so a stashed result set cannot flood the request.
+The model is given the pipeline language reference and the engine you are connected to, and it can look at the database on its own through four read-only tools — `list_databases`, `list_tables`, `get_table_schema` and `sample_data`. Two more read the [shared variables](pipelines.md) an earlier run left behind: `get_vars_keys` lists what is in the store with each variable's type and size, `get_var` reads one of them. So "filter by the ids I saved" is something it can act on — the same store `.SET_VAR` writes and `.VARS` shows. A long variable arrives cut to its first 20 rows with the real length alongside, so a stashed result set cannot flood the request.
 
 With [several connections open](configuration.md#multiple-connections-and-tabs) the model is also told which tabs there are — name, engine, database — and which one is current, refreshed every time the chat is opened, so switching tabs between questions is enough to change what it writes for. Each of the database tools takes an optional `tab` argument, so it can read the schema of one connection while writing a query for another, and it knows it can join them in a pipeline with [`.CONN`](pipelines.md#moving-data-between-databases). With a single connection nothing of this appears in the prompt.
 
 A fifth database tool, `run_sql`, runs a statement of the model's own — to check a count, the distinct values of a column, whether matching rows exist — and hands back at most 50 rows. You see the statement before it runs and can [edit it first](#approving-tool-calls). The query it proposes only ever runs when you run it.
 
-Ask it to *show* you something — "show me last week's failed orders" — and the rows do not go through the model at all. It runs the query with `save_as`, which keeps the whole result in that pipeline variable and hands the model only the row count, the columns and three rows; then `show_var` opens the variable for you in VisiData, and the request waits until you close the sheet with `q`. The rows stay in the variable afterwards — `.GET_VAR`, `.VARS`, or the next question can pick them up. `show_var` is never asked about: it shows you your own data. When a choice is yours to make rather than its to guess, it can [ask you](#when-the-model-asks-you) and wait for the answer.
+Ask it to *show* you something — "show me last week's failed orders" — and the rows do not go through the model at all. It runs the query with `save_as`, which keeps the whole result in that shared variable and hands the model only the row count, the columns and three rows; then `show_var` opens the variable for you in VisiData, and the request waits until you close the sheet with `q`. The rows stay in the variable afterwards — `.GET_VAR`, `.VARS`, or the next question can pick them up. `show_var` is never asked about: it shows you your own data. When a choice is yours to make rather than its to guess, it can [ask you](#when-the-model-asks-you) and wait for the answer.
 
 ## Setup
 
@@ -36,6 +36,7 @@ The same settings work as `DBCLS_LLM_BASE_URL` / `DBCLS_LLM_API_KEY` / `DBCLS_LL
         "base_url": "http://localhost:11434/v1",
         "model": "qwen2.5-coder",
         "timeout": 120,
+        "max_tool_rounds": 10,
         "no_confirm_tools": false,
         "no_confirm_exec": false
     }
@@ -91,13 +92,14 @@ You are never limited to the options the model offered: whatever you type also s
 
 ## Approving tool calls
 
-Every tool call the model makes — listing databases and tables, reading a schema, sampling rows, reading pipeline variables, running SQL, and any tool a plugin added — is put to you first:
+Every tool call the model makes — listing databases and tables, reading a schema, sampling rows, reading shared variables, running SQL, and any tool a plugin added — is put to you first:
 
 | Choice | What happens |
 |--------|--------------|
 | `Allow` | Run this call |
 | `Allow for this chat` | Run it, and don't ask about this tool again until `Ctrl+N` |
 | `Deny` / `Esc` | Don't run it; the model is told you refused and carries on without it |
+| `Allow with a note…` / `Deny with a note…` | The same, with a word to the model: a line opens to type it into, and what you type goes along with the result or the refusal — "the ids are strings", "use the orders table instead". `Enter` sends it; `Enter` on an empty line or `Esc` sends none, and the choice stands |
 
 Reading the pipeline and `.VDM` references, asking you a question (`ask_user`) and handing over its answer (`propose_query`, `answer_question`) are never asked about.
 
@@ -108,6 +110,7 @@ A tool that runs code the model wrote — `run_sql`, or a plugin tool registered
 | `Allow` | Run it as the model wrote it |
 | `Edit…` | Open the code in place of the Result pane. Fix it — filter on an indexed column, add a `LIMIT` — then `Alt+Enter` runs your version, and the model is told it was edited and what actually ran. `Esc` there refuses it |
 | `Deny` / `Esc` | Don't run it |
+| `Allow with a note…` / `Deny with a note…` | As above, with a word to the model attached |
 
 There is no `Allow for this chat` for these: each statement is a different one.
 
@@ -119,6 +122,18 @@ Two separate settings turn the questions off:
 | `--llm-no-confirm-exec` | `DBCLS_LLM_NO_CONFIRM_EXEC=1` / `"no_confirm_exec": true` | Code-running tools run without asking |
 
 `Toggle asking before the model's tool calls` and `Toggle asking before the model runs code (SQL, ...)` switch them mid-conversation — from the chat's own palette (`Ctrl+P` inside the window) or the editor's.
+
+## When it keeps looking things up
+
+Each round of tool calls is a full request to the model, with the whole conversation attached, so a model that keeps exploring costs time and tokens without end. After `--llm-max-tool-rounds` rounds in one request (`DBCLS_LLM_MAX_TOOL_ROUNDS` / `"max_tool_rounds"`, default `10`) the request pauses and you are asked (unless the last of those rounds handed the answer over — then the model gets one more round to close, and you are asked only if it calls tools again):
+
+| Choice | What happens |
+|--------|--------------|
+| `Allow N more rounds` | The request carries on for as many rounds again, and asks once more when those are spent. The model is told nothing |
+| `Tell it to finish with what it has` | The model is told its budget is spent and that the lookups are closed: any further lookup is refused, and only `propose_query` / `answer_question` still work. It gets two rounds to hand its answer over, then one more in which no tool call is accepted at all, and is asked to say what it could not check. The notice is about this request only: it is dropped from the conversation once the request is over, so the next question starts with the lookups open again (the refused calls stay in the history, reworded to say the tool is available again) |
+| `Stop the request` / `Esc` | The request ends there, reported as an error. The conversation stays whole, so the next question picks up where it left off |
+
+The model is kept in the dark on purpose until you choose the second: a model told its budget is short stops exploring and rushes to a poor answer. `0` lifts the limit — then only `Esc` stops a request that will not finish. Stopping keeps what was already handed over: a query the model proposed before the stop still lands in the Result pane.
 
 The letter shortcuts are `Ctrl` rather than `Alt` on purpose: a control code is the same whatever keyboard layout is active, while `Alt+L` on a Cyrillic layout arrives as `Alt+д` and matches nothing. `Alt+Enter` is unaffected — `Enter` is not a letter.
 

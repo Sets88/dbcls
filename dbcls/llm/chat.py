@@ -20,13 +20,15 @@ import asyncio
 import curses
 import threading
 import time
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple
 
 from ..editor import (
     CommandTable, K, Lexer, PopupItem, SelectPopup, TextArea, key_alt, key_ctrl,
 )
 from ..syntax import Highlighter, Token
-from .client import LLMClient, LLMError
+from .client import (
+    EXTEND, FINISH, STOP, Decision, LLMClient, LLMError, ToolBudgetSpent,
+)
 from .prompt import build_context_message, build_system_prompt
 
 #: Keys, as encoded by Editor._encode_key.  Ctrl rather than Alt for the
@@ -38,6 +40,7 @@ from .prompt import build_context_message, build_system_prompt
 #: since the panes are TextAreas, and everything the terminal keeps for itself
 #: (^O is VDISCARD, ^S/^Q are flow control).
 KEY_ESC = K(27)
+KEY_ENTER = (K(curses.KEY_ENTER), K(ord('\n')), K(ord('\r')))
 KEY_TAB = K(ord('\t'))
 KEY_SHIFT_TAB = K(353)          # curses.KEY_BTAB
 KEY_SEND = (key_alt(ord('\n')), key_alt(ord('\r')))
@@ -84,7 +87,7 @@ ANSWER_TOOL = 'answer_question'
 #: result so the same turn carries on with it.
 ASK_TOOL = 'ask_user'
 
-#: What the model calls to put a pipeline variable in front of the user in
+#: What the model calls to put a shared variable in front of the user in
 #: VisiData — typically a result run_sql saved with save_as, so the rows reach
 #: the user without passing through the model's context.
 SHOW_TOOL = 'show_var'
@@ -98,9 +101,22 @@ DENY = 'Deny'
 #: statement is its own, and the user may want to fix one — narrow a query to
 #: an index, add a LIMIT — rather than refuse it outright.
 EDIT = 'Edit…'
+#: The same two choices with a word to the model attached: a line to type
+#: opens, and what is typed goes along with the result ("the ids are
+#: strings") or the refusal ("use the orders table instead").
+ALLOW_WITH_NOTE = 'Allow with a note…'
+DENY_WITH_NOTE = 'Deny with a note…'
 #: How much of the code the permission prompt's title shows; the whole of it
 #: is in the transcript.
 MAX_TITLE_CODE = 200
+
+#: The choices when a request has used up its rounds of tool calls
+#: (``--llm-max-tool-rounds``) without finishing — see ChatWindow._extend_rounds.
+#: The model hears nothing of this unless the user picks FINISH_NOW: told its
+#: budget is short, a model rushes to a poor answer.
+MORE_ROUNDS = 'Allow {n} more rounds'
+FINISH_NOW = 'Tell it to finish with what it has'
+STOP_NOW = 'Stop the request'
 
 #: What the model is told when it does not get what it called for.  Each one
 #: says what happened and what to do next: a model given only "denied" retries
@@ -167,6 +183,8 @@ class ChatWindow:
     HINT_ASK = ' The assistant is asking · ↑↓ pick or type your own · Enter answer · Esc skip the question '
     HINT_ASK_MULTI = ' The assistant is asking · ↑↓ move · Tab mark · type your own · Enter answer · Esc skip '
     HINT_APPROVE = ' The assistant wants to run a tool · ↑↓ pick · Enter answer · Esc deny '
+    HINT_BUDGET = ' The assistant has used its tool rounds · ↑↓ pick · Enter answer · Esc stop the request '
+    HINT_NOTE = ' Your note to the assistant · type it · Enter send · Enter on an empty line or Esc: no note '
     HINT_EDIT = ' Edit what the assistant will run · Alt+Enter run it · Esc deny '
 
     def __init__(self, api, config, tools=None):
@@ -175,7 +193,8 @@ class ChatWindow:
         editor = self.editor
         self.config = config
         self.tools = tools
-        self.client = LLMClient(config, tools, approve=self._approve_tool)
+        self.client = LLMClient(config, tools, approve=self._approve_tool,
+                                extend=self._extend_rounds)
         #: Tools the user answered "Allow for this chat" for; forgotten with
         #: the conversation (reset).
         self._allowed_tools: set = set()
@@ -247,7 +266,8 @@ class ChatWindow:
         #: palette and the pipeline's choose()/select() use, so marking,
         #: filtering and scrolling behave the way they do everywhere else.
         self.question_popup = SelectPopup()
-        #: 'ask' or 'approve' — what the open popup is for, for the hint bar.
+        #: 'ask', 'approve', 'budget' or 'note' — what the open popup is for,
+        #: for the hint bar.
         self._question_kind = 'ask'
         #: The pending 'edit_code' request while code_area is up, else None.
         self._code_edit: Optional[dict] = None
@@ -445,14 +465,14 @@ class ChatWindow:
         )
 
     def _register_show_tool(self, tools) -> None:
-        """Let the model show the user a pipeline variable in VisiData — see
+        """Let the model show the user a shared variable in VisiData — see
         SHOW_TOOL."""
         async def show_var(key: str, title: str = '') -> Any:
             return await self._show_var(str(key), str(title or '') or str(key))
 
         tools.add(
             SHOW_TOOL,
-            'Show a pipeline variable to the user as a VisiData sheet, and wait '
+            'Show a shared variable to the user as a VisiData sheet, and wait '
             'until they close it. Use it for a result the user wants to look '
             'at — save it with run_sql\'s save_as first, so the rows go to '
             'the user without passing through you. It returns only once the '
@@ -533,33 +553,54 @@ class ChatWindow:
             result['typed'] = request['typed']
         return result
 
-    async def _approve_tool(self, name: str, arguments: dict) -> Union[None, str, dict]:
+    async def _approve_tool(self, name: str, arguments: dict) -> Decision:
         """Ask before *name* runs — the client calls this while confirm_tools
-        (or, for an ``executes`` tool, confirm_exec) is on.  None lets the call
-        go ahead; a string refuses it, and is what the model gets back in place
-        of the result; a dict runs it with those arguments instead."""
+        (or, for an ``executes`` tool, confirm_exec) is on."""
         argument = self.tools.executes(name) if self.tools is not None else None
         if argument:
             return await self._approve_code(name, arguments, argument)
         if name in self._allowed_tools:
-            return None
+            return Decision()
         shown = ', '.join(f'{k}={v!r}' for k, v in arguments.items())
         request = await self._wait_for_user({
             'kind': 'approve', 'question': f'Allow {name}({shown})?',
-            'options': [ALLOW, ALLOW_FOR_CHAT, DENY], 'multi': False,
-            'free_text': False,
+            'options': [ALLOW, ALLOW_FOR_CHAT, DENY, ALLOW_WITH_NOTE, DENY_WITH_NOTE],
+            'multi': False, 'free_text': False,
         })
-        if request['dismissed']:
-            return DISMISSED_APPROVAL.format(name=name)
         if request['answer'] == ALLOW_FOR_CHAT:
             self._allowed_tools.add(name)
-            return None
-        if request['answer'] == ALLOW:
-            return None
-        return DENIED.format(name=name)
+            return Decision()
+        return await self._decide(request, name)
 
-    async def _approve_code(self, name: str, arguments: dict,
-                            argument: str) -> Union[None, str, dict]:
+    async def _decide(self, request: dict, name: str) -> Decision:
+        """The Decision for the choices every permission prompt offers: Allow,
+        Deny, the two with a note, and Esc.  Anything else is a refusal — the
+        caller has taken its own choices (for this chat, edit) out already."""
+        if request['dismissed']:
+            return Decision(allowed=False, refusal=DISMISSED_APPROVAL.format(name=name))
+        answer = request['answer']
+        if answer == ALLOW:
+            return Decision()
+        if answer == ALLOW_WITH_NOTE:
+            return Decision(note=await self._ask_note(name))
+        if answer == DENY_WITH_NOTE:
+            return Decision(allowed=False, refusal=DENIED.format(name=name),
+                            note=await self._ask_note(name))
+        return Decision(allowed=False, refusal=DENIED.format(name=name))
+
+    async def _ask_note(self, name: str) -> str:
+        """The line the user types their word to the model into, after picking
+        a "with a note" choice.  Esc, or Enter with nothing typed, is no note;
+        the choice itself stands either way."""
+        request = await self._wait_for_user({
+            'kind': 'note', 'question': f'Your note to the assistant about {name}',
+            'transcript': '', 'options': [], 'multi': False, 'free_text': True,
+        })
+        if request['dismissed']:
+            return ''
+        return (request['typed'] or '').strip()
+
+    async def _approve_code(self, name: str, arguments: dict, argument: str) -> Decision:
         """The permission prompt for a tool that runs code the model wrote,
         held in *argument*: run it, edit it first, or refuse.
 
@@ -574,26 +615,38 @@ class ChatWindow:
         request = await self._wait_for_user({
             'kind': 'approve', 'question': f'Run {called}: {title}',
             'transcript': f'Run {called}?\n{code}',
-            'options': [ALLOW, EDIT, DENY], 'multi': False,
-            'free_text': False,
+            'options': [ALLOW, EDIT, DENY, ALLOW_WITH_NOTE, DENY_WITH_NOTE],
+            'multi': False, 'free_text': False,
         })
-        if request['dismissed']:
-            return DISMISSED_APPROVAL.format(name=name)
-        if request['answer'] == ALLOW:
-            return None
         if request['answer'] != EDIT:
-            return DENIED.format(name=name)
+            return await self._decide(request, name)
         edit = await self._wait_for_user({
             'kind': 'edit_code', 'question': f'Edit {argument}', 'code': code,
             'tool': name, 'argument': argument,
             'options': [], 'multi': False, 'free_text': False,
         })
         if edit['dismissed']:
-            return DENIED.format(name=name)
+            return Decision(allowed=False, refusal=DENIED.format(name=name))
         edited = (edit['typed'] or '').strip()
         if edited == code.strip():
-            return None             # opened the editor, changed nothing
-        return dict(arguments, **{argument: edited})
+            return Decision()       # opened the editor, changed nothing
+        return Decision(arguments=dict(arguments, **{argument: edited}))
+
+    async def _extend_rounds(self, used: int, more: int) -> str:
+        """The client's question when a request has made *used* rounds of tool
+        calls without finishing: *more* rounds, have the model finish with what
+        it has, or stop here.  Esc stops — the same as answering so."""
+        request = await self._wait_for_user({
+            'kind': 'budget',
+            'question': f'{used} rounds of tool calls and no answer yet — carry on?',
+            'options': [MORE_ROUNDS.format(n=more), FINISH_NOW, STOP_NOW],
+            'multi': False, 'free_text': False,
+        })
+        if request['dismissed'] or request['answer'] == STOP_NOW:
+            return STOP
+        if request['answer'] == FINISH_NOW:
+            return FINISH
+        return EXTEND
 
     async def _wait_for_user(self, request: dict) -> dict:
         """Raise *request* for the main thread to put on screen, and wait until
@@ -788,6 +841,10 @@ class ChatWindow:
         try:
             appended = task.result()
         except (Exception, asyncio.CancelledError) as exc:
+            if isinstance(exc, ToolBudgetSpent):
+                # Stopped by the user, but what the model had already handed
+                # over is theirs: stopping must not throw a finished query away.
+                self._keep_handed_over()
             self._fail(exc)
             return
         answer = ''
@@ -818,6 +875,16 @@ class ChatWindow:
             self._error = (f'The model never called {RESULT_TOOL}, even when asked '
                            f'directly — nothing to apply')
         self.editor.request_redraw()
+
+    def _keep_handed_over(self) -> None:
+        """Apply what the result tools received in a run that did not finish:
+        the explanation goes to the transcript, the query to the Result pane."""
+        explanation, self._answered = self._answered, None
+        if explanation:
+            self._add_transcript('Assistant', explanation)
+        query, self._proposed = self._proposed, None
+        if query is not None and query.strip():
+            self.result_area.set_text(query.strip(), keep_undo=True)
 
     def _fail(self, exc: Exception) -> None:
         self._error = f'{type(exc).__name__}: {exc}' if not isinstance(exc, LLMError) else str(exc)
@@ -893,9 +960,13 @@ class ChatWindow:
                                  multi=request['multi'],
                                  free_text=request['free_text'])
         self._question_kind = request['kind']
-        self._add_transcript('Assistant asks', request.get('transcript', request['question']))
-        self._status = ('waiting for your permission' if request['kind'] == 'approve'
-                        else 'waiting for your answer')
+        shown = request.get('transcript', request['question'])
+        if shown:       # '' — a prompt of our own, not the assistant's (a note)
+            self._add_transcript('Assistant asks', shown)
+        self._status = {'approve': 'waiting for your permission',
+                        'budget': 'waiting for your permission',
+                        'note': 'waiting for your note'}.get(request['kind'],
+                                                             'waiting for your answer')
         self.editor.request_redraw()
 
     def _answer_question(self, answer=None, typed: Optional[str] = None,
@@ -910,7 +981,11 @@ class ChatWindow:
         request['answer'] = answer
         request['typed'] = typed
         request['dismissed'] = dismissed
-        if dismissed:
+        if request['kind'] == 'note' and not typed:
+            # Esc or an empty line: the Allow/Deny already given stands, so
+            # "closed without answering" would read as if it did not.
+            shown = '(no note)'
+        elif dismissed:
             shown = '(closed without answering)'
         else:
             parts = list(answer) if isinstance(answer, list) else (
@@ -992,6 +1067,11 @@ class ChatWindow:
             # unanswered (or the tool was refused) and carries on.  Esc again,
             # with the popup gone, stops the request itself.
             self._answer_question(dismissed=True)
+        elif key in KEY_ENTER and self._question_kind == 'note':
+            # The popup holds an empty free-text line open on Enter — a question
+            # from the model deserves an answer.  A note is optional: nothing
+            # typed is no note, and the Allow/Deny already given stands.
+            self._answer_question(typed='')
 
     # ── Applying ─────────────────────────────────────────────────────────────
 
@@ -1139,6 +1219,10 @@ class ChatWindow:
             popup = self.question_popup
             if self._question_kind == 'approve':
                 text = self.HINT_APPROVE
+            elif self._question_kind == 'budget':
+                text = self.HINT_BUDGET
+            elif self._question_kind == 'note':
+                text = self.HINT_NOTE
             elif popup.multi:
                 text = self.HINT_ASK_MULTI
             else:

@@ -586,7 +586,7 @@ Example:
 """)
 
 HELP_VARS = _help_entry('vars', """
-Open all pipeline variables (the store shared with .SET_VAR / set_var()) as an
+Open all shared variables (the store shared with .SET_VAR / set_var()) as an
 editable `key` / `value` sheet.  Like .VIEW it blocks until the sheet is closed
 with `q`, so the edits are already in effect for the steps after it, and it
 opens even when there are no variables yet — the place to add the first one.

@@ -1049,7 +1049,7 @@ def register(api):
         if client is None:
             api.notify('no database connection on this tab', error=True)
             return
-        sync = SyncClient(api.editor.asyncloop_thread, client)
+        sync = SyncClient(api.editor.asyncloop_thread, client, api.vars)
         try:
             api.open_sheet(lambda: make_sheet(sync))
         finally:

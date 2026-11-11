@@ -9,6 +9,7 @@ from copy import copy
 from visidata import VisiData, BaseSheet, TableSheet, Column, ColumnItem, ItemColumn
 from visidata import vd, asyncthread, ENTER, AttrDict, deduceType, Progress
 
+from ..pipeline.templates import render_template
 from ..utils import SqlExpr
 from .vd_completion import Completer  # importing it also installs the prompt patches
 
@@ -140,23 +141,98 @@ class CompleteSqlColumn(Completer):
         return val[:start] + name
 
 
+#: The pipeline helpers that put a question to the user.  The browser has no
+#: way to ask one -- VisiData owns the screen and the query is rendered in the
+#: loader's thread -- so each is refused by name.  `input` matters most: left
+#: out, the name would reach Python's builtin and read the terminal.
+_INTERACTIVE_HELPERS = ('choose', 'select', 'schoose', 'sselect', 'input', 'ask')
+
+
+def _refuse_interactive(name: str):
+    def refuse(*args, **kwargs):
+        raise ValueError(f'{name}() is not available in the table browser: '
+                         'the query cannot ask questions here')
+    return refuse
+
+
+_ESCAPED_BRACES = '\\{{'
+_BRACES_MARKER = '\x00dbcls-braces\x00'
+
+
+def render_browser_sql(template: str, variables: dict) -> str:
+    """Render the ``{{expr}}`` placeholders of a table browser query the way a
+    pipeline's ``.RUN`` does with no input rows: the shared VARS (*variables*)
+    as ``_vars`` / ``get_var()`` / ``set_var()``, plus ``sql_in_list``,
+    ``sql_values``, ``datetime``, ``json``, ... and the functions plugins
+    registered.  ``info()`` / ``warn()`` go to the VisiData status line; the
+    interactive prompts are refused.  ``\\{{`` is a literal ``{{`` -- a
+    ``LIKE '%\\{{name}}%'`` is SQL, not Python.  Raises ValueError on a failing
+    expression."""
+    if '{{' not in template:
+        return template
+    # the escaped braces sit out the rendering behind a marker no query holds
+    template = template.replace(_ESCAPED_BRACES, _BRACES_MARKER)
+
+    def set_var(name, value):
+        variables[name] = value
+
+    try:
+        rendered = render_template(template, extra={
+            '_vars': variables,
+            'get_var': variables.get,
+            'set_var': set_var,
+            'info': lambda msg: vd.status(str(msg)),
+            'warn': lambda msg: vd.warning(str(msg)),
+            **{name: _refuse_interactive(name) for name in _INTERACTIVE_HELPERS},
+        })
+    except ValueError as exc:
+        raise ValueError(f'{exc} (write \\{{{{ for a literal {{{{)') from exc
+    return rendered.replace(_BRACES_MARKER, '{{')
+
+
 class TableSampleDataSheet(TableSheet):
     guide = '''# Sample data
 Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cursor approaches the bottom.
 
-- `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); the sheet reloads with the new query.  In the prompt `Tab` / `Shift+Tab` complete column names; the matches are listed in a menu above the prompt, the one in the line highlighted.
+- `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); the sheet reloads with the new query.  In the prompt `Tab` / `Shift+Tab` complete column names; the matches are listed in a menu above the prompt, the one in the line highlighted.  `{{{{expr}}}}` in the query is Python, rendered as in a pipeline on every (re)load: `{{{{_vars['ids']}}}}`, `{{{{get_var('uid', 0)}}}}`, `{{{{sql_in_list(_vars['rows'])}}}}`, `{{{{sql_values(...)}}}}`, `{{{{datetime.date.today()}}}}` (no interactive prompts); `\\{{{{` is a literal `{{{{`.
 - `gE` to open the rows loaded so far on an edit sheet (`e` / `a` / `d`, `Ctrl+S` to commit) without re-reading them from the database.
 - `Ctrl+C` to stop the chunked loader.
 '''
     rowtype = 'tables'
     CHUNK_SIZE = 500
-    CUSTOM_SQL = None
+    CUSTOM_SQL = None  # the `E` query as typed: its {{expr}} are rendered on every load
     _known_columns = None
+    _rendered = None  # (template, sql) `E` has just rendered: the next load takes it as is
 
     def get_sample_base_sql(self, table: str, db: str):
         if self.CUSTOM_SQL:
             return self.CUSTOM_SQL
         return self.client.get_sample_data_sql(table, db)
+
+    def render_sql(self, template: str) -> str:
+        variables = getattr(self.client, 'vars', None)
+        return render_browser_sql(template, variables if isinstance(variables, dict) else {})
+
+    def take_rendered(self):
+        """The rendering `E` left for the load it started, taken -- so no
+        later load can find it.  A load calls this before anything that may
+        fail: a rendering left behind by a load that died early would be run
+        by the next `Ctrl+R` with the variables as they were back then."""
+        rendered, self._rendered = self._rendered, None
+        return rendered
+
+    def get_sample_sql(self, table: str, db: str, rendered=None) -> str:
+        """The query one load pages through: the `E` query with its
+        ``{{expr}}`` rendered -- once per load, so every chunk runs the same
+        text (a ``{{datetime.datetime.now()}}`` rendered per chunk would shift
+        the rows under the OFFSET).  The engine's own default query is not a
+        template and is left alone.  *rendered* is what :meth:`take_rendered`
+        returned for this load: used as is when it is of the current query."""
+        if not self.CUSTOM_SQL:
+            return self.client.get_sample_data_sql(table, db)
+        if rendered and rendered[0] == self.CUSTOM_SQL:
+            return rendered[1]
+        return self.render_sql(self.CUSTOM_SQL)
 
     def update_current_sql(self, sql: str):
         self.CUSTOM_SQL = sql
@@ -182,6 +258,19 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
         completer = CompleteSqlColumn(self.sql_completions(), self.client.quote_ident)
         sql = vd.input('current sql: ', value=self.get_sample_base_sql(self.table, self.db),
                        completer=completer)
+        # rendered here, before the reload drops the rows on screen: a typo in
+        # an {{expr}} fails the command and leaves the sheet as it was.  The
+        # load takes this rendering instead of making its own, so a set_var()
+        # in the query runs once.
+        try:
+            rendered = self.render_sql(sql)
+        except ValueError as exc:
+            vd.fail(str(exc))
+        # the chunked loader is stopped only now, with a query to reload: a
+        # prompt left with Esc or a failing {{expr}} keeps it, and with it the
+        # rows still to come as the sheet is scrolled
+        vd.cancelThread(*self.currentThreads)
+        self._rendered = (sql, rendered)
         self.update_current_sql(sql)
 
     def open_editor(self):
@@ -234,7 +323,7 @@ Rows of _{sheet.table}_, loaded lazily in chunks of {sheet.CHUNK_SIZE} as the cu
         loaded = False
         offset = 0
         progress = None
-        base_sql = self.get_sample_base_sql(self.table, self.db)
+        base_sql = self.get_sample_sql(self.table, self.db, self.take_rendered())
 
         while True:
             if (len(self.rows) -  self.cursorRowIndex) > 200:
@@ -352,7 +441,7 @@ Changes are collected locally and only executed after confirmation.
 - `a` to add a new row (green until committed).
 - `d` / `gd` to mark the current / selected rows for deletion (red until committed); a row added with `a` is just removed, on its copies too.  A marked row stays selected; bulk edits of the selection leave its cells as they are.
 - `gn` to revert the selected rows: edited cells get their original values back, deletion marks are cleared, added rows are removed.  Right after `gd` it takes the marks back.
-- `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); `Tab` / `Shift+Tab` complete column names, listed in a menu above the prompt.
+- `E` to edit the underlying SQL (add WHERE / ORDER BY, ...); `Tab` / `Shift+Tab` complete column names, listed in a menu above the prompt.  `{{{{expr}}}}` is rendered as in a pipeline (`_vars`, `get_var`, `set_var`, `sql_in_list`, `sql_values`, ...; no interactive prompts); `\\{{{{` is a literal `{{{{`.
 - `"` to edit the selected rows on a sheet of their own: its edits are this sheet's too, `Ctrl+S` on either commits them all.
 - `Ctrl+S` to review the INSERT/UPDATE/DELETE statements before executing them.  Afterwards only the changed rows are re-read, by primary key.
 
@@ -405,11 +494,16 @@ Editing and deleting existing rows requires the table to have a primary key; wit
         return AttrDict()
 
     def iterload(self):
+        # taken before the primary key is asked for: should that fail, the
+        # rendering `E` made must not wait for the next reload (take_rendered)
+        rendered = self.take_rendered()
         self.pk_columns = list(self.client.get_primary_key(self.table, self.db))
         if not self.pk_columns:
             vd.warning('no primary key: editing existing rows disabled, only row adds allowed')
+        self._rendered = rendered   # for the chunk loader below, in this same load
         seed, self._seed = self._seed, None
         if seed is not None:
+            self._rendered = None
             # rows handed over from a Sample data sheet (`gE`): show them as
             # they are; a later reload (`E`, the fallback after a commit)
             # reads from the database as usual
@@ -882,7 +976,7 @@ The CREATE TABLE statement for _{sheet.table}_ (reconstructed from the system ca
 
 DataBaseSheet.addCommand(ENTER, 'tables-list', 'vd.push(TablesSheet(f\'tables__{cursorRow["database"]}\', client=sheet.client, db=cursorRow["database"]))', '')
 TablesSheet.addCommand(ENTER, 'table-options', 'vd.push(TableOptionsSheet(f\'table_options__{cursorRow["database"]}__{cursorRow["table"]}\', client=sheet.client, db=cursorRow["database"], table=cursorRow["table"]))', '')
-TableSampleDataSheet.addCommand('E', 'edit-sql', 'cancelThread(*sheet.currentThreads); sheet.edit_sql()', 'Edit current sql (Tab completes column names)')
+TableSampleDataSheet.addCommand('E', 'edit-sql', 'sheet.edit_sql()', 'Edit current sql (Tab completes column names)')
 # EditTableSheet keeps its own `gE` (edit-selected-sql-expr): the subclass
 # binding wins over this one.
 TableSampleDataSheet.addCommand('gE', 'edit-loaded-rows', 'sheet.open_editor()', 'open the loaded rows on an edit sheet (e/a/d, Ctrl+S to commit)')

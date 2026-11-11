@@ -146,7 +146,7 @@ class DbTools:
             self.api.vars[key] = rows
             answer['saved_as'] = key
             answer['columns'] = list(rows[0]) if rows and isinstance(rows[0], dict) else []
-            answer['note'] = (f'All {len(rows)} rows are in the pipeline variable '
+            answer['note'] = (f'All {len(rows)} rows are in the shared variable '
                               f'{key!r}. show_var shows them to the user; '
                               f'get_var reads them.')
         answer['rows'] = _shorten_rows(rows[:max_rows])
@@ -226,7 +226,7 @@ class DbTools:
             'edit it before it runs; an edited one comes back with '
             '"edited_by_user" and the statement that actually ran. To show '
             'a result to the user rather than read it yourself, pass save_as: '
-            'the rows go into that pipeline variable, you get the row count, '
+            'the rows go into that shared variable, you get the row count, '
             'the columns and a few rows, and show_var opens them for the user.',
             {
                 'type': 'object',
@@ -240,7 +240,7 @@ class DbTools:
                     },
                     'save_as': {
                         'type': 'string',
-                        'description': 'Pipeline variable to keep the whole '
+                        'description': 'Shared variable to keep the whole '
                                        'result in (replacing what it held). '
                                        'Use it for a result the user should '
                                        'see, then call show_var.',
@@ -256,7 +256,7 @@ class DbTools:
 
 
 class VarsTools:
-    """The pipeline variable store, read-only.
+    """The shared variable store, read-only.
 
     The same store ``.SET_VAR`` writes, ``.GET_VAR`` reads and ``.VARS`` shows,
     so a user can run a pipeline, stash a result and then ask the model about
@@ -304,7 +304,7 @@ class VarsTools:
     def register(self, registry) -> None:
         registry.add(
             'get_vars_keys',
-            'List the pipeline variables the user currently has — the store '
+            'List the shared variables the user currently has — the store '
             '.SET_VAR writes to and .VARS shows. Gives each one\'s name, type '
             'and size, not its contents. Call it when the user mentions '
             'something they saved earlier, or before writing a pipeline that '
@@ -314,7 +314,7 @@ class VarsTools:
         )
         registry.add(
             'get_var',
-            'Read one pipeline variable by name, to see what is actually in it. '
+            'Read one shared variable by name, to see what is actually in it. '
             f'A long list comes back as its first {MAX_VAR_ROWS} rows with the '
             'real length alongside, so check the size before relying on it. '
             'Reading only — you cannot set or delete a variable.',

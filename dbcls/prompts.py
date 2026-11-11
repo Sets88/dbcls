@@ -38,7 +38,7 @@ class PromptKind(str, enum.Enum):
     SCHOOSE = 'schoose'
     #: Only show the rows; there is no answer to give back.
     VIEW = 'view'
-    #: Show the pipeline variables and write edits straight back into them.
+    #: Show the shared variables and write edits straight back into them.
     VARS = 'vars'
     #: Like SSELECT, but the rows keep being re-read while the sheet is up.
     WATCH = 'watch'

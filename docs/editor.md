@@ -262,7 +262,8 @@ The `Edit` table option opens the table's sample data with pending, locally-coll
 edits — nothing is sent to the database until you confirm. `gE` on a `Sample data` sheet
 opens the same edit sheet with the rows loaded so far (the `E` query included) without
 re-reading them from the database; `E` or `Ctrl+R` on the edit sheet reads from the
-database again.
+database again. The `E` query may use pipeline `{{expr}}` templates
+(`_vars`, `sql_in_list`, …) — see [Templates in the table browser query](visidata.md#templates-in-the-table-browser-query).
 
 | Hotkey | Action |
 |--------|--------|

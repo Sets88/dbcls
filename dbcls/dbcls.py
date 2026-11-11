@@ -191,12 +191,19 @@ class SyncClient:
     task was cancelled raises :class:`asyncio.CancelledError`.  Neither is
     turned into a :class:`Result`, so a caller that expects a list gets a list
     or an exception, and a loader that dies of a timeout shows the timeout
-    rather than "no data"."""
+    rather than "no data".
 
-    def __init__(self, asyncloop_th, async_client: ClientClass):
+    *vars* is the editor's shared VARS dict (``DbEditor.vars``), carried along for the
+    sheets that render ``{{expr}}`` templates of their own (the table
+    browser's `E` query): the client is the one thing every browser sheet
+    hands to the next."""
+
+    def __init__(self, asyncloop_th, async_client: ClientClass,
+                 vars: Optional[dict] = None):
         self.asyncloop_thread = asyncloop_th
         self.client = async_client
         self.timeout = 60
+        self.vars = vars
 
     def __getattr__(self, name):
         attr = getattr(self.client, name)
@@ -535,7 +542,9 @@ DB-specific extensions
       `Tab` / `Shift+Tab` complete column names
   `E`
       Edit sample-data SQL (table browser only); `Tab` / `Shift+Tab`
-      complete column names
+      complete column names; `{{expr}}` is rendered as in a pipeline
+      (`_vars`, `get_var`, `set_var`, `sql_in_list`, `sql_values`, …;
+      no interactive prompts)
   `gE`
       Sample data (table browser only): open the loaded rows on an
       edit sheet without re-reading them from the DB
@@ -546,10 +555,10 @@ DB-specific extensions
   `gz+Enter`
       Open all selected reference cells merged into one sheet
   `gT`
-      Save selected rows (or current row) to pipeline vars
+      Save selected rows (or current row) to shared vars
       as a list of dicts
   `gzT`
-      Save current column values from selected rows to pipeline vars
+      Save current column values from selected rows to shared vars
       as a flat list
 
 Edit mode (table browser `Edit` option; MySQL/PostgreSQL/SQLite only)
@@ -588,7 +597,7 @@ Expression helpers
   `ts_to_start_of_interval(ts, seconds)`
       Same for a timestamp (keeps input type)
   `get_var(key)`
-      Pipeline variable saved by `.SET_VAR` / `gT` / `gzT`
+      Shared variable saved by `.SET_VAR` / `gT` / `gzT`
 
   Example: `=ts_to_dt_utc(created_ts)`
 """
@@ -855,7 +864,7 @@ class DbEditorTab(Editor):
 
     @property
     def vars(self) -> dict:
-        """Pipeline variables (.SET_VAR / .GET_VAR) — one store for every tab,
+        """Shared variables (.SET_VAR / .GET_VAR) — one store for every tab,
         so a pipeline can carry values from one database to another."""
         return self.shell.vars
 
@@ -1415,18 +1424,18 @@ class DbEditorTab(Editor):
 
     def _db_show_tables(self):
         self._show_in_visidata(lambda: TablesSheet(
-            client=SyncClient(self.asyncloop_thread, self.client),
+            client=SyncClient(self.asyncloop_thread, self.client, self.vars),
             db=getattr(self.client, 'dbname', None),
         ))
 
     def _db_show_databases(self):
         self._show_in_visidata(lambda: DataBaseSheet(
-            client=SyncClient(self.asyncloop_thread, self.client)))
+            client=SyncClient(self.asyncloop_thread, self.client, self.vars)))
 
 
 class DbEditor(EditorShell):
     """The application: one tab per configured connection, and everything the
-    tabs share — the async loop, the pipeline variables, the plugins, the
+    tabs share — the async loop, the shared variables, the plugins, the
     screen lock, and the commands, which always act on the tab on screen."""
 
     def __init__(
@@ -1458,7 +1467,7 @@ class DbEditor(EditorShell):
         self.visidata_on_screen = False
         self.asyncloop_thread = AsyncLoopThread(daemon=True)
         self.asyncloop_thread.start()
-        #: Pipeline variables, shared by every tab.
+        #: The shared variables: one store for every tab.
         self.vars = {}
         # Filter chains plugins hook into (before_query / after_query).
         self.hooks = HookBus(on_error=lambda text: self.set_status_notification(text, error=True))

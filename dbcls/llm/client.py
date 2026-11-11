@@ -11,18 +11,57 @@ import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
-#: How many times the model may call tools before we stop feeding results back.
-#: Each round trip is a full request, so this bounds both time and token spend.
-MAX_TOOL_ROUNDS = 8
+#: How many rounds of tool calls one request may take before the user is asked
+#: what to do (``max_tool_rounds``; 0 lifts the limit).  Each round trip is a
+#: full request, so this bounds both time and token spend.
+MAX_TOOL_ROUNDS = 10
+
+#: The user's answers when the rounds are spent (see LLMClient.extend).
+EXTEND = 'extend'      # as many rounds again, nothing said to the model
+FINISH = 'finish'      # tell the model the budget is spent; it finishes with what it has
+STOP = 'stop'          # end the request here
+
+#: Rounds granted after FINISH for handing the answer over: the lookups are
+#: refused by then, only the finishing tools still run.
+CLOSING_ROUNDS = 2
 
 #: Cap on a single tool result handed back to the model, in characters.
 MAX_TOOL_RESULT_CHARS = 8000
 
+#: What the model gets in place of a lookup it called after FINISH.
+BUDGET_SPENT = ('Refused: the tool budget for this request is spent and {name} is '
+                'not available any more. Finish with what you already have.')
+#: What a BUDGET_SPENT refusal is rewritten to once its request is over: the
+#: call has to stay answered, but the next question starts with the lookups open.
+BUDGET_REOPENED = ('Not run: the tool budget of that earlier request was spent. '
+                   '{name} is available again.')
+
 
 class LLMError(Exception):
     """The endpoint could not be reached, or answered with something unusable."""
+
+
+class ToolBudgetSpent(LLMError):
+    """The request used up its rounds of tool calls and the user stopped it."""
+
+
+@dataclass
+class Decision:
+    """The user's answer to a permission prompt (see :attr:`LLMClient.approve`).
+
+    Allowed, the call runs — with *arguments* in place of the model's when the
+    user edited them.  Refused, *refusal* is what the model gets as the result,
+    so it carries on without the call instead of retrying blindly.  *note* is
+    what the user wants to tell the model either way — "use the orders table",
+    "that column is a timestamp" — and goes along with the result or the
+    refusal."""
+
+    allowed: bool = True
+    arguments: Optional[dict] = None
+    refusal: str = ''
+    note: str = ''
 
 
 @dataclass
@@ -35,6 +74,8 @@ class LLMConfig:
     model: str = ''
     max_tokens: int = 131072
     timeout: float = 600.0
+    #: Rounds of tool calls one request may take; 0 for no limit.
+    max_tool_rounds: int = MAX_TOOL_ROUNDS
     #: Extra HTTP headers (OpenRouter's HTTP-Referer / X-Title, for instance).
     headers: Dict[str, str] = field(default_factory=dict)
     #: Ask the user before running a tool registered with needs_approval —
@@ -64,7 +105,7 @@ class LLMConfig:
             value = values.get(name)
             if value:
                 setattr(config, name, str(value))
-        for name, cast in (('max_tokens', int), ('timeout', float)):
+        for name, cast in (('max_tokens', int), ('timeout', float), ('max_tool_rounds', int)):
             value = values.get(name)
             if value in (None, ''):
                 continue
@@ -72,6 +113,9 @@ class LLMConfig:
                 setattr(config, name, cast(value))
             except (TypeError, ValueError):
                 raise LLMError(f'--llm-{name.replace("_", "-")} must be a number, got {value!r}')
+        if config.max_tool_rounds < 0:
+            raise LLMError('--llm-max-tool-rounds must be 0 (no limit) or more, '
+                           f'got {config.max_tool_rounds}')
         headers = values.get('headers')
         if isinstance(headers, dict):
             config.headers = {str(k): str(v) for k, v in headers.items()}
@@ -115,16 +159,21 @@ class LLMClient:
     """A chat conversation with tools, over the OpenAI chat-completions API."""
 
     def __init__(self, config: LLMConfig, tools: Optional['ToolRegistry'] = None,
-                 approve: Optional[Callable[[str, dict], Awaitable[Union[None, str, dict]]]] = None):
+                 approve: Optional[Callable[[str, dict], Awaitable[Decision]]] = None,
+                 extend: Optional[Callable[[int, int], Awaitable[str]]] = None):
         self.config = config
         self.tools = tools
-        #: ``async approve(name, arguments)`` — asked before a tool that needs
-        #: approval runs, while the config's switch for its kind is on
-        #: (confirm_tools, or confirm_exec for an ``executes`` tool).  None lets it
-        #: run; a string refuses, and is what the model gets back as the
-        #: result; a dict runs it with those arguments instead — the user
-        #: edited the call (see :func:`edited_result`).
+        #: ``async approve(name, arguments) -> Decision`` — asked before a tool
+        #: that needs approval runs, while the config's switch for its kind is
+        #: on (confirm_tools, or confirm_exec for an ``executes`` tool).
         self.approve = approve
+        #: ``async extend(rounds_used, more)`` — asked when a request has used
+        #: up its rounds of tool calls (``max_tool_rounds``) without finishing.
+        #: Answers EXTEND (*more* rounds, the model is told nothing), FINISH
+        #: (the model is told the budget is spent and finishes with what it
+        #: has) or STOP (the request ends).  Without a callback the request
+        #: stops (see :meth:`run`).
+        self.extend = extend
 
     def _headers(self) -> Dict[str, str]:
         headers = dict(self.config.headers)
@@ -132,22 +181,27 @@ class LLMClient:
             headers['Authorization'] = f'Bearer {self.config.api_key}'
         return headers
 
-    async def complete(self, messages: List[dict], *, use_tools: bool = True,
+    async def complete(self, messages: List[dict], *, allow_tools: bool = True,
                        force_tool: Optional[str] = None) -> dict:
         """One round trip; returns the assistant message dict.
 
         *force_tool* names a tool the model must call this turn instead of
-        choosing for itself — the endpoint's ``tool_choice``."""
+        choosing for itself — the endpoint's ``tool_choice``.  *allow_tools*
+        False forbids calls the same way (``tool_choice: none``) while still
+        sending the definitions: a history with tool calls in it is rejected
+        by some endpoints when the tools they refer to are missing."""
         payload = {
             'model': self.config.model,
             'messages': messages,
             'max_tokens': self.config.max_tokens,
         }
-        if use_tools and self.tools and self.tools.schemas():
-            payload['tools'] = self.tools.schemas()
-            payload['tool_choice'] = (
-                {'type': 'function', 'function': {'name': force_tool}}
-                if force_tool else 'auto')
+        schemas = self.tools.schemas() if self.tools else None
+        if schemas:
+            payload['tools'] = schemas
+            if force_tool:
+                payload['tool_choice'] = {'type': 'function', 'function': {'name': force_tool}}
+            else:
+                payload['tool_choice'] = 'auto' if allow_tools else 'none'
 
         response = await asyncio.to_thread(
             _post_json, self.config.endpoint, payload, self._headers(), self.config.timeout)
@@ -166,7 +220,7 @@ class LLMClient:
 
     async def run(self, messages: List[dict], *,
                   on_event: Optional[Callable[[str, dict], None]] = None,
-                  max_rounds: int = MAX_TOOL_ROUNDS,
+                  max_rounds: Optional[int] = None,
                   require_tool: Optional[str] = None,
                   satisfied_by: Sequence[str] = ()) -> List[dict]:
         """Drive the conversation until the model answers with text.
@@ -174,9 +228,9 @@ class LLMClient:
         *messages* is extended in place with everything exchanged — the
         assistant's tool calls, each tool result, and the final answer — so the
         caller can both display the trace and keep it as the conversation's
-        history.  *on_event* is called with ``('thinking'|'tool'|'tool_result',
-        details)`` so a UI can show what is happening; it must be cheap and must
-        not raise.
+        history.  *on_event* is called with ``('thinking'|'tool'|'tool_result'|
+        'budget', details)`` so a UI can show what is happening; it must be
+        cheap and must not raise.
 
         *require_tool* names a tool the answer is worthless without — the one
         that hands the result over.  Models forget to call it and just describe
@@ -186,40 +240,120 @@ class LLMClient:
         that called one of them is complete and nothing is demanded — the chat
         answers a question that way, without proposing a query.
 
+        *max_rounds* (the config's ``max_tool_rounds`` unless given; 0 for no
+        limit) is how many rounds of tool calls may go by before the question
+        is put to :attr:`extend`: as many again, or have the model finish with
+        what it has, or stop.  The model is told nothing unless the answer is
+        FINISH — a model told its budget is short rushes to a poor answer.
+        Stopping raises :class:`ToolBudgetSpent`; the history is left whole,
+        every call answered, so the conversation can go on from there.
+
+        The turn that tells the model its budget is spent (FINISH) is about
+        this request only, so it is taken out of *messages* once the run is
+        over, however it ends — left in, the next question in the chat would
+        be answered with the lookups still "closed".  It is not among the
+        messages returned either: nothing of it outlives the run.  The lookups
+        refused meanwhile stay — a call must keep its answer — but each refusal
+        is rewritten to say the tool is available again (BUDGET_REOPENED).
+
+        A round that hands the answer over (*require_tool* or one of
+        *satisfied_by*) just as the budget runs out is not followed by the
+        question: the model gets one round more to close with text, once per
+        run, and only if it goes on calling tools is the user asked.
+
         Returns the messages appended during this run.
         """
         appended: List[dict] = []
         called: set = set()
+        step = self.config.max_tool_rounds if max_rounds is None else max_rounds
+        budget = step           # grows by *step* with every EXTEND
+        finishing = {name for name in (require_tool, *satisfied_by) if name}
+        rounds = 0
+        #: Rounds left for handing the answer over once FINISH was chosen; None
+        #: while the lookups are still open.
+        closing: Optional[int] = None
+        nudge: Optional[dict] = None
+        refused: List[dict] = []    # BUDGET_SPENT replies, reworded on the way out
+        handed_over = False         # the round just made handed the answer over
+        wrap_up_given = False       # the one round past the budget was granted
 
         def emit(kind: str, details: dict) -> None:
             if on_event is not None:
                 on_event(kind, details)
 
-        for _round in range(max_rounds):
-            emit('thinking', {})
-            message = await self.complete(messages)
-            messages.append(message)
-            appended.append(message)
+        try:
+            while True:
+                if (budget and rounds >= budget and closing is None
+                        and handed_over and not wrap_up_given):
+                    wrap_up_given = True    # the answer is in: let it say so
+                elif budget and rounds >= budget and closing is None:
+                    answer = await self.extend(rounds, step) if self.extend is not None else STOP
+                    emit('budget', {'rounds': rounds, 'answer': answer})
+                    if answer == EXTEND:
+                        budget += step
+                    elif answer == FINISH:
+                        closing = CLOSING_ROUNDS
+                        nudge = closing_nudge(rounds, finishing)
+                        messages.append(nudge)
+                    else:
+                        raise ToolBudgetSpent(
+                            f'Stopped after {rounds} rounds of tool calls without an answer')
 
-            tool_calls = message.get('tool_calls') or []
-            if not tool_calls:
-                appended.extend(await self._demand_tool(require_tool, called, messages,
-                                                        emit, satisfied_by))
-                return appended
+                emit('thinking', {})
+                message = await self._complete_round(messages, last=closing == 0)
+                messages.append(message)
+                appended.append(message)
 
-            for call in tool_calls:
-                called.add(((call.get('function') or {}).get('name')) or '')
-                result_message = await self._run_tool_call(call, emit)
-                messages.append(result_message)
-                appended.append(result_message)
+                tool_calls = message.get('tool_calls') or []
+                if not tool_calls:
+                    appended.extend(await self._demand_tool(require_tool, called, messages,
+                                                            emit, satisfied_by))
+                    return appended
 
-        # Out of rounds: ask for a final answer with the tools withheld, so the
-        # user gets something rather than a silent stop.
-        emit('thinking', {})
-        message = await self.complete(messages, use_tools=False)
-        messages.append(message)
-        appended.append(message)
-        return appended
+                handed_over = False
+                for call in tool_calls:
+                    name = call_name(call)
+                    called.add(name)
+                    if closing is not None and name not in finishing:
+                        result_message = tool_reply(call, BUDGET_SPENT.format(name=name))
+                        refused.append(result_message)
+                        emit('tool_result', {'name': name, 'content': result_message['content']})
+                    else:
+                        result_message, ran = await self._run_tool_call(call, emit)
+                        # only a finishing call that went through: one with
+                        # unparsable arguments, denied or failing handed
+                        # nothing over, and earns no round past the budget
+                        handed_over = handed_over or (ran and name in finishing)
+                    messages.append(result_message)
+                    appended.append(result_message)
+                rounds += 1
+
+                if closing is not None:
+                    if closing == 0:
+                        return appended     # it would not stop calling; the UI reports that
+                    closing -= 1
+        finally:
+            if nudge is not None:
+                remove_message(messages, nudge)
+            for result_message in refused:
+                result_message['content'] = BUDGET_REOPENED.format(
+                    name=result_message['name'])
+
+    async def _complete_round(self, messages: List[dict], *, last: bool) -> dict:
+        """One round of :meth:`run`.
+
+        The *last* closing round forbids calls outright: the model has had its
+        chance to hand over, now it answers in text or not at all.  Not every
+        endpoint takes ``tool_choice: none`` (some know only ``auto`` and a
+        named function), and this is the round meant to salvage an answer, so
+        a refusal is retried as an ordinary round — any lookup the model makes
+        then is refused by the caller anyway."""
+        if not last:
+            return await self.complete(messages)
+        try:
+            return await self.complete(messages, allow_tools=False)
+        except LLMError:
+            return await self.complete(messages)
 
     async def _demand_tool(self, name: Optional[str], called: set,
                            messages: List[dict], emit,
@@ -256,22 +390,25 @@ class LLMClient:
         appended: List[dict] = [nudge, message]
         messages.append(message)
         for call in message.get('tool_calls') or []:
-            called.add(((call.get('function') or {}).get('name')) or '')
-            result_message = await self._run_tool_call(call, emit)
+            called.add(call_name(call))
+            result_message, _ran = await self._run_tool_call(call, emit)
             messages.append(result_message)
             appended.append(result_message)
         return appended
 
-    async def _run_tool_call(self, call: dict, emit) -> dict:
+    async def _run_tool_call(self, call: dict, emit) -> Tuple[dict, bool]:
         """Execute one tool call and build the ``role: tool`` reply for it.
 
         A failing tool is reported back to the model as its result rather than
         raised: the model can then correct itself (wrong table name, say)
         instead of the whole chat dying.
+
+        Returns the reply and whether the handler ran to the end: False for
+        arguments that do not parse, a call the user refused and a handler
+        that raised.
         """
-        function = call.get('function') or {}
-        name = function.get('name') or ''
-        raw_arguments = function.get('arguments') or '{}'
+        name = call_name(call)
+        raw_arguments = (call.get('function') or {}).get('arguments') or '{}'
         try:
             arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
             if not isinstance(arguments, dict):
@@ -279,38 +416,36 @@ class LLMClient:
         except (ValueError, TypeError) as exc:
             arguments = {}
             content = f'Error: cannot parse arguments {raw_arguments!r}: {exc}'
+            ran = False
         else:
             emit('tool', {'name': name, 'arguments': arguments})
-            content = await self._call_tool(name, arguments)
+            content, ran = await self._call_tool(name, arguments)
         emit('tool_result', {'name': name, 'content': content})
-        return {
-            'role': 'tool',
-            'tool_call_id': call.get('id', ''),
-            'name': name,
-            'content': content,
-        }
+        return tool_reply(call, content), ran
 
-    async def _call_tool(self, name: str, arguments: dict) -> str:
+    async def _call_tool(self, name: str, arguments: dict) -> Tuple[str, bool]:
+        """The result of *name* for the model, and whether its handler ran to
+        the end (not refused by the user, not raising)."""
         if self.tools is None:
-            return f'Error: no tools are available (tried to call {name!r})'
-        edited = None
+            return f'Error: no tools are available (tried to call {name!r})', False
+        decision = Decision()
         if self.approve is not None and self._asks_before(name):
-            answer = await self.approve(name, arguments)
-            if isinstance(answer, str):
-                # The handler never runs; the model is told why instead, so it
-                # carries on without the result rather than retrying blindly.
-                return answer
-            if isinstance(answer, dict):
-                edited = arguments = answer
+            decision = await self.approve(name, arguments)
+            if not decision.allowed:
+                # The handler never runs; the model is told why instead.
+                return with_note(decision.refusal, decision.note), False
+            if decision.arguments is not None:
+                arguments = decision.arguments
+        ran = True
         try:
             result = await self.tools.call(name, arguments)
         except Exception as exc:   # a broken tool must not kill the conversation
             result = f'Error: {type(exc).__name__}: {exc}'
-            if edited is None:
-                return result
-        if edited is not None:
-            result = edited_result(edited, result)
-        return truncate_result(result, self.tools.result_limit(name))
+            ran = False
+            if decision.arguments is None and not decision.note:
+                return result, ran
+        result = annotated_result(result, edited=decision.arguments, note=decision.note)
+        return truncate_result(result, self.tools.result_limit(name)), ran
 
     def _asks_before(self, name: str) -> bool:
         """Whether *name* is put to the user before it runs, as things stand."""
@@ -319,16 +454,75 @@ class LLMClient:
                 'exec': self.config.confirm_exec}.get(kind, False)
 
 
-def edited_result(arguments: dict, result: Any) -> dict:
-    """The result of a call the user changed before it ran.  The model has to
-    be told: otherwise it reads the rows as the answer to what *it* asked."""
+def closing_nudge(rounds: int, finishing: set) -> dict:
+    """The user's turn that tells the model its lookups are over (FINISH).
+
+    It names the tools that hand the answer over, when there are any, so the
+    model does not describe its answer in text and leave the Result pane empty."""
+    if finishing:
+        hand_over = (f'call {" or ".join(sorted(finishing))} with your best answer '
+                     'so far')
+    else:
+        hand_over = 'answer now in text with your best answer so far'
     return {
-        'edited_by_user': True,
-        'ran_with': arguments,
-        'note': 'The user edited this call before it ran; the result is for '
-                'the edited version, not the one you sent.',
-        'result': result,
+        'role': 'user',
+        'content': (f'You have made {rounds} rounds of tool calls and the budget for '
+                    'this request is spent: the lookup tools are closed and any call '
+                    f'to them will be refused. Finish with what you already have — '
+                    f'{hand_over}, and say plainly what you could not check.'),
     }
+
+
+def call_name(call: dict) -> str:
+    """The tool a ``tool_calls`` entry names; '' when it is malformed."""
+    return ((call.get('function') or {}).get('name')) or ''
+
+
+def tool_reply(call: dict, content: str) -> dict:
+    """The ``role: tool`` message answering *call* — with its result, or with
+    why it was not run."""
+    return {
+        'role': 'tool',
+        'tool_call_id': call.get('id', ''),
+        'name': call_name(call),
+        'content': content,
+    }
+
+
+def remove_message(messages: List[dict], message: dict) -> None:
+    """Take *message* — that very dict, not an equal one — out of *messages*."""
+    for index, candidate in enumerate(messages):
+        if candidate is message:
+            del messages[index]
+            return
+
+
+def annotated_result(result: Any, *, edited: Optional[dict] = None, note: str = '') -> Any:
+    """The result of a call the user had a say in before it ran.
+
+    *edited*: the arguments it actually ran with — the model has to be told,
+    otherwise it reads the rows as the answer to what *it* asked.  *note*: the
+    user's words to the model, sent as ``user_says``.  With neither, *result*
+    is returned as it is."""
+    if edited is None and not note:
+        return result
+    wrapped: dict = {}
+    if edited is not None:
+        wrapped.update({
+            'edited_by_user': True,
+            'ran_with': edited,
+            'note': 'The user edited this call before it ran; the result is for '
+                    'the edited version, not the one you sent.',
+        })
+    if note:
+        wrapped['user_says'] = note
+    wrapped['result'] = result
+    return wrapped
+
+
+def with_note(refusal: str, note: str) -> str:
+    """A refusal with the user's words to the model appended, if any."""
+    return f'{refusal}\nThe user says: {note}' if note else refusal
 
 
 def truncate_result(result: Any, limit: Optional[int] = MAX_TOOL_RESULT_CHARS) -> str:

@@ -423,7 +423,7 @@ class TestTabs:
         assert len(ed.documents[1].buf.lines) == 2
         assert len(ed.documents[0].buf.lines) == 1
 
-    def test_pipeline_vars_are_shared_by_every_tab(self):
+    def test_vars_are_shared_by_every_tab(self):
         ed = make_shell('one', 'two')
         ed.documents[0].vars['x'] = 1
         assert ed.documents[1].vars['x'] == 1

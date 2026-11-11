@@ -109,18 +109,18 @@ Pick one row to hand back to the schoose() pipeline step.
 '''
 
 
-# ── .VARS: the pipeline variables as an editable sheet ────────────────────────
+# ── .VARS: the shared variables as an editable sheet ────────────────────────
 # The three functions below hold the whole write-back rule set.  They touch
 # nothing but the plain dict they are given (no vd calls), so the sheet layer
 # stays a thin wrapper and the rules can be tested without VisiData.
 
 def store_var(variables: dict, key, value) -> None:
-    """Set *key* to *value* in the pipeline variables."""
+    """Set *key* to *value* in the shared variables."""
     variables[key] = value
 
 
 def drop_var(variables: dict, key):
-    """Remove *key* from the pipeline variables and return its old value
+    """Remove *key* from the shared variables and return its old value
     (which the caller registers as the undo)."""
     return variables.pop(key, None)
 
@@ -174,12 +174,12 @@ class VarValueColumn(ColumnItem):
 
 
 class VarsSheet(ViewSheet):
-    """Pipeline .VARS sheet: the shared pipeline variables as editable
+    """Pipeline .VARS sheet: the shared variables as editable
     key/value rows.  Every edit is applied to the variables immediately (there
     is nothing to commit), and q hands control back to the pipeline the same
     way .VIEW does."""
-    guide = '''# Pipeline variables
-Edits are applied to the pipeline variables immediately.
+    guide = '''# Shared variables
+Edits are applied to the shared variables immediately.
 
 - `e` to set the key / value (the value is stored as a string).
 - `z=` / `g=` to set the value to the result of a Python expression (number, list, dict).
