@@ -794,6 +794,177 @@ class TestPipelineMacro:
         ''')
 
 
+    def test_color_row_replays_from_a_macro_and_the_first_rule_wins(self):
+        """What the guide tells the model about color-row: the input is an
+        object, an expression that cannot be evaluated paints nothing, and
+        of two matching rules the earlier one gives the colour."""
+        run_with_real_visidata('''
+            import visidata
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.pipeline.executor import parse_vd_macro
+
+            rows = [{'host': 'a', 'lag': -5}, {'host': 'b', 'lag': 50},
+                    {'host': 'c', 'lag': 500}, {'host': 'd', 'lag': None}]
+            vs = visidata.PyobjSheet('result', source=rows)
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            macro = parse_vd_macro("""
+            {"longname": "color-row", "input": {"expr": "lag > 100", "color": "magenta"}}
+            {"longname": "color-row", "input": {"expr": "0 < lag <= 100", "color": "red"}}
+            {"longname": "color-row", "input": {"expr": "lag > 10", "color": "yellow"}}
+            """)
+            log = visidata.CommandLogJsonl('vdm', source=None)
+            for line in macro:
+                assert not vd.replayOne(log.newRow(**line)), line
+
+            col = vs.column('lag')
+
+            def painted(row):
+                # the colour options that apply, in the order VisiData stacks
+                # them: the first one is the one drawn
+                return [c.coloropt for c in vs._colorizers
+                        if c.coloropt in ('magenta', 'red', 'yellow') and c.func(vs, col, row, None)]
+
+            assert painted(rows[0]) == []
+            assert painted(rows[1]) == ['red', 'yellow']
+            assert painted(rows[2]) == ['magenta', 'yellow']
+            assert painted(rows[3]) == []            # None > 100 raises: left plain
+
+            # same precedence, so VisiData keeps the first colour it meets
+            from visidata.color import ColorAttr, update_attr
+            first, second = ColorAttr(1, -1, 0, 8), ColorAttr(2, -1, 0, 8)
+            assert update_attr(update_attr(ColorAttr(), first, 8), second, 8).fg == 1
+        ''')
+
+    def test_the_command_catalog_is_searchable(self):
+        """find_visidata_commands reads VisiData's registry as it stands."""
+        run_with_real_visidata('''
+            from dbcls.llm.vd_commands import MAX_LIMIT, _entries, find_commands
+
+            entries = _entries()
+            names = {e['longname'] for e in entries}
+            assert len(names) > 300, len(names)
+            assert {'color-row', 'freq-col', 'alt-plot', 'type-size'} <= names
+            assert not any(n.startswith('menu-') for n in names)
+            # sheet types a pipeline never shows are left out
+            assert not any('S3' in e['sheet'] or 'Zulip' in e['sheet'] for e in entries)
+
+            fields = {e['longname']: e['fields'] for e in entries if e['fields']}
+            assert fields['color-row'] == ('expr', 'color'), fields
+            assert fields['addcol-regex-subst'] == ('before', 'after'), fields
+
+            text = find_commands('color rows')
+            assert text.splitlines()[0].startswith('color-row —'), text
+            assert 'runs: color_row(**inputCondFmt())' in text
+            assert 'fields: expr, color' in text
+
+            assert find_commands('alt-plot').splitlines()[0].startswith('alt-plot [key gp] —')
+            assert 'join (' in find_commands('') and 'addcol (' in find_commands('')
+            # whatever is asked for, the answer stays a size a request can carry
+            assert len(find_commands('col', MAX_LIMIT)) < 16000
+        ''')
+
+    def test_the_catalog_leaves_out_what_a_macro_must_not_run(self):
+        """The guide forbids quitting, files, the shell and database edits; the
+        catalog must not hand the model those commands with a ready `runs:`."""
+        run_with_real_visidata('''
+            import re
+            from visidata import vd
+            from dbcls.llm.vd_commands import _entries, find_commands
+
+            entries = _entries()
+            names = {e['longname'] for e in entries}
+            # each of these is in the registry — and none is in the catalog
+            forbidden = {'quit-sheet', 'quit-all', 'save-sheet', 'save-all', 'save-col',
+                         'open-file', 'exec-shell', 'exec-python', 'exec-longname',
+                         'addcol-shell', 'import-python', 'sysopen-help', 'sysedit-cell',
+                         'commit-sheet', 'pending-sql-execute', 'signal-process',
+                         'kill-process', 'view-close', 'watch-close', 'open-url'}
+            assert forbidden <= set(vd.commands), forbidden - set(vd.commands)
+            assert not forbidden & names, forbidden & names
+
+            # the table editor's own versions go, the plain sheet's stay
+            sheets = {e['sheet'] for e in entries}
+            assert not sheets & {'EditTableSheet', 'PendingSqlSheet', 'DirSheet',
+                                 'ProcessesSheet', 'PluginsSheet'}, sheets
+            assert [e['sheet'] for e in entries if e['longname'] == 'delete-row'] == ['']
+
+            # nothing that is left reaches a file, a shell or another process
+            danger = re.compile(r'saveSheets|saveCols|openSource|inputPath|inputShell'
+                                r'|launch|os[.]kill|[^.\\w]exec[(]|vd[.]quit|subprocess')
+            left = [e['longname'] for e in entries if danger.search(e['runs'])]
+            assert not left, left
+
+            for query in ('shell', 'quit', 'save sheet', 'exec'):
+                text = find_commands(query)
+                for name in forbidden:
+                    assert name + ' ' not in text, (query, name)
+            # what does match says why the obvious command is not among it
+            assert 'left out of this catalog' in find_commands('quit')
+
+            # what the guide itself is made of is still found
+            kept = {'color-row', 'freq-col', 'open-cell', 'open-row', 'dup-selected',
+                    'select-expr', 'addcol-expr', 'rename-col', 'aggregate-col',
+                    'delete-row', 'save-to-vars', 'reload-sheet'}
+            assert kept <= names, kept - names
+        ''')
+
+    def test_a_command_asks_through_more_than_input(self):
+        """The guide's rule for reading `runs:` — a call named input…, choose…
+        or editCell is a prompt — checked on commands known to ask."""
+        run_with_real_visidata('''
+            import re
+            from dbcls.llm.vd_commands import _entries
+
+            runs = {e['longname']: e['runs'] for e in _entries() if not e['sheet']}
+            asks = re.compile(r'input\\w*[(]|choose\\w*[(]|editCell[(]', re.I)
+            for name in ('aggregate-col', 'addcol-aggregate', 'rename-col', 'edit-cell',
+                         'theme-input', 'select-expr', 'addcol-expr', 'color-row'):
+                assert asks.search(runs[name]), (name, runs[name])
+            # and it does not see a prompt where there is none
+            for name in ('freq-col', 'sort-desc', 'resize-cols-max', 'select-rows'):
+                assert not asks.search(runs[name]), (name, runs[name])
+        ''')
+
+    def test_a_colour_rule_cannot_name_a_column_called_c_or_value(self):
+        """VisiData binds value/v, col/c, row/r, sheet/s in a colour rule ahead
+        of the columns — the guide tells the model to alias such a column."""
+        run_with_real_visidata('''
+            import visidata
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.pipeline.executor import parse_vd_macro
+
+            rows = [{'name': 'a', 'c': 500, 'value': 500, 'cnt': 500}]
+            vs = visidata.PyobjSheet('result', source=rows)
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            macro = parse_vd_macro("""
+            {"longname": "color-row", "input": {"expr": "c > 100", "color": "magenta"}}
+            {"longname": "color-row", "input": {"expr": "value > 100", "color": "red"}}
+            {"longname": "color-row", "input": {"expr": "cnt > 100", "color": "yellow"}}
+            """)
+            log = visidata.CommandLogJsonl('vdm', source=None)
+            for line in macro:
+                assert not vd.replayOne(log.newRow(**line)), line
+
+            def painted(colname):
+                col = vs.column(colname)
+                cell = col.getTypedValue(rows[0])
+                return [c.coloropt for c in vs._colorizers
+                        if c.coloropt in ('magenta', 'red', 'yellow')
+                        and c.func(vs, col, rows[0], cell)]
+
+            # `c` is the column object: never true.  `value` is the one cell
+            # looked at: true on a number, not on the text next to it.
+            assert painted('name') == ['yellow']
+            assert painted('cnt') == ['red', 'yellow']
+        ''')
+
+
 class TestClosedSheetsAreReleased:
     """VisiData keeps a sheet deleted in `gS` alive from its threads, option
     caches and undo log; release_closed_sheets lets it go and nothing else."""

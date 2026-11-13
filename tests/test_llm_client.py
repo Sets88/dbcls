@@ -940,7 +940,8 @@ class TestDbTools:
         DbTools(fake_api(self._client())).register(registry)
         assert set(registry.names()) == {
             'list_databases', 'list_tables', 'get_table_schema', 'sample_data',
-            'run_sql', 'get_pipeline_reference', 'get_visidata_macro_reference'}
+            'run_sql', 'get_pipeline_reference', 'get_visidata_macro_reference',
+            'find_visidata_commands'}
         for schema in registry.schemas():
             function = schema['function']
             assert function['description']
@@ -976,6 +977,7 @@ class TestPipelineReferenceTool:
         registry = self._registry()
         assert registry.result_limit('get_pipeline_reference') is None
         assert registry.result_limit('get_visidata_macro_reference') is None
+        assert registry.result_limit('find_visidata_commands') is None
         assert registry.result_limit('list_tables') == 8000
         assert registry.result_limit('unknown_tool') == 8000
 

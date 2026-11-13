@@ -6,7 +6,10 @@ Those two facts are what these tests hold in place.
 """
 from unittest.mock import MagicMock
 
+import json
 import re
+
+import pytest
 
 from dbcls.llm.prompt import build_context_message, build_system_prompt
 from dbcls.llm.reference import pipeline_reference, reference_path
@@ -245,6 +248,133 @@ class TestVisidataMacroReference:
         monkeypatch.setattr(reference, 'reference_path', lambda name: '/definitely/not/here.md')
         text = reference.visidata_macro_reference()
         assert 'missing' in text and '.VDM' in text
+
+    def test_colouring_rows_is_covered_with_an_example(self):
+        """color-row takes a form, so its input is an object — the one thing
+        a model cannot guess from the other commands."""
+        import json
+        text = self._text()
+        assert '### Colouring' in text
+        rules = [json.loads(line) for line in text.splitlines()
+                 if line.startswith('{"longname": "color-row"')]
+        assert len(rules) >= 2
+        for rule in rules:
+            assert set(rule['input']) == {'expr', 'color'}, rule
+
+    def test_points_at_the_command_catalog_for_the_rest(self):
+        assert 'find_visidata_commands' in self._text()
+
+    def test_a_prompt_is_not_only_a_call_named_input(self):
+        """`aggregate-col` asks through chooseAggregators() and `rename-col`
+        through editCell(): the rule for reading `runs:` has to name them, or
+        it contradicts the guide's own tables."""
+        text = self._text()
+        rule = text[text.index('read the `input` off it'):text.index('`only on <Sheet>`')]
+        assert 'choose…(' in rule and 'chooseAggregators' in rule
+        assert 'editCell(' in rule
+        assert 'asks nothing, give no `input`' not in text
+
+    def test_colour_rules_warn_of_the_names_that_hide_a_column(self):
+        text = self._text()
+        section = text[text.index('### Colouring'):text.index('## Charts')
+                       if '## Charts' in text else len(text)]
+        for name in ('`value` / `v`', '`col` / `c`', '`row` / `r`', '`sheet` / `s`'):
+            assert name in section, name
+        assert 'hide a column of the same name' in section
+        # and no example of its own walks into it
+        for line in text.splitlines():
+            if line.startswith('{"longname": "color-row"'):
+                assert not re.search(r'\b(c|v|r|s|col|row|value|sheet)\b',
+                                     json.loads(line)['input']['expr']), line
+
+
+class TestVisidataCommandSearch:
+    """find_visidata_commands, without VisiData: the ranking and the layout.
+    Against the real catalog it is tested in test_visidata_seams."""
+
+    ENTRIES = [
+        {'longname': 'color-row', 'help': 'apply color to rows where Python expr is truthy',
+         'runs': 'color_row(**inputCondFmt())', 'sheet': '', 'key': '',
+         'fields': ('expr', 'color')},
+        {'longname': 'color-cell', 'help': 'apply color to cells where Python expr is truthy',
+         'runs': 'color_cell(**inputCondFmt())', 'sheet': '', 'key': '',
+         'fields': ('expr', 'color')},
+        {'longname': 'open-row', 'help': 'open source rows of the group',
+         'runs': 'vd.push(openRow(cursorRow))', 'sheet': 'FreqTableSheet', 'key': 'Enter',
+         'fields': ()},
+    ] + [
+        {'longname': f'go-row-{n}', 'help': f'move to row {n}', 'runs': f'go({n})',
+         'sheet': '', 'key': '', 'fields': ()}
+        for n in range(30)
+    ]
+
+    def _find(self, monkeypatch, query='', limit=None):
+        import dbcls.llm.vd_commands as vd_commands
+        monkeypatch.setattr(vd_commands, '_entries', lambda: list(self.ENTRIES))
+        return vd_commands.find_commands(query, limit)
+
+    def test_a_rare_word_outweighs_a_common_one(self, monkeypatch):
+        """"row" is in every name here and says nothing; "color" picks."""
+        lines = [line for line in self._find(monkeypatch, 'color rows').splitlines()
+                 if line and not line.startswith(' ')]
+        assert lines[0].startswith('color-row —')
+        assert lines[1].startswith('color-cell —')
+        assert not any(line.startswith('go-row-') for line in lines)
+
+    def test_a_match_shows_what_a_macro_line_needs(self, monkeypatch):
+        text = self._find(monkeypatch, 'color-row')
+        assert 'runs: color_row(**inputCondFmt())' in text
+        assert 'fields: expr, color' in text
+        assert '"input"' in text            # the note on how to read it
+
+    def test_a_sheet_bound_command_and_its_key_are_tagged(self, monkeypatch):
+        assert 'open-row [key Enter, only on FreqTableSheet] —' in self._find(monkeypatch, 'open')
+
+    def test_the_limit_is_kept_and_the_rest_is_counted(self, monkeypatch):
+        text = self._find(monkeypatch, 'go', limit=5)
+        assert text.count('go-row-') == 5
+        assert '… and 25 more' in text
+
+    def test_no_query_lists_the_families(self, monkeypatch):
+        text = self._find(monkeypatch)
+        assert 'color (2)' in text and 'go (30)' in text and 'open (1)' in text
+
+    def test_nothing_found_says_so(self, monkeypatch):
+        text = self._find(monkeypatch, 'zzzz')
+        assert 'No VisiData command matches' in text
+        # the command may exist and be one a macro must not run
+        assert 'not in this catalog' in text
+
+    @pytest.mark.parametrize('limit', ['all', 'many', '', float('inf'), float('nan'), [], {}])
+    def test_a_limit_that_is_no_number_means_the_default(self, monkeypatch, limit):
+        """A model's "all" must not turn the search into a failed tool call."""
+        from dbcls.llm.vd_commands import DEFAULT_LIMIT
+        text = self._find(monkeypatch, 'go', limit=limit)
+        assert text.count('go-row-') == DEFAULT_LIMIT
+
+    @pytest.mark.parametrize('limit, shown', [(-3, 1), (0, 15), ('7', 7), (2.9, 2),
+                                              (True, 1), (10 ** 9, 30)])
+    def test_a_limit_out_of_range_is_clamped(self, monkeypatch, limit, shown):
+        assert self._find(monkeypatch, 'go', limit=limit).count('go-row-') == shown
+
+    def test_no_visidata_degrades_to_a_message(self, monkeypatch):
+        """The chat must stay usable where the catalog cannot be read."""
+        import dbcls.llm.vd_commands as vd_commands
+
+        def broken():
+            raise ImportError('No module named visidata')
+
+        monkeypatch.setattr(vd_commands, '_entries', broken)
+        text = vd_commands.find_commands('color')
+        assert 'not available' in text and '.VDM guide' in text
+
+    def test_the_tool_passes_its_arguments_through(self, monkeypatch):
+        import asyncio
+        from dbcls.llm.tools import find_visidata_commands
+        import dbcls.llm.vd_commands as vd_commands
+        monkeypatch.setattr(vd_commands, '_entries', lambda: list(self.ENTRIES))
+        text = asyncio.run(find_visidata_commands('go', 3))
+        assert text.count('go-row-') == 3
 
 
 class TestPluginAdditionsInTheReference:

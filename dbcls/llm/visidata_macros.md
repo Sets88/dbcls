@@ -3,7 +3,7 @@
 `.VDM` replays a VisiData macro on the sheet a pipeline shows, as soon as that
 sheet opens. Use it when the user wants the result *arranged* for them — sorted,
 grouped into a frequency table, narrowed to some rows, some columns hidden or
-added — rather than just listed. Anything that is plain data work (filtering,
+added, rows coloured by a condition — rather than just listed. Anything that is plain data work (filtering,
 joining, aggregating) is still better done in SQL or in `.PY`: a macro only
 changes the view the user lands on.
 
@@ -39,7 +39,7 @@ Fields of one line:
 | `keystrokes` | The key binding instead of the longname, e.g. `"["`. Only when there is no longname; bindings are less readable. |
 | `col` | Put the cursor on this column first: a column **name** (string, exact match) or a 0-based index among the visible columns (integer). Omit or `""` to leave the cursor where it is. |
 | `row` | Put the cursor on this row first: 0-based row index (integer, or a digit string). Omit or `""` to leave it. |
-| `input` | The answer to the prompt the command asks, if it asks one (see the table below). Omit for commands that ask nothing. |
+| `input` | The answer to the prompt the command asks, if it asks one (see the tables below): a string for a single prompt, an object keyed by field for a form of several (`{"expr": "…", "color": "…"}`). Omit for commands that ask nothing. |
 | `sheet` | Name of the sheet to run on. Leave it out (or `""`): then the command runs on the sheet on top at that moment — the display sheet first, and after a command that opens a new sheet (`freq-col`, `open-row`, `dup-selected`…) on that new sheet. Naming sheets is fragile; don't. |
 | `comment` | Free text shown in the status bar while the line runs. Optional. |
 
@@ -109,6 +109,56 @@ Checked against the VisiData dbcls ships with. "input" is what goes into the
 | `select-duplicate-rows` | select each row that repeats an earlier one | — |
 | `dup-selected` | open a new sheet with only the selected rows — the usual way to *show* a selection | — |
 
+### Colouring
+
+| longname | does | input |
+|---|---|---|
+| `color-row` | paint whole rows where the expression is true — the way to make rows stand out by a condition | object `{"expr": "expression", "color": "color"}` |
+| `color-cell` | paint single cells: the expression is tried on every cell, with `value` being that cell | same object |
+| `color-col` | paint whole columns: the expression is about the column, e.g. `"col.name.startswith('total_')"` | same object |
+
+One line per rule; they ask nothing of the cursor, so no `col` / `row`.
+
+- **`expr`** is a Python expression over column names, as in `select-expr`:
+  `"status == 'failed'"`, `"lag > 100"`, `"0 < lag <= 100"`,
+  `"'timeout' in (error or '')"`.
+- **Eight names are taken and hide a column of the same name**: `value` / `v`
+  (the cell being painted), `col` / `c` (its column — `col.name`), `row` / `r`,
+  `sheet` / `s`. With `count(*) AS c` in the SQL, `"c > 100"` compares a column
+  *object* to a number and the rule paints nothing; a column called `value`
+  gives a different answer for every cell. So a result column named `c`, `v`,
+  `r`, `s`, `col`, `row`, `value` or `sheet` must get another alias in the SQL
+  (`count(*) AS cnt`) before a rule can name it. A column whose name is not a
+  Python identifier is not reachable by name either: alias it too.
+- `value` is for `color-cell`. A `color-row` rule is also tried cell by cell,
+  so one that tests `value` paints the row in patches — in `color-row` name
+  the columns.
+- **`color`** is `[attributes] [foreground] [on background]`: the names
+  `black` `red` `green` `yellow` `blue` `magenta` `cyan` `white` or a number
+  `0`–`255`; attributes `bold` `underline` `italic` `reverse`. So `"red"`,
+  `"bold green"`, `"on red"`, `"bold white on 52"`. Give both keys in every
+  rule: an object without `color` aborts the replay.
+- **Overlapping rules: the first one wins.** When two rules match the same row
+  the earlier line gives the colour, so put the most specific or most important
+  rule first (`lag > 1000` before `lag > 100`), or make the conditions
+  exclusive. A later rule only adds what the earlier left unset — a background
+  under a foreground, an attribute.
+- **A rule that cannot be evaluated paints nothing, silently.** Comparing a
+  `NULL` (`None`) or a text value to a number raises, and the row just stays
+  uncoloured — no error is shown. Rows with `NULL` staying plain is usually
+  what is wanted; a *text* column is the trap: when the driver returns numbers
+  as text, put a `type-int` / `type-float` line on that column first, or
+  convert in the expression (`"float(lag) > 100"`).
+- The colour is evaluated as the sheet is drawn, so it follows sorting and, on
+  a `.WATCH` sheet, the live data: a row changes colour as its values change.
+- Colours belong to the sheet they were set on. `freq-col`, `pivot` and the
+  other derived sheets start uncoloured, so colour lines go **after** the
+  command that opens the sheet the user lands on, with that sheet's column
+  names (`count`, `percent`… on a frequency table).
+- A coloured row shows its rule's colour even when selected. If the user is
+  meant to mark rows on the sheet (a `.WATCH` picker), colour with a
+  background (`"on 52"`) or an attribute and leave the foreground alone.
+
 ### Opening derived sheets (each becomes the new top sheet)
 
 | longname | does | input |
@@ -174,7 +224,69 @@ What it cannot do, and what to do instead:
   after it runs on the chart, where nothing works. Do everything else first.
 - On a `.WATCH` sheet the chart follows the live data and redraws with it.
 
+## Other commands
+
+The tables above are the commands checked against dbcls — enough for most
+macros. VisiData has several hundred more (joining sheets, expanding nested
+columns, filling blanks, ranking, splitting a column by a regex, sliding
+columns around, freezing computed columns…). They are not described here;
+**look them up** with `find_visidata_commands` when the tables do not have
+what the request needs:
+
+- `find_visidata_commands(query="fill empty cells")` — words from what you want
+  to do, matched against the commands' names and descriptions.
+- `find_visidata_commands(query="addcol")` — a family: every longname starts
+  with one (`addcol-…`, `setcol-…`, `join-…`, `expand-…`).
+- `find_visidata_commands()` — the list of families, to see what there is.
+
+Each match is the longname, the key the user would press, VisiData's own
+one-line description and `runs:` — the expression the command executes. A
+command asks wherever that expression calls one of VisiData's prompting
+functions, so read the `input` off it:
+
+- a call with `input` in its name — `input("…")`, `vd.input(…)`,
+  `inputExpr(…)`, `inputRegex(…)`, `moveInputRegex(…)`, `inputJointype()` →
+  one prompt, a string (numbers as strings too: `"3"`);
+- `choose…(` — `chooseOne(…)`, `chooseMany(…)`, `chooseAggregators(…)` → a
+  pick from a list, also a string: the name picked, several separated by
+  spaces where more than one may be (`"sum avg"`);
+- `editCell(…)` → the in-place editor of a cell or a column header
+  (`rename-col`, `edit-cell`): a string, the new value;
+- a `fields:` line → a form: an object with those keys. A plain string fills
+  the first field and leaves the others at their defaults;
+- none of these → most likely the command asks nothing: give no `input`. Only
+  most likely — some commands ask from inside a function, where `runs:` does
+  not show it (`setcol_expr(cursorCol)`), and the description is then the
+  hint ("…by a regex", "…to a given value").
+- A line that asks and has no `input` **stops the replay at the prompt**, for
+  the user to type the answer — not a failure, but tell the user to expect it.
+- `only on <Sheet>` — the command exists on that kind of sheet alone (a
+  frequency table, the columns sheet): it works only after the line that opens
+  one.
+
+Never invent a longname: a line naming a command that does not exist aborts
+the replay. Whatever comes from the catalog is unchecked here — say so when
+you hand such a macro over, so the user knows which line to look at if the
+sheet comes out wrong. The rule against quitting, saving, shell and database
+edits holds for these commands as well: the catalog leaves such commands out,
+and a command it does not show is not to be written from memory instead.
+
 ## Recipes
+
+Rows coloured by a threshold — the worst case first, since the first matching
+rule wins:
+
+```sql
+.RUN "SELECT host, queue, lag FROM replication_lag" | .VDM """
+{"longname": "color-row", "input": {"expr": "lag > 100", "color": "magenta"}}
+{"longname": "color-row", "input": {"expr": "0 < lag <= 100", "color": "red"}}
+{"longname": "color-row", "input": {"expr": "lag < 0", "color": "green"}}
+{"col": "lag", "longname": "sort-desc"}
+"""
+```
+
+Rows with `lag` of `0` or `NULL` match no rule and stay plain. On a `.WATCH`
+the same lines keep the colours current as the numbers move.
 
 Most frequent value of a column, drilled into straight away:
 
@@ -251,9 +363,15 @@ before it:
 2. Every `col` is a column the sheet has *at that point* — after a `freq-col`
    the columns are the grouped column, `count`, `percent`, `histogram` and
    the aggregates.
-3. A command that asks something has its `input`.
+3. A command that asks something has its `input` — an object for a form
+   (`color-row`, `addcol-regex-subst`). Colour rules: most important first,
+   compared columns are numbers and not text, none of them is named `c`, `v`,
+   `r`, `s`, `col`, `row`, `value` or `sheet`, and they come after the command
+   that opens the sheet they are for.
 4. Nothing that quits, saves, edits a table or runs a shell command.
    `alt-plot`, if any, is the last line, its X column is a time or a number,
    and in bucket mode a `sort-desc` on the Y column comes right before it.
 5. The macro sits before the display point it is meant for (`.VIEW` or the end),
    not before a `.SHEET`.
+6. Every longname is from the tables here or from `find_visidata_commands` —
+   none from memory.

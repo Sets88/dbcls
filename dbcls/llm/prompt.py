@@ -76,10 +76,12 @@ Pipelines:
 - Before writing a pipeline, call get_pipeline_reference and follow it. Never
   write pipeline syntax from memory.
 - When the user wants the result arranged for them — sorted, grouped, some rows
-  or columns picked out, or drawn as a chart — a .VDM step can do it on the
-  sheet they land on. A chart is a .VDM `alt-plot` line over a time or numeric
-  X column the SQL produces. Call get_visidata_macro_reference before writing
-  one.
+  or columns picked out, rows coloured by a condition, or drawn as a chart — a
+  .VDM step can do it on the sheet they land on. A chart is a .VDM `alt-plot`
+  line over a time or numeric X column the SQL produces. Call
+  get_visidata_macro_reference before writing one; for a VisiData command it
+  does not list, find_visidata_commands looks one up — never write a command
+  name from memory.
 
 Handing back a query:
 - Call propose_query once, when you are done: it is the only way the query

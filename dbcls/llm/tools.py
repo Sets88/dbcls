@@ -14,13 +14,16 @@ schema/sample-data statements, which already differ per engine.
 Some tools are not about the database.  ``get_pipeline_reference`` pulls the
 pipeline-language reference when the model needs one, so the reference is not
 carried in every request, and ``get_visidata_macro_reference`` the guide to
-``.VDM`` macros, which only some pipelines need; ``get_vars_keys`` / ``get_var`` read the pipeline
+``.VDM`` macros, which only some pipelines need; ``find_visidata_commands``
+searches VisiData's own command catalog for what that guide does not spell
+out; ``get_vars_keys`` / ``get_var`` read the pipeline
 variable store, so the model can talk about what an earlier pipeline left
 behind (see :class:`VarsTools`).
 """
 from typing import Any, Dict, List, Optional
 
 from .reference import pipeline_reference, visidata_macro_reference
+from .vd_commands import DEFAULT_LIMIT, MAX_LIMIT, find_commands
 
 #: Rows a single sample_data call may return.
 MAX_SAMPLE_ROWS = 20
@@ -361,6 +364,11 @@ async def get_visidata_macro_reference() -> str:
     return visidata_macro_reference()
 
 
+async def find_visidata_commands(query: str = '', limit: Optional[int] = None) -> str:
+    """Tool handler: VisiData commands matching *query*, for a ``.VDM`` line."""
+    return find_commands(query, limit)
+
+
 def register_reference_tool(registry) -> None:
     registry.add(
         'get_pipeline_reference',
@@ -378,12 +386,46 @@ def register_reference_tool(registry) -> None:
         'get_visidata_macro_reference',
         'Read the guide to writing VisiData macros for the .VDM pipeline step — '
         'the JSON-lines format, the commands that sort, group, select, hide or '
-        'add columns on the sheet the user lands on, the in-terminal chart '
-        '(alt-plot) and recipes. Call this before putting a .VDM step in a '
-        'pipeline, and whenever the user asks for a chart, plot or graph.',
+        'add columns and colour rows by a condition on the sheet the user '
+        'lands on, the in-terminal chart (alt-plot) and recipes. Call this '
+        'before putting a .VDM step in a pipeline, and whenever the user asks '
+        'for a chart, plot or graph, or for rows to be highlighted.',
         {'type': 'object', 'properties': {}},
         get_visidata_macro_reference,
         max_result_chars=None,
+        needs_approval=False,
+    )
+    registry.add(
+        'find_visidata_commands',
+        'Search VisiData\'s own command catalog for a command to use in a '
+        '.VDM macro line — for what the macro guide does not list (joining '
+        'sheets, expanding nested columns, filling blanks, ranking, '
+        'splitting or moving columns…). Gives each match\'s longname, key, '
+        'one-line description and the expression it runs, which shows what '
+        'it asks for as "input". Read get_visidata_macro_reference first: '
+        'it has the macro format and the commands already checked. Never '
+        'write a longname from memory — look it up here.',
+        {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Words from what the command should do '
+                                   '("fill empty cells"), or a family of '
+                                   'longnames ("addcol", "join"). Omit for '
+                                   'the list of families.',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': f'Matches to return (1-{MAX_LIMIT}), '
+                                   f'{DEFAULT_LIMIT} by default.',
+                },
+            },
+        },
+        find_visidata_commands,
+        # Bounded by `limit` already, and the note that ends it must arrive.
+        max_result_chars=None,
+        # A fixed catalog, not the user's data: never worth asking about.
         needs_approval=False,
     )
 

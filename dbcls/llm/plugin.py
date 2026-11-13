@@ -79,8 +79,8 @@ to the model as the call's result, so it knows you said no and carries on
 without it. `Allow with a note…` and `Deny with a note…` do the same and open a
 line to type a word to the model into — "the ids are strings", "use the orders
 table instead" — which goes along with the result or the refusal. Reading the
-pipeline or `.VDM` reference, asking you a question and handing over its
-answer are never asked about.
+pipeline or `.VDM` reference, searching VisiData's command catalog, asking
+you a question and handing over its answer are never asked about.
 
 A tool that runs code the model wrote — `run_sql`, or a plugin's, a shell
 command say — is asked about differently: the title shows the code, and the
@@ -137,8 +137,14 @@ pipeline is what you want, it calls `get_pipeline_reference` and reads the
 language reference first. Commands and functions your plugins added are listed
 there too, marked as local to this installation, so the model can use them and
 knows not to treat them as part of dbcls itself. A `.VDM` step (a VisiData
-macro that arranges the sheet you land on) has a guide of its own,
+macro that arranges the sheet you land on — sorts it, groups it, colours rows
+by a condition, draws a chart) has a guide of its own,
 `get_visidata_macro_reference`, which the model reads only when it writes one.
+The guide spells out a few dozen commands; for the rest of VisiData the model
+searches the command catalog of your installation with
+`find_visidata_commands` — names, keys and one-line descriptions, straight
+from VisiData. What a macro must not run (quitting, saving or opening files,
+the shell, edits of a database table) is left out of that catalog.
 
 `Configuration` — any OpenAI-compatible endpoint (OpenRouter, Ollama, vLLM,
 LM Studio, a local proxy):

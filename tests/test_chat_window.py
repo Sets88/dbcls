@@ -2185,7 +2185,7 @@ class TestPluginWiring:
         editor = self._register()
         tools = editor.llm_tools
         exempt = {RESULT_TOOL, ANSWER_TOOL, ASK_TOOL, SHOW_TOOL, 'get_pipeline_reference',
-                  'get_visidata_macro_reference'}
+                  'get_visidata_macro_reference', 'find_visidata_commands'}
         for name in tools.names():
             assert (tools.approval_kind(name) is not None) == (name not in exempt), name
 
