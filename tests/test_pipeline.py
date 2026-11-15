@@ -1199,6 +1199,201 @@ class TestPipelineVdm:
 
 
 @pytest.mark.asyncio
+class TestPipelineVdmHelper:
+    """vdm() is .VDM from Python — and, with sheet=, the macro of a sheet the
+    pipeline does not show itself, as bind_key(..., sheet=) is for its keys."""
+
+    async def test_without_a_sheet_it_queues_what_the_step_queues(self):
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}]), vars={'m': _MACRO}))
+        result = await exe.execute(
+            '.VDM \'{"longname": "a"}\' | .PY "vdm(get_var(\'m\'))" | .RUN "q"')
+        assert result.macro == [{'longname': 'a'}] + _MACRO_ROWS
+        assert result.data == [{'id': 1}]       # the step passes its data on
+
+    async def test_rows_may_be_dicts_and_are_copied(self):
+        mine = {'longname': 'sort-desc', 'col': 'n'}
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}]), vars={'m': mine}))
+        result = await exe.execute(
+            '.PY "vdm(get_var(\'m\')); vdm([get_var(\'m\'), {\'longname\': \'b\'}])" | .RUN "q"')
+        assert result.macro == [mine, mine, {'longname': 'b'}]
+        assert all(row is not mine for row in result.macro)
+
+    async def test_a_view_takes_it_like_the_steps(self):
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        dbeditor.request_user_input = MagicMock(return_value=None)
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(
+            '.PY "vdm({\'longname\': \'a\'})" | .RUN "q" | .VIEW "s" | .PY "data"')
+        request = dbeditor.request_user_input.call_args.args[0]
+        assert request['extra'] == {'vdm_macro': [{'longname': 'a'}]}
+        assert result.macro == []
+
+    async def test_a_sheet_given_by_hand_gets_it_and_nothing_is_queued(self):
+        mine = object()
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]), vars={'s': mine})
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(
+            '.PY "vdm({\'longname\': \'a\'}, sheet=get_var(\'s\'))" | .RUN "q"')
+        dbeditor.queue_sheet_macro.assert_called_once_with(mine, [{'longname': 'a'}])
+        assert result.macro == []
+
+    async def test_bad_macros_raise(self):
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}])))
+        with pytest.raises(ValueError, match='line 1 is not valid JSON'):
+            await exe.execute('.PY "vdm(\'nope\')"')
+        with pytest.raises(ValueError, match='row 2 names no command'):
+            await exe.execute('.PY "vdm([{\'longname\': \'a\'}, {\'col\': \'n\'}])"')
+        with pytest.raises(ValueError, match='got NoneType'):
+            await exe.execute('.PY "vdm(None)"')
+
+
+_BIND = (".PY \"\"\"\n"
+         "def on_x(row):\n"
+         "    return run_sql('SELECT ' + str(row['id']))\n"
+         "bind_key('x', on_x, 'cursorRow')\n"
+         "\"\"\"")
+
+
+def _waits_on(loop):
+    """A host's wait_from_sheet: run the coroutine on *loop* and block for it —
+    what DbEditorTab does through SyncClient, minus the polling."""
+    def wait(coro_func, *args):
+        return asyncio.run_coroutine_threadsafe(coro_func(*args), loop).result(5)
+    return wait
+
+
+@pytest.mark.asyncio
+class TestPipelineBindKey:
+    """bind_key() queues a function for the next sheet the pipeline shows, the
+    way .VDM queues a macro; run_sql() is what that function queries with."""
+
+    async def test_the_keys_go_with_the_final_result(self):
+        rows = [{'id': 1}]
+        exe = PipelineExecutor(_make_dbeditor(_make_client(rows)))
+        result = await exe.execute(f'{_BIND} | .RUN "q"')
+        assert result.data == rows
+        assert list(result.keys) == ['x']
+        func, params = result.keys['x']
+        assert func.__name__ == 'on_x' and params == 'cursorRow'
+        # a new run starts clean
+        assert (await exe.execute('.RUN "q"')).keys == {}
+
+    async def test_a_view_takes_the_keys_and_the_result_is_left_without(self):
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        dbeditor.request_user_input = MagicMock(return_value=None)
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(f'{_BIND} | .RUN "q" | .VIEW "s" | .PY "data"')
+        request = dbeditor.request_user_input.call_args.args[0]
+        assert list(request['extra']['keys']) == ['x']
+        assert 'vdm_macro' not in request['extra']
+        assert result.keys == {}
+
+    async def test_sheet_does_not_take_the_keys(self):
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(f'{_BIND} | .RUN "q" | .SHEET "s"')
+        dbeditor.add_pipeline_sheet.assert_called_once_with('s', [{'id': 1}])
+        assert list(result.keys) == ['x']
+
+    async def test_binding_a_key_again_replaces_it(self):
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}])))
+        result = await exe.execute(
+            '.PY "bind_key(\'x\', len)" | .PY "bind_key(\'x\', str, \'cursorValue\')" | .RUN "q"')
+        assert result.keys == {'x': (str, 'cursorValue')}
+
+    async def test_a_sheet_given_by_hand_is_bound_at_once_and_nothing_is_queued(self):
+        """bind_key(..., sheet=...): for the sheet a bound function opens
+        itself — no display point of the pipeline would ever reach it."""
+        mine = object()
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]), vars={'s': mine})
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(
+            '.PY "bind_key(\'x\', len, \'rows\', sheet=get_var(\'s\'))" | .RUN "q"')
+        dbeditor.bind_sheet_key.assert_called_once_with(mine, 'x', len, 'rows')
+        assert result.keys == {}
+
+    async def test_a_key_pressed_on_a_view_can_query(self):
+        """The .VIEW wait leaves the event loop when keys are bound: run_sql()
+        needs that loop for its query."""
+        client, calls = _make_recording_client()
+        dbeditor = _make_dbeditor(client)
+        dbeditor.wait_from_sheet = _waits_on(asyncio.get_running_loop())
+        loop_thread = threading.current_thread()
+        answers: list = []
+
+        def show(request):
+            assert threading.current_thread() is not loop_thread
+            func, _params = request['extra']['keys']['x']
+            answers.append(func({'id': 7}))     # the user presses x
+
+        dbeditor.request_user_input = MagicMock(side_effect=show)
+        exe = PipelineExecutor(dbeditor)
+        await exe.execute(f'{_BIND} | .RUN "q" | .VIEW "s"')
+        assert answers == [[{'sql': 'SELECT 7'}]]
+        assert calls == ['q', 'SELECT 7']
+
+    async def test_a_key_pressed_on_the_result_queries_the_connection_the_run_ended_on(self):
+        first, first_calls = _make_recording_client()
+        second, second_calls = _make_recording_client()
+        dbeditor = _make_dbeditor(first)
+        dbeditor.get_client.return_value = second
+        dbeditor.wait_from_sheet = _waits_on(asyncio.get_running_loop())
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(f'{_BIND} | .RUN "q" | .CONN "other" | .RUN "q2"')
+        func, _params = result.keys['x']
+        # long after the run: the sheet is up, the key is pressed on its thread
+        assert await asyncio.to_thread(func, {'id': 3}) == [{'sql': 'SELECT 3'}]
+        assert first_calls == ['q'] and second_calls == ['q2', 'SELECT 3']
+
+    async def test_two_presses_do_not_share_the_connection(self):
+        """Two @asyncthread handlers, one connection: the second query waits."""
+        client = MagicMock()
+        running: list = []
+        overlaps: list = []
+
+        async def execute(sql):
+            overlaps.append(bool(running))
+            running.append(sql)
+            await asyncio.sleep(0.02)
+            running.remove(sql)
+            return Result(data=[{'sql': sql}], rowcount=1)
+
+        client.execute = execute
+        dbeditor = _make_dbeditor(client)
+        dbeditor.wait_from_sheet = _waits_on(asyncio.get_running_loop())
+        exe = PipelineExecutor(dbeditor)
+        func, _params = (await exe.execute(f'{_BIND} | .RUN "q"')).keys['x']
+        await asyncio.gather(*(asyncio.to_thread(func, {'id': i}) for i in range(3)))
+        assert len(overlaps) == 4 and not any(overlaps)
+
+    async def test_a_prompt_from_a_bound_function_is_refused_not_left_hanging(self):
+        """choose() and the rest are in the function's namespace, but the
+        editor that would open them is inside VisiData."""
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(
+            '.PY "bind_key(\'x\', lambda: choose(\'t\', [1, 2]))" | .RUN "q"')
+        func, _params = result.keys['x']
+        with pytest.raises(ValueError, match='cannot open from a function bound'):
+            await asyncio.to_thread(func)
+        dbeditor.request_user_input.assert_not_called()
+
+    async def test_run_sql_refuses_to_run_inside_the_pipeline(self):
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}])))
+        with pytest.raises(ValueError, match='run_sql.. is for functions bound'):
+            await exe.execute('.PY "run_sql(\'SELECT 1\')"')
+
+    async def test_bad_bindings_raise_in_the_pipeline(self):
+        exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}])))
+        with pytest.raises(ValueError, match='non-empty string'):
+            await exe.execute('.PY "bind_key(\'\', len)"')
+        with pytest.raises(ValueError, match='is not a function'):
+            await exe.execute('.PY "bind_key(\'x\', \'open_col\')"')
+        with pytest.raises(ValueError, match='not a list of Python expressions'):
+            await exe.execute('.PY "bind_key(\'x\', len, \'cursorRow,, x\')"')
+
+
+@pytest.mark.asyncio
 class TestPipelineWatch:
     """.WATCH — the live counterpart of .VIEW.
 
@@ -1276,6 +1471,33 @@ class TestPipelineWatch:
         result = await exe.execute(f'.RUN "q" | .WATCH 1 | .VDM """{_MACRO}"""')
         assert 'vdm_macro' not in dbeditor.request_user_input.call_args.args[0]['extra']
         assert result.macro == _MACRO_ROWS
+
+    async def test_the_live_sheet_takes_the_keys_before_it_once(self):
+        dbeditor = _make_dbeditor(_make_client([{'id': 1}]))
+        dbeditor.request_user_input = MagicMock(
+            side_effect=self._showing(refreshes=3, picked=[{'id': 1}]))
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(f'{_BIND} | .RUN "q" | .WATCH 1')
+        request = dbeditor.request_user_input.call_args.args[0]
+        assert list(request['extra']['keys']) == ['x']
+        # three refreshes re-ran the bind_key(), and none of them queued it again
+        assert result.keys == {}
+
+    async def test_a_key_pressed_on_the_live_sheet_queries_between_refreshes(self):
+        client, calls = _make_recording_client()
+        dbeditor = _make_dbeditor(client)
+        dbeditor.wait_from_sheet = _waits_on(asyncio.get_running_loop())
+
+        def show(request):
+            request['extra']['producer']()
+            request['extra']['keys']['x'][0]({'id': 5})
+            request['extra']['producer']()
+            return [{'id': 1}]
+
+        dbeditor.request_user_input = MagicMock(side_effect=show)
+        exe = PipelineExecutor(dbeditor)
+        await exe.execute(f'{_BIND} | .RUN "q" | .WATCH 1')
+        assert calls == ['q', 'q', 'SELECT 5', 'q']
 
     async def test_defaults_to_one_second_and_the_name_watch(self):
         dbeditor = _make_dbeditor(_make_client([{'id': 1}]))

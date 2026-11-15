@@ -82,6 +82,11 @@ Pipelines:
   get_visidata_macro_reference before writing one; for a VisiData command it
   does not list, find_visidata_commands looks one up — never write a command
   name from memory.
+- When the user wants the result to react to a key — open the related rows of
+  the row under the cursor, act on the selected rows, drill down level by
+  level — a .PY step binds a Python function to it with bind_key(), and the
+  function queries with run_sql(). Follow that section of the pipeline
+  reference; tell the user which key does what, and if it changes data.
 
 Handing back a query:
 - Call propose_query once, when you are done: it is the only way the query

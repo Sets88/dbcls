@@ -1,14 +1,15 @@
 """Walking the tree: the interpreter, and the host it talks to the user through.
 
 :class:`PipelineHost` is the whole of what the executor needs from the
-application — two attributes and six methods — which is why the executor's own
+application — two attributes and a handful of methods — which is why the executor's own
 tests need neither curses, nor VisiData, nor a database.
 """
 import asyncio
 import concurrent.futures
 import json
 import re
-from typing import Any, List, Optional, Protocol, Tuple
+import weakref
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from ..clients.base import Result
 from ..prompts import PromptKind
@@ -80,10 +81,49 @@ class PipelineHost(Protocol):
 
     def add_pipeline_sheet(self, name: str, rows: List[dict]) -> None: ...
 
+    def wait_from_sheet(self, coro_func: Callable, *args: Any) -> Any: ...
+
+    def bind_sheet_key(self, sheet: Any, key: str, func: Callable, params: str) -> None: ...
+
+    def queue_sheet_macro(self, sheet: Any, rows: List[dict]) -> None: ...
+
     def request_user_input(self, request: dict) -> Any: ...
 
     def task_stop_requested(self) -> bool: ...
 
+
+
+#: client → the lock its queries are run under (see :func:`_client_lock`).
+_CLIENT_LOCKS: 'weakref.WeakKeyDictionary[Any, asyncio.Lock]' = weakref.WeakKeyDictionary()
+
+
+def _client_lock(client: Any) -> asyncio.Lock:
+    """The lock that keeps two queries off *client*'s one connection at once.
+
+    A pipeline used to be the only thing querying while it ran, one step after
+    another.  A key bound with ``bind_key()`` changed that: its function calls
+    ``run_sql()`` from a VisiData thread whenever the user presses the key —
+    while a ``.WATCH`` refresh is mid-query, or twice in a row from two
+    ``@asyncthread`` workers — and a driver cursor cannot be interleaved.
+
+    Per client rather than per executor: the sheet of a finished run keeps its
+    keys, and its queries must queue behind the run that is live now.  Only
+    ever called on the event loop, so the lock is created there."""
+    lock = _CLIENT_LOCKS.get(client)
+    if lock is None:
+        lock = _CLIENT_LOCKS[client] = asyncio.Lock()
+    return lock
+
+
+def _check_key_params(params: str) -> None:
+    """Fail now, in the pipeline, if *params* cannot be an argument list —
+    rather than on the sheet, the first time the key is pressed."""
+    try:
+        compile(f'_f({params})', '<bind_key params>', 'eval')
+    except SyntaxError as exc:
+        raise ValueError(
+            f'bind_key(): params {params!r} is not a list of Python '
+            f'expressions: {exc.msg}') from None
 
 
 def parse_vd_macro(text: str) -> List[dict]:
@@ -98,10 +138,32 @@ def parse_vd_macro(text: str) -> List[dict]:
             row = json.loads(line)
         except ValueError as exc:
             raise ValueError(f'.VDM line {n} is not valid JSON: {exc}') from None
-        if not isinstance(row, dict) or not (row.get('longname') or row.get('keystrokes')):
+        if not _names_a_command(row):
             raise ValueError(f'.VDM line {n} names no command (longname/keystrokes)')
         rows.append(row)
     return rows
+
+
+def _names_a_command(row: Any) -> bool:
+    return isinstance(row, dict) and bool(row.get('longname') or row.get('keystrokes'))
+
+
+def macro_rows(macro: Any) -> List[dict]:
+    """The cmdlog rows of *macro* as ``vdm()`` takes it: the text ``.VDM``
+    takes (see :func:`parse_vd_macro`), or — Python has no need to spell JSON
+    — one row as a dict, or a list of them.  The rows are copied: the macro is
+    kept until a sheet replays it, and the caller's dicts stay the caller's."""
+    if isinstance(macro, str):
+        return parse_vd_macro(macro)
+    rows = [macro] if isinstance(macro, dict) else macro
+    if not isinstance(rows, (list, tuple)):
+        raise ValueError(
+            'vdm(): the macro is cmdlog JSON lines as a string, a dict, or a '
+            f'list of dicts — got {type(macro).__name__}')
+    for n, row in enumerate(rows, 1):
+        if not _names_a_command(row):
+            raise ValueError(f'vdm(): row {n} names no command (longname/keystrokes)')
+    return [dict(row) for row in rows]
 
 
 class PipelineExecutor:
@@ -140,6 +202,9 @@ class PipelineExecutor:
         # VisiData cmdlog rows queued by .VDM, waiting for the next display
         # point (.VIEW or the final result) to replay them — see _cmd_vdm.
         self._pending_macro: List[dict] = []
+        # key → (function, params) queued by bind_key(), waiting for the same
+        # display point the macro waits for — see _bind_key.
+        self._pending_keys: Dict[str, Tuple[Callable, str]] = {}
         # (nodes already run in the current node list, the value that list
         # started from) — what .WATCH re-executes on every refresh.  Maintained
         # by _execute_nodes; see _cmd_watch.
@@ -179,7 +244,17 @@ class PipelineExecutor:
         showing the row count of the previous one until (and unless) its own
         engine reports progress of its own."""
         self.client.report_progress(0)
-        return await self.client.execute(sql)
+        async with _client_lock(self.client):
+            return await self.client.execute(sql)
+
+    async def _sheet_query(self, sql: str) -> list:
+        """One query for a key handler (``run_sql()``), on the client the
+        pipeline is on now — or ended on.  No overlay to report progress to:
+        VisiData has the screen."""
+        client = self.client
+        async with _client_lock(client):
+            result = await client.execute(sql)
+        return (result.data or []) if result else []
 
     async def execute(self, sql: str):
         """Execute the full pipeline *sql* and return a ``Result`` object."""
@@ -187,6 +262,7 @@ class PipelineExecutor:
         self._call_stack = []
         self._shown_data = NOTHING_SHOWN
         self._pending_macro = []
+        self._pending_keys = {}
         self.prompts.reset()
         self.host.reset_task_info()
 
@@ -207,10 +283,10 @@ class PipelineExecutor:
         # The only normalisation point: rows are shaped into dicts for display,
         # having flowed between steps unchanged.
         rows = [] if data is NO_DATA else normalize_to_dicts(data)
-        # A .VDM still waiting goes with the final result; the host drops it
-        # when there is nothing to show.
+        # A .VDM still waiting goes with the final result, and so do the keys
+        # of bind_key(); the host drops both when there is nothing to show.
         return Result(data=rows, rowcount=len(rows), shown=shown,
-                      macro=self._take_macro())
+                      macro=self._take_macro(), keys=self._take_keys())
 
     # ── AST execution (walks PipelineStep / ForBlock / WhileBlock / FnBlock) ────
 
@@ -596,6 +672,77 @@ class PipelineExecutor:
         ``get_var()`` to user Python code."""
         return self.host.vars.get(name, default)
 
+    def _bind_key(self, key: Any, func: Callable, params: Any = '',
+                  sheet: Any = None) -> None:
+        """Bind *key* to *func* on the next sheet this pipeline shows — the
+        next ``.VIEW`` or ``.WATCH``, or else the final result — and on that
+        sheet only.  Exposed as ``bind_key()``.
+
+        With *sheet* — a VisiData sheet the caller has in hand — the key is
+        bound on that one instead, at once.  That is for a bound function that
+        opens a sheet of its own and gives it keys in turn: a second level,
+        which no display point of the pipeline will ever show.
+
+        *params* is what the function is called with: Python expressions,
+        comma-separated, evaluated on the sheet when the key is pressed, so the
+        sheet's own names work in it — ``'cursorCol, cursorRow, selectedRows'``.
+        Binding a key again replaces what it had.
+
+        The function is not called here and nothing about it is kept beyond
+        the sheet: the queue travels with the macro (see ``_cmd_vdm``), the
+        sheet takes it, and it goes when the sheet does."""
+        key = str(key).strip() if isinstance(key, str) else ''
+        if not key:
+            raise ValueError("bind_key(): the key must be a non-empty string, e.g. 'x' or 'gx'")
+        if not callable(func):
+            raise ValueError(f'bind_key(): {func!r} is not a function')
+        params = '' if params is None else str(params).strip()
+        _check_key_params(params)
+        if sheet is not None:
+            self.host.bind_sheet_key(sheet, key, func, params)
+        else:
+            self._pending_keys[key] = (func, params)
+
+    def _vdm(self, macro: Any, sheet: Any = None) -> None:
+        """Queue a VisiData macro for the next sheet this pipeline shows —
+        what a ``.VDM`` step does, from Python.  Exposed as ``vdm()``.
+
+        With *sheet* — a VisiData sheet the caller has in hand — the macro is
+        for that one instead and replays when it comes on screen: the
+        counterpart of ``bind_key(..., sheet=...)``, for the sheet a bound
+        function builds and pushes itself, which no display point of the
+        pipeline will ever show.
+
+        Like the keys, nothing is kept beyond the sheet: the rows wait on it
+        and go when it does."""
+        rows = macro_rows(macro)
+        if sheet is not None:
+            self.host.queue_sheet_macro(sheet, rows)
+        else:
+            self._pending_macro.extend(rows)
+
+    def _take_keys(self) -> Dict[str, Tuple[Callable, str]]:
+        """Hand the queued ``bind_key()`` bindings to a display point and
+        clear them."""
+        keys, self._pending_keys = self._pending_keys, {}
+        return keys
+
+    def _sheet_sql(self, sql: Any) -> list:
+        """Run *sql* and return its rows — for a function bound with
+        ``bind_key()``, which runs on a VisiData thread long after the step
+        that defined it.  Exposed as ``run_sql()``.
+
+        Blocking, by design: the caller is not a coroutine.  That is also why
+        it refuses to run inside the pipeline itself — there it would be
+        waiting, on the event loop, for a query only the event loop can run."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self.host.wait_from_sheet(self._sheet_query, str(sql))
+        raise ValueError(
+            'run_sql() is for functions bound to a key with bind_key() — '
+            'inside the pipeline itself, run the query with a .RUN step')
+
     def _helper_context(self) -> dict:
         """The helper functions exposed to every piece of user Python — both
         Python-executing steps (via :meth:`_python_context`) and ``{{expr}}``
@@ -607,6 +754,9 @@ class PipelineExecutor:
             'stop': self._stop,
             'set_var': self._set_var,
             'get_var': self._get_var,
+            'bind_key': self._bind_key,
+            'vdm': self._vdm,
+            'run_sql': self._sheet_sql,
             'choose': self.prompts.choose,
             'select': self.prompts.select,
             'schoose': self.prompts.schoose,
@@ -805,9 +955,18 @@ class PipelineExecutor:
         name = self.render_template(args[0], data=data)
         # A display point — shape rows into dicts for VisiData; the pipeline
         # itself continues with the raw data.
-        macro = self._take_macro()
-        self._show_blocking_sheet(PromptKind.VIEW, name, normalize_to_dicts(data),
-                                  extra={'vdm_macro': macro} if macro else None)
+        macro, keys = self._take_macro(), self._take_keys()
+        rows = normalize_to_dicts(data)
+        if keys:
+            # A bound key may query (run_sql()), and the query runs on this
+            # event loop — which the wait would otherwise be blocking until
+            # the sheet closes.  Off the loop, as .WATCH waits.
+            await self.prompts.request_off_loop({
+                'kind': PromptKind.VIEW, 'title': name, 'rows': rows,
+                'extra': {**({'vdm_macro': macro} if macro else {}), 'keys': keys}})
+        else:
+            self._show_blocking_sheet(PromptKind.VIEW, name, rows,
+                                      extra={'vdm_macro': macro} if macro else None)
         # the data itself, not the shaped copy: that is what a following step
         # would pass on and what the final result would be normalised from
         return self._mark_shown(data)
@@ -870,16 +1029,18 @@ class PipelineExecutor:
         # A display point like .VIEW: a .VDM before it is replayed on the live
         # sheet, once, when it opens — not on every refresh, and not again on
         # the final result.
-        sheet_macro = self._take_macro()
+        sheet_macro, sheet_keys = self._take_macro(), self._take_keys()
 
         async def refresh() -> Any:
             # A refresh re-runs the prefix's .VDM steps too; what they queue is
             # thrown away, or every tick would add a copy for the final result.
-            macro = list(self._pending_macro)
+            # Likewise the keys of a bind_key() in the prefix: the sheet has
+            # had them since it opened.
+            macro, keys = list(self._pending_macro), dict(self._pending_keys)
             try:
                 return await self._execute_nodes(list(prefix), initial)
             finally:
-                self._pending_macro = macro
+                self._pending_macro, self._pending_keys = macro, keys
 
         def produce() -> List[dict]:
             """Re-run the pipeline prefix and return its rows.  Called from the
@@ -897,7 +1058,8 @@ class PipelineExecutor:
             'title': WATCH_SHEET_NAME,
             'rows': normalize_to_dicts(data),
             'extra': {'producer': produce, 'interval': interval,
-                      **({'vdm_macro': sheet_macro} if sheet_macro else {})},
+                      **({'vdm_macro': sheet_macro} if sheet_macro else {}),
+                      **({'keys': sheet_keys} if sheet_keys else {})},
         }
         self.prompts.in_watch = True
         try:

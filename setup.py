@@ -34,7 +34,7 @@ def get_long_description():
 
 setup(
     name='dbcls',
-    version='1.4.11',
+    version='1.4.12',
     license='BSD',
     author='Maksim Nikitenko',
     author_email='iam@sets88.com',

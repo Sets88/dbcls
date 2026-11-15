@@ -29,6 +29,9 @@ class Result:
     shown: bool = False
     # VisiData cmdlog rows (.VDM) to replay on the result sheet once it opens.
     macro: list = field(default_factory=list)
+    # key → (function, params): what the pipeline's bind_key() calls bound, for
+    # the result sheet alone (see vd_modules.vd_keys).
+    keys: dict = field(default_factory=dict)
 
     def __str__(self) -> str:
         if self.message:

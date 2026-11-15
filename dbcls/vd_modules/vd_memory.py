@@ -428,6 +428,12 @@ if hasattr(BaseSheet, '__copy__') and \
     def __copy__(vs):
         ret = _orig_copy(vs)
         ret.__dict__.pop('dbcls_id', None)
+        # The keys a pipeline bound (bind_key(), see vd_keys) are for the one
+        # sheet it opened too — and their functions hold that run's namespace.
+        ret.__dict__.pop('dbcls_keys', None)
+        # Likewise a macro still waiting for the sheet to be shown (vdm(...,
+        # sheet=), see vd_sheet_macro): the copy would replay it a second time.
+        ret.__dict__.pop('dbcls_macro', None)
         return ret
 
     BaseSheet._dbcls_copy_wrapped = True

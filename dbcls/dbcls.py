@@ -25,7 +25,7 @@ import visidata
 from .clients.base import Result
 from .vd_modules import (
     DataBaseSheet, TablesSheet, SselectSheet, SchooseSheet, ViewSheet, VarsSheet,
-    LiveRowsSheet, release_closed_sheets)
+    LiveRowsSheet, bind_sheet_keys, queue_sheet_macro, release_closed_sheets)
 from .clients import DEFAULT_ENGINE, check_engine, engine_names
 from .config import (
     DEFAULT_CONFIG_PATH,
@@ -1059,7 +1059,6 @@ class DbEditorTab(Editor):
         (q on the last picker sheet, gq/Ctrl+Q)."""
         with self._visidata_session():
             try:
-                self._queue_macro(getattr(sheet, 'vdm_macro', None))
                 visidata.vd.run(sheet)  # returned normally = full quit (gq/Ctrl+Q)
                 return None
             except visidata.ReturnValue as e:
@@ -1084,10 +1083,39 @@ class DbEditorTab(Editor):
         kwargs as attributes); only VarsSheet uses it, to write the edited
         variables straight into self.vars.  *extra* goes the same way — it is
         how .WATCH passes its row producer and refresh interval to
-        LiveRowsSheet."""
-        return self._run_picker_sheet(
-            self._PICKER_SHEETS[kind](str(title) or kind, source=rows, host=self,
-                                      **(extra or {})))
+        LiveRowsSheet — except ``keys``, the pipeline's bind_key() bindings,
+        and ``vdm_macro``, its .VDM rows: both are left on the sheet in the
+        form the mainloop reads (see vd_modules.vd_keys / vd_sheet_macro)."""
+        extra = dict(extra or {})
+        keys, macro = extra.pop('keys', None), extra.pop('vdm_macro', None)
+        sheet = self._PICKER_SHEETS[kind](str(title) or kind, source=rows, host=self,
+                                          **extra)
+        bind_sheet_keys(sheet, keys)
+        queue_sheet_macro(sheet, macro)
+        return self._run_picker_sheet(sheet)
+
+    def bind_sheet_key(self, sheet, key, func, params) -> None:
+        """Pipeline host hook for bind_key(..., sheet=...): the key goes on a
+        sheet the caller already has, rather than on the next one shown."""
+        if not isinstance(sheet, visidata.BaseSheet):
+            raise ValueError(
+                f'bind_key(): sheet must be a VisiData sheet, got {type(sheet).__name__}')
+        bind_sheet_keys(sheet, {key: (func, params)})
+
+    def queue_sheet_macro(self, sheet, rows) -> None:
+        """Pipeline host hook for vdm(..., sheet=...): the macro goes to a
+        sheet the caller already has, replayed when that sheet is on screen,
+        rather than to the next one the pipeline shows."""
+        if not isinstance(sheet, visidata.BaseSheet):
+            raise ValueError(
+                f'vdm(): sheet must be a VisiData sheet, got {type(sheet).__name__}')
+        queue_sheet_macro(sheet, rows)
+
+    def wait_from_sheet(self, coro_func, *args):
+        """Pipeline host hook for run_sql() in a bind_key() function: run a
+        coroutine on the async loop and block the calling VisiData thread until
+        it answers — or raise TimeoutError, as every SyncClient call does."""
+        return SyncClient(self.asyncloop_thread, self.client)._run_coro(coro_func, *args)
 
     def _vd_run(self, sheet) -> None:
         """Run a VisiData mainloop starting at `sheet`, guarding against a
@@ -1104,17 +1132,6 @@ class DbEditorTab(Editor):
         finally:
             # a macro (.VDM) cut short must not replay into the next session
             visidata.vd.replay_cancel()
-
-    @staticmethod
-    def _queue_macro(rows) -> None:
-        """Queue a pipeline .VDM macro (VisiData cmdlog rows) to replay as
-        soon as the next VisiData mainloop starts, on whatever sheet is active
-        then — the one the caller is about to show."""
-        if not rows:
-            return
-        log = visidata.CommandLogJsonl('vdm', source=None)
-        log.rows = [log.newRow(**r) for r in rows]
-        visidata.vd.replay(log)
 
     @staticmethod
     def _opens_result_sheet(result) -> bool:
@@ -1142,6 +1159,11 @@ class DbEditorTab(Editor):
             result_sheet = visidata.PyobjSheet(
                 'result', source=result.data,
                 dbcls_id=next(_SHEET_IDS) if sheet_id is None else sheet_id)
+            # bind_key() and .VDM: on the result alone — the .SHEET sheets
+            # take neither.  The macro waits on the sheet and replays once the
+            # mainloop has it on screen (see vd_modules.vd_sheet_macro).
+            bind_sheet_keys(result_sheet, result.keys)
+            queue_sheet_macro(result_sheet, result.macro)
         if had_pipeline_sheets:
             # .SHEET was used: its sheets are already on the stack (pushed as
             # the steps ran, see add_pipeline_sheet) — put the pipeline's final
@@ -1149,12 +1171,9 @@ class DbEditorTab(Editor):
             with self._visidata_session():
                 if has_result:
                     visidata.vd.push(result_sheet)
-                    # .SHEET sheets take no macro: .VDM goes to the result only
-                    self._queue_macro(result.macro)
                 self._vd_run(visidata.vd.sheets[0])
         else:
             with self._visidata_session():
-                self._queue_macro(result.macro)
                 # not visidata.vd.view(): that calls vd.run() unguarded, and a
                 # stale handover sheet left on the stack (see _vd_run) raises
                 # ReturnValue right through it and kills the app.

@@ -10,7 +10,9 @@ host's single request slot and, while a ``.WATCH`` sheet is up, VisiData owning
 the terminal.  That is UI policy, and it used to be interleaved with the AST
 walk in one 1000-line class.
 """
-from typing import Any, List, Optional
+import asyncio
+import threading
+from typing import Any, List, Optional, Tuple
 
 from ..prompts import PromptKind
 from .errors import PipelineCancelled
@@ -32,10 +34,14 @@ class UserPrompts:
         self.answers: dict = {}
         #: True while a .WATCH sheet owns the screen.
         self.in_watch = False
+        #: The thread the run is on — its event loop's — once a run has
+        #: started; see _refuse_from_a_key.
+        self.run_thread: Optional[threading.Thread] = None
 
     def reset(self) -> None:
-        """Forget the answers of the previous run."""
+        """Forget the answers of the previous run; note the thread of this one."""
         self.answers = {}
+        self.run_thread = threading.current_thread()
 
     @staticmethod
     def _cancel() -> None:
@@ -227,6 +233,33 @@ class UserPrompts:
                 'across refreshes'
             )
 
+    def _refuse_from_a_key(self, kind: Any) -> None:
+        """Raise when a prompt is opened by a function bound with
+        ``bind_key()`` — recognised by its thread: the run's own code is all
+        on the event loop's, a key's function on one of VisiData's.
+
+        The helpers are in that function's namespace because it was defined
+        in a ``.PY`` step, but there is nobody to answer them: the editor's
+        loop, which opens every prompt, is inside VisiData for as long as the
+        sheet is up.  From VisiData's main thread the request would be turned
+        away by the host; from an ``@asyncthread`` worker it would wait
+        forever.  The sheet has prompts of its own."""
+        if self.run_thread is not None and threading.current_thread() is not self.run_thread:
+            raise ValueError(
+                f'a {kind} prompt cannot open from a function bound with '
+                'bind_key() — the pipeline is not there to ask; on the sheet '
+                'use vd.input() / vd.confirm() instead')
+
+    def _recall(self, request: dict) -> Tuple[tuple, bool]:
+        """The (kind, title) *request* is remembered under, and whether the
+        memory answers it — which it does only while a ``.WATCH`` is up."""
+        key = (str(request.get('kind')), str(request.get('title', '')))
+        if self.in_watch:
+            if key in self.answers:
+                return key, True
+            self._refuse_during_watch(request.get('kind'))
+        return key, False
+
     def request(self, request: dict) -> Any:
         """Put *request* to the user and block until it is answered — the one
         place the whole executor talks to the host's UI.
@@ -236,11 +269,22 @@ class UserPrompts:
         refreshes re-run the prefix with the terminal in VisiData's hands, so
         the question is asked once — on the run that produced the sheet's first
         rows — and kept until the sheet is closed (see ``_cmd_watch``)."""
-        key = (str(request.get('kind')), str(request.get('title', '')))
-        if self.in_watch:
-            if key in self.answers:
-                return self.answers[key]
-            self._refuse_during_watch(request.get('kind'))
+        self._refuse_from_a_key(request.get('kind'))
+        key, known = self._recall(request)
+        if known:
+            return self.answers[key]
         answer = self.host.request_user_input(request)
+        self.answers[key] = answer
+        return answer
+
+    async def request_off_loop(self, request: dict) -> Any:
+        """:meth:`request`, with the wait moved onto a worker thread so the
+        event loop stays free while the prompt is up — for a sheet whose keys
+        may query (``bind_key()`` + ``run_sql()``): the query runs on this
+        loop, and a loop blocked on the sheet would never get to it."""
+        key, known = self._recall(request)
+        if known:
+            return self.answers[key]
+        answer = await asyncio.to_thread(self.host.request_user_input, request)
         self.answers[key] = answer
         return answer

@@ -390,6 +390,116 @@ stop()
 set_var('some_var', 42)
 ```
 
+`bind_key(key, func, params='', sheet=None)`
+  binds `key` to a function of your own on the next sheet the pipeline shows —
+  the next `.VIEW` or `.WATCH`, or else the final result (`.SHEET` does not
+  take it, like `.VDM`). The binding holds on that one sheet: not on the sheets
+  opened from it (a duplicate, a frequency table, a row you dive into), not on
+  the result of the next run — and it is gone when the sheet is.
+
+  `params` is what the function is called with: Python expressions separated
+  by commas, evaluated on the sheet at the moment the key is pressed, so the
+  sheet's own names work — `cursorRow` (the row under the cursor, a dict),
+  `cursorCol` (the column; `.name`, `.getValue(row)`), `cursorValue`,
+  `selectedRows` (a list, empty when nothing is selected), `sheet`.
+
+  `key` is spelled the VisiData way: `'x'`, `'gx'`, `'zx'`, `'^X'`. A key that
+  already does something keeps doing it everywhere else and is shadowed on
+  this sheet — do not take `q` or `Enter`. The status line names the bound
+  keys when the sheet opens, and they are listed with the sheet's commands:
+  `z Ctrl+H`, and the `Space` palette, where the first line of the function's
+  docstring is its description.
+
+  The function runs inside VisiData, usually after the pipeline has finished.
+  `choose()` / `input()` / `ask()` and the other prompts cannot open from it —
+  use `vd.input()` / `vd.confirm()`; `set_var()` / `get_var()` work. It runs on
+  VisiData's interface thread, so put anything slow under `@asyncthread`.
+
+  Example (`x` opens the current column of the selected rows on a new sheet):
+```
+.PY \"\"\"
+from visidata import vd, PyobjSheet
+def open_col(col, rows):
+    vd.push(PyobjSheet(col.name, source=[{col.name: col.getValue(r)} for r in rows]))
+bind_key('x', open_col, 'cursorCol, selectedRows')
+\"\"\" |
+.RUN "SELECT * FROM User"
+```
+
+  `sheet` binds the key on a sheet you already have instead of the next one
+  shown — at once. That is how a bound function gives the sheet it opens keys
+  of its own, one level after another. There it is required: without `sheet`
+  the binding waits for a sheet the pipeline shows, the pipeline has finished
+  by then, and the sheet the function pushes opens with no key — silently.
+
+  Example (`X` on a user opens their orders; `X` on an order, its items):
+```
+.PY \"\"\"
+from visidata import vd, PyobjSheet, asyncthread
+@asyncthread
+def items_of(order):
+    '''Open the items of this order.'''
+    found = run_sql(f"SELECT * FROM OrderItem WHERE order_id = {order['id']}")
+    vd.push(PyobjSheet(f"items_{order['id']}", source=found))
+@asyncthread
+def orders_of(user):
+    '''Open the orders of this user.'''
+    found = run_sql(f"SELECT * FROM Orders WHERE user_id = {user['id']}")
+    orders = PyobjSheet(f"orders_{user['id']}", source=found)
+    bind_key('X', items_of, 'cursorRow', sheet=orders)
+    vd.push(orders)
+bind_key('X', orders_of, 'cursorRow')
+\"\"\" |
+.RUN "SELECT * FROM User"
+```
+
+`vdm(macro, sheet=None)`
+  the `.VDM` step as a function: queues `macro` for the next sheet the
+  pipeline shows. `macro` is what `.VDM` takes — cmdlog JSON lines — or one
+  command as a dict, or a list of them.
+
+  `sheet` hands the macro to a sheet you already have instead: it replays
+  once, when that sheet comes on screen — on that sheet only, not on a copy
+  and not on another of the same name. That is how a function bound with
+  `bind_key()` sorts, colours or charts the sheet it opens, which `.VDM`
+  cannot reach. There `sheet` is required, as it is for `bind_key()`.
+
+  Example (`X` on a user opens their orders, biggest first):
+```
+.PY \"\"\"
+from visidata import vd, PyobjSheet, asyncthread
+@asyncthread
+def orders_of(user):
+    found = run_sql(f"SELECT * FROM Orders WHERE user_id = {user['id']}")
+    orders = PyobjSheet(f"orders_{user['id']}", source=found)
+    vdm({'longname': 'sort-desc', 'col': 'total'}, sheet=orders)
+    vd.push(orders)
+bind_key('X', orders_of, 'cursorRow')
+\"\"\" |
+.RUN "SELECT * FROM User"
+```
+
+`run_sql(sql)`
+  for a function bound with `bind_key()`: runs `sql` on the connection the
+  pipeline is on (the one it ended on, after a `.CONN`) and returns the rows.
+  It blocks until the query answers (60 s at most), so call it under
+  `@asyncthread` or the sheet freezes meanwhile. It is plain SQL — no
+  `{{expr}}`, no pipeline steps. Inside the pipeline itself it is an error:
+  that is what `.RUN` is for.
+
+  Example (`x` on a user opens their orders):
+```
+.PY \"\"\"
+from visidata import vd, PyobjSheet, asyncthread
+@asyncthread
+def orders_of(row):
+    found = run_sql(f"SELECT * FROM Orders WHERE user_id = {row['id']}")
+    vd.push(PyobjSheet(f"orders_{row['id']}", source=found))
+bind_key('x', orders_of, 'cursorRow')
+\"\"\" |
+.RUN "SELECT * FROM User"
+```
+
 `The four row prompts`
   come as two pairs — `choose`/`select` as a popup over the editor,
   `schoose`/`sselect` as a sheet in VisiData — where the s-less name picks one
@@ -677,7 +787,9 @@ the sheet on top at that moment — so after `open-row` the next command runs on
 the sheet it opened.
 
 `.SHEET` does not take the macro: it stays waiting for the next `.VIEW` / `.WATCH`
-or the final result. Several `.VDM` steps before one display point add up. A macro left
+or the final result. A sheet opened by a `bind_key()` function is not shown by
+the pipeline at all — give it its macro with `vdm(macro, sheet=that_sheet)`.
+Several `.VDM` steps before one display point add up. A macro left
 with nothing to show (the run ends on `.VIEW`, or with no rows) is dropped.
 A command that fails stops the replay, like in VisiData itself.
 

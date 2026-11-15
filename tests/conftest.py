@@ -83,6 +83,8 @@ sys.modules['visidata.color'] = MagicMock()
 sys.modules['visidata.aggregators'] = MagicMock()
 # vd_macro_sheet: MacroSheet, which visidata does not re-export either
 sys.modules['visidata.macros'] = MagicMock()
+# vd_keys: Command, likewise
+sys.modules['visidata.settings'] = MagicMock()
 sys.modules['plotext'] = MagicMock()
 
 # curses: a MagicMock with the few values that are read as numbers rather than

@@ -421,7 +421,7 @@ class TestPluginAdditionsInTheReference:
         self.register_a_plugin()
         after = pipeline_reference()
         assert after.startswith(before)
-        assert before.rstrip().endswith('`.WATCH` refreshes itself.')
+        assert before.rstrip().endswith('goes to the final result instead.')
 
     def test_a_command_registered_without_help_is_still_listed(self, clean_pipeline_registry):
         from dbcls import pipeline

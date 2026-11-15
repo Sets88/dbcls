@@ -56,6 +56,9 @@ class TestTheModulesLoad:
             assert getattr(BaseSheet, '_dbcls_release_wrapped', False), 'Q wrapper missing'
             assert getattr(VisiData, '_dbcls_push_wrapped', False), 'push wrapper missing'
             assert getattr(BaseSheet, '_dbcls_copy_wrapped', False), 'copy wrapper missing'
+            assert getattr(BaseSheet, '_dbcls_sheet_keys_wrapped', False), 'bind_key() lookup missing'
+            assert getattr(vd.bindkeys, '_dbcls_sheet_keys', False), 'bind_key() key lookup missing'
+            assert getattr(vd.HelpSheet, '_dbcls_help_keys_wrapped', False), 'bind_key() commands-sheet listing missing'
         ''')
 
     def test_importing_it_twice_does_not_stack_the_wrappers(self):
@@ -658,14 +661,15 @@ class TestTheAggregators:
 
 
 class TestPipelineMacro:
-    """.VDM hands VisiData's own replay queue the macro rows; the mainloop
-    plays them on whatever sheet is active once it starts."""
+    """.VDM / vdm() leave the macro rows on the sheet they are for; the
+    mainloop moves them into VisiData's own replay queue the first time that
+    sheet is the active one (see vd_modules.vd_sheet_macro)."""
 
     def test_a_recorded_macro_replays_on_the_active_sheet(self):
         run_with_real_visidata('''
             import visidata
             from visidata import vd
-            from dbcls.dbcls import DbEditorTab
+            from dbcls.vd_modules import queue_sheet_macro
             from dbcls.pipeline.executor import parse_vd_macro
 
             macro = parse_vd_macro(
@@ -676,8 +680,12 @@ class TestPipelineMacro:
             rows = [{'id': i, 't': t} for i, t in enumerate('aabcca')]
             vs = visidata.PyobjSheet('result', source=rows)
             vd.push(vs)
-            DbEditorTab._queue_macro(macro)
-            assert len(vd._nextCommands) == 2
+            queue_sheet_macro(vs, macro)
+            # on the sheet, not in the queue: nothing global knows of it yet
+            assert not vd._nextCommands and len(vs.dbcls_macro) == 2
+            vd._playNextQueuedCommand(vd.activeSheet)   # one mainloop frame
+            vd.sync()
+            assert 'dbcls_macro' not in vars(vs) and len(vd._nextCommands) == 1
             while vd._nextCommands:
                 vd._playNextQueuedCommand(vd.activeSheet)
                 vd.sync()
@@ -697,7 +705,7 @@ class TestPipelineMacro:
             import visidata
             import dbcls.vd_modules  # noqa: F401
             from visidata import vd
-            from dbcls.dbcls import DbEditorTab
+            from dbcls.vd_modules import queue_sheet_macro
             from dbcls.pipeline.executor import parse_vd_macro
             from dbcls.vd_modules.vd_plotter import Plot
 
@@ -712,7 +720,9 @@ class TestPipelineMacro:
             vd.push(vs)
             vs.ensureLoaded()
             vd.sync()
-            DbEditorTab._queue_macro(macro)
+            queue_sheet_macro(vs, macro)
+            vd._playNextQueuedCommand(vd.activeSheet)
+            vd.sync()
             while vd._nextCommands:
                 vd._playNextQueuedCommand(vd.activeSheet)
                 vd.sync()
@@ -724,6 +734,77 @@ class TestPipelineMacro:
             # the sort took: 'err' is met first, so it is the series the user hides with `1`
             assert [r['status'] for r in vs.rows][:2] == ['err', 'ok'], [r['cnt'] for r in vs.rows]
             vd.replay_cancel()
+        ''')
+
+    def test_a_macro_waits_for_its_own_sheet_and_no_other_gets_it(self):
+        """vdm(..., sheet=): a bound function hands the macro to the sheet it
+        builds — before pushing it, from a key pressed on another sheet.  The
+        macro must not play on that other sheet, nor on one of the same name."""
+        run_with_real_visidata('''
+            import copy
+            import visidata
+            from visidata import vd
+            from dbcls.vd_modules import queue_sheet_macro
+
+            def frames():
+                vd._playNextQueuedCommand(vd.activeSheet)
+                vd.sync()
+                while vd._nextCommands:
+                    vd._playNextQueuedCommand(vd.activeSheet)
+                    vd.sync()
+
+            rows = [{'id': i, 'n': n} for i, n in enumerate((2, 9, 4))]
+            first = visidata.PyobjSheet('orders', source=list(rows))
+            vd.push(first)
+            first.ensureLoaded()
+            vd.sync()
+            mine = visidata.PyobjSheet('orders', source=list(rows))     # same name
+            queue_sheet_macro(mine, [{'col': 'n', 'longname': 'sort-desc'}])
+            # a copy starts without it, or it would replay twice
+            assert 'dbcls_macro' not in vars(copy.copy(mine))
+            frames()        # `first` is on screen: nothing to play
+            assert [r['n'] for r in first.rows] == [2, 9, 4]
+            assert 'dbcls_macro' in vars(mine)
+            vd.push(mine)
+            frames()
+            assert [r['n'] for r in mine.rows] == [9, 4, 2], [r['n'] for r in mine.rows]
+            assert [r['n'] for r in first.rows] == [2, 9, 4]
+            assert 'dbcls_macro' not in vars(mine) and vd.currentReplay is None
+            frames()        # played once
+            assert [r['n'] for r in mine.rows] == [9, 4, 2]
+        ''')
+
+    def test_a_sheets_macro_runs_ahead_of_the_one_that_opened_it(self):
+        """A .VDM line presses a bound key, the key's function pushes a sheet
+        with a macro of its own: that one plays first, then the rest of the
+        outer macro goes on — on the sheet now on top, as a nested one does."""
+        run_with_real_visidata('''
+            import visidata
+            from visidata import vd
+            from dbcls.vd_modules import queue_sheet_macro
+
+            rows = [{'id': i, 'n': n} for i, n in enumerate((2, 9, 4))]
+            outer = visidata.PyobjSheet('result', source=list(rows))
+            vd.push(outer)
+            outer.ensureLoaded()
+            vd.sync()
+            queue_sheet_macro(outer, [{'longname': 'go-down'}, {'longname': 'go-down'}])
+            vd._playNextQueuedCommand(vd.activeSheet)       # the first go-down
+            vd.sync()
+            assert outer.cursorRowIndex == 1 and len(vd._nextCommands) == 1
+            inner = visidata.PyobjSheet('inner', source=list(rows))
+            queue_sheet_macro(inner, [{'col': 'n', 'longname': 'sort-desc'}])
+            vd.push(inner)
+            inner.ensureLoaded()
+            vd.sync()
+            vd._playNextQueuedCommand(vd.activeSheet)
+            vd.sync()
+            assert [r['n'] for r in inner.rows] == [9, 4, 2]
+            assert len(vd._nextCommands) == 1           # the outer's second line
+            vd._playNextQueuedCommand(vd.activeSheet)
+            vd.sync()
+            assert inner.cursorRowIndex == 1 and outer.cursorRowIndex == 1
+            assert not vd._nextCommands and vd.currentReplay is None
         ''')
 
     def test_zm_stops_a_recording_and_opens_it_as_a_sheet_vdm_reads(self):
@@ -963,6 +1044,308 @@ class TestPipelineMacro:
             assert painted('name') == ['yellow']
             assert painted('cnt') == ['red', 'yellow']
         ''')
+
+
+class TestPipelineKeys:
+    '''bind_key(): a key bound on one sheet — found by the two lookups the
+    mainloop makes for a keystroke (vd.bindkeys._get, then execCommand), and
+    by nothing else.'''
+
+    PRELUDE = '''
+        import copy
+        import visidata
+        import dbcls.vd_modules  # noqa: F401
+        from visidata import vd
+        from dbcls.vd_modules.vd_keys import bind_sheet_keys, sheet_keys
+
+        rows = [{'id': i, 't': t} for i, t in enumerate('aabcca')]
+
+        def opened(name='result'):
+            vs = visidata.PyobjSheet(name, source=list(rows))
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            return vs
+
+        def press(vs, key):
+            # what the mainloop does once it has read the keystrokes
+            longname = vd.bindkeys._get(key)
+            assert longname is not None, f'{key} is not bound'
+            return vs.execCommand(longname, keystrokes=key)
+    '''
+
+    def run(self, body: str):
+        run_with_real_visidata(textwrap.dedent(self.PRELUDE) + textwrap.dedent(body))
+
+    def test_the_key_calls_the_function_with_what_the_sheet_has_under_the_cursor(self):
+        self.run('''
+            vs = opened()
+            seen = []
+            bind_sheet_keys(vs, {
+                'x': (lambda col, row, sel: seen.append((col.name, row, list(sel))),
+                      'cursorCol, cursorRow, selectedRows'),
+                '^X': (lambda: seen.append('ctrl'), ''),
+            })
+            assert 'pipeline keys' in str(vd.statuses), vd.statuses
+            vs.cursorRowIndex = 2
+            vs.select([vs.rows[0]])
+            assert press(vs, 'x') is False
+            assert seen == [('id', rows[2], [rows[0]])], seen
+            press(vs, 'Ctrl+X')
+            assert seen[-1] == 'ctrl'
+            # the stock keys of the sheet are all still there
+            assert vs.getCommand('Shift+F').longname == 'freq-col'
+        ''')
+
+    def test_no_other_sheet_gets_the_key(self):
+        '''Not one of the same name (VisiData's own per-sheet level goes by
+        name), not a copy, not the sheet a command derives from it.'''
+        self.run('''
+            other = opened()
+            vs = opened()
+            bind_sheet_keys(vs, {'x': (lambda: None, '')})
+            stock = vd.bindkeys._get('x', other)
+            assert stock != 'dbcls-key-x'
+            assert vd.bindkeys._get('x', vs) == 'dbcls-key-x'
+            assert sheet_keys(copy.copy(vs)) is None and sheet_keys(vs)
+            vs.execCommand('freq-col')
+            vd.sync()
+            assert vd.activeSheet is not vs
+            assert vd.bindkeys._get('x') == stock
+        ''')
+
+    def test_a_failing_function_is_an_error_on_the_status_line(self):
+        self.run('''
+            vs = opened()
+
+            def boom():
+                raise RuntimeError('nope')
+
+            bind_sheet_keys(vs, {'x': (boom, '')})
+            assert press(vs, 'x') is True
+            assert 'nope' in vd.lastErrors[-1][-1]
+        ''')
+
+    def test_a_closed_sheet_goes_with_its_keys(self):
+        '''The sheet owns the bindings; nothing global remembers it or them.'''
+        self.run('''
+            import gc, weakref
+            from dbcls.vd_modules.vd_memory import release_closed_sheets
+
+            class Payload:      # what the function's namespace holds on to
+                pass
+
+            vs = opened()
+            payload = Payload()
+            bind_sheet_keys(vs, {'x': (lambda row, p=payload: None, 'cursorRow')})
+            press(vs, 'x')
+            refs = weakref.ref(vs), weakref.ref(payload)
+            g = vd.allSheetsSheet
+            g.reload()
+            vd.push(g)
+            g.cursorRowIndex = vd.allSheets.index(vs)
+            g.execCommand('delete-row')
+            vd.sync()
+            vd.remove(g)
+            vd.remove(vs)
+            del vs, payload
+            release_closed_sheets()
+            gc.collect()
+            assert refs[0]() is None, gc.get_referrers(refs[0]())
+            assert refs[1]() is None, gc.get_referrers(refs[1]())
+        ''')
+
+    def test_the_commands_sheet_and_the_palette_list_the_keys_of_their_sheet(self):
+        '''`z Ctrl+H` and `Space` are built from vd.commands, where nothing of
+        this is registered — HelpSheet adds its source sheet's own keys, with
+        the function's docstring for a description.'''
+        self.run('''
+            from visidata import HelpSheet
+
+            def orders_of(row):
+                """Open the orders of this user.
+                Not this line."""
+                seen.append(row)
+
+            seen = []
+            other = opened()
+            vs = opened()
+            bind_sheet_keys(vs, {'X': (orders_of, 'cursorRow')})
+            vs.execCommand('help-commands')
+            vd.sync()
+            listing = vd.activeSheet
+            listing.ensureLoaded()
+            vd.sync()
+            mine = [r for r in listing.rows if r.longname == 'dbcls-key-Shift+X']
+            assert len(mine) == 1, [r.longname for r in listing.rows][-5:]
+            assert listing.column('keystrokes').getValue(mine[0]) == 'Shift+X'
+            described = listing.column('description').getValue(mine[0])
+            assert described == 'pipeline key — orders_of(): Open the orders of this user.', described
+            # the stock commands are still all there, keys included
+            stock = [r for r in listing.rows if r.longname == 'freq-col']
+            assert listing.column('keystrokes').getValue(stock[0]) == 'Shift+F'
+            vd.remove(listing)
+
+            # the palette reads the same sheet, and runs the command by its name
+            palette = HelpSheet('', source=vs)
+            vd.sync(palette.ensureLoaded())
+            assert [c.description for c in palette.cmdlist
+                    if c.longname == 'dbcls-key-Shift+X'] == [described]
+            vs.exec_longname('dbcls-key-Shift+X')
+            assert seen == [rows[0]]
+
+            # no other sheet's listing has it
+            foreign = HelpSheet('', source=other)
+            vd.sync(foreign.ensureLoaded())
+            assert not [r for r in foreign.rows if r.longname.startswith('dbcls-key-')]
+        ''')
+
+    def test_a_bound_function_gives_the_sheet_it_opens_keys_of_its_own(self):
+        '''bind_key(..., sheet=...) from inside a bound function: a second
+        level.  Each sheet has its own X, and neither has the other's.'''
+        self.run('''
+            from unittest.mock import MagicMock
+            from visidata import PyobjSheet
+            from dbcls.dbcls import DbEditorTab
+            from dbcls.pipeline import PipelineExecutor
+
+            tab = DbEditorTab.__new__(DbEditorTab)
+            tab.client = MagicMock()
+            exe = PipelineExecutor(tab)
+            bind_key = exe._bind_key
+            opened_items = []
+
+            def items_of(order):
+                opened_items.append(order)
+
+            def orders_of(user):
+                orders = PyobjSheet(f"orders_{user['id']}", source=[{'order': 10 + user['id']}])
+                bind_key('X', items_of, 'cursorRow', sheet=orders)
+                bind_key('B', lambda: None, sheet=orders)     # a second key: added, not replacing
+                vd.push(orders)
+
+            users = opened('users')
+            bind_sheet_keys(users, {'X': (orders_of, 'cursorRow')})
+            users.cursorRowIndex = 2
+            press(users, 'Shift+X')
+            orders = vd.activeSheet
+            orders.ensureLoaded()
+            vd.sync()
+            assert orders.name == 'orders_2' and list(sheet_keys(orders)) == ['Shift+X', 'Shift+B']
+            press(orders, 'Shift+X')
+            assert opened_items == [{'order': 12}]
+            assert list(sheet_keys(users)) == ['Shift+X']        # level one is as it was
+            assert exe._pending_keys == {}                       # and nothing was queued
+
+            try:
+                bind_key('X', items_of, sheet={'not': 'a sheet'})
+            except ValueError as exc:
+                assert 'must be a VisiData sheet' in str(exc)
+            else:
+                raise AssertionError('a dict was taken for a sheet')
+        ''')
+
+    def test_the_host_binds_the_result_and_the_picker_sheets(self):
+        '''run_sheet_prompt takes `keys` out of the extras (the rest become
+        sheet attributes) and binds them; the result sheet gets result.keys.'''
+        self.run('''
+            from unittest.mock import MagicMock
+            from dbcls.clients.base import Result
+            from dbcls.dbcls import DbEditorTab
+
+            tab = DbEditorTab.__new__(DbEditorTab)
+            shown = []
+            tab._run_picker_sheet = lambda sheet: shown.append(sheet)
+            tab.run_sheet_prompt('view', 's', list(rows), {'keys': {'gx': (len, 'rows')}})
+            assert list(sheet_keys(shown[0])) == ['gx']
+            assert 'keys' not in shown[0].__dict__
+
+            tab._pipeline_sheets = []
+            tab._visidata_session = MagicMock()
+            tab._vd_run = lambda sheet: shown.append(sheet)
+            tab._open_result_in_visidata(
+                Result(data=list(rows), rowcount=len(rows), keys={'X': (len, 'rows')}))
+            assert list(sheet_keys(shown[1])) == ['Shift+X']
+        ''')
+
+
+class TestTheReferencesKeyExamplesRun:
+    '''The model imitates the bind_key() examples of its pipeline reference,
+    so each is run the whole way: the pipeline on a real event-loop thread,
+    its result on a real sheet, the key pressed, the function's query back
+    through the tab's wait_from_sheet.'''
+
+    def test_every_bind_key_example_binds_shift_x_and_queries(self):
+        out = run_with_real_visidata('''
+            import asyncio, re, time
+            from pathlib import Path
+            from unittest.mock import MagicMock
+            import visidata
+            import dbcls
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.clients.base import Result
+            from dbcls.dbcls import AsyncLoopThread, DbEditorTab
+            from dbcls.pipeline import PipelineExecutor
+
+            calls = []
+
+            class Client:
+                on_progress = None
+
+                def report_progress(self, rows):
+                    pass
+
+                async def execute(self, sql):
+                    calls.append(sql)
+                    await asyncio.sleep(0.01)
+                    return Result(data=[{'id': i, 'name': f'u{i}'} for i in range(1, 6)],
+                                  rowcount=5)
+
+            loop_thread = AsyncLoopThread(daemon=True)
+            loop_thread.start()
+            tab = DbEditorTab.__new__(DbEditorTab)
+            tab.shell = MagicMock(asyncloop_thread=loop_thread, vars={})
+            tab.client = Client()
+            tab.reset_task_info = lambda: None
+            tab.task_stop_requested = lambda: False
+            tab._visidata_session = MagicMock()
+            vd.confirm = lambda prompt, **kwargs: True      # the user says yes
+
+            reference = Path(dbcls.__file__).parent / 'llm' / 'pipeline_reference.md'
+            examples = [
+                '\\n'.join(line for line in example.split('\\n')
+                          if not line.startswith('-- ')).strip()
+                for block in re.findall(r'```sql\\n(.*?)```', reference.read_text(), re.S)
+                for example in re.split(r'\\n(?=-- )', block)
+                if 'bind_key(' in example]
+            assert len(examples) >= 2, examples
+
+            for example in examples:
+                calls.clear()
+                task = loop_thread.submit(PipelineExecutor(tab).execute(example))
+                while not task.is_done():
+                    time.sleep(0.01)
+                shown = []
+                tab._pipeline_sheets = []
+                tab._vd_run = shown.append
+                tab._open_result_in_visidata(task.result())
+                vs = shown[0]
+                vd.push(vs)
+                vs.ensureLoaded()
+                vd.sync()
+                vs.cursorRowIndex = 2
+                assert vd.bindkeys._get('Shift+X') == 'dbcls-key-Shift+X', example
+                errors = len(vd.lastErrors)
+                assert vs.execCommand('dbcls-key-Shift+X', keystrokes='Shift+X') is False
+                vd.sync()
+                assert len(vd.lastErrors) == errors, vd.lastErrors[-1]
+                # the pipeline's own query, then the one the key made — for row 3
+                assert len(calls) == 2 and '3' in calls[1], calls
+                print(calls[1])
+        ''')
+        assert 'SELECT * FROM orders WHERE user_id = 3' in out
+        assert 'DELETE FROM jobs WHERE id IN (3)' in out
 
 
 class TestClosedSheetsAreReleased:

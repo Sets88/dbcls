@@ -215,6 +215,7 @@ DEFAULT_CONTEXT = {
 #: step with :meth:`PipelineExecutor._helper_context` by a test.
 HELPER_NAMES: frozenset = frozenset({
     'result', 'info', 'warn', 'br', 'stop', 'set_var', 'get_var',
+    'bind_key', 'run_sql', 'vdm',
     'choose', 'select', 'schoose', 'sselect', 'input', 'ask',
     'data', 'row', '_vars', 'sql_in_list', 'sql_values',
 })

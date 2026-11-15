@@ -162,7 +162,8 @@ Pipeline commands
     saves them (a template, usually in '''…''') — on the next sheet the
     pipeline shows: the next .VIEW or .WATCH (replayed once, when the live
     sheet opens — not on its refreshes), or else the final result.  .SHEET
-    does not take it.  The data passes through unchanged; several .VDM steps add
+    does not take it (nor does a sheet a bind_key() function opens: see
+    vdm()).  The data passes through unchanged; several .VDM steps add
     up.  An empty "sheet" field means the sheet on top at that moment; lines
     starting with # are skipped.  In VisiData, zm opens the macro being
     recorded (or the last one) on a sheet to edit; Y / gY / Ctrl+S there
@@ -222,6 +223,40 @@ set_var(name, value)
             store value in the shared VARS under name (same store as .SET_VAR).
 get_var(name, default=None)
             return the VARS value for name (default if absent).
+bind_key(key, func, params='', sheet=None)
+            bind key to func on the next sheet the pipeline shows — the next
+            .VIEW or .WATCH, or else the final result (.SHEET does not take
+            it) — and on that sheet only: not on the sheets opened from it,
+            not on the next run's result.  The binding goes when the sheet
+            does.  params is what func is called with: Python expressions,
+            comma-separated, evaluated on the sheet when the key is pressed,
+            e.g. 'cursorRow, cursorCol, selectedRows'.  key is spelled as in
+            VisiData ('x', 'gx', '^X'); it shadows a stock key on that sheet.
+            func runs inside VisiData, on its interface thread: the prompts
+            above cannot open from it (use vd.input / vd.confirm), and
+            anything slow belongs under visidata's @asyncthread.
+            With sheet — a VisiData sheet the caller has in hand — the key
+            is bound on that sheet instead, at once: how a bound function
+            gives the sheet it opens keys of its own (a second level).
+            There sheet is required: without it the binding waits for a
+            sheet the pipeline shows, which after the run never comes —
+            the sheet the function pushes gets no key, and no error.
+            The bound keys are listed with the sheet's commands (z Ctrl+H,
+            and the Space palette), described by func's docstring.
+vdm(macro, sheet=None)
+            the .VDM step as a function: queue macro for the next sheet the
+            pipeline shows.  macro is the text .VDM takes, or one cmdlog row
+            as a dict, or a list of them.  With sheet — a VisiData sheet the
+            caller has in hand — the macro is for that sheet instead and
+            replays once, when it comes on screen (and on no other: not a
+            copy, not one of the same name).  That is how a function bound
+            with bind_key() sorts, colours or charts the sheet it opens;
+            there sheet is required, as it is for bind_key().
+run_sql(sql)
+            for a function bound with bind_key(): run sql on the connection
+            the pipeline is on (or ended on) and return its rows.  Blocks
+            until the query answers.  Inside the pipeline itself it is an
+            error — that is what .RUN is for.
 The four row prompts come as two pairs — choose/select as a popup over the
 editor, schoose/sselect as a sheet in VisiData — where the s-less name picks
 one item and the plural one marks any number:

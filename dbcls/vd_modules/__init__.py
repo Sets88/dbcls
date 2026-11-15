@@ -17,6 +17,8 @@ from . import vd_aggregators  # noqa: F401 — makes `topk<N>` / any `p<N>` reso
 from . import vd_lock  # noqa: F401 — installs the getkeystroke lock wrapper on import
 from . import vd_idle  # noqa: F401 — installs the idle-polling get_curses_timeout wrapper (asks vd_live how long it may sleep)
 from . import vd_sidebar  # noqa: F401 — installs the "b to close" hint in every sidebar title
+from .vd_keys import bind_sheet_keys  # re-exported for dbcls.py; installs the per-sheet key lookup (bind_key())
+from .vd_sheet_macro import queue_sheet_macro  # re-exported for dbcls.py; installs the per-sheet macro replay (vdm(..., sheet=))
 from .vd_macro_sheet import MacroSheet  # VisiData's macros sheet (`gm`), which it does not re-export
 
 

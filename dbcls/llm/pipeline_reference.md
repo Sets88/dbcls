@@ -121,7 +121,7 @@ set_var('n', 5)
 | `.SHEET NAME` | Create a VisiData sheet named `NAME` (template) from the current rows, pass data through unchanged. Built in the background as the step runs (never blocks, survives a cancelled run, and the user can reach it while the run is still going); the whole stack opens when the pipeline finishes. Inside `.WHILE` that is one sheet per iteration — name them apart, e.g. `.SHEET "articles {{_i}}"`. |
 | `.VIEW NAME` | Blocking `.SHEET`: shows the rows immediately and waits until the user closes them, then passes data through unchanged. This is what you want inside a `.WHILE` loop or a `.FN` function. Closing it is not an answer — it never cancels the pipeline. As the **last** step (like `.VARS`) the rows are not opened a second time. |
 | `.WATCH [INTERVAL]` | Live `.VIEW`: blocks like `.VIEW`, but re-runs **everything to its left in the same block** every `INTERVAL` seconds (default `1`, floor `0.1`) and merges the fresh rows into the sheet in place, so the sort order, column layout and cursor position survive each refresh. Works for SQL and Python alike, since the source is just the pipeline prefix. The sheet is always named `watch`; `INTERVAL` is the only argument. It is also a row picker like `sselect()`: the user answers with the row under the cursor or with the rows marked on the sheet (nothing marked hands over no rows), which is what makes `.RUN "SHOW PROCESSLIST" | .WATCH 1 | .FOR_RUN "KILL {{_0}}"` work — the rows handed over are the sheet's own dicts, rebuilt by every refresh, so there are no original items behind them. Quitting the sheet instead **cancels the run** (unlike `.VIEW`, which resumes): nothing after the `.WATCH` runs, nothing is shown, and that is the way out of a `.WHILE` around it. Note the loop is not what refreshes the sheet either: `.WATCH` re-runs its prefix itself every `INTERVAL`, so `.WHILE "1" | ... | .WATCH 1 | .ENDWHILE` is just a longer way to write `... | .WATCH 1`. Inside a `.FOR` / `.WHILE` / `.FN` body the prefix is that **body's** steps alone — the steps before the block never re-run — and in a `.FOR` the item `_i` is frozen at the iteration the sheet is parked on, so `.FOR "range(10000)" | .PY "_i" | .WATCH 1` shows `0` and never moves; whatever should change has to be produced by the prefix (a query, or a `.PY` step keeping state in `_vars`, which outlive a prefix re-run). The user can also refresh on demand, pause, change the interval, add a column with a numeric column's change (or change per second) over a period they type — which needs a key column set on the sheet, so a `.WATCH` meant for that should return a column that identifies each row — and narrow what is on display; narrowing is display-only — hidden rows keep being produced and watched — but only rows on screen are handed to the next step. A prompt in the watched prefix (`input()`, `choose()`, `sselect()`, `.VIEW`…) is asked **once** — by the run that fills the sheet before it opens — and every refresh reuses that answer instead of stopping on it, so `.RUN "SELECT * FROM pg_stat_activity WHERE datname = '{{input('Database')}}'" \| .WATCH 2` keeps ticking; the answer is remembered per prompt title and only while the sheet is up, and blocking display steps (`.VIEW`, `.VARS`, `warn()`) simply do not reopen on a refresh. What is still refused is a prompt with nothing remembered — a title that changes on every tick, or a branch only a refresh reaches — and a second `.WATCH`: VisiData owns the terminal. Closing the sheet waits for an in-flight refresh, so it can never overlap with the next run. |
-| `.VDM MACRO` | Queue a VisiData macro (cmdlog JSON lines, one command per line, as VisiData's macro recorder saves them; a template — write it as `"""…"""`) to replay on the **next sheet the pipeline shows**: the next `.VIEW` or `.WATCH` (a live sheet replays it once, when it opens — not on each refresh), or else the final result. `.SHEET` does not take it. Data passes through unchanged; several `.VDM` add up; each line needs `longname` or `keystrokes`, `row`/`col` set the cursor, empty `sheet` = the sheet on top at that moment, `#` lines are skipped. The user gets a recorded macro out of VisiData with `zm` (a sheet of its commands; `Y` / `gY` copy them as jsonl). Example: `.RUN "SELECT * FROM t" \| .VDM '{"col": "kind", "longname": "freq-col"}'` opens the result straight on the frequency table of `kind`. **Before writing a macro, call `get_visidata_macro_reference`** — it has the fields, the command names and their inputs; do not write macro commands from memory. |
+| `.VDM MACRO` | Queue a VisiData macro (cmdlog JSON lines, one command per line, as VisiData's macro recorder saves them; a template — write it as `"""…"""`) to replay on the **next sheet the pipeline shows**: the next `.VIEW` or `.WATCH` (a live sheet replays it once, when it opens — not on each refresh), or else the final result. `.SHEET` does not take it, and neither does a sheet a `bind_key()` function opens — that one takes `vdm(macro, sheet=…)`. Data passes through unchanged; several `.VDM` add up; each line needs `longname` or `keystrokes`, `row`/`col` set the cursor, empty `sheet` = the sheet on top at that moment, `#` lines are skipped. The user gets a recorded macro out of VisiData with `zm` (a sheet of its commands; `Y` / `gY` copy them as jsonl). Example: `.RUN "SELECT * FROM t" \| .VDM '{"col": "kind", "longname": "freq-col"}'` opens the result straight on the frequency table of `kind`. **Before writing a macro, call `get_visidata_macro_reference`** — it has the fields, the command names and their inputs; do not write macro commands from memory. |
 | `.WHILE "code" ... .ENDWHILE` | Loop the following steps while `code` stays truthy. The condition sees the data that entered the block (frozen) every iteration; its value becomes the body's input and `_i`. See Control flow below. |
 | `.FN "NAME" ... .ENDFN` | Define a named function. Hoisted: the main flow does **not** run the body (data passes through the definition unchanged), and the definition may sit before or after its use. Top level only (not inside `.FOR`/`.WHILE`/`.FN`), `.ENDFN` mandatory. |
 | `.CALL "NAME"` | Run the `.FN` block `NAME` with the current data and continue with the data of its last step — a call, not a jump. `NAME` is a template, so it can be picked at run time. Max nesting 20. |
@@ -201,6 +201,12 @@ not executed as steps themselves. `.CALL` *is* a normal step (`.CALL?` works).
   abort entire pipeline.
 - `set_var(name, val)` / `get_var(name, default=None)` — same store as `.SET_VAR`/`.GET_VAR`,
   and the one the user can write into from the editor.
+- `bind_key(key, func, params='', sheet=None)` / `run_sql(sql)` — give the sheet the user lands on a key
+  that calls a function defined in the `.PY` step, and let that function query. See *Keys on
+  a sheet* below before using either.
+- `vdm(macro, sheet=None)` — the `.VDM` step as a function: queue a macro for the next sheet
+  the pipeline shows. In the pipeline itself prefer the `.VDM` step; the function is for
+  `sheet=`, the sheet a bound function opens — see *Keys on a sheet*.
 - Row prompts come as two pairs — popup over the editor vs. sheet in VisiData, s-less name picks
   one item vs. plural marks any number:
 
@@ -227,6 +233,123 @@ not executed as steps themselves. `.CALL` *is* a normal step (`.CALL?` works).
   or, with `chunk_size`, a *list* of such strings for chunked `.FOR_RUN` inserts. Both **raise on
   empty input** — guard a step that may filter everything away (`?` on the step, or a `.PY`
   check) instead of letting `sql_in_list([])` abort the run.
+
+## Keys on a sheet (`bind_key()` / `run_sql()`)
+
+When the user wants the result to **do something on a keypress** — open the orders of the user
+under the cursor, act on the selected rows — a `.PY` step defines a Python function and binds
+it to a key on the sheet the user lands on. This is the only way to give a sheet behaviour;
+`.VDM` replays commands once, it does not add any.
+
+```sql
+.PY """
+from visidata import vd, PyobjSheet, asyncthread
+@asyncthread
+def orders_of(row):
+    found = run_sql(f"SELECT * FROM orders WHERE user_id = {int(row['id'])}")
+    vd.push(PyobjSheet(f"orders_{row['id']}", source=found))
+bind_key('X', orders_of, 'cursorRow')
+""" |
+.RUN "SELECT id, name FROM users"
+```
+
+`bind_key(key, func, params='', sheet=None)`:
+
+- **Where it lands** — on the next sheet the pipeline shows, exactly like `.VDM`: the next
+  `.VIEW` or `.WATCH`, or else the final result. `.SHEET` does not take it. So the `.PY` step
+  that calls `bind_key()` goes **before** that display point; it passes `data` through, so it
+  may be the first step or sit between two others. One sheet takes the binding and it is
+  spent: when a `.WHILE` or `.FN` body shows a `.VIEW` on every pass, the `.PY` step with
+  `bind_key()` has to be **inside** that body.
+- **Only that sheet** — not the sheets the user opens from it (a frequency table, a duplicate,
+  a row they dive into, the sheet your own function pushes), not the next run's result. It is
+  gone when the sheet closes. Nothing has to be unbound.
+- **`params`** — what `func` is called with: Python expressions separated by commas, evaluated
+  on the sheet when the key is pressed. Use these names and no others:
+  `cursorRow` (the row under the cursor — a **dict** keyed by column name), `cursorCol` (the
+  column under the cursor: `.name`, `.getValue(row)`), `cursorValue` (the cell under the
+  cursor), `selectedRows` (list of row dicts the user marked — **empty** when nothing is
+  marked, so handle that: `rows or [row]`), `sheet`. The function's parameters are positional,
+  in that order; their names are yours to choose.
+- **`key`** — VisiData spelling: one character (`'X'`), a `g`/`z` prefix plus a character
+  (`'gx'`), or `'^X'` for Ctrl. Almost every key already has a stock command, which the
+  binding **shadows on this sheet**. Unbound on a result sheet, so shadowing nothing: capital
+  `X`, `B`, `E`, `V` and the digits `1`–`9` — use these. Never bind `q`, `Enter`, a bare
+  `g` or `z`, or on a `.WATCH` sheet its own keys (`p`, `zi`, `gf`, `gR`, `Ctrl+R`). Take
+  another key only when the user names it, and then tell them it replaces whatever that key
+  did on this sheet — you have no tool that looks a command up by its key. Binding the same
+  key twice keeps the last.
+- **Give the function a one-line docstring** (`'''…'''` inside a `"""…"""` step) and **tell
+  the user** which key does what. The sheet names its keys on the status line when it opens
+  and lists them among its commands, where the docstring's first line is the description.
+- **`sheet=`** — bind on a sheet you already hold instead of the next one shown, at once. Its
+  one use: a bound function that builds a sheet, gives *it* keys, then pushes it — a second
+  level, and a third the same way. Create the sheet, call `bind_key(…, sheet=that_sheet)`,
+  then `vd.push(that_sheet)`. Each level's keys are its own, so the same key can mean the next
+  step down on every level. The rule is which sheet the key is for:
+  - a sheet **the pipeline shows** (`.VIEW`, `.WATCH`, the final result) does not exist while
+    the `.PY` step runs, so there is nothing to name — leave `sheet=` out and the binding
+    waits for that display point. Never pass `sheet=` at the top of the `.PY` step;
+  - a sheet **your function builds** is never shown by the pipeline, so no display point will
+    ever hand it the binding — inside a bound function `sheet=` is **required**. Without it
+    the call is not an error and does nothing you can see: the binding waits for a display
+    point of a pipeline that has already finished, and the sheet you push opens with no key.
+- **`vdm(macro, sheet=that_sheet)`** — the same for a macro: `.VDM` reaches only the sheets the
+  pipeline shows, so the sheet your function builds gets its macro (a sort, a colour rule, a
+  chart) this way. `macro` is what `.VDM` takes — cmdlog JSON lines in a string — or, simpler
+  in Python, one row as a dict or a list of them: `vdm({'longname': 'sort-desc', 'col':
+  'total'}, sheet=orders)`. It replays once, when that sheet comes on screen, so call it
+  before or after `vd.push(that_sheet)` — on that sheet only, not on a copy and not on another
+  sheet of the same name. `sheet=` is required inside a bound function for the same reason as
+  with `bind_key()`: without it the macro waits for a display point that will not come. The
+  rows follow the macro reference like any `.VDM` (`get_visidata_macro_reference`); leave
+  their `sheet` field out.
+
+```sql
+.PY """
+from visidata import vd, PyobjSheet, asyncthread
+@asyncthread
+def items_of(order):
+    '''Open the items of this order.'''
+    found = run_sql(f"SELECT * FROM order_items WHERE order_id = {int(order['id'])}")
+    vd.push(PyobjSheet(f"items_{order['id']}", source=found))
+@asyncthread
+def orders_of(user):
+    '''Open the orders of this user.'''
+    found = run_sql(f"SELECT * FROM orders WHERE user_id = {int(user['id'])}")
+    orders = PyobjSheet(f"orders_{user['id']}", source=found)
+    bind_key('X', items_of, 'cursorRow', sheet=orders)
+    vdm({'longname': 'sort-desc', 'col': 'id'}, sheet=orders)
+    vd.push(orders)
+bind_key('X', orders_of, 'cursorRow')
+""" |
+.RUN "SELECT id, name FROM users"
+```
+
+Inside the function — it runs in VisiData when the key is pressed, usually **after the
+pipeline has finished**:
+
+- `run_sql(sql)` runs one plain SQL statement on the connection the pipeline was on (after a
+  `.CONN`: that one) and returns its rows as a list of dicts. No `{{…}}` in it and no pipeline
+  steps — build the string in Python (`sql_in_list()` / `sql_values()` are there for lists;
+  cast or quote a value you splice in). It blocks until the query answers, so a function that
+  calls it must be decorated with `@asyncthread` (from `visidata`), or the sheet freezes.
+  `run_sql()` is for these functions only: called in the pipeline itself it raises — use `.RUN`.
+- **No pipeline prompts**: `choose()`, `select()`, `schoose()`, `sselect()`, `input()`,
+  `ask()`, `warn()` raise there, and `info()` / `br()` / `stop()` / `result()` mean nothing —
+  there is no pipeline to answer to. Ask on the sheet with `vd.input('prompt: ')` (a string)
+  or `vd.confirm('sure? ')` — and do it in a plain function, not under `@asyncthread`: split
+  the work into an undecorated function that asks and an `@asyncthread` one it then calls.
+- `set_var()` / `get_var()` work, and so does anything the `.PY` step imported or defined:
+  the function keeps that step's namespace.
+- From VisiData use only: `vd.push(PyobjSheet(name, source=list_of_dicts))` to show rows on a
+  new sheet, `vd.status(text)` / `vd.warning(text)` for a message, `vd.input` / `vd.confirm`
+  as above, `col.name` / `col.getValue(row)`, and the `params` names. Do not write other
+  VisiData API from memory.
+- An exception in the function is shown on the sheet's status line; it does not close anything.
+- If the function **changes data** (`run_sql("DELETE …")`), it does so the instant the key is
+  pressed, with no confirmation unless you write one (`vd.confirm`). Say so plainly to the
+  user when you propose such a pipeline.
 
 ## Template placeholders
 
@@ -304,6 +427,21 @@ if mtime is not None:
     stop()
 """
 
+-- a key on the result: X deletes the selected rows (or the one under the cursor) after asking
+.PY """
+from visidata import vd, asyncthread
+@asyncthread
+def delete(ids):
+    run_sql(f"DELETE FROM jobs WHERE id IN {sql_in_list(ids)}")
+    vd.status(f"deleted {len(ids)} jobs")
+def ask_delete(row, rows):
+    ids = [r['id'] for r in rows or [row]]
+    vd.confirm(f"delete {len(ids)} jobs? ")
+    delete(ids)
+bind_key('X', ask_delete, 'cursorRow, selectedRows')
+""" |
+.RUN "SELECT id, state, created_at FROM jobs WHERE state = 'failed'"
+
 -- interactive browser: pick users → drill into what they wrote → come back
 .FN "names" | .PY "[x['name'] for x in data]" | .VIEW "names" | .ENDFN |
 .FN "articles" |
@@ -367,3 +505,11 @@ if mtime is not None:
     on one iteration while the sheet is up, so `_i` never changes (`.FOR "range(10000)" |
     .PY "_i" | .WATCH 1` shows `0` forever). Put what should change in the prefix and drop the
     loop — `.WATCH` refreshes itself.
+18. A function bound with `bind_key()` that calls a pipeline prompt (`choose()`, `input()`,
+    `ask()`…), calls `run_sql()` without `@asyncthread`, or expects `selectedRows` to hold the
+    cursor row when nothing is marked? → the prompt raises, the sheet freezes for the length
+    of the query, the list is empty. A `bind_key()` or `vdm()` *inside* a bound function
+    without `sheet=the_sheet_it_pushes` does nothing, silently — that sheet opens with no key
+    and no macro. And a
+    `bind_key()` placed *after* the `.VIEW` / `.WATCH`
+    it was meant for goes to the final result instead.
