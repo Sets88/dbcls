@@ -479,11 +479,14 @@ bind_key('X', orders_of, 'cursorRow')
 .RUN "SELECT * FROM User"
 ```
 
-`run_sql(sql)`
+`run_sql(sql, timeout=60)`
   for a function bound with `bind_key()`: runs `sql` on the connection the
   pipeline is on (the one it ended on, after a `.CONN`) and returns the rows.
-  It blocks until the query answers (60 s at most), so call it under
-  `@asyncthread` or the sheet freezes meanwhile. It is plain SQL — no
+  It blocks until the query answers, so call it under `@asyncthread` or the
+  sheet freezes meanwhile. `timeout` is how many seconds it waits before
+  giving up with a `TimeoutError`: `run_sql(sql, timeout=600)` for a slow
+  query, `timeout=None` for no limit (`Ctrl+C` on the sheet still stops an
+  `@asyncthread` function that is waiting). It is plain SQL — no
   `{{expr}}`, no pipeline steps. Inside the pipeline itself it is an error:
   that is what `.RUN` is for.
 

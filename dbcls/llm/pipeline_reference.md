@@ -201,7 +201,7 @@ not executed as steps themselves. `.CALL` *is* a normal step (`.CALL?` works).
   abort entire pipeline.
 - `set_var(name, val)` / `get_var(name, default=None)` — same store as `.SET_VAR`/`.GET_VAR`,
   and the one the user can write into from the editor.
-- `bind_key(key, func, params='', sheet=None)` / `run_sql(sql)` — give the sheet the user lands on a key
+- `bind_key(key, func, params='', sheet=None)` / `run_sql(sql, timeout=60)` — give the sheet the user lands on a key
   that calls a function defined in the `.PY` step, and let that function query. See *Keys on
   a sheet* below before using either.
 - `vdm(macro, sheet=None)` — the `.VDM` step as a function: queue a macro for the next sheet
@@ -329,12 +329,15 @@ bind_key('X', orders_of, 'cursorRow')
 Inside the function — it runs in VisiData when the key is pressed, usually **after the
 pipeline has finished**:
 
-- `run_sql(sql)` runs one plain SQL statement on the connection the pipeline was on (after a
-  `.CONN`: that one) and returns its rows as a list of dicts. No `{{…}}` in it and no pipeline
-  steps — build the string in Python (`sql_in_list()` / `sql_values()` are there for lists;
-  cast or quote a value you splice in). It blocks until the query answers, so a function that
-  calls it must be decorated with `@asyncthread` (from `visidata`), or the sheet freezes.
-  `run_sql()` is for these functions only: called in the pipeline itself it raises — use `.RUN`.
+- `run_sql(sql, timeout=60)` runs one plain SQL statement on the connection the pipeline was
+  on (after a `.CONN`: that one) and returns its rows as a list of dicts. No `{{…}}` in it and
+  no pipeline steps — build the string in Python (`sql_in_list()` / `sql_values()` are there
+  for lists; cast or quote a value you splice in). It blocks until the query answers, so a
+  function that calls it must be decorated with `@asyncthread` (from `visidata`), or the sheet
+  freezes. It waits `timeout` seconds, then raises `TimeoutError`: for a query known to be slow
+  pass more (`run_sql(sql, timeout=600)`), or `timeout=None` for no limit — a positive number
+  or `None`, nothing else. `run_sql()` is for these functions only: called in the pipeline
+  itself it raises — use `.RUN`.
 - **No pipeline prompts**: `choose()`, `select()`, `schoose()`, `sselect()`, `input()`,
   `ask()`, `warn()` raise there, and `info()` / `br()` / `stop()` / `result()` mean nothing —
   there is no pipeline to answer to. Ask on the sheet with `vd.input('prompt: ')` (a string)

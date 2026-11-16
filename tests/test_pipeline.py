@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -1257,8 +1258,10 @@ _BIND = (".PY \"\"\"\n"
 def _waits_on(loop):
     """A host's wait_from_sheet: run the coroutine on *loop* and block for it —
     what DbEditorTab does through SyncClient, minus the polling."""
-    def wait(coro_func, *args):
+    def wait(coro_func, *args, timeout=None):
+        wait.timeouts.append(timeout)
         return asyncio.run_coroutine_threadsafe(coro_func(*args), loop).result(5)
+    wait.timeouts = []
     return wait
 
 
@@ -1377,6 +1380,53 @@ class TestPipelineBindKey:
         with pytest.raises(ValueError, match='cannot open from a function bound'):
             await asyncio.to_thread(func)
         dbeditor.request_user_input.assert_not_called()
+
+    async def _bound(self, call, host_wait=None):
+        """The function of a key bound to *call* (an expression), and the
+        host's wait_from_sheet it queries through."""
+        client, _calls = _make_recording_client()
+        dbeditor = _make_dbeditor(client)
+        dbeditor.wait_from_sheet = host_wait or _waits_on(asyncio.get_running_loop())
+        exe = PipelineExecutor(dbeditor)
+        result = await exe.execute(
+            f'.PY "bind_key(\'x\', lambda: {call})" | .RUN "q"')
+        return result.keys['x'][0], dbeditor.wait_from_sheet
+
+    async def test_run_sql_waits_a_minute_unless_told_otherwise(self):
+        func, wait = await self._bound("run_sql('SELECT 1')")
+        assert await asyncio.to_thread(func) == [{'sql': 'SELECT 1'}]
+        assert wait.timeouts == [60]
+
+    async def test_run_sql_passes_its_timeout_to_the_host(self):
+        func, wait = await self._bound(
+            "(run_sql('a', timeout=600), run_sql('b', 0.5), run_sql('c', timeout=None))")
+        await asyncio.to_thread(func)
+        assert wait.timeouts == [600, 0.5, None]
+
+    @pytest.mark.parametrize('bad', ['0', '-5', "'60'", 'True', "float('nan')"])
+    async def test_run_sql_refuses_a_timeout_that_is_no_number_of_seconds(self, bad):
+        func, wait = await self._bound(f"run_sql('SELECT 1', timeout={bad})")
+        with pytest.raises(ValueError, match='timeout must be a positive number'):
+            await asyncio.to_thread(func)
+        assert wait.timeouts == []
+
+    async def test_a_wait_that_ran_out_says_how_to_wait_longer(self):
+        def host_wait(coro_func, *args, timeout=None):
+            time.sleep(timeout)
+            raise TimeoutError('_sheet_query: no answer in 0.05s')
+
+        func, _wait = await self._bound("run_sql('SELECT 1', timeout=0.05)", host_wait)
+        with pytest.raises(TimeoutError, match=r'no answer in 0\.05s .* timeout=None'):
+            await asyncio.to_thread(func)
+
+    async def test_a_timeout_of_the_drivers_own_is_left_as_it_is(self):
+        def host_wait(coro_func, *args, timeout=None):
+            raise TimeoutError('socket timed out')
+
+        for call in ("run_sql('SELECT 1')", "run_sql('SELECT 1', timeout=None)"):
+            func, _wait = await self._bound(call, host_wait)
+            with pytest.raises(TimeoutError, match='socket timed out'):
+                await asyncio.to_thread(func)
 
     async def test_run_sql_refuses_to_run_inside_the_pipeline(self):
         exe = PipelineExecutor(_make_dbeditor(_make_client([{'id': 1}])))

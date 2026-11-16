@@ -8,6 +8,7 @@ import asyncio
 import concurrent.futures
 import json
 import re
+import time
 import weakref
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
@@ -81,7 +82,8 @@ class PipelineHost(Protocol):
 
     def add_pipeline_sheet(self, name: str, rows: List[dict]) -> None: ...
 
-    def wait_from_sheet(self, coro_func: Callable, *args: Any) -> Any: ...
+    def wait_from_sheet(self, coro_func: Callable, *args: Any,
+                        timeout: Optional[float] = None) -> Any: ...
 
     def bind_sheet_key(self, sheet: Any, key: str, func: Callable, params: str) -> None: ...
 
@@ -92,6 +94,9 @@ class PipelineHost(Protocol):
     def task_stop_requested(self) -> bool: ...
 
 
+
+#: Seconds ``run_sql()`` waits for its query unless the caller says otherwise.
+SHEET_QUERY_TIMEOUT = 60
 
 #: client → the lock its queries are run under (see :func:`_client_lock`).
 _CLIENT_LOCKS: 'weakref.WeakKeyDictionary[Any, asyncio.Lock]' = weakref.WeakKeyDictionary()
@@ -727,21 +732,47 @@ class PipelineExecutor:
         keys, self._pending_keys = self._pending_keys, {}
         return keys
 
-    def _sheet_sql(self, sql: Any) -> list:
+    def _sheet_sql(self, sql: Any,
+                   timeout: Optional[float] = SHEET_QUERY_TIMEOUT) -> list:
         """Run *sql* and return its rows — for a function bound with
         ``bind_key()``, which runs on a VisiData thread long after the step
         that defined it.  Exposed as ``run_sql()``.
 
         Blocking, by design: the caller is not a coroutine.  That is also why
         it refuses to run inside the pipeline itself — there it would be
-        waiting, on the event loop, for a query only the event loop can run."""
+        waiting, on the event loop, for a query only the event loop can run.
+
+        *timeout* is how many seconds to wait for the rows — the wait for the
+        connection included, when another query has it — before giving the
+        query up with :class:`TimeoutError`; ``None`` waits for as long as it
+        takes."""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return self.host.wait_from_sheet(self._sheet_query, str(sql))
-        raise ValueError(
-            'run_sql() is for functions bound to a key with bind_key() — '
-            'inside the pipeline itself, run the query with a .RUN step')
+            pass
+        else:
+            raise ValueError(
+                'run_sql() is for functions bound to a key with bind_key() — '
+                'inside the pipeline itself, run the query with a .RUN step')
+        if timeout is not None and (
+                isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not timeout > 0):
+            raise ValueError(
+                f'run_sql(): timeout must be a positive number of seconds, or '
+                f'None for no limit, got {timeout!r}')
+        started = time.monotonic()
+        try:
+            return self.host.wait_from_sheet(
+                self._sheet_query, str(sql), timeout=timeout)
+        except TimeoutError:
+            # Only the wait running out is reworded: a timeout of the driver's
+            # own (a socket, a server-side limit) says what it has to say.
+            if timeout is None or time.monotonic() - started < timeout:
+                raise
+            raise TimeoutError(
+                f'run_sql(): no answer in {timeout:g}s — a query that needs '
+                f'longer takes run_sql(sql, timeout=seconds), '
+                f'timeout=None for no limit') from None
 
     def _helper_context(self) -> dict:
         """The helper functions exposed to every piece of user Python — both

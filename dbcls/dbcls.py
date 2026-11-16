@@ -187,7 +187,8 @@ class SyncClient:
     """The async client as seen from a VisiData thread: every coroutine method
     becomes a blocking call that returns what the coroutine returns.
 
-    A call that outlives ``timeout`` raises :class:`TimeoutError`; one whose
+    A call that outlives ``timeout`` raises :class:`TimeoutError` (``None``:
+    no call does, it is waited for however long it takes); one whose
     task was cancelled raises :class:`asyncio.CancelledError`.  Neither is
     turned into a :class:`Result`, so a caller that expects a list gets a list
     or an exception, and a loader that dies of a timeout shows the timeout
@@ -222,7 +223,7 @@ class SyncClient:
             while not task.is_done():
                 time.sleep(0.1)
 
-                if time.monotonic() - start > self.timeout:
+                if self.timeout is not None and time.monotonic() - start > self.timeout:
                     raise TimeoutError(f'{coro.__name__}: no answer in {self.timeout:g}s')
 
             return task.result()
@@ -1111,11 +1112,14 @@ class DbEditorTab(Editor):
                 f'vdm(): sheet must be a VisiData sheet, got {type(sheet).__name__}')
         queue_sheet_macro(sheet, rows)
 
-    def wait_from_sheet(self, coro_func, *args):
+    def wait_from_sheet(self, coro_func, *args, timeout=None):
         """Pipeline host hook for run_sql() in a bind_key() function: run a
         coroutine on the async loop and block the calling VisiData thread until
-        it answers — or raise TimeoutError, as every SyncClient call does."""
-        return SyncClient(self.asyncloop_thread, self.client)._run_coro(coro_func, *args)
+        it answers — or, *timeout* seconds later, raise TimeoutError as every
+        SyncClient call does.  None waits for as long as it takes."""
+        sync = SyncClient(self.asyncloop_thread, self.client)
+        sync.timeout = timeout
+        return sync._run_coro(coro_func, *args)
 
     def _vd_run(self, sheet) -> None:
         """Run a VisiData mainloop starting at `sheet`, guarding against a

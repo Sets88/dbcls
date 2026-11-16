@@ -117,6 +117,17 @@ class TestSyncClient:
             sync_client._run_coro(get_table_columns)
         mock_task.cancel.assert_called_once()
 
+    def test_run_coro_without_a_timeout_waits_for_as_long_as_it_takes(self, sync_client):
+        mock_task = MagicMock()
+        mock_task.is_done.side_effect = [False, False, False, True, True]
+        mock_task.result.return_value = "late"
+
+        sync_client.asyncloop_thread.submit.return_value = mock_task
+        sync_client.timeout = None
+
+        assert sync_client._run_coro(lambda: None) == "late"
+        mock_task.cancel.assert_not_called()
+
     def test_run_coro_cancelled_task_raises(self, sync_client):
         import asyncio
 

@@ -252,11 +252,13 @@ vdm(macro, sheet=None)
             copy, not one of the same name).  That is how a function bound
             with bind_key() sorts, colours or charts the sheet it opens;
             there sheet is required, as it is for bind_key().
-run_sql(sql)
+run_sql(sql, timeout=60)
             for a function bound with bind_key(): run sql on the connection
             the pipeline is on (or ended on) and return its rows.  Blocks
-            until the query answers.  Inside the pipeline itself it is an
-            error — that is what .RUN is for.
+            until the query answers, timeout seconds at most — then it
+            raises TimeoutError; timeout=None waits for as long as it takes.
+            Inside the pipeline itself it is an error — that is what .RUN
+            is for.
 The four row prompts come as two pairs — choose/select as a popup over the
 editor, schoose/sselect as a sheet in VisiData — where the s-less name picks
 one item and the plural one marks any number:
