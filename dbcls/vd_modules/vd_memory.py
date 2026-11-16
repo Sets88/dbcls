@@ -428,9 +428,16 @@ if hasattr(BaseSheet, '__copy__') and \
     def __copy__(vs):
         ret = _orig_copy(vs)
         ret.__dict__.pop('dbcls_id', None)
-        # The keys a pipeline bound (bind_key(), see vd_keys) are for the one
-        # sheet it opened too — and their functions hold that run's namespace.
-        ret.__dict__.pop('dbcls_keys', None)
+        # The keys a pipeline bound (bind_key(), see vd_keys) do go along: a
+        # copy shows rows of the very sheet they were bound for — the selected
+        # ones, a frequency group — and a key that works on a row is expected
+        # to work there.  In a dict of its own: a key bound on either sheet
+        # later is not bound on the other.  The bindings are functions and
+        # strings, nothing that leads back to the original, so the copy does
+        # not keep it alive — only the functions, for as long as it lives.
+        keys = ret.__dict__.get('dbcls_keys')
+        if keys is not None:
+            ret.__dict__['dbcls_keys'] = dict(keys)
         # Likewise a macro still waiting for the sheet to be shown (vdm(...,
         # sheet=), see vd_sheet_macro): the copy would replay it a second time.
         ret.__dict__.pop('dbcls_macro', None)

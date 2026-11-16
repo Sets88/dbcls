@@ -261,9 +261,11 @@ bind_key('X', orders_of, 'cursorRow')
   may be the first step or sit between two others. One sheet takes the binding and it is
   spent: when a `.WHILE` or `.FN` body shows a `.VIEW` on every pass, the `.PY` step with
   `bind_key()` has to be **inside** that body.
-- **Only that sheet** — not the sheets the user opens from it (a frequency table, a duplicate,
-  a row they dive into, the sheet your own function pushes), not the next run's result. It is
-  gone when the sheet closes. Nothing has to be unbound.
+- **That sheet and its copies** — the sheets VisiData copies from it show the same rows and
+  keep the key: a duplicate (`"` on the selected rows, `g"`), the rows of a frequency-table
+  group (Enter there). A sheet of *other* rows does not have it: the frequency table itself, a
+  row the user dives into, the sheet your own function pushes (that one takes `sheet=`), the
+  next run's result. It is gone when those sheets close. Nothing has to be unbound.
 - **`params`** — what `func` is called with: Python expressions separated by commas, evaluated
   on the sheet when the key is pressed. Use these names and no others:
   `cursorRow` (the row under the cursor — a **dict** keyed by column name), `cursorCol` (the

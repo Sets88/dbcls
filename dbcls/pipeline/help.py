@@ -393,9 +393,12 @@ set_var('some_var', 42)
 `bind_key(key, func, params='', sheet=None)`
   binds `key` to a function of your own on the next sheet the pipeline shows —
   the next `.VIEW` or `.WATCH`, or else the final result (`.SHEET` does not
-  take it, like `.VDM`). The binding holds on that one sheet: not on the sheets
-  opened from it (a duplicate, a frequency table, a row you dive into), not on
-  the result of the next run — and it is gone when the sheet is.
+  take it, like `.VDM`). The binding holds on that sheet and on the copies
+  VisiData makes of it — `"` on the selected rows, Enter on a group of a
+  frequency table: the same rows, so the same keys. It does not hold on a
+  sheet of other rows opened from it (the frequency table itself, a row you
+  dive into), nor on the result of the next run — and it is gone when the
+  sheets that have it are.
 
   `params` is what the function is called with: Python expressions separated
   by commas, evaluated on the sheet at the moment the key is pressed, so the

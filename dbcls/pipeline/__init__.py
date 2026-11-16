@@ -226,9 +226,12 @@ get_var(name, default=None)
 bind_key(key, func, params='', sheet=None)
             bind key to func on the next sheet the pipeline shows — the next
             .VIEW or .WATCH, or else the final result (.SHEET does not take
-            it) — and on that sheet only: not on the sheets opened from it,
-            not on the next run's result.  The binding goes when the sheet
-            does.  params is what func is called with: Python expressions,
+            it).  The copies VisiData makes of that sheet have the key too
+            (" on selected rows, Enter on a group of a frequency table);
+            a sheet of other rows opened from it (the frequency table
+            itself, a row dived into) and the next run's result do not.
+            The binding goes when the sheets that have it do.
+            params is what func is called with: Python expressions,
             comma-separated, evaluated on the sheet when the key is pressed,
             e.g. 'cursorRow, cursorCol, selectedRows'.  key is spelled as in
             VisiData ('x', 'gx', '^X'); it shadows a stock key on that sheet.

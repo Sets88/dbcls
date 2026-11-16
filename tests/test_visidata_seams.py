@@ -1099,7 +1099,7 @@ class TestPipelineKeys:
 
     def test_no_other_sheet_gets_the_key(self):
         '''Not one of the same name (VisiData's own per-sheet level goes by
-        name), not a copy, not the sheet a command derives from it.'''
+        name), not the sheet of other rows a command derives from it.'''
         self.run('''
             other = opened()
             vs = opened()
@@ -1107,11 +1107,66 @@ class TestPipelineKeys:
             stock = vd.bindkeys._get('x', other)
             assert stock != 'dbcls-key-x'
             assert vd.bindkeys._get('x', vs) == 'dbcls-key-x'
-            assert sheet_keys(copy.copy(vs)) is None and sheet_keys(vs)
             vs.execCommand('freq-col')
             vd.sync()
             assert vd.activeSheet is not vs
             assert vd.bindkeys._get('x') == stock
+        ''')
+
+    def test_a_copy_of_the_sheet_has_the_keys(self):
+        '''`"` on the selected rows and Enter on a frequency group are copies
+        of the sheet — its rows, so its keys, called with what the copy has
+        under the cursor.  The frequency table in between has none.'''
+        self.run('''
+            vs = opened()
+            seen = []
+            bind_sheet_keys(vs, {'x': (lambda row, sel: seen.append((row, list(sel))),
+                                       'cursorRow, selectedRows')})
+
+            vs.select([vs.rows[1], vs.rows[4]])
+            vs.execCommand('dup-selected')
+            vd.sync()
+            dup = vd.activeSheet
+            vd.sync(dup.ensureLoaded())
+            assert dup is not vs and dup.rows == [rows[1], rows[4]]
+            dup.cursorRowIndex = 1
+            press(dup, 'x')
+            assert seen == [(rows[4], [])], seen
+
+            vd.push(vs)
+            vs.cursorVisibleColIndex = [c.name for c in vs.visibleCols].index('t')
+            vs.execCommand('freq-col')
+            vd.sync()
+            freq = vd.activeSheet
+            assert sheet_keys(freq) is None
+            freq.cursorRowIndex = [r.discrete_keys[0] for r in freq.rows].index('c')
+            freq.execCommand('open-row')
+            vd.sync()
+            group = vd.activeSheet
+            assert group not in (vs, freq) and group.rows == [rows[3], rows[4]]
+            press(group, 'x')
+            assert seen[-1] == (rows[3], []), seen
+
+            # a copy of a copy, and the deep one (`z"`), too
+            assert list(sheet_keys(copy.copy(dup))) == ['x']
+            assert list(sheet_keys(copy.deepcopy(vs))) == ['x']
+            # a sheet that never had a key copies as before
+            assert sheet_keys(copy.copy(visidata.PyobjSheet('p', source=[]))) is None
+        ''')
+
+    def test_a_key_bound_later_stays_on_the_sheet_it_was_bound_on(self):
+        '''The copy has the bindings in a dict of its own: bind_key(...,
+        sheet=) on either of the two does not reach the other.'''
+        self.run('''
+            vs = opened()
+            bind_sheet_keys(vs, {'x': (lambda: None, '')})
+            dup = copy.copy(vs)
+            assert sheet_keys(dup) is not sheet_keys(vs)
+            bind_sheet_keys(dup, {'y': (lambda: None, ''), 'x': (len, 'rows')})
+            bind_sheet_keys(vs, {'z': (lambda: None, '')})
+            assert list(sheet_keys(vs)) == ['x', 'z']
+            assert list(sheet_keys(dup)) == ['x', 'y']
+            assert sheet_keys(dup)['x'].func is len and sheet_keys(vs)['x'].func is not len
         ''')
 
     def test_a_failing_function_is_an_error_on_the_status_line(self):
@@ -1153,6 +1208,55 @@ class TestPipelineKeys:
             gc.collect()
             assert refs[0]() is None, gc.get_referrers(refs[0]())
             assert refs[1]() is None, gc.get_referrers(refs[1]())
+        ''')
+
+    def test_a_copy_with_the_keys_keeps_nothing_but_the_functions(self):
+        '''A copy carries the functions, not the sheet it was copied from:
+        the original deleted in gS is freed while the copy is still open, and
+        what the functions hold on to goes with the last sheet that has them.'''
+        self.run('''
+            import gc, weakref
+            from dbcls.vd_modules.vd_memory import release_closed_sheets
+
+            class Payload:      # what the function's namespace holds on to
+                pass
+
+            def delete_in_gS(sheet):
+                g = vd.allSheetsSheet
+                g.reload()
+                vd.push(g)
+                g.cursorRowIndex = vd.allSheets.index(sheet)
+                g.execCommand('delete-row')
+                vd.sync()
+                vd.remove(g)
+                vd.remove(sheet)
+
+            vs = opened()
+            payload = Payload()
+            bind_sheet_keys(vs, {'x': (lambda row, p=payload: None, 'cursorRow')})
+            vs.select([vs.rows[0]])
+            vs.execCommand('dup-selected')
+            vd.sync()
+            dup = vd.activeSheet
+            vd.sync(dup.ensureLoaded())
+            press(vs, 'x')
+            press(dup, 'x')
+            original, held, copied = weakref.ref(vs), weakref.ref(payload), weakref.ref(dup)
+
+            delete_in_gS(vs)
+            del vs, payload
+            release_closed_sheets()
+            gc.collect()
+            assert original() is None, gc.get_referrers(original())
+            assert held() is not None       # the copy's key still calls it
+            press(dup, 'x')
+
+            delete_in_gS(dup)
+            del dup
+            release_closed_sheets()
+            gc.collect()
+            assert copied() is None, gc.get_referrers(copied())
+            assert held() is None, gc.get_referrers(held())
         ''')
 
     def test_the_commands_sheet_and_the_palette_list_the_keys_of_their_sheet(self):

@@ -1,12 +1,13 @@
-"""Keys a pipeline binds on the one sheet it opens (``bind_key()``).
+"""Keys a pipeline binds on the sheet it opens (``bind_key()``).
 
 A pipeline's ``.PY`` step may hand a function of its own to a key::
 
     bind_key('x', open_col, 'cursorCol, cursorRow, selectedRows')
 
 and the binding has to hold on exactly one sheet — the next display point
-(``.VIEW`` / ``.WATCH``, or the final result) — and nowhere else: not on the
-sheets derived from it, not on the result of the next run.
+(``.VIEW`` / ``.WATCH``, or the final result) — and on the copies VisiData
+makes of it, which show rows of that same sheet; nowhere else: not on a
+sheet of other rows opened from it, not on the result of the next run.
 
 VisiData has no such scope.  Its commands and key bindings are registered per
 sheet *class*, and its "this one sheet" level is keyed by the sheet's **name**
@@ -27,9 +28,17 @@ The sheet owns its bindings, so they go when it goes, and there is nothing
 global to clean up.  For the same reason VisiData's own lists of commands —
 the commands sheet (``z Ctrl+H``) and the palette built from it (``Space``) —
 would not know of them; :class:`HelpSheet` is taught to add its source
-sheet's keys to what it loads.  A copy of the sheet (``"``, a join, a frequency
-drill-down) starts without them: ``BaseSheet.__copy__`` copies ``__dict__``,
-and :mod:`.vd_memory` drops the attribute there, as it does ``dbcls_id``.
+sheet's keys to what it loads.
+
+A copy of the sheet (``"`` / ``g"``, the drill-down out of a frequency table,
+random rows, a concat) has the keys too: ``BaseSheet.__copy__`` copies
+``__dict__``, and :mod:`.vd_memory` gives the copy a dict of its own there —
+the same bindings, but a key bound on one of the two later stays off the
+other.  That is all a copy shares: a :class:`SheetKey` holds a function and a
+string, never a sheet, so a copy does not keep its original alive, and what
+the functions hold on to is let go with the last sheet that has them.  A
+sheet that is *not* a copy — the frequency table itself, a pivot, the sheet a
+bound function pushes — has other rows, and gets no key.
 """
 from typing import Any, Callable, Dict, Optional
 

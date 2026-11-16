@@ -680,8 +680,9 @@ class PipelineExecutor:
     def _bind_key(self, key: Any, func: Callable, params: Any = '',
                   sheet: Any = None) -> None:
         """Bind *key* to *func* on the next sheet this pipeline shows — the
-        next ``.VIEW`` or ``.WATCH``, or else the final result — and on that
-        sheet only.  Exposed as ``bind_key()``.
+        next ``.VIEW`` or ``.WATCH``, or else the final result — and on the
+        copies VisiData makes of it (see vd_modules.vd_keys), nowhere else.
+        Exposed as ``bind_key()``.
 
         With *sheet* — a VisiData sheet the caller has in hand — the key is
         bound on that one instead, at once.  That is for a bound function that
