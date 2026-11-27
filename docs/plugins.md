@@ -97,6 +97,7 @@ Keys present in that section but never declared as options reach `api.settings` 
 | `api.add_pipeline_command(name, hint, handler, help_text, raw_data)` | Add a `.COMMAND`; the handler is `async def handler(executor, args, data)`. `help_text` goes to the help page *and* to the [LLM chat](llm.md)'s language reference |
 | `api.add_pipeline_function(name, value, help_text)` | Add a function (or any value) to the namespace `{{expr}}` and `.PY` run in; `help_text` reaches the model too |
 | `api.add_llm_tool(name, description, parameters, handler, max_result_chars, needs_approval, executes)` | Offer a tool to the [LLM chat](llm.md); load order does not matter, a tool offered before the chat is up waits for it. A no-op when the chat is not configured. `max_result_chars` caps how much text one call may hand the model (omit it to send the result whole). The user is asked before each call unless `--llm-no-confirm-tools` is set; pass `needs_approval=False` only for a tool that reads nothing they would want a say about. `executes='command'` names the argument holding code the tool runs (a shell command line, say): the tool is then asked about under `--llm-no-confirm-exec` instead, and the user may edit that argument before it runs |
+| `api.add_llm_skill(name, description, instructions, argument_hint, briefing)` | Teach the [LLM chat](llm.md#skills) a job the user starts with `/name` (or `.LLM "/name …"` from the editor). It is carried out by a new agent with an empty context and the same tools; `instructions` is what that agent is told — text, or `func(arguments) -> text` built from what the user typed after the name. `argument_hint` is how the arguments are spelled in the list (`'[description]'`). `briefing=True` has the main agent write down, once, what from the conversation so far matters for the job — all of it the new agent sees; text instead of `True` adds your word on what that note should carry. Held until the chat is up, like a tool; a no-op when the chat is not configured. [`example_plugins/review_skill.py`](../example_plugins/review_skill.py) is the worked example |
 | `api.add_help_page(title, text)` | Add a page to the in-app help (`F1`) |
 | `setup.add_syntax(name, factory, replace)` | Add a [syntax highlighter](editor.md#syntax-highlighting): a `dbcls.syntax.Highlighter` subclass implementing `tokenize(line, state) -> (tokens, state_after)`. Registered in `setup()` it is a `--syntax` and a `"syntax"` in the config file; `api.add_syntax(...)` from `register()` only reaches `Set syntax…`. [`example_plugins/json_syntax.py`](../example_plugins/json_syntax.py) is the worked example |
 | `api.add_embedded_syntax(command, syntax, arg=0)` | Highlight argument `arg` of a pipeline command in that syntax, on the embedded-code background — the way `.PY`'s argument is Python |
@@ -124,6 +125,7 @@ Keys present in that section but never declared as options reach `api.settings` 
 | `api.get_statement()` | The selection, or the statement under the cursor (what `Alt+Enter` would run) |
 | `api.replace_statement(text)` | Replace it, as one undoable edit; False when read-only |
 | `api.insert_text(text)` | Insert at the cursor, replacing the selection |
+| `api.run_query(text, on_finished=None)` | Run `text` — SQL or a pipeline — on the current tab the way `Alt+Enter` runs a statement: the running popup, `Esc`, the result in VisiData, the filters below. The document is not touched; the text need not be in it. Returns at once; `on_finished(meta)` is called on the main thread when the run is over, with the `meta` of `after_query`. Main thread only, with no overlay of yours on screen (the result opens only once nothing else holds it); `RuntimeError` on a tab with no connection |
 
 **The editor's world**
 
@@ -147,3 +149,22 @@ Keys present in that section but never declared as options reach `api.settings` 
 Built-in pipeline commands cannot be replaced — registering `.RUN` is refused. Neither can the pipeline context: a function named after a helper (`info`, `get_var`, `data`, …) or a built-in value (`datetime`, `json`, …) is refused too, as is any name starting with `_` (those are the `_0` / `_i` overlays). A registered name does shadow a same-named result column inside `{{…}}`, so pick one no column is likely to have.
 
 To build a text field that behaves like the editor (selection, undo, wrap, clipboard), use `dbcls.editor.TextArea`; the chat window is made of three of them.
+
+A pipeline command of yours can put a window of its own in front of the user and wait for it — the way [`.LLM`](llm.md#from-the-editor-llm) opens the chat. The handler runs on the pipeline's event loop and the screen belongs to the main thread, so the request crosses over as a prompt of the `custom` kind:
+
+```python
+from dbcls.pipeline import PipelineCancelled
+
+async def ask_my_window(executor, args, data):
+    answer = await executor.prompts.request_off_loop({
+        'kind': 'custom', 'title': args[0],
+        # called on the main thread: push your overlay, call resolve(answer)
+        # — on the main thread too — when the user is done with it
+        'open': lambda resolve: my_window.open(args[0], resolve),
+    })
+    if answer is None:
+        raise PipelineCancelled()
+    return await executor.run_text(answer)      # SQL or a pipeline, run inside this one
+```
+
+`request_off_loop` keeps the event loop free while the window is up — needed when the window itself runs things on it. `executor.run_text(text)` runs SQL or a whole pipeline as part of the current run and returns its data; `executor.mark_shown(rows)` returns rows the user has already seen in your window, so that as the last step they are not opened again.

@@ -40,7 +40,7 @@ class TestSystemPrompt:
         assert '.FOR_RUN' not in prompt
         # A few KB of instructions, not the reference: the point of the bound
         # is the order of magnitude, not the exact figure.
-        assert len(prompt) < 7000
+        assert len(prompt) < 8000
 
     def test_points_at_the_reference_tool(self):
         prompt = build_system_prompt(None)

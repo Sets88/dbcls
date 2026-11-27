@@ -540,7 +540,8 @@ DB-specific extensions
       one column per parameter
   `gp`
       Plot chart from the prompted columns (`x[,bucket],y` or `x,y1,y2,…`);
-      `Tab` / `Shift+Tab` complete column names
+      `Tab` / `Shift+Tab` complete column names; on the chart `1`-`9`, `0`
+      and `Shift`+digit (`!` … `)`) toggle series 1-20 and `t` sets a title
   `E`
       Edit sample-data SQL (table browser only); `Tab` / `Shift+Tab`
       complete column names; `{{expr}}` is rendered as in a pipeline
@@ -1193,6 +1194,17 @@ class DbEditorTab(Editor):
         sel = self.buf.get_selected_text() if self.buf.has_selection() else ''
         if not sel:
             sel = get_expression_under_cursor(self.buf)
+        self.run_query(sel)
+
+    def run_query(self, sel: str, on_finished=None) -> None:
+        """Run *sel* — SQL or a pipeline — on this tab's connection and show
+        its result: what ``Alt+Enter`` does with the statement under the
+        cursor, for text that need not be in the document at all (the LLM
+        chat's ``run_result``, a plugin's ``api.run_query``).
+
+        *on_finished(meta)*, when given, is called once the run is over and
+        its result closed, with the ``meta`` the ``after_query`` filters got —
+        ``status``, ``error``, ``cancelled``, ``rowcount`` and the rest."""
         if not sel or not sel.strip():
             self.set_status_notification('Nothing to execute')
             return
@@ -1313,6 +1325,17 @@ class DbEditorTab(Editor):
                 # with the full text — the bar only carries the short version.
                 self.set_status_notification(
                     f'{round(end - start, 2)}s  {message}', error=is_error, popup=not is_error)
+                if on_finished is not None:
+                    # After everything else: whoever asked for the run is told
+                    # last, when the tab is back to how a run leaves it.  What
+                    # it is told is what the user was — a failure while showing
+                    # the result included.
+                    if is_error and meta.get('error') is None:
+                        meta.update(status=message, error=RuntimeError(message))
+                    try:
+                        on_finished(meta)
+                    except Exception:
+                        logger.exception('run_query on_finished callback failed')
 
         # request_cancel stops the query on the server; without it Esc only
         # stops us from waiting, and the rows keep coming.  Resolved on Esc, not

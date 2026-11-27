@@ -238,7 +238,9 @@ class LLMClient:
         out asking for it and nothing else (see :meth:`_demand_tool`).
         *satisfied_by* names tools that end a turn just as validly, so a run
         that called one of them is complete and nothing is demanded — the chat
-        answers a question that way, without proposing a query.
+        answers a question that way, without proposing a query.  Only a call
+        that went through counts, for either: one the user refused, or whose
+        arguments did not parse, handed nothing over.
 
         *max_rounds* (the config's ``max_tool_rounds`` unless given; 0 for no
         limit) is how many rounds of tool calls may go by before the question
@@ -313,7 +315,6 @@ class LLMClient:
                 handed_over = False
                 for call in tool_calls:
                     name = call_name(call)
-                    called.add(name)
                     if closing is not None and name not in finishing:
                         result_message = tool_reply(call, BUDGET_SPENT.format(name=name))
                         refused.append(result_message)
@@ -322,8 +323,12 @@ class LLMClient:
                         result_message, ran = await self._run_tool_call(call, emit)
                         # only a finishing call that went through: one with
                         # unparsable arguments, denied or failing handed
-                        # nothing over, and earns no round past the budget
+                        # nothing over — it earns no round past the budget,
+                        # and does not count as the turn's answer either (a
+                        # run the user refused still owes them the query)
                         handed_over = handed_over or (ran and name in finishing)
+                        if ran:
+                            called.add(name)
                     messages.append(result_message)
                     appended.append(result_message)
                 rounds += 1
@@ -354,6 +359,14 @@ class LLMClient:
             return await self.complete(messages, allow_tools=False)
         except LLMError:
             return await self.complete(messages)
+
+    async def complete_in_text(self, messages: List[dict]) -> dict:
+        """One reply to *messages* that is meant to be text, not tool calls —
+        for a question put to the model on the side (a skill's briefing),
+        which :meth:`run` and its tool loop have no part in.  *messages* is
+        not extended.  Calls are forbidden where the endpoint allows that; a
+        model that makes one anyway comes back with no ``content``."""
+        return await self._complete_round(messages, last=True)
 
     async def _demand_tool(self, name: Optional[str], called: set,
                            messages: List[dict], emit,
@@ -390,8 +403,9 @@ class LLMClient:
         appended: List[dict] = [nudge, message]
         messages.append(message)
         for call in message.get('tool_calls') or []:
-            called.add(call_name(call))
-            result_message, _ran = await self._run_tool_call(call, emit)
+            result_message, ran = await self._run_tool_call(call, emit)
+            if ran:
+                called.add(call_name(call))
             messages.append(result_message)
             appended.append(result_message)
         return appended

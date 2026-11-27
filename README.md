@@ -16,6 +16,8 @@ DbCls is a terminal database client in which a SQL editor and [visidata](https:/
 
 **LLM chat (optional)**
 - `Ctrl+L` — a model writes and fixes queries, reading your schema through read-only tools
+- "…and run it": the model runs what it wrote once you allow it (or edit it first) — nothing to save; `.LLM "request"` does the same from a pipeline, and the rows flow on to the next step
+- Skills: a plugin adds `/review` and the like, each carried out by a fresh agent with the same tools
 - Any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter, a corporate proxy); nothing to install
 
 **Data**
@@ -26,7 +28,7 @@ DbCls is a terminal database client in which a SQL editor and [visidata](https:/
 - MySQL, PostgreSQL, ClickHouse, SQLite — and Cassandra / ScyllaDB through the driver plugin in [`plugins/cassandra`](plugins/cassandra)
 - With no connection arguments it starts on an in-memory SQLite — just open a file and type
 - Unix sockets (including ones forwarded over SSH), JSON config, inactivity screen lock
-- Plugin API: your own editor commands, pipeline commands, syntax highlighters, LLM tools and full-screen windows
+- Plugin API: your own editor commands, pipeline commands, syntax highlighters, LLM tools and skills, and full-screen windows
 
 ## Documentation
 
@@ -38,7 +40,7 @@ This page is the short version. The details live in [`docs/`](docs/README.md):
 | [Editor](docs/editor.md) | Hotkeys, fold blocks, syntax highlighting, key remapping and `Alt` on macOS, the `Ctrl+X` prefix, autocomplete, beautify, browsing and editing tables |
 | [Results in VisiData](docs/visidata.md) | Sheets, DB-aware hotkeys, JSON / URL / size column types, aggregators, charts, exporting, cross-sheet references, expression functions |
 | [Pipelines](docs/pipelines.md) | The language: steps, control flow, functions, live sheets (`.WATCH`), prompts, helpers, templates, examples |
-| [LLM chat](docs/llm.md) | Setup, the chat window, questions from the model, approving tool calls, how the answer arrives |
+| [LLM chat](docs/llm.md) | Setup, the chat window, questions from the model, approving tool calls, running the result, skills, `.LLM` from the editor, how the answer arrives |
 | [Plugins](docs/plugins.md) | Writing a plugin, where plugins are loaded from, settings, the plugin API, the bundled plugins |
 | [Screen lock and password safety](docs/security.md) | Locking the terminal after inactivity, keeping passwords off disk |
 

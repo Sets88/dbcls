@@ -174,11 +174,13 @@ One line per rule; they ask nothing of the cursor, so no `col` / `row`.
 | `transpose` | rows become columns | — |
 | `columns-sheet` | the sheet's columns as rows | — |
 | `alt-plot` | in-terminal line chart (the user's `gp`) — see **Charts** below | column names, comma-separated: `"x,y"`, `"x,bucket,y"` or `"x,y1,y2,…"` |
+| `plot-title` | title of the chart `alt-plot` has just opened: a line of text above it (the user's `t` on the chart) — only after `alt-plot` | the title text; `""` removes it |
+| `plot-style` | how the chart `alt-plot` has just opened draws its series (the user's `v` / `gv` on the chart) — only after `alt-plot` | `"line"` (the default), `"linepoints"`, `"points"` or `"bars"` |
 
 ### Charts
 
-`alt-plot` is how a pipeline *draws* a result: it opens a plotext line chart
-over the sheet, and the user closes it with `q` to get back to the rows. When
+`alt-plot` is how a pipeline *draws* a result: it opens a plotext chart — lines
+by default, see `plot-style` below — over the sheet, and the user closes it with `q` to get back to the rows. When
 the user asks for a chart, a plot or a graph, this is the step to use.
 
 The `input` names the columns by role, in order:
@@ -197,9 +199,9 @@ The `input` names the columns by role, in order:
 
 What it cannot do, and what to do instead:
 
-- **No bar charts, no text on the X axis.** The X column has to be a time or a
-  number, so "sales by category" is not a chart here — group in SQL and show it
-  as a table (`freq-col` / `sort-desc`) instead. Charts are for something
+- **No text on the X axis.** The X column has to be a time or a number, so
+  "sales by category" is not a chart here, bars or not — group in SQL and show
+  it as a table (`freq-col` / `sort-desc`) instead. Charts are for something
   *over time* or over a numeric scale.
 - **The axes come from the SQL.** Produce them in the query: a bucketed time
   (`DATE_TRUNC`, `toStartOfHour`, `strftime`…) as the first column, the numbers
@@ -211,17 +213,45 @@ What it cannot do, and what to do instead:
 - **A selection narrows the chart.** With rows selected only those are plotted,
   so `select-expr` before `alt-plot` charts a subset without changing the SQL.
 - **Biggest series first — sort before you plot.** Every series gets a number
-  in the legend, and the user presses that number (`1`–`9`) to hide the series;
+  in the legend, and the user presses that number to hide the series (`1`–`9`, `0` for the
+  10th, `Shift`+digit — `!` … `)` — for 11–20);
   the chart then rescales to what is left. That is how a small series is read
   under a huge one, so the huge ones need the low numbers. In bucket mode the
   numbers follow the order the bucket values are first met in the rows, so put
   `{"col": "<y column>", "longname": "sort-desc"}` right before `alt-plot`: the
   bucket with the largest value becomes `1`. In multi-value mode the numbers
   follow the order of the Y columns in `input` — list the largest measure
-  first. Only nine series can be toggled, another reason to keep the big ones
-  in front.
-- **Last line of the macro.** `alt-plot` opens the chart sheet on top; any line
-  after it runs on the chart, where nothing works. Do everything else first.
+  first. Only the first twenty series can be toggled, another reason to keep the
+  big ones in front.
+- **Nothing after it but the title and the style.** `alt-plot` opens the chart
+  sheet on top; any line after it runs on the chart, where the table commands
+  do not exist. Do everything else first. The only lines that belong after it
+  are `plot-title` and `plot-style`, in either order.
+- **A line is not always the honest drawing.** The chart opens as lines, and a
+  line joins two points however far apart they are: over a gap in the data it
+  reads as values that were never measured. `{"longname": "plot-style",
+  "input": "…"}` after `alt-plot` draws the same series another way:
+  - `"line"` — the default; right for a dense, regular series.
+  - `"linepoints"` — the line with every real point marked on it: the trend,
+    and where the measurements are.
+  - `"points"` — the points alone: sparse or irregular measurements, events,
+    anything where "between" means nothing.
+  - `"bars"` — a bar from zero at every point, on the same time or numeric X
+    axis: counts and amounts per bucket ("orders per day"), where a missing
+    bucket should show as a hole. Bars of different series on the same X stand
+    one in front of another, the shortest in front; they are not stacked and
+    not put side by side.
+
+  Leave the line out when the default is right, and use what the user asked
+  for when they named a kind of chart ("bar chart", "scatter", "dots").
+- **A title says what the chart shows.** `{"longname": "plot-title", "input":
+  "…"}` right after `alt-plot` puts one line of text above the chart, centred,
+  cut off at the width of the window — so keep it short: what is measured, over
+  what, for which slice ("Orders per hour, last 24 h, by status"). Plain text,
+  one line, in the language the user writes in. The legend already names the
+  series and the axis shows the dates; do not repeat them. It is optional: add
+  one when the user asks for it or when the chart would not explain itself
+  without it (a filter, a period or a unit that shows nowhere on the chart).
 - On a `.WATCH` sheet the chart follows the live data and redraws with it.
 
 ## Other commands
@@ -330,12 +360,13 @@ Only the interesting rows, on a sheet of their own:
 ```
 
 A chart — the SQL makes the time axis and the numbers, the macro sorts so the
-biggest series is numbered `1` and then draws:
+biggest series is numbered `1`, draws, and then titles the chart it has opened:
 
 ```sql
 .RUN "SELECT DATE_TRUNC('hour', created_at) AS hour, status, COUNT(*) AS cnt FROM orders WHERE created_at > now() - interval '1 day' GROUP BY 1, 2" | .VDM """
 {"col": "cnt", "longname": "sort-desc"}
 {"longname": "alt-plot", "input": "hour,status,cnt"}
+{"longname": "plot-title", "input": "Orders per hour, last 24 h, by status"}
 """
 ```
 
@@ -369,8 +400,10 @@ before it:
    `r`, `s`, `col`, `row`, `value` or `sheet`, and they come after the command
    that opens the sheet they are for.
 4. Nothing that quits, saves, edits a table or runs a shell command.
-   `alt-plot`, if any, is the last line, its X column is a time or a number,
-   and in bucket mode a `sort-desc` on the Y column comes right before it.
+   `alt-plot`, if any, is the last line but for a `plot-title` and/or a
+   `plot-style` after it,
+   its X column is a time or a number, and in bucket mode a `sort-desc` on the
+   Y column comes right before it.
 5. The macro sits before the display point it is meant for (`.VIEW` or the end),
    not before a `.SHEET`.
 6. Every longname is from the tables here or from `find_visidata_commands` —

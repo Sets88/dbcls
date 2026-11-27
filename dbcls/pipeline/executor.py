@@ -43,6 +43,7 @@ from .parser import (
     _BLOCK_COMMANDS,
     _collect_functions,
     _is_soft,
+    is_pipeline,
     parse_pipeline,
 )
 from .templates import (
@@ -260,6 +261,43 @@ class PipelineExecutor:
         async with _client_lock(client):
             result = await client.execute(sql)
         return (result.data or []) if result else []
+
+    async def run_text(self, text: str) -> Any:
+        """Run *text* — plain SQL, or a whole pipeline expression — as part of
+        this run, and return its data for the next step.
+
+        Public: for a plugin command that only learns at run time what there
+        is to run (the LLM chat's ``.LLM`` runs the query the model handed
+        over this way).  SQL is run as it stands — no ``{{…}}`` is rendered in
+        it, the text is not a template.  A pipeline runs inside this one: it
+        starts with no data, its prompts and display steps work as they would
+        on its own, a ``.VDM`` or ``bind_key()`` of its is queued for the next
+        sheet *this* run shows, and its ``.FN`` blocks are callable from
+        within it only.  ``br()`` at its top level ends it, like an early
+        return from ``.CALL``, and cannot break a loop of the caller's."""
+        text = str(text).strip()
+        if not is_pipeline(text):
+            result = await self._run_sql(text)
+            return (result.data or []) if result else []
+        nodes = parse_pipeline(text)
+        outer = self._functions
+        self._functions = {**outer, **_collect_functions(nodes)}
+        try:
+            return await self._execute_nodes(nodes, NO_DATA)
+        except _PipelineBreak as brk:
+            return _as_item_list(brk.data)
+        finally:
+            self._functions = outer
+
+    def mark_shown(self, data: Any) -> Any:
+        """Tell the run that *data* — what this step returns — has just been in
+        front of the user, and return it unchanged.
+
+        Public: for a plugin command that shows its output itself (the LLM
+        chat's ``.LLM``: the answer was read in its window).  If the pipeline
+        ends on that step, no sheet is opened to show the same thing again;
+        a step after it gets the data as usual.  See :meth:`_mark_shown`."""
+        return self._mark_shown(data)
 
     async def execute(self, sql: str):
         """Execute the full pipeline *sql* and return a ``Result`` object."""

@@ -8,7 +8,9 @@ The model is given the pipeline language reference and the engine you are connec
 
 With [several connections open](configuration.md#multiple-connections-and-tabs) the model is also told which tabs there are — name, engine, database — and which one is current, refreshed every time the chat is opened, so switching tabs between questions is enough to change what it writes for. Each of the database tools takes an optional `tab` argument, so it can read the schema of one connection while writing a query for another, and it knows it can join them in a pipeline with [`.CONN`](pipelines.md#moving-data-between-databases). With a single connection nothing of this appears in the prompt.
 
-A fifth database tool, `run_sql`, runs a statement of the model's own — to check a count, the distinct values of a column, whether matching rows exist — and hands back at most 50 rows. You see the statement before it runs and can [edit it first](#approving-tool-calls). The query it proposes only ever runs when you run it.
+A fifth database tool, `run_sql`, runs a statement of the model's own — to check a count, the distinct values of a column, whether matching rows exist — and hands back at most 50 rows. You see the statement before it runs and can [edit it first](#approving-tool-calls). The query it proposes only ever runs when you run it — or when you [ask for it to be run](#running-the-result), and then allow it.
+
+A plugin can teach the chat a job under a name — a [skill](#skills), started with `/name` — and a pipeline can put a request to the model on its own with the [`.LLM`](#from-the-editor-llm) step.
 
 Ask it to *show* you something — "show me last week's failed orders" — and the rows do not go through the model at all. It runs the query with `save_as`, which keeps the whole result in that shared variable and hands the model only the row count, the columns and three rows; then `show_var` opens the variable for you in VisiData, and the request waits until you close the sheet with `q`. The rows stay in the variable afterwards — `.GET_VAR`, `.VARS`, or the next question can pick them up. `show_var` is never asked about: it shows you your own data. When a choice is yours to make rather than its to guess, it can [ask you](#when-the-model-asks-you) and wait for the answer.
 
@@ -63,7 +65,8 @@ The request and result panes are ordinary editor fields: selection, word jumps, 
 | `Alt+Enter` | Send the request. Whatever is in the Result pane goes along with it, so "add a LIMIT" works on what is there right now |
 | `Ctrl+T` | Take the Result into the document, replacing the selection or the statement under the cursor. `Ctrl+Z` in the editor undoes it |
 | `Ctrl+N` | Start over: the conversation is forgotten and the query in the Result pane becomes the context of the new one |
-| `Ctrl+P` | The chat's own command palette: the keys above by name, plus the commands that have no key — `Toggle read-only mode of the document`, for when `Ctrl+T` refuses because the document is read-only (leaving the chat to switch it there would lose the result), and the confirmation toggles from [Approving tool calls](#approving-tool-calls). Only what works inside the window is listed |
+| `/name …` | A request that starts with the name of a [skill](#skills) runs that skill; the rest of the request goes along with it |
+| `Ctrl+P` | The chat's own command palette: the keys above by name, plus the commands that have no key — `Toggle read-only mode of the document`, for when `Ctrl+T` refuses because the document is read-only (leaving the chat to switch it there would lose the result), and the confirmation toggles from [Approving tool calls](#approving-tool-calls) — and, below them, the [skills](#skills). Only what works inside the window is listed |
 | `Esc` | Close and change nothing; while a request is running, cancel it |
 
 The conversation is kept for the session, so reopening the window continues it. `Ctrl+N` — or `Start a new model conversation` in the command palette — throws it away.
@@ -103,7 +106,7 @@ Every tool call the model makes — listing databases and tables, reading a sche
 
 Reading the pipeline and `.VDM` references, searching VisiData's command catalog (`find_visidata_commands`), asking you a question (`ask_user`) and handing over its answer (`propose_query`, `answer_question`) are never asked about.
 
-A tool that runs code the model wrote — `run_sql`, or a plugin tool registered with `executes` (a shell command, say) — gets a prompt of its own: the title shows the code, and the choices are
+A tool that runs code the model wrote — `run_sql`, [`run_result`](#running-the-result), or a plugin tool registered with `executes` (a shell command, say) — gets a prompt of its own: the title shows the code, and the choices are
 
 | Choice | What happens |
 |--------|--------------|
@@ -118,7 +121,7 @@ Two separate settings turn the questions off:
 
 | Option | Environment / `"llm"` key | Effect |
 |--------|---------------------------|--------|
-| `--llm-no-confirm-tools` | `DBCLS_LLM_NO_CONFIRM_TOOLS=1` / `"no_confirm_tools": true` | Lookups and plugin tools run without asking. Code-running tools (`run_sql`, ...) are still asked about |
+| `--llm-no-confirm-tools` | `DBCLS_LLM_NO_CONFIRM_TOOLS=1` / `"no_confirm_tools": true` | Lookups and plugin tools run without asking. Code-running tools (`run_sql`, `run_result`, ...) are still asked about |
 | `--llm-no-confirm-exec` | `DBCLS_LLM_NO_CONFIRM_EXEC=1` / `"no_confirm_exec": true` | Code-running tools run without asking |
 
 `Toggle asking before the model's tool calls` and `Toggle asking before the model runs code (SQL, ...)` switch them mid-conversation — from the chat's own palette (`Ctrl+P` inside the window) or the editor's.
@@ -130,12 +133,94 @@ Each round of tool calls is a full request to the model, with the whole conversa
 | Choice | What happens |
 |--------|--------------|
 | `Allow N more rounds` | The request carries on for as many rounds again, and asks once more when those are spent. The model is told nothing |
-| `Tell it to finish with what it has` | The model is told its budget is spent and that the lookups are closed: any further lookup is refused, and only `propose_query` / `answer_question` still work. It gets two rounds to hand its answer over, then one more in which no tool call is accepted at all, and is asked to say what it could not check. The notice is about this request only: it is dropped from the conversation once the request is over, so the next question starts with the lookups open again (the refused calls stay in the history, reworded to say the tool is available again) |
+| `Tell it to finish with what it has` | The model is told its budget is spent and that the lookups are closed: any further lookup is refused, and only `propose_query` / `answer_question` / `run_result` still work. It gets two rounds to hand its answer over, then one more in which no tool call is accepted at all, and is asked to say what it could not check. The notice is about this request only: it is dropped from the conversation once the request is over, so the next question starts with the lookups open again (the refused calls stay in the history, reworded to say the tool is available again) |
 | `Stop the request` / `Esc` | The request ends there, reported as an error. The conversation stays whole, so the next question picks up where it left off |
 
-The model is kept in the dark on purpose until you choose the second: a model told its budget is short stops exploring and rushes to a poor answer. `0` lifts the limit — then only `Esc` stops a request that will not finish. Stopping keeps what was already handed over: a query the model proposed before the stop still lands in the Result pane.
+The model is kept in the dark on purpose until you choose the second: a model told its budget is short stops exploring and rushes to a poor answer. `0` lifts the limit — then only `Esc` stops a request that will not finish. Stopping keeps what was already handed over: a query the model proposed before the stop still lands in the Result pane (a run it had asked for is dropped — you stopped the request).
 
 The letter shortcuts are `Ctrl` rather than `Alt` on purpose: a control code is the same whatever keyboard layout is active, while `Alt+L` on a Cyrillic layout arrives as `Alt+д` and matches nothing. `Alt+Enter` is unaffected — `Enter` is not a letter.
+
+## Running the result
+
+Ask for a query *and* for it to be run — "users grouped by birth date with a count, draw a chart and run it" — and the model ends the turn with `run_result` instead of `propose_query`. The query (plain SQL or a pipeline, a `.VDM` chart included) lands in the Result pane as usual and is run at once, the way `Alt+Enter` runs a statement, **without being saved into the document**.
+
+It happens only when you asked for it in so many words. A request to write, fix or change a query is never taken as a request to run it.
+
+The run is put to you first, like any code the model wants to run — the title shows the query:
+
+| Choice | What happens |
+|--------|--------------|
+| `Allow` | Run it as the model wrote it |
+| `Edit…` | Open the query in place of the Result pane; `Alt+Enter` runs your version (it is also what ends up in the Result pane), `Esc` refuses it |
+| `Deny` / `Esc` | Don't run it. The model is told so and hands the query over with `propose_query` instead — you still get it, just not run |
+| `Allow with a note…` / `Deny with a note…` | The same, with a word to the model attached |
+
+`--llm-no-confirm-exec` turns that question off together with the one about `run_sql`.
+
+Once the turn is over the window closes and the query runs like any other: the running popup, `Esc` to cancel, the rows in VisiData, the [`before_query` / `after_query`](plugins.md) filters. Nothing is run inside the model's turn, and the rows do not go to the model. What became of the run does — "12 rows returned", or the error — as a note in the conversation, so after a failure `Ctrl+L` and "fix it" is all it takes.
+
+The document is untouched, so the query exists only in the Result pane. The next `Ctrl+L` therefore leaves the pane as it is instead of loading the statement under the cursor into it: `Ctrl+T` puts the query in the document if you want to keep it.
+
+## Skills
+
+A skill is a job with a name that a [plugin](plugins.md) teaches the chat: `/review`, say. Start the request with the name and what follows is passed along:
+
+```
+/review
+/review especially the dates
+```
+
+`Ctrl+P` lists the skills below the commands, each with what it does; `Enter` there starts the request pane with the name, keeping what you had typed as its arguments. A name nobody registered is not sent: the hint bar lists the skills that exist. With no skill loaded there is no such syntax, and a request starting with `/` is ordinary text.
+
+A skill is **carried out by a new agent with an empty context**. It gets the system prompt, the skill's instructions, your words, the query in the Result pane — and the same tools the chat's own agent has, permission prompts and all. It does not see the conversation you were having. That is the point: a review done by the agent that wrote the query defends the query, and a long conversation is not paid for again by a job that needs three sentences of it.
+
+What it *does* hear of the conversation is up to the skill. One registered with `briefing=True` has the agent you were talking to write down, once, the facts the job needs — what you are after, the tables and columns that were settled, what you said to avoid — and that note is all that is passed on. You see it in the Chat pane before the new agent starts. With nothing said yet there is nothing to brief from, and no request is spent on it.
+
+The new agent ends its turn the way any turn ends: an answer in the Chat pane, a query in the Result pane, or a query that is [run](#running-the-result). Its own lookups are not kept. The conversation keeps a note that the skill ran and what it returned, so "apply the second point" works afterwards.
+
+```python
+# ./example_plugins/review_skill.py
+def register(api):
+    api.add_llm_skill(
+        'review', 'Review the query in the Result pane',
+        """Review the query in the editor pane ... End with answer_question:
+        the findings, most serious first.""",
+        argument_hint='[what to look at]',   # shown as /review [what to look at]
+        briefing=True,                       # or text: what the briefing should carry
+    )
+```
+
+The instructions may be a function of what the user typed — `lambda arguments: ...` — for a skill that builds its job from the arguments. [`example_plugins/review_skill.py`](../example_plugins/review_skill.py) is the whole of a working one.
+
+## From the editor: `.LLM`
+
+The [pipeline](pipelines.md) step `.LLM "REQUEST" ["QUERY"]` puts a request to the model without opening the chat by hand — a skill included:
+
+```sql
+.LLM "Users grouped by birth date with a count; draw a chart and run it"
+
+.LLM "/review especially the dates" """SELECT * FROM orders WHERE created > now() - 7"""
+
+.LLM "id, name and birth_date of every user in Users — and run it" |
+.FOR_RUN "SELECT {{_0}} AS id, '{{_1}}' AS name, TIMESTAMPDIFF(YEAR, '{{_2}}', CURDATE()) AS age"
+```
+
+The chat window opens on a **new conversation** — what a pipeline gets must not depend on what was said in the chat before — and shows the turn as it happens: the tool calls, the model's questions, the permission prompts, all answered there as usual. `REQUEST` is a template, like the argument of any step. `QUERY`, when given, is the query the request is about: it is taken as it is (its own `{{…}}` are not rendered) and starts the Result pane.
+
+What the step passes on is what the turn came to:
+
+| The turn ended with | The step's output |
+|---------------------|-------------------|
+| `run_result`, and you allowed it | The window closes and the query runs **inside this pipeline** — SQL as it stands, a pipeline as a pipeline within it — and its rows go to the next step. A `.VDM` of the model's (a chart) lands on the sheet the pipeline shows next |
+| `propose_query` | The window stays for you to read, edit, continue the conversation. Closing it (`Esc`) passes on one row, `{query: …}` — the Result pane as you left it, your edits included; an emptied pane cancels the pipeline |
+| `answer_question` | The same, with `{answer: …}` |
+| an error | The window stays, showing it; closing it fails the step with that error (`.LLM?` makes it [soft](pipelines.md#soft-steps-)) |
+
+Closing the window while the request is still running cancels the pipeline. As the last step, a `{query}` / `{answer}` row is not opened in VisiData: you have just read it. A follow-up typed into the window replaces the outcome: "now run it" after a proposal closes the window and sends the rows on.
+
+The rows that came into the step are **not** sent to the model: every look at your data is one you allow. Put what the model should see into `REQUEST` with `{{…}}`, or leave it in a variable (`.SET_VAR`) for `get_var` to read.
+
+`.LLM` exists only while the chat is configured, and it is a step for your own pipelines: the model is told not to put it into what it hands over.
 
 ## How the answer gets to you
 
@@ -144,6 +229,8 @@ The Result pane is written by one thing only: the model calling the `propose_que
 Models forget that call, so it is not left to good intentions: a turn that ends without `propose_query` gets one more request that *forces* the call through the endpoint's `tool_choice`. Only when that is refused as well are you told nothing was handed over — the answer is still there in the transcript to read.
 
 Not every request is a request for a query, though. "What does this pipeline do?", "why does this fail?", "which of these two is faster?" are answered in the Chat pane through a second tool, `answer_question`, and that ends the turn just as validly: nothing is proposed, nothing is forced, and the Result pane keeps the query you were working on. Without it a model told it must always call `propose_query` answers "explain this" by handing the same query straight back, explaining nothing.
+
+The third way a turn ends is [`run_result`](#running-the-result): the query is handed over and run.
 
 Pipeline syntax is not carried in every request either. The language reference (~34 KB) sits behind a `get_pipeline_reference` tool, which the model calls when it decides a pipeline is what you want — so an ordinary SQL question never pays for it. The guide to `.VDM` macros is a second document behind `get_visidata_macro_reference`, read only when the model writes a macro. It spells out the few dozen commands most macros are made of — sorting, grouping, selecting, colouring rows by a condition (`color-row`), charts. The other several hundred VisiData commands are not described anywhere in dbcls: `find_visidata_commands` searches the command registry of the VisiData you have installed (plus what dbcls and your plugins added to it) and hands the model the matching longnames with their keys, VisiData's own one-line descriptions and the expression each runs — which is where the model reads what a command asks for. Commands a macro must not run are left out of what the search returns: quitting or closing sheets, saving or opening files, the shell, Python and external programs, signals to processes, the table editor and its pending SQL.
 

@@ -21,7 +21,7 @@ To keep sheets open when navigating between them, quit VisiData with `Ctrl+q` in
 | `g@` | Set the type of the current column to JSON (the counterpart of visidata's `@` for dates): cells are parsed once and then display as real JSON, expand with `(` / `g+`, and can be indexed in `=` expressions. Sorting such a column is not possible — visidata reports "sort incomplete due to TypeError". The cell itself is edited as text like any other — what is typed is parsed again with `json.loads`. Inside it, only what cannot be expanded any further — a string, number, bool or null — is edited as text; an object or array is reached, not typed over. Either `e` on a column expanded with `(`, or `z Enter` to open the object / array on visidata's own object sheets (`Enter` goes into nested ones; `e` edits a value or, on `key`, renames the key, `a` / `d` add / delete a key or element, `zd` sets null). Typed text is read as JSON (`5` a number, `"5"` a string, `{"a": 1}` an object; anything else stays a string), and each change rewrites the whole JSON cell — in the `Alt+T` edit sheet it is a pending edit that `Ctrl+S` turns into an `UPDATE`, and a row it cannot update (no primary key) opens read-only |
 | `g#` | Set the type of the current column to URL. The cells keep displaying the URL unchanged, but `(` expands the column into `schema`, `domain`, `port`, `path`, `query`, `anchor`, and `(` on the resulting `query` column expands it further into one column per query parameter, by name (a parameter repeated in the URL becomes a list). Values that are not URL-shaped display as a typing error, and editing such a cell still writes the URL text back to the database. The parts are editable too, the same way as JSON's: `e` on a column expanded with `(`, or `z Enter` to open the six parts (`d` clears one; they cannot be renamed or added) and `Enter` on `query` for its parameters (`e` on `key` renames, `a` / `d` add / delete). Only the changed part is replaced in the URL text — user info, the case of the host and the encoding of the other parameters stay as they were |
 | `g$` | Set the type of the current column to byte size (the counterpart of visidata's `$` for currency; `type-size` by name). Cells display human-readable (`512B`, `880K`, `1.5G`, 1024-based) but sort, sum (`+`), plot and `describe` as the number of bytes. Whatever a driver or a text column hands over is accepted: an int, a float, a `Decimal`, a numeric string, or a size already written for humans (`1.5G`, `512B`, `2 MiB`, `3kb`). Anything else, a blank cell included, shows as a typing error, like a bad `@` date. `Database info` and the process manager type their size columns this way, and a `.VDM` step can do the same for a query result |
-| `gp` | Draw a chart from the columns you type at the prompt, `Tab` completes column names (see [Plotting](#plotting) below) |
+| `gp` | Draw a chart from the columns you type at the prompt, `Tab` completes column names; `v` on the chart switches between line, line with points, points and bars (see [Plotting](#plotting) below) |
 | `E` | Edit the SQL query used to fetch sample data for the current table (in the `Alt+T` table browser only); `Tab` / `Shift+Tab` complete column names, and the matches show up in a menu above the prompt. `{{expr}}` in the query is rendered as in a pipeline — see [Templates in the table browser query](#templates-in-the-table-browser-query) |
 | `gE` | On a `Sample data` sheet: open the rows loaded so far on an edit sheet (see [Editing Table Data](editor.md#editing-table-data)) without re-reading them from the database |
 | `gT` | Save current or selected rows to shared vars |
@@ -71,7 +71,30 @@ plot columns (x[,bucket],y): ts,action,cnt
 
 **Multi-value mode** (`ts,ok,err,total`): one line per value column — used whenever every column after the first is numeric. To bucket by a *numeric* column instead (a shard id, a status code), mark it with `*`: `ts,*shard,cnt`.
 
-Each series is assigned a number (`1`, `2`, …) shown in the legend. Press the corresponding number key to toggle that series on/off.
+Each series is assigned a number (`1`, `2`, …) shown in the legend. Press the corresponding number key to toggle that series on/off: `1`–`9`, then `0` for the 10th, and the same keys with `Shift` for the next ten — `!` `@` `#` `$` `%` `^` `&` `*` `(` `)` toggle series 11–20.
+
+Press `v` on the chart to draw it another way. A line joins two measurements however far apart they are, so over a gap in the data it reads as values that were never there; the other styles show where the points really are:
+
+| Style | What is drawn |
+|-------|---------------|
+| `line` | The points joined by a line (what the chart opens as) |
+| `linepoints` | The same line with every real point marked on it |
+| `points` | The points alone |
+| `bars` | A bar from zero at every point, on the same time / numeric X axis, so a gap in the data stays a gap. The Y axis starts at zero. Bars of several series on the same X stand one in front of another, the shortest in front; hide a series with its number to see the others whole |
+
+`v` walks them in that order and comes round to `line`; `gv` asks for the style by name (`Tab` completes it, the start of a name is enough). The sheet remembers the style, so `gp` pressed again to change the columns keeps it. In a `.VDM` macro the command is `plot-style`, after the `alt-plot` that opens the chart:
+
+```
+{"longname": "alt-plot", "input": "ts,action,cnt"}
+{"longname": "plot-style", "input": "bars"}
+```
+
+Press `t` on the chart to give it a title: one line of text, centred above the chart, which moves down a row to make room. The prompt opens on the current title; an empty answer removes it. In a `.VDM` macro the same command is `plot-title`, on a line after the `alt-plot` that opens the chart:
+
+```
+{"longname": "alt-plot", "input": "ts,action,cnt"}
+{"longname": "plot-title", "input": "Events per minute, by action"}
+```
 
 A timestamp column needs no `@` — an untyped column is accepted for the X axis as long as it holds timestamps or numbers. Value columns do have to be typed as numbers (`#` / `%` on the column) if the driver returned them as anything else.
 

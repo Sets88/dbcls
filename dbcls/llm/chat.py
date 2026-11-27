@@ -23,13 +23,18 @@ import time
 from typing import Any, List, Optional, Tuple
 
 from ..editor import (
-    CommandTable, K, Lexer, PopupItem, SelectPopup, TextArea, key_alt, key_ctrl,
+    CommandTable, K, Lexer, PopupItem, SelectPopup, TextArea, is_fold_end,
+    is_fold_start, key_alt, key_ctrl,
 )
 from ..syntax import Highlighter, Token
 from .client import (
     EXTEND, FINISH, STOP, Decision, LLMClient, LLMError, ToolBudgetSpent,
 )
 from .prompt import build_context_message, build_system_prompt
+from .skills import (
+    Skill, SkillRegistry, briefing_request, briefing_text, skill_record,
+    skill_system_section, skill_task_message,
+)
 
 #: Keys, as encoded by Editor._encode_key.  Ctrl rather than Alt for the
 #: letters: a control code is the same on every keyboard layout, whereas Alt+T
@@ -82,6 +87,14 @@ RESULT_TOOL = 'propose_query'
 #: back instead of explaining it.
 ANSWER_TOOL = 'answer_question'
 
+#: The third way: the user asked for the query *and* for it to be run.  It
+#: hands the query over like RESULT_TOOL and has it run once the turn is over —
+#: by the editor, the way Alt+Enter runs a statement, or, under a ``.LLM``
+#: pipeline step, by the pipeline, whose next step gets the rows.  The document
+#: is not touched.  Registered with ``executes``, so the user sees the query
+#: first and may edit or refuse it (see ChatWindow._approve_code).
+RUN_TOOL = 'run_result'
+
 #: What the model calls when a choice is genuinely the user's to make: it
 #: offers the options, the user picks, and the answer comes back as the tool's
 #: result so the same turn carries on with it.
@@ -130,6 +143,18 @@ DISMISSED_APPROVAL = ('Denied: the user closed the permission prompt for {name} 
 DISMISSED_QUESTION = ('The user closed the question without answering. Do not ask '
                       'it again. Carry on with your best assumption and say what '
                       'you assumed, or answer with what you can.')
+#: A refused run still owes the user the query: say so, or the model drops it.
+RUN_DENIED = ('Denied: the user refused to have this query run. Do not call '
+              f'{RUN_TOOL} for it again. Hand it over with {RESULT_TOOL} instead, '
+              'so they can read it and run it themselves.')
+#: What run_result answers.  The run itself comes after the turn, so the model
+#: is told not to wait for rows — and not to describe ones it will never see.
+RUN_ACCEPTED = ('Accepted: the query is in the editor pane and runs as soon as '
+                'this turn ends; the rows open for the user in VisiData and do '
+                'not come back to you. End the turn now with one line saying '
+                'what was run. Do not describe the result.')
+#: How much of a failed run's message goes back into the conversation.
+MAX_RUN_STATUS_CHARS = 2000
 #: For tool calls a cancelled run left without a result — the endpoint rejects
 #: a conversation where an assistant's tool call has no reply.
 CANCELLED = 'Cancelled: the user stopped the request before this call finished.'
@@ -142,8 +167,17 @@ TRANSCRIPT_STYLES = {
     'Assistant': 'comment',
     'Assistant asks': 'comment',
     'Tool': 'function',
+    'Skill': 'function',
     'Error': 'keyword',
 }
+
+
+def strip_fold_markers(query: str) -> str:
+    """*query* without its ``>>>`` / ``<<<`` marker lines: they are editor
+    syntax, kept in the Result pane so that applying it leaves the user's block
+    whole, and taken out of what actually runs — as the editor does itself."""
+    return '\n'.join(line for line in query.split('\n')
+                     if not (is_fold_start(line) or is_fold_end(line))).strip()
 
 
 class TranscriptHighlighter(Highlighter):
@@ -186,13 +220,19 @@ class ChatWindow:
     HINT_BUDGET = ' The assistant has used its tool rounds · ↑↓ pick · Enter answer · Esc stop the request '
     HINT_NOTE = ' Your note to the assistant · type it · Enter send · Enter on an empty line or Esc: no note '
     HINT_EDIT = ' Edit what the assistant will run · Alt+Enter run it · Esc deny '
+    #: Shown instead of HINT while a pipeline's .LLM step waits on the window.
+    HINT_PIPELINE = (' .LLM step · Alt+Enter send · ^T apply · ^P commands · '
+                     'Esc close: the pipeline goes on with what was handed over ')
 
-    def __init__(self, api, config, tools=None):
+    def __init__(self, api, config, tools=None, skills=None):
         self.api = api
         self.editor = api.editor
         editor = self.editor
         self.config = config
         self.tools = tools
+        #: The skills ``/name`` starts (see dbcls.llm.skills).  Read on every
+        #: request, so one a plugin adds later works at once.
+        self.skills = skills if skills is not None else SkillRegistry()
         self.client = LLMClient(config, tools, approve=self._approve_tool,
                                 extend=self._extend_rounds)
         #: Tools the user answered "Allow for this chat" for; forgotten with
@@ -204,6 +244,7 @@ class ChatWindow:
             self._register_answer_tool(tools)
             self._register_ask_tool(tools)
             self._register_show_tool(tools)
+            self._register_run_tool(tools)
 
         colors = editor.colors
         # A lexer of its own: the editor's caches tokens per line index, and the
@@ -258,6 +299,20 @@ class ChatWindow:
         #: The explanation the model handed over through answer_question, for a
         #: turn that answered a question instead of proposing a query.
         self._answered: Optional[str] = None
+        #: The query the model handed over through run_result and the user
+        #: let through — to be run once the turn is over (see _finish_turn).
+        self._run_request: Optional[str] = None
+        #: While a pipeline's ``.LLM`` step waits on the window: the function
+        #: that hands the step its outcome (see open_for_pipeline).
+        self._pipeline = None
+        #: What the last finished turn came to, for that step: handed back
+        #: when the window is closed.
+        self._outcome: Optional[dict] = None
+        #: A request waiting to be sent — a cancelled run is still unwinding.
+        self._queued: Optional[str] = None
+        #: The Result pane holds a query that was run and never applied: the
+        #: next open() leaves it there instead of reseeding the pane.
+        self._keep_result = False
         #: The ask_user call or permission prompt waiting for an answer, or
         #: None.  Raised by the worker thread, opened and resolved on the main
         #: one — under _lock.
@@ -337,8 +392,14 @@ class ChatWindow:
     # ── The command palette ──────────────────────────────────────────────────
 
     def open_palette(self) -> None:
-        """List the window's described commands; Enter runs the chosen one."""
-        self.palette.open(self.commands.palette_items(), title='Commands')
+        """List the window's described commands, and the skills below them;
+        Enter runs the chosen command, or starts the request with the skill."""
+        items = self.commands.palette_items()
+        items.extend(
+            PopupItem(insert=f'/{skill.name}', weight=1,
+                      label=f'{skill.usage} — {skill.description}'.rstrip(' —'))
+            for skill in self.skills.all())
+        self.palette.open(items, title='Commands')
         self.editor.request_redraw()
 
     def _handle_palette_key(self, key) -> None:
@@ -347,9 +408,20 @@ class ChatWindow:
         if action == 'insert':
             name = popup.selected_word()
             popup.close()
-            self.commands.run(name)
+            if name.startswith('/'):
+                self._begin_skill_request(name)
+            else:
+                self.commands.run(name)
         elif action == 'cancel':
             popup.close()
+
+    def _begin_skill_request(self, call: str) -> None:
+        """Start the request pane with *call* (``/review``), keeping what was
+        typed there as its arguments: the skill runs when the user sends it."""
+        typed = self.input_area.text.strip()
+        self.input_area.set_text(f'{call} {typed}')
+        self.input_area.file_end()
+        self.focus = 0
 
     def _register_result_tool(self, tools) -> None:
         """The model returns its answer by calling this, not by writing it in
@@ -498,6 +570,63 @@ class ChatWindow:
             needs_approval=False,
         )
 
+    def _register_run_tool(self, tools) -> None:
+        """Let the model run what it hands over, when the user asked for
+        that — see RUN_TOOL."""
+        async def run_result(query: str, note: str = '') -> str:
+            query = str(query).strip()
+            if not query:
+                raise ValueError('there is no query to run')
+            if self._pipeline is None:
+                self._check_tab_runs()
+            self._proposed = query
+            self._run_request = query
+            self.editor.request_redraw()
+            return RUN_ACCEPTED
+
+        tools.add(
+            RUN_TOOL,
+            'Hand the finished query to the user AND have it run for them '
+            'right away, without them saving it anywhere — its result opens '
+            'in VisiData. Call this instead of propose_query, and only when '
+            'the user explicitly asked for the result to be run, executed or '
+            'shown ("...and run it", "execute", "и выполни"); asked only to '
+            'write, fix or change a query, use propose_query. It ends the '
+            'turn like propose_query does: the query lands in the editor pane '
+            'either way. The user is usually asked first and may edit the '
+            'query or refuse the run; an edited one comes back with '
+            '"edited_by_user", and after a refusal you hand the query over '
+            'with propose_query. The rows go to the user, not to you — to '
+            'read data yourself, use run_sql.',
+            {
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': 'The complete SQL or pipeline expression, '
+                                       'ready to run. No markdown fence, no placeholders.',
+                    },
+                    'note': {
+                        'type': 'string',
+                        'description': 'Optional one-line note about the query.',
+                    },
+                },
+                'required': ['query'],
+            },
+            run_result,
+            # It runs what the model wrote: asked about like run_sql, with the
+            # query there to edit — and under the same switch (confirm_exec).
+            executes='query',
+        )
+
+    def _check_tab_runs(self) -> None:
+        """Raise when the tab on screen has nothing to run a query on — said
+        to the model at the call, not found out after the turn."""
+        doc = getattr(self.editor, 'doc', self.editor)
+        if getattr(doc, 'run_query', None) is None:
+            raise RuntimeError('the current tab has no connection to run a '
+                               f'query on; hand the query over with {RESULT_TOOL}')
+
     async def _show_var(self, key: str, title: str) -> dict:
         """Hand variable *key* to the main thread to show in VisiData, and
         wait until the user has closed the sheet."""
@@ -558,7 +687,10 @@ class ChatWindow:
         (or, for an ``executes`` tool, confirm_exec) is on."""
         argument = self.tools.executes(name) if self.tools is not None else None
         if argument:
-            return await self._approve_code(name, arguments, argument)
+            decision = await self._approve_code(name, arguments, argument)
+            if name == RUN_TOOL and not decision.allowed:
+                decision.refusal = RUN_DENIED
+            return decision
         if name in self._allowed_tools:
             return Decision()
         shown = ', '.join(f'{k}={v!r}' for k, v in arguments.items())
@@ -695,17 +827,51 @@ class ChatWindow:
         self.active = True
         self.focus = 0
         self._error = ''
-        self.result_area.set_text(query or '')
+        if self._keep_result and self.result_area.text.strip():
+            # The query run_result ran is not in the document: reseeding the
+            # pane now would be the one way to lose it.
+            self._notice = ('The query that was run is still in the Result pane '
+                            '— ^T applies it')
+        else:
+            self.result_area.set_text(query or '')
+        self._keep_result = False
         self._start_conversation(query, selection)
         self.editor.push_overlay(self)
 
-    def _system_message(self) -> dict:
-        """The system prompt for the tab the user is on right now."""
-        return {
-            'role': 'system',
-            'content': build_system_prompt(getattr(self.editor, 'client', None),
-                                           tabs=self.api.tabs),
-        }
+    def open_for_pipeline(self, request: str, query: str, resolve) -> None:
+        """Open for a pipeline's ``.LLM`` step and send *request* — main
+        thread only.  *query* is what the request is about (the Result pane
+        starts with it); *resolve* takes the step's outcome, once:
+
+        * ``{'run': text}`` — the model ran the result and the user let it:
+          the window has closed and the pipeline runs *text* itself;
+        * ``{'query': text}`` / ``{'answer': text}`` — what the last turn
+          handed over, when the user closes the window; a query is the Result
+          pane as the user left it;
+        * ``{'error': text}`` — that turn failed;
+        * ``None`` — closed with a request still running, or with nothing
+          handed over: the pipeline is cancelled.
+
+        The conversation starts afresh: what a pipeline gets must not depend
+        on what was said in the chat before it ran."""
+        if self.active:
+            resolve({'error': 'The chat window is already open'})
+            return
+        self.reset()
+        self._keep_result = False
+        self.open(query)
+        self._pipeline = resolve
+        self._outcome = None
+        self._queued = request
+        self._send_queued()
+
+    def _system_message(self, extra: str = '') -> dict:
+        """The system prompt for the tab the user is on right now; *extra* is
+        appended to it (a skill's instructions)."""
+        content = build_system_prompt(getattr(self.editor, 'client', None),
+                                      tabs=self.api.tabs)
+        return {'role': 'system',
+                'content': f'{content}\n\n{extra}' if extra else content}
 
     def _start_conversation(self, query: str, selection: bool = False) -> None:
         """Lay down the system prompt and the editor context, unless a
@@ -725,10 +891,27 @@ class ChatWindow:
 
     def close(self) -> None:
         """Hide the window.  The conversation is kept, so reopening continues
-        it; a running request is cancelled."""
+        it; a running request is cancelled.
+
+        A ``.LLM`` step waiting on the window gets its answer here: what the
+        last turn handed over — a query as it stands in the Result pane now,
+        with the user's edits — or nothing, which cancels the pipeline, when
+        the window is closed over a request that has not finished."""
+        interrupted = self._task is not None or self._queued is not None
         self._cancel_task()
+        self._queued = None
         self.active = False
         self.editor.pop_overlay(self)
+        resolve, self._pipeline = self._pipeline, None
+        outcome, self._outcome = self._outcome, None
+        if resolve is None:
+            return
+        if not interrupted and outcome is not None and 'query' in outcome:
+            # The pane is the query: what the user made of the proposal there
+            # is what the step passes on — an emptied pane hands over nothing.
+            query = strip_fold_markers(self.result_area.text)
+            outcome = {'query': query} if query else None
+        resolve(None if interrupted else outcome)
 
     def reset(self) -> None:
         """Forget the conversation and start a fresh one.
@@ -740,6 +923,8 @@ class ChatWindow:
         self.messages = []
         self._proposed = None
         self._answered = None
+        self._run_request = None
+        self._outcome = None
         self._error = ''
         self._allowed_tools = set()
         with self._lock:
@@ -779,42 +964,128 @@ class ChatWindow:
         """Send what is typed in the input pane."""
         if self._busy():
             return
-        question = self.input_area.text.strip()
-        if not question:
-            return
+        text = self.input_area.text.strip()
+        if text and self._submit(text):
+            self.input_area.set_text('')
+
+    def _submit(self, text: str) -> bool:
+        """Start the request *text* — a skill call (``/name …``) or an
+        ordinary request to the conversation.  False, with the reason on the
+        hint bar, when it names a skill nobody registered."""
+        call = self.skills.parse(text)
+        if call is not None and call[1] is None:
+            self._error = self.skills.unknown(call[0])
+            self.editor.request_redraw()
+            return False
         self._start_conversation(self.result_area.text.strip())
         self._proposed = None
         self._answered = None
+        self._run_request = None
+        self._outcome = None
         # The result pane is the query under discussion: send whatever is in it
         # now, so edits made here are what the model revises.
         current = self.result_area.text.strip()
-        if current:
-            question = (f'{question}\n\nThe query currently in the editor pane:\n'
-                        f'```sql\n{current}\n```')
-        self.messages.append({'role': 'user', 'content': question})
-        self._add_transcript('You', self.input_area.text.strip())
-        self.input_area.set_text('')
+        self._add_transcript('You', text)
         self._error = ''
         self._status = 'thinking'
         self._started_at = time.time()
-        self._task = self.editor.asyncloop_thread.submit(self._run())
+        if call is not None:
+            _name, skill, arguments = call
+            coro = self._run_skill(skill, arguments, current)
+        else:
+            question = text
+            if current:
+                question = (f'{question}\n\nThe query currently in the editor pane:\n'
+                            f'```sql\n{current}\n```')
+            self.messages.append({'role': 'user', 'content': question})
+            coro = self._run()
+        self._task = self.editor.asyncloop_thread.submit(coro)
+        return True
+
+    def _send_queued(self) -> None:
+        """Send the request a ``.LLM`` step opened the window with, once no
+        cancelled run is still unwinding."""
+        if self._queued is None or self._busy():
+            return
+        text, self._queued = self._queued, None
+        if not self._submit(text):
+            self._finish_turn({'error': self._error})
 
     async def _run(self) -> List[dict]:
         # The list itself, not the attribute: reset() may put a fresh one in
         # self.messages while this run is still unwinding a cancel.
         messages = self.messages
         try:
-            # satisfied_by: a turn that answered a question is complete without
-            # a proposal, so the client must not go and demand one.
-            return await self.client.run(messages, on_event=self._on_event,
-                                         require_tool=RESULT_TOOL,
-                                         satisfied_by=(ANSWER_TOOL,))
+            return await self._run_agent(messages)
         except asyncio.CancelledError:
             # Here, on the loop thread, rather than in _cancel_task: the run is
             # the only one appending to the list, and once the cancel has landed
             # it appends nothing more — so nothing can slip in after the scan.
             self._close_dangling_tool_calls(messages)
             raise
+
+    async def _run_agent(self, messages: List[dict]) -> List[dict]:
+        """One turn of an agent over *messages* — the main conversation, or a
+        skill's own.  Either ends the same way and has the same tools."""
+        # satisfied_by: a turn that answered a question, or ran its result, is
+        # complete without a proposal, so the client must not go and demand one.
+        return await self.client.run(messages, on_event=self._on_event,
+                                     require_tool=RESULT_TOOL,
+                                     satisfied_by=(ANSWER_TOOL, RUN_TOOL))
+
+    # ── Skills ───────────────────────────────────────────────────────────────
+
+    async def _run_skill(self, skill: Skill, arguments: str, query: str) -> List[dict]:
+        """Carry out *skill* in a new agent and return what it appended, as
+        :meth:`_run` does for the main one.
+
+        The new agent's conversation is a list of its own: the system prompt
+        with the skill's instructions, and one message — what the user typed,
+        the query in the Result pane, and the main agent's briefing when the
+        skill asks for one.  It is dropped when the run is over; the main
+        conversation keeps only that the skill ran and what came back."""
+        main = self.messages
+        briefing = ''
+        if skill.briefing and any(m.get('role') == 'assistant' for m in main):
+            # With nothing said yet there is nothing to brief from.
+            self._status = f'briefing the /{skill.name} agent'
+            self.editor.request_redraw()
+            briefing = await self._write_briefing(main, skill, arguments)
+        started = f'/{skill.name} runs in a new agent with an empty context.'
+        if briefing:
+            started += f' Briefing from this conversation:\n{briefing}'
+        elif skill.briefing:
+            started += ' Nothing from this conversation was passed on.'
+        self._add_transcript('Skill', started)
+
+        messages = [self._system_message(skill_system_section(skill, arguments)),
+                    skill_task_message(skill, arguments, briefing, query)]
+        appended = await self._run_agent(messages)
+        answer = self._answered or ''
+        if not answer:
+            for message in appended:
+                if message.get('role') == 'assistant' and message.get('content'):
+                    answer = message['content']
+        main.extend(skill_record(skill, arguments, answer=answer,
+                                 query=(self._proposed or '').strip(),
+                                 ran=self._run_request is not None))
+        return appended
+
+    async def _write_briefing(self, main: List[dict], skill: Skill,
+                              arguments: str) -> str:
+        """Ask the main agent what, of the conversation so far, the new one
+        needs.  One request, and nothing of it stays in the conversation: the
+        question is about this skill run alone.
+
+        A briefing that cannot be had does not stop the skill — the transcript
+        says the new agent went without one."""
+        try:
+            message = await self.client.complete_in_text(
+                main + [briefing_request(skill, arguments)])
+        except LLMError as exc:
+            self._add_transcript('Error', f'No briefing for /{skill.name}: {exc}')
+            return ''
+        return briefing_text(message)
 
     def _on_event(self, kind: str, details: dict) -> None:
         """Progress from the worker thread: show what the model is doing."""
@@ -831,6 +1102,7 @@ class ChatWindow:
     def tick(self) -> None:
         """Called every loop iteration: put a pending question on screen, and
         collect a finished request."""
+        self._send_queued()
         self._open_question()
         if self._task is None or not self._task.is_done():
             return
@@ -838,15 +1110,26 @@ class ChatWindow:
         # A finished run has nothing left waiting on an answer.
         self._discard_question()
         self._status = ''
+        outcome = self._collect(task)
+        self.editor.request_redraw()
+        self._finish_turn(outcome)
+
+    def _collect(self, task) -> dict:
+        """Put what a finished request came to on screen — the answer in the
+        transcript, the query in the Result pane — and say which it was:
+        ``{'run': query}``, ``{'query': query}``, ``{'answer': text}`` or
+        ``{'error': text}``."""
+        run, self._run_request = self._run_request, None
         try:
             appended = task.result()
         except (Exception, asyncio.CancelledError) as exc:
             if isinstance(exc, ToolBudgetSpent):
                 # Stopped by the user, but what the model had already handed
-                # over is theirs: stopping must not throw a finished query away.
+                # over is theirs: stopping must not throw a finished query
+                # away.  It is not run, though — they stopped the request.
                 self._keep_handed_over()
             self._fail(exc)
-            return
+            return {'error': self._error}
         answer = ''
         for message in appended:
             if message.get('role') == 'assistant' and message.get('content'):
@@ -860,21 +1143,78 @@ class ChatWindow:
             self._add_transcript('Assistant', answer)
 
         query, self._proposed = self._proposed, None
+        if run is not None:
+            # What the user let through is what runs — and what the pane shows,
+            # whatever else the model proposed in the same turn.
+            query = run
         if query is not None and query.strip():
             # keep_undo: Ctrl+Z in the pane goes back to the previous suggestion.
             self.result_area.set_text(query.strip(), keep_undo=True)
-        elif explanation:
-            pass        # a question answered: the Result pane is not its business
-        elif not answer:
+            return {'run' if run is not None else 'query': query.strip()}
+        if explanation:
+            # a question answered: the Result pane is not its business
+            return {'answer': answer}
+        if not answer:
             self._fail(LLMError('The model returned nothing'))
+            return {'error': self._error}
+        # The answer is in the transcript, but the Result pane is only ever
+        # written by the tool — say so rather than guessing at the text.
+        # The client already asked a second time, forcing the call, so this
+        # is a model that will not hand anything over.
+        self._error = (f'The model never called {RESULT_TOOL}, even when asked '
+                       f'directly — nothing to apply')
+        return {'answer': answer}
+
+    def _finish_turn(self, outcome: dict) -> None:
+        """What a finished turn sets off: a result to run is run — by the
+        pipeline, when a ``.LLM`` step is waiting on the window, otherwise by
+        the editor.  Anything else stays on screen for the user."""
+        if self._pipeline is not None:
+            if 'run' in outcome:
+                # The step takes it from here; nothing is left to look at.
+                resolve, self._pipeline = self._pipeline, None
+                self._keep_result = True
+                self.close()
+                resolve({'run': strip_fold_markers(outcome['run'])})
+            else:
+                # Handed to the step when the user closes the window; a
+                # query is read from the Result pane then, edits and all.
+                self._outcome = outcome
+            return
+        if 'run' in outcome:
+            self._run_in_editor(outcome['run'])
+
+    def _run_in_editor(self, query: str) -> None:
+        """Run *query* the way the editor runs a statement — its popup, Esc,
+        the result in VisiData — without putting it in the document.  The
+        window closes for it: a result opens only with nothing over the
+        editor.  What became of the run is added to the conversation, so
+        "fix it" has something to go on."""
+        messages = self.messages
+        try:
+            self.api.run_query(strip_fold_markers(query),
+                               on_finished=lambda meta: self._ran(messages, meta))
+        except Exception as exc:    # a tab with nothing to run it on
+            self._fail(exc)
+            return
+        self._keep_result = True
+        self.close()
+
+    def _ran(self, messages: List[dict], meta: dict) -> None:
+        """The run run_result asked for is over: note the outcome for the user
+        and — while that conversation is still the current one — the model."""
+        status = str(meta.get('status') or '')[:MAX_RUN_STATUS_CHARS]
+        if meta.get('cancelled'):
+            outcome = 'was cancelled before it finished'
+        elif meta.get('error') is not None:
+            outcome = f'failed:\n{status}'
         else:
-            # The answer is in the transcript, but the Result pane is only ever
-            # written by the tool — say so rather than guessing at the text.
-            # The client already asked a second time, forcing the call, so this
-            # is a model that will not hand anything over.
-            self._error = (f'The model never called {RESULT_TOOL}, even when asked '
-                           f'directly — nothing to apply')
-        self.editor.request_redraw()
+            outcome = f'ran: {status}'
+        self._add_transcript('Error' if meta.get('error') is not None else 'Tool',
+                             f'{RUN_TOOL} {outcome}')
+        if messages and messages is self.messages:
+            messages.append({'role': 'user',
+                             'content': f'(The query handed to {RUN_TOOL} {outcome})'})
 
     def _keep_handed_over(self) -> None:
         """Apply what the result tools received in a run that did not finish:
@@ -1004,7 +1344,7 @@ class ChatWindow:
         change.  A fresh area each time: SQL is highlighted as SQL, anything
         else — a shell command line — as plain text."""
         editor = self.editor
-        lexer = self.sql_lexer if request.get('argument') == 'sql' else None
+        lexer = self.sql_lexer if request.get('argument') in ('sql', 'query') else None
         self.code_area = TextArea(
             editor.stdscr, editor.colors, lexer, gutter=0,
             clipboard=editor.clipboard, border=True,
@@ -1238,7 +1578,7 @@ class ChatWindow:
             text = f' {self._error} '
             pair = colors.status_warn
         else:
-            text = self.HINT
+            text = self.HINT_PIPELINE if self._pipeline is not None else self.HINT
             pair = colors.status_bar
         try:
             stdscr.addstr(height - 1, 0, text.ljust(width)[:width], curses.color_pair(pair))

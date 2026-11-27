@@ -8,8 +8,10 @@ what makes the whole feature optional: with no settings nothing is registered
 and no key is taken.
 """
 from ..editor import key_ctrl
-from ..plugins import deliver_pending_llm_tools
-from .client import LLMConfig, ToolRegistry
+from ..pipeline import PipelineCancelled
+from ..plugins import deliver_pending_llm_skills, deliver_pending_llm_tools
+from ..prompts import PromptKind
+from .client import LLMConfig, LLMError, ToolRegistry
 
 #: Editor command name and the key that opens the chat.  Ctrl, not Alt: the
 #: control code does not depend on the keyboard layout (see key_ctrl).
@@ -18,6 +20,33 @@ OPEN_CHAT_KEY = key_ctrl('l')       # Ctrl+L
 RESET_CHAT = 'llm_chat_reset'
 TOGGLE_CONFIRM = 'llm_toggle_confirm_tools'
 TOGGLE_CONFIRM_EXEC = 'llm_toggle_confirm_exec'
+
+#: The pipeline step that puts a request to the model from the editor.
+LLM_COMMAND = 'llm'
+LLM_COMMAND_HINT = '.LLM "REQUEST" ["QUERY"]'
+#: Read by the user on the Pipelines help page and by the model in its
+#: language reference — hence the last paragraph.
+LLM_COMMAND_HELP = """
+    Put REQUEST (a template) to the model of the LLM chat and wait for the
+    turn to end.  The chat window opens on a new conversation, so the tool
+    calls, the model's questions and the permission prompts are answered
+    there as usual.  REQUEST may start with a skill: .LLM "/review the dates".
+    QUERY, when given, is the query the request is about (taken as it is,
+    not rendered) — it starts the window's Result pane.
+    The step's output is what the turn came to.  If the request asked for the
+    result to be run and you allowed it, the window closes and the query —
+    SQL or a pipeline — runs inside this pipeline: its rows go to the next
+    step, e.g. .LLM "users with id, name, birthday — and run it" |
+    .FOR_RUN "SELECT {{_0}} AS id, {{_1}} AS name".  Otherwise the window
+    stays for you to read; closing it (Esc) passes on one row, {query: …}
+    for a query handed over or {answer: …} for an answer, and as the last
+    step that row is not opened again.  Closing the window while the request
+    is still running cancels the pipeline.  The input rows are not sent to
+    the model: put what it should see into REQUEST with {{…}}.
+    For the model reading this: a step for the user's own pipelines. Never
+    put .LLM in a query you hand over unless the user asked for a pipeline
+    that calls the model.
+"""
 
 HELP_PAGE = """\
 `Ctrl+L` opens a chat with a language model that can write and fix queries for
@@ -45,6 +74,8 @@ The window has three panes; `Tab` moves between them.
   `Ctrl+N`
       Start over: the conversation so far is forgotten and the query in the
       Result pane becomes the context of the new one.
+  `/name …`
+      A request that starts with a skill's name runs that skill (see below).
   `Ctrl+P`
       The chat's own command palette: the keys above by name, and the
       commands that have no key — `Toggle read-only mode of the document`,
@@ -132,6 +163,38 @@ fails, which of two approaches to take — is answered in the Chat pane instead,
 through `answer_question`. The Result pane keeps whatever is in it, so a
 question never overwrites the query you are working on.
 
+`Running the result` — ask for the query and for it to be run ("users by
+birth date with a count, draw a chart and run it") and the model ends the turn
+with `run_result` instead: the query lands in the Result pane and is run at
+once, the way `Alt+Enter` would run it, without being saved into the document.
+It only does so when you asked for it in so many words. The run is put to you
+first, with the query in the title: `Allow`, `Edit…` (change it, `Alt+Enter`
+runs your version), `Deny` — then you get the query without the run — and the
+two with a note; `--llm-no-confirm-exec` turns the question off, as it does
+for `run_sql`. The window closes for the run and the rows open in VisiData.
+They do not go to the model; what became of the run does (so many rows, or the
+error), so `Ctrl+L` and "fix it" is enough after a failure. The query is still
+in the Result pane then — `Ctrl+T` puts it in the document.
+
+`Skills` — a plugin can teach the chat a job under a name
+(`api.add_llm_skill`): `/review`, say. A request that starts with the name
+runs it, and what follows the name is passed along: `/review especially the
+dates`. `Ctrl+P` lists the skills below the commands; `Enter` there starts
+the request with the name. A skill is carried out by a new agent with an empty
+context: it has the skill's instructions, your words, the query in the Result
+pane and the same tools — and nothing of the conversation so far, unless the
+skill asks for a briefing. Then the model you were talking to writes down,
+once, what from the conversation matters for the job, and that — shown in the
+Chat pane — is all of it the new agent sees. Its answer or query arrives the
+usual way, and the conversation keeps a note of what the skill returned, so
+"apply the second point" works afterwards.
+
+`From the editor` — the pipeline step `.LLM "request"` puts a request to the
+model without opening the chat by hand: `.LLM "/review"`, or
+`.LLM "orders per day for the last month, and run it" | .SET_VAR daily`. The
+window opens on a new conversation and shows the turn; a result that is run
+goes down the pipeline as rows. See `.LLM` on the Pipelines page.
+
 Pipeline syntax is not carried in every request. When the model decides a
 pipeline is what you want, it calls `get_pipeline_reference` and reads the
 language reference first. Commands and functions your plugins added are listed
@@ -192,10 +255,45 @@ def setup(setup):
              '--llm-no-confirm-exec. Toggled at runtime from the command palette')
     setup.add_argument('--llm-no-confirm-exec', dest='llm_no_confirm_exec',
         action='store_true', default=False,
-        help='run code the model writes (run_sql, and any plugin tool that '
-             'executes something, a shell command say) without asking first, '
+        help='run code the model writes (run_sql, run_result, and any plugin '
+             'tool that executes something, a shell command say) without asking first, '
              'and without a chance to edit it. Toggled at runtime from the '
              'command palette')
+
+
+def llm_command(chat):
+    """The handler of the ``.LLM`` pipeline step, for the window *chat*.
+
+    The step runs on the pipeline's event loop and the window lives on the
+    main thread, so the request crosses over as a prompt of the custom kind:
+    the editor opens the window, and the window answers when the turn is over
+    (see :meth:`ChatWindow.open_for_pipeline`).  The wait is off the loop — the
+    request itself, and every tool the model calls, run on it."""
+    async def run_llm(executor, args, data):
+        if not args or not str(args[0]).strip():
+            raise ValueError('.LLM requires a REQUEST argument')
+        request = executor.render_template(args[0], data=data).strip()
+        if not request:
+            raise ValueError('.LLM: the REQUEST is empty')
+        # Not rendered: it is a query to talk about, {{…}} of its own and all.
+        query = str(args[1]).strip() if len(args) > 1 else ''
+        outcome = await executor.prompts.request_off_loop({
+            'kind': PromptKind.CUSTOM, 'title': request,
+            'open': lambda resolve: chat.open_for_pipeline(request, query, resolve),
+        })
+        if outcome is None:
+            raise PipelineCancelled()
+        if outcome.get('error'):
+            # Not a ValueError: those pass a soft step by, and .LLM? is how a
+            # pipeline carries on when the model could not be reached.
+            raise LLMError(outcome['error'])
+        if 'run' in outcome:
+            return await executor.run_text(outcome['run'])
+        # Read in the window already: not shown again as the last step.
+        key = 'query' if 'query' in outcome else 'answer'
+        return executor.mark_shown([{key: outcome.get(key, '')}])
+
+    return run_llm
 
 
 def register(api):
@@ -207,6 +305,7 @@ def register(api):
     # Imported here, not at module level: with no --llm-* settings the chat
     # window and the DB tools are never even loaded.
     from .chat import ChatWindow
+    from .skills import SkillRegistry
     from .tools import DbTools, VarsTools
 
     tools = ToolRegistry()
@@ -224,9 +323,16 @@ def register(api):
     # may deliberately replace a tool of ours by taking its name.
     deliver_pending_llm_tools(api.editor, tools)
     api.editor.llm_tools = tools
+    # Skills travel the same road: held until now, added straight to the
+    # registry from here on (api.add_llm_skill).
+    skills = SkillRegistry()
+    deliver_pending_llm_skills(api.editor, skills)
+    api.editor.llm_skills = skills
 
-    chat = ChatWindow(api, config, tools)
+    chat = ChatWindow(api, config, tools, skills)
     api.editor.llm_chat = chat
+    api.add_pipeline_command(LLM_COMMAND, LLM_COMMAND_HINT, llm_command(chat),
+                             help_text=LLM_COMMAND_HELP)
 
     api.add_editor_function(OPEN_CHAT, chat.open_for_editor,
                             'Ask the model about this query', '^L')

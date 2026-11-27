@@ -733,7 +733,222 @@ class TestPipelineMacro:
             assert vs._plot_cols == 'hour,status,cnt'
             # the sort took: 'err' is met first, so it is the series the user hides with `1`
             assert [r['status'] for r in vs.rows][:2] == ['err', 'ok'], [r['cnt'] for r in vs.rows]
+            assert chart.title == ''
             vd.replay_cancel()
+        ''')
+
+    def test_a_style_line_after_the_chart_redraws_it(self):
+        '''`plot-style` after `alt-plot` says how the series are drawn; `v`
+        walks the same styles by hand, and the sheet keeps the last one for
+        the chart `gp` opens next.'''
+        run_with_real_visidata('''
+            import datetime
+            import visidata
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.vd_modules import queue_sheet_macro
+            from dbcls.pipeline.executor import parse_vd_macro
+            from dbcls.vd_modules.vd_plotter import PLOT_STYLES, POINT_MARKER, Plot
+
+            class Screen:
+                def __init__(self, height, width):
+                    self.size, self.cells = (height, width), {}
+
+                def getmaxyx(self):
+                    return self.size
+
+                def addstr(self, y, x, text, attr=0):
+                    for i, ch in enumerate(text):
+                        self.cells[(y, x + i)] = ch
+
+                def text(self):
+                    height, width = self.size
+                    return '\\n'.join(''.join(self.cells.get((y, x), ' ') for x in range(width)).rstrip()
+                                      for y in range(height))
+
+            def drawn(chart):
+                scr = Screen(14, 80)
+                chart.draw(scr)
+                return scr.text()
+
+            macro = parse_vd_macro(
+                '{"longname": "alt-plot", "input": "hour,status,cnt"}\\n'
+                '{"longname": "plot-style", "input": "bars"}')
+            t0 = datetime.datetime(2024, 1, 1)
+            # two measurements, a long gap, two more
+            rows = [{'hour': t0 + datetime.timedelta(hours=h), 'status': s, 'cnt': 5 + h + len(s)}
+                    for h in (0, 1, 30, 31) for s in ('ok', 'err')]
+            vs = visidata.PyobjSheet('result', source=rows)
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            queue_sheet_macro(vs, macro)
+            vd._playNextQueuedCommand(vd.activeSheet)
+            vd.sync()
+            while vd._nextCommands:
+                vd._playNextQueuedCommand(vd.activeSheet)
+                vd.sync()
+            chart = vd.activeSheet
+            assert isinstance(chart, Plot), [s.name for s in vd.sheets]
+            assert chart.style == 'bars'
+
+            bars = drawn(chart)
+            assert 'Error' not in bars and 'Exception' not in bars, bars
+            # a bar is as long as its value: the axis starts at zero...
+            assert any(line.lstrip().startswith('0.0') for line in bars.splitlines()), bars
+            # ...and the gap between the measurements is left empty
+            middle = [line[30:50] for line in bars.splitlines()[3:10]]
+            assert not any('\\u2588' in part for part in middle), bars
+            assert '(1) ok' in bars and '(2) err' in bars
+
+            # `v` from the last style comes round to the first
+            seen = []
+            for _ in PLOT_STYLES:
+                chart.execCommand('plot-style-next')
+                seen.append(chart.style)
+                text = drawn(chart)
+                assert 'Error' not in text and 'Exception' not in text, (chart.style, text)
+                assert (POINT_MARKER in text) == (chart.style in ('linepoints', 'points')), (chart.style, text)
+            assert seen == ['line', 'linepoints', 'points', 'bars'], seen
+
+            # the next chart of this sheet opens the way the last one was left
+            assert vs._plot_style == 'bars'
+            assert Plot(source=vs, plot_cols=['hour', 'cnt']).style == 'bars'
+
+            # a name that is no style is refused and nothing changes
+            try:
+                chart.set_style('pie')
+            except Exception as e:
+                assert 'unknown chart style: pie' in str(e), e
+            else:
+                raise AssertionError('pie was accepted')
+            chart.set_style('')
+            assert chart.style == 'bars'
+            vd.replay_cancel()
+        ''')
+
+    def test_the_time_axis_is_labelled_with_the_times_charted(self):
+        '''plotext reads a date as UTC and prints the ticks in local time: east
+        or west of Greenwich every label was off by the UTC offset.'''
+        run_with_real_visidata('''
+            import os
+            import time
+            os.environ['TZ'] = 'Asia/Tokyo'      # UTC+9 all year round
+            time.tzset()
+
+            import datetime
+            import visidata
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.vd_modules.vd_plotter import Plot
+
+            class Screen:
+                def __init__(self, height, width):
+                    self.size, self.cells = (height, width), {}
+
+                def getmaxyx(self):
+                    return self.size
+
+                def addstr(self, y, x, text, attr=0):
+                    for i, ch in enumerate(text):
+                        self.cells[(y, x + i)] = ch
+
+                def text(self):
+                    height, width = self.size
+                    return '\\n'.join(''.join(self.cells.get((y, x), ' ') for x in range(width)).rstrip()
+                                      for y in range(height))
+
+            t0 = datetime.datetime(2026, 11, 1, 10)
+            rows = [{'ts': t0 + datetime.timedelta(hours=h), 'cnt': h} for h in (0, 4, 8)]
+            vs = visidata.PyobjSheet('result', source=rows)
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            scr = Screen(10, 90)
+            Plot(source=vs, plot_cols=['ts', 'cnt']).draw(scr)
+            labels = scr.text().splitlines()[-1]
+            assert '2026-11-01 10:00:00' in labels and '2026-11-01 18:00:00' in labels, labels
+            assert '19:00:00' not in labels, labels
+        ''')
+
+    def test_a_title_line_after_the_chart_titles_it(self):
+        """The guide's other chart line: `plot-title` comes *after* `alt-plot`,
+        so it has to play on the chart the line before it opened — and the
+        title has to take the top row, with the chart one row down."""
+        run_with_real_visidata('''
+            import datetime
+            import visidata
+            import dbcls.vd_modules  # noqa: F401
+            from visidata import vd
+            from dbcls.vd_modules import queue_sheet_macro
+            from dbcls.pipeline.executor import parse_vd_macro
+            from dbcls.vd_modules.vd_plotter import Plot
+
+            class Screen:
+                """What draw() needs of a curses window, kept as text."""
+                def __init__(self, height, width):
+                    self.size, self.cells = (height, width), {}
+
+                def getmaxyx(self):
+                    return self.size
+
+                def addstr(self, y, x, text, attr=0):
+                    for i, ch in enumerate(text):
+                        self.cells[(y, x + i)] = ch
+
+                def lines(self):
+                    height, width = self.size
+                    return [''.join(self.cells.get((y, x), ' ') for x in range(width)).rstrip()
+                            for y in range(height)]
+
+            def drawn(chart, width=60):
+                scr = Screen(12, width)
+                chart.draw(scr)
+                return scr.lines()
+
+            macro = parse_vd_macro(
+                '{"longname": "alt-plot", "input": "hour,status,cnt"}\\n'
+                '{"longname": "plot-title", "input": "Orders per hour, by status"}')
+            t0 = datetime.datetime(2024, 1, 1)
+            rows = [{'hour': t0 + datetime.timedelta(hours=h), 'status': s, 'cnt': h * 10 + len(s)}
+                    for h in range(3) for s in ('ok', 'err')]
+            vs = visidata.PyobjSheet('result', source=rows)
+            vd.push(vs)
+            vs.ensureLoaded()
+            vd.sync()
+            queue_sheet_macro(vs, macro)
+            vd._playNextQueuedCommand(vd.activeSheet)
+            vd.sync()
+            while vd._nextCommands:
+                vd._playNextQueuedCommand(vd.activeSheet)
+                vd.sync()
+            chart = vd.activeSheet
+            assert isinstance(chart, Plot), [s.name for s in vd.sheets]
+            assert chart.title == 'Orders per hour, by status'
+            vd.replay_cancel()
+
+            titled = drawn(chart)
+            assert titled[0].strip() == 'Orders per hour, by status', titled[0]
+            # centred: as much room on the left as on the right, give or take one
+            left = len(titled[0]) - len(titled[0].lstrip())
+            assert abs(left - (59 - left - len('Orders per hour, by status'))) <= 1, titled[0]
+            assert titled[1].lstrip().startswith('+--'), titled[1]
+
+            # too long for the window: cut off, never wrapped onto the chart
+            chart.set_title('orders ' * 30)
+            long = drawn(chart)
+            assert long[0].startswith('orders orders') and len(long[0]) <= 59, long[0]
+            assert long[1].lstrip().startswith('+--'), long[1]
+
+            # one line whatever was typed or pasted
+            chart.set_title('  two\\nlines\\t here ')
+            assert chart.title == 'two lines here'
+
+            # an empty title gives the row back to the chart
+            chart.set_title('')
+            bare = drawn(chart)
+            assert bare[0].lstrip().startswith('+--'), bare[0]
+            assert len([line for line in bare if line]) == len([line for line in titled if line])
         ''')
 
     def test_a_macro_waits_for_its_own_sheet_and_no_other_gets_it(self):
@@ -927,7 +1142,7 @@ class TestPipelineMacro:
             entries = _entries()
             names = {e['longname'] for e in entries}
             assert len(names) > 300, len(names)
-            assert {'color-row', 'freq-col', 'alt-plot', 'type-size'} <= names
+            assert {'color-row', 'freq-col', 'alt-plot', 'plot-title', 'plot-style', 'type-size'} <= names
             assert not any(n.startswith('menu-') for n in names)
             # sheet types a pipeline never shows are left out
             assert not any('S3' in e['sheet'] or 'Zulip' in e['sheet'] for e in entries)
@@ -942,6 +1157,10 @@ class TestPipelineMacro:
             assert 'fields: expr, color' in text
 
             assert find_commands('alt-plot').splitlines()[0].startswith('alt-plot [key gp] —')
+            assert find_commands('chart title').splitlines()[0].startswith(
+                'plot-title [key t, only on Plot] —')
+            assert find_commands('chart style').splitlines()[0].startswith(
+                'plot-style [key gv, only on Plot] —')
             assert 'join (' in find_commands('') and 'addcol (' in find_commands('')
             # whatever is asked for, the answer stays a size a request can carry
             assert len(find_commands('col', MAX_LIMIT)) < 16000

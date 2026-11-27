@@ -2154,6 +2154,7 @@ class TestAskUserInAWholeTurn:
         assert endpoint.payloads == []          # every canned reply was used
 
 
+@pytest.mark.usefixtures('clean_pipeline_registry')     # register() adds .LLM
 class TestPluginWiring:
     """register() as the editor runs it: what the model ends up being offered."""
 

@@ -5,14 +5,18 @@ built from and what the `gp` prompt opens on, and they touch nothing but the
 column objects handed to them, so no VisiData sheet or plotext figure is
 involved (both are MagicMocks under conftest anyway).
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import pytest
 
+from dbcls.vd_modules import vd_plotter
 from dbcls.vd_modules.vd_plotter import (
-    CompletePlotColumn, classify_plot_columns, default_plot_columns,
-    parse_plot_columns, plot_column_names, plot_sheet, plot_spec,
-    resolve_plot_columns, strip_bucket_marker)
+    BAR_MARKER, BUCKET_KEYS, PLOT_STYLES, POINT_MARKER, CompletePlotColumn,
+    CompletePlotStyle, _covered_bars, classify_plot_columns,
+    default_plot_columns, fix_plotext_time_labels,
+    parse_plot_columns, plot_column_names, plot_series, plot_sheet, plot_spec,
+    resolve_plot_columns, resolve_plot_style, strip_bucket_marker)
 
 #: What VisiData calls an untyped (anytype) column — `deduceType` only ever
 #: names int and float, so this is what a timestamp column starts out as.
@@ -297,3 +301,201 @@ class TestPlotPrompt:
         completer = fake_vd.kwargs['completer']
         assert isinstance(completer, CompletePlotColumn)
         assert completer('ts,c', 0) == 'ts,cnt'
+
+
+class TestSeriesToggleKeys:
+    """The legend numbers the series; the digit row toggles them by number."""
+
+    def test_digits_then_shifted_digits_cover_series_1_to_20(self):
+        # 1-9, 0 for the 10th, then the same keys with Shift for 11-20
+        assert dict(enumerate(BUCKET_KEYS, start=1)) == {
+            1: '1', 2: '2', 3: '3', 4: '4', 5: '5',
+            6: '6', 7: '7', 8: '8', 9: '9', 10: '0',
+            11: '!', 12: '@', 13: '#', 14: '$', 15: '%',
+            16: '^', 17: '&', 18: '*', 19: '(', 20: ')',
+        }
+
+
+class TestPlotStyleNames:
+    def test_a_style_names_itself(self):
+        assert [resolve_plot_style(name) for name in PLOT_STYLES] == list(PLOT_STYLES)
+
+    def test_case_and_spaces_do_not_matter(self):
+        assert resolve_plot_style('  Bars ') == 'bars'
+
+    def test_the_start_of_one_style_is_enough(self):
+        assert resolve_plot_style('bar') == 'bars'
+        assert resolve_plot_style('p') == 'points'
+        assert resolve_plot_style('linep') == 'linepoints'
+
+    def test_line_is_itself_although_linepoints_starts_with_it(self):
+        assert resolve_plot_style('line') == 'line'
+
+    def test_the_start_of_two_styles_is_refused(self):
+        with pytest.raises(Exception, match='unknown chart style: li'):
+            resolve_plot_style('li')
+
+    def test_an_unknown_name_is_refused_with_the_list(self):
+        with pytest.raises(Exception, match='line, linepoints, points, bars'):
+            resolve_plot_style('pie')
+
+    def test_the_prompt_completes_the_whole_answer(self):
+        completer = CompletePlotStyle(PLOT_STYLES)
+        assert completer('b', 0) == 'bars'
+        assert completer.matches('li') == ['line', 'linepoints']
+
+
+@pytest.fixture
+def figure(monkeypatch):
+    """A stand-in for plotext that keeps what was drawn on it."""
+    fake = MagicMock()
+    monkeypatch.setattr(vd_plotter, 'plt', fake)
+    return fake
+
+
+def drawn(calls):
+    """``[(xs, ys, kwargs), …]`` of the recorded plot()/scatter() calls."""
+    return [(call.args[0], call.args[1], call.kwargs) for call in calls]
+
+
+SIDE = {'xside': 'lower', 'yside': 'left'}
+
+
+class TestPlotSeries:
+    A = ([1, 2], [5, 7], {'label': '(1) a', 'color': 1})
+    B = ([1, 2], [9, 3], {'label': '(2) b', 'color': 2})
+
+    def test_line_is_one_plot_per_series_and_nothing_else(self, figure):
+        plot_series('line', [self.A, self.B])
+        assert drawn(figure.plot.call_args_list) == [
+            ([1, 2], [5, 7], {**SIDE, 'label': '(1) a', 'color': 1}),
+            ([1, 2], [9, 3], {**SIDE, 'label': '(2) b', 'color': 2})]
+        assert not figure.scatter.called
+        assert not figure.ylim.called
+
+    def test_linepoints_marks_the_points_in_the_colour_of_the_line(self, figure):
+        plot_series('linepoints', [self.A])
+        assert len(figure.plot.call_args_list) == 1
+        # no label on the markers: the line already has the legend entry
+        assert drawn(figure.scatter.call_args_list) == [
+            ([1, 2], [5, 7], {**SIDE, 'marker': POINT_MARKER, 'color': 1})]
+
+    def test_points_draws_no_line(self, figure):
+        plot_series('points', [self.A])
+        assert not figure.plot.called
+        assert drawn(figure.scatter.call_args_list) == [
+            ([1, 2], [5, 7], {**SIDE, 'marker': POINT_MARKER, 'label': '(1) a', 'color': 1})]
+
+    def test_a_lone_series_has_neither_label_nor_colour(self, figure):
+        for style in PLOT_STYLES:
+            figure.reset_mock()
+            plot_series(style, [([1, 2], [5, 7], {})])
+            for call in figure.plot.call_args_list + figure.scatter.call_args_list:
+                assert 'label' not in call.kwargs and 'color' not in call.kwargs, style
+
+    def test_bars_are_filled_down_to_the_x_axis(self, figure):
+        plot_series('bars', [([1, 2], [5, 7], {})])
+        assert not figure.plot.called
+        assert drawn(figure.scatter.call_args_list) == [
+            ([1, 2], [5, 7], {**SIDE, 'marker': BAR_MARKER, 'fillx': True})]
+
+    def test_bars_start_the_axis_at_zero(self, figure):
+        # left alone plotext starts the axis at the smallest value, and that
+        # value's bar has no length
+        plot_series('bars', [([1, 2], [5, 7], {})])
+        figure.ylim.assert_called_once_with(0, None)
+
+    def test_bars_below_zero_end_the_axis_at_zero(self, figure):
+        plot_series('bars', [([1, 2], [-5, -7], {})])
+        figure.ylim.assert_called_once_with(None, 0)
+
+    def test_bars_on_both_sides_of_zero_leave_the_axis_alone(self, figure):
+        plot_series('bars', [([1, 2], [-5, 7], {})])
+        figure.ylim.assert_called_once_with(None, None)
+
+    def test_bars_with_nothing_to_measure_set_no_limits(self, figure):
+        plot_series('bars', [([1, 2], [None, None], {})])
+        assert not figure.ylim.called
+
+    def test_bars_sharing_an_x_are_drawn_again_shortest_last(self, figure):
+        plot_series('bars', [self.A, self.B])
+        calls = drawn(figure.scatter.call_args_list)
+        # both series whole, with their legend entries...
+        assert [c[2].get('label') for c in calls[:2]] == ['(1) a', '(2) b']
+        # ...then what the second one covered or was about to: at x=1 `a` (5)
+        # stands behind `b` (9), at x=2 `b` (3) in front of `a` (7)
+        assert calls[2:] == [
+            ([1], [5], {**SIDE, 'marker': BAR_MARKER, 'fillx': True, 'color': 1}),
+            ([2], [3], {**SIDE, 'marker': BAR_MARKER, 'fillx': True, 'color': 2})]
+
+
+class TestCoveredBars:
+    def test_bars_on_their_own_x_need_nothing(self):
+        assert _covered_bars([([1], [5], {}), ([2], [9], {})]) == []
+
+    def test_every_bar_but_the_tallest_is_drawn_again_tallest_first(self):
+        series = [([1], [2], {'color': 1}), ([1], [9], {'color': 2}), ([1], [5], {'color': 3})]
+        assert _covered_bars(series) == [([1], [5], {'color': 3}), ([1], [2], {'color': 1})]
+
+    def test_height_is_the_distance_from_zero(self):
+        series = [([1], [-9], {'color': 1}), ([1], [-2], {'color': 2})]
+        assert _covered_bars(series) == [([1], [-2], {'color': 2})]
+
+    def test_two_rows_of_one_series_on_one_x_count_too(self):
+        assert _covered_bars([([1, 1], [9, 4], {})]) == [([1], [4], {})]
+
+    def test_what_is_not_a_number_is_left_out(self):
+        assert _covered_bars([([1], [None], {}), ([1], [4], {})]) == []
+
+
+class LocalClock:
+    """plotext 5.3.2's date_class, as far as the bug goes: a string is read as
+    UTC and written back through a zone three hours east of it."""
+    time0 = 0
+    zone = timezone(timedelta(hours=3))
+
+    def date_form(self, input_form=None, output_form=None):
+        pass
+
+    def string_to_time(self, string, input_form=None, time0=None):
+        return datetime.strptime(string, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
+
+    def datetime_to_string(self, value, output_form=None):
+        return value.strftime('%Y-%m-%d %H:%M:%S')
+
+    def time_to_string(self, time, output_form=None):
+        return self.datetime_to_string(datetime.fromtimestamp(time + self.time0, self.zone), output_form)
+
+
+class TestPlotextTimeLabels:
+    TEXT = '2026-11-01 10:00:00'
+
+    def test_a_clock_that_shifts_the_labels_is_fixed(self):
+        clock_class = type('Clock', (LocalClock,), {})
+        clock = clock_class()
+        assert clock.time_to_string(clock.string_to_time(self.TEXT)) == '2026-11-01 13:00:00'
+
+        assert fix_plotext_time_labels(clock_class) is True
+        assert clock.time_to_string(clock.string_to_time(self.TEXT)) == self.TEXT
+
+    def test_time0_is_still_honoured(self):
+        # plotext counts from 1900, not from the epoch
+        clock_class = type('Clock', (LocalClock,), {'time0': -3600.0})
+        clock_class.string_to_time = lambda self, string, input_form=None, time0=None: (
+            LocalClock.string_to_time(self, string) - self.time0)
+        assert fix_plotext_time_labels(clock_class) is True
+        clock = clock_class()
+        assert clock.time_to_string(clock.string_to_time(self.TEXT)) == self.TEXT
+
+    def test_a_clock_that_round_trips_is_left_alone(self):
+        clock_class = type('Clock', (LocalClock,), {'zone': timezone.utc})
+        original = clock_class.time_to_string
+        assert fix_plotext_time_labels(clock_class) is False
+        assert clock_class.time_to_string is original
+
+    def test_a_clock_broken_some_other_way_is_put_back(self):
+        clock_class = type('Clock', (LocalClock,), {})
+        clock_class.string_to_time = lambda self, string, input_form=None, time0=None: 0.0
+        original = clock_class.time_to_string
+        assert fix_plotext_time_labels(clock_class) is False
+        assert clock_class.time_to_string is original

@@ -4952,7 +4952,10 @@ class EditorShell:
         widget (SelectPopup / InputBar / y-n status prompt) and resolves the
         request with the user's answer.
 
-        *request* needs ``kind`` and ``title``.  Popup kinds — ``'choose'``
+        *request* needs ``kind`` and ``title`` (``'custom'`` — a window of the
+        caller's own — needs ``open`` as well, see
+        :attr:`~dbcls.prompts.PromptKind.CUSTOM`, and returns whatever that
+        window answers).  Popup kinds — ``'choose'``
         (pick one) and ``'select'`` (mark any number) — take ``options`` (list
         of strings); the viewer kinds in :data:`SHEET_PROMPT_KINDS` take
         ``rows`` (list of row dicts) instead.  ``'input'`` / ``'ask'`` /
@@ -5006,6 +5009,17 @@ class EditorShell:
             # dismiss it.  Esc means "cancelled" (None), distinct from "no".
             self._resolve_ui_request(
                 self._read_yes_no(f"{req['title']} (y/Enter = yes, n = no, Esc = cancel): "))
+        elif kind == PromptKind.CUSTOM:
+            # The caller's own window: it opens it, and answers through the
+            # function it is handed.  One that fails to open answers nothing —
+            # the task must not be left waiting on a window that never came.
+            try:
+                req['open'](lambda answer: self._answer_ui_request(req, answer))
+            except Exception as exc:
+                logger.exception('a custom prompt failed to open')
+                self.set_status_notification(
+                    f'{type(exc).__name__}: {exc}', error=True)
+                self._answer_ui_request(req, None)
         elif kind in SHEET_KINDS:
             # Row prompts shown in an external viewer (VisiData in DbEditor).
             # Synchronous like 'ask': the viewer owns the terminal on the main
@@ -5039,6 +5053,15 @@ class EditorShell:
         if req is not None:
             req['result'] = result
             req['event'].set()
+
+    def _answer_ui_request(self, req: dict, result: Any) -> None:
+        """Deliver *result* for *req* — if it is still the one waiting.  What a
+        custom prompt's window calls: by then the request may be long gone
+        (answered already, or its task cancelled), and the slot may hold
+        another task's question."""
+        if self._ui_request is req:
+            self._resolve_ui_request(result)
+            self.request_redraw()
 
     def _handle_ui_request_key(self, key) -> None:
         """Route *key* to the active prompt widget; resolve when it finishes."""

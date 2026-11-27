@@ -372,6 +372,38 @@ class PluginAPI:
             pending = self.editor.pending_llm_tools = []
         pending.append(tool)
 
+    def add_llm_skill(self, name: str, description: str, instructions,
+                      argument_hint: str = '', briefing=False) -> None:
+        """Teach the LLM chat a skill: a job the user starts by typing
+        ``/name`` in the chat's request pane, or with ``.LLM "/name …"`` from
+        the editor (no-op when the chat is not configured).
+
+        The job is carried out by a *new* agent with an empty context — it has
+        the system prompt, *instructions* and what the user typed after the
+        name, and every tool the main agent has.  *instructions* is text, or
+        ``func(arguments) -> text`` to build it from what the user typed.
+        *argument_hint* is how the arguments are spelled where skills are
+        listed (``'[description]'`` gives ``/review [description]``).
+
+        *briefing* decides what the new agent hears of the conversation the
+        user was having.  False: nothing.  True: the main agent is asked, once,
+        to write down what from that conversation matters for the job, and
+        that is all of it the new agent sees.  Text: the same, with your word
+        on what the briefing should carry ("the tables and date columns the
+        user named").
+
+        Like a tool (:meth:`add_llm_tool`), a skill offered before the chat is
+        up waits for it (:func:`deliver_pending_llm_skills`)."""
+        skill = (name, description, instructions, argument_hint, briefing)
+        registry = getattr(self.editor, 'llm_skills', None)
+        if registry is not None:
+            registry.add(*skill)
+            return
+        pending = getattr(self.editor, 'pending_llm_skills', None)
+        if pending is None:
+            pending = self.editor.pending_llm_skills = []
+        pending.append(skill)
+
     def add_engine(self, name: str, fields, factory, **kwargs):
         """Register a database engine from the running editor — see
         :func:`dbcls.clients.register_engine`.
@@ -528,6 +560,27 @@ class PluginAPI:
         """Insert *text* at the cursor (replacing the selection, if any)."""
         return self.editor.insert_text(text)
 
+    def run_query(self, text: str, on_finished=None) -> None:
+        """Run *text* — SQL or a pipeline — on the current tab, the way
+        ``Alt+Enter`` runs the statement under the cursor: the running popup,
+        ``Esc`` to cancel, the result in VisiData, the ``before_query`` /
+        ``after_query`` filters.  The document is not touched: the text need
+        not be in it.
+
+        It returns at once; *on_finished(meta)*, when given, is called on the
+        main thread when the run is over, with the ``meta`` the ``after_query``
+        filters saw (``status``, ``error``, ``cancelled``, ``rowcount``, …).
+
+        Call it from the main thread, with no overlay of yours on screen: the
+        result opens only once nothing else holds the screen.  Raises
+        RuntimeError on a tab that runs nothing (a plain file)."""
+        doc = getattr(self.editor, 'doc', self.editor)
+        run = getattr(doc, 'run_query', None)
+        if run is None:
+            raise RuntimeError('the current tab has no connection to run a '
+                               'query on; switch to a database tab')
+        run(text, on_finished=on_finished)
+
 
 # ─── LLM tools offered before the chat exists ─────────────────────────────────
 
@@ -561,6 +614,23 @@ def deliver_pending_llm_tools(editor, registry) -> int:
             continue
         delivered += 1
     editor.pending_llm_tools = []
+    return delivered
+
+
+def deliver_pending_llm_skills(editor, registry) -> int:
+    """Hand *registry* every skill a plugin offered before the chat was up —
+    the companion of :func:`deliver_pending_llm_tools`, with the same rule: one
+    that fails to register is logged and skipped."""
+    pending = getattr(editor, 'pending_llm_skills', None) or []
+    delivered = 0
+    for skill in pending:
+        try:
+            registry.add(*skill)
+        except Exception as exc:
+            _log_error(f'llm skill {skill[0]!r}', exc)
+            continue
+        delivered += 1
+    editor.pending_llm_skills = []
     return delivered
 
 

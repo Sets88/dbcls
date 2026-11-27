@@ -30,6 +30,13 @@ class PromptKind(str, enum.Enum):
     ASK = 'ask'
     #: A message the task waits on until the user closes it.
     WARN = 'warn'
+    #: A window of the caller's own.  The request carries ``open``: called on
+    #: the main thread with the function that delivers the answer, it puts its
+    #: window on screen (an overlay, see ``EditorShell.push_overlay``) and
+    #: calls that function — on the main thread too — when the user is done
+    #: with it.  How a plugin's pipeline command asks something no widget of
+    #: the editor's can: the LLM chat's ``.LLM`` step opens its window so.
+    CUSTOM = 'custom'
 
     # ── Answered in the external viewer (see SHEET_KINDS) ────────────────────
     #: Pick the cursor row, or any number of marked ones.
